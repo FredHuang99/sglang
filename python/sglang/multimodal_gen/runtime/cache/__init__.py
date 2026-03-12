@@ -7,9 +7,16 @@ diffusion transformer (DiT) inference:
 
 - TeaCache: Temporal similarity-based caching for diffusion models
 - cache-dit integration: Block-level caching with DBCache and TaylorSeer
-
+- TransferBuffer: Memory buffers for PD disaggregation transfer
 """
 
+from sglang.multimodal_gen.runtime.cache.buffer import (
+    META_SLOT_SIZE,
+    TransferMetaBuffer,
+    TransferMetaBufferSlot,
+    TransferTensorBuffer,
+    TransferTensorBufferSlot,
+)
 from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     enable_cache_on_dual_transformer,
@@ -27,4 +34,10 @@ __all__ = [
     "enable_cache_on_transformer",
     "enable_cache_on_dual_transformer",
     "get_scm_mask",
+    # TransferBuffer for PD disaggregation
+    "TransferTensorBuffer",
+    "TransferTensorBufferSlot",
+    "TransferMetaBuffer",
+    "TransferMetaBufferSlot",
+    "META_SLOT_SIZE",
 ]
