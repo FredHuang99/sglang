@@ -62,6 +62,12 @@ class DecodingStage(PipelineStage):
         self.pipeline = weakref.ref(pipeline) if pipeline else None
 
     @property
+    def role_affinity(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        return RoleType.DECODER
+
+    @property
     def parallelism_type(self) -> StageParallelismType:
         if get_global_server_args().enable_cfg_parallel:
             return StageParallelismType.MAIN_RANK_ONLY

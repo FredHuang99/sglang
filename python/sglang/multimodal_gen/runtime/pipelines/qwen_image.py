@@ -135,6 +135,7 @@ class QwenImageEditPipeline(LoRAPipeline, ComposedPipelineBase):
         "transformer",
         "vae",
     ]
+    _encoder_required_config_modules = ["vae"]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""
@@ -215,6 +216,7 @@ class QwenImageLayeredPipeline(QwenImageEditPipeline):
         "transformer",
         "scheduler",
     ]
+    _encoder_required_config_modules = ["vae"]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""

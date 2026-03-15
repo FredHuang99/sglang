@@ -44,6 +44,7 @@ class MOVAPipeline(ComposedPipelineBase):
         "audio_dit",
         "dual_tower_bridge",
     ]
+    _encoder_required_config_modules = ["video_vae", "audio_vae"]
     pipeline_config_cls = MOVAPipelineConfig
     sampling_params_cls = MOVASamplingParams
 

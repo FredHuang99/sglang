@@ -116,6 +116,7 @@ class LTX2Pipeline(ComposedPipelineBase):
         "vocoder",
         "connectors",
     ]
+    _encoder_required_config_modules = ["audio_vae"]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         """Set up pipeline stages with proper dependency injection."""

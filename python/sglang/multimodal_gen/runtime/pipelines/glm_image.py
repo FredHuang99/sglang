@@ -27,6 +27,7 @@ class GlmImagePipeline(LoRAPipeline, ComposedPipelineBase):
         "transformer",
         "scheduler",
     ]
+    _encoder_required_config_modules = ["vae"]
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         self.add_stage(

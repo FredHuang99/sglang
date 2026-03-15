@@ -2,16 +2,46 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import dataclasses
+import json
 import os
 import pickle
+import time
 from collections import deque
 from copy import deepcopy
 from typing import Any, List
 
+import torch
 import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.transport.p2p_protocol import (
+    P2P_MAGIC,
+    P2PAllocatedMsg,
+    P2PDoneMsg,
+    P2PMsgType,
+    P2PPushedMsg,
+    P2PRegisterMsg,
+    decode_p2p_msg,
+    encode_p2p_msg,
+    is_p2p_message,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport.relay.tensor_transport import (
+    send_tensors,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport.role_connector import (
+    DENOISER_TO_DECODER_SCALAR_FIELDS,
+    DENOISER_TO_DECODER_TENSOR_FIELDS,
+    ENCODER_TO_DENOISER_SCALAR_FIELDS,
+    ENCODER_TO_DENOISER_TENSOR_FIELDS,
+    _extract_scalar_fields,
+    _extract_tensor_fields,
+    build_req_from_frames,
+)
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -51,9 +81,16 @@ class Scheduler:
         port_args: PortArgs,
         task_pipes_to_slaves: list = None,
         result_pipes_from_slaves: list = None,
+        local_rank: int | None = None,
     ):
         self.server_args = server_args
         self.port_args = port_args
+
+        # local_rank is the physical GPU index for torch.cuda.set_device.
+        # In non-disagg mode, it equals gpu_id. In disagg mode, it may differ
+        # (e.g., denoiser rank 0 on physical GPU 1).
+        if local_rank is None:
+            local_rank = gpu_id
 
         set_global_server_args(server_args=server_args)
 
@@ -70,6 +107,7 @@ class Scheduler:
             self.receiver = None
 
         worker = GPUWorker(
+            local_rank=local_rank,
             local_rank=gpu_id,
             master_port=port_args.master_port,
             rank=gpu_id,
@@ -89,6 +127,7 @@ class Scheduler:
             List[Req]: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
+            GetDisaggStatsReq: self._handle_get_disagg_stats,
         }
 
         # FIFO, new reqs are appended
@@ -105,6 +144,45 @@ class Scheduler:
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
+
+        # Disaggregation state
+        self._disagg_role = server_args.disagg_role
+        self._disagg_timeout_s: float = float(
+            getattr(server_args, "disagg_timeout", 600)
+        )
+
+        # Per-role observability metrics
+        self._disagg_metrics = None
+        self._pool_mode = getattr(server_args, "disagg_pool_mode", False)
+        self._p2p_mode = getattr(server_args, "disagg_p2p_mode", False)
+        # Pool mode sockets (set by _init_pool_mode_sockets)
+        self._pool_work_pull = None
+        self._pool_result_push = None
+        # P2P transfer manager (set by _init_p2p_transfer_manager)
+        self._transfer_manager = None
+
+        if self._disagg_role != RoleType.MONOLITHIC:
+            from sglang.multimodal_gen.runtime.disaggregation.metrics import (
+                DisaggMetrics,
+            )
+
+            self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
+            self._init_pool_mode_sockets()
+            if self._p2p_mode:
+                self._init_p2p_transfer_manager()
+
+    def get_disagg_metrics(self) -> dict | None:
+        """Return disagg role metrics snapshot, or None if not in disagg mode."""
+        if self._disagg_metrics is None:
+            return None
+        return self._disagg_metrics.snapshot().to_dict()
+
+    def _handle_get_disagg_stats(self, _reqs: List[Any]) -> OutputBatch:
+        """Handle stats request — return disagg metrics via OutputBatch.output."""
+        stats = self.get_disagg_metrics()
+        return OutputBatch(
+            output=stats or {"role": "monolithic", "message": "not in disagg mode"}
+        )
 
     def _handle_set_lora(self, reqs: List[Any]) -> OutputBatch:
         # TODO: return set status
@@ -288,6 +366,810 @@ class Scheduler:
         assert recv_reqs is not None
 
         return recv_reqs
+    
+    def _migrate_req_tensors(self, req: Req) -> None:
+        """Move all GPU tensor attributes of a Req to this worker's device.
+        After broadcast or ZMQ recv, tensors may be on a different GPU
+        (e.g., rank 0's device). This moves them to the local device.
+        Handles both direct tensor attributes and lists of tensors.
+        """
+        target = torch.device(f"cuda:{self.worker.local_rank}")
+        for attr_name in dir(req):
+            if attr_name.startswith("_"):
+                continue
+            try:
+                val = getattr(req, attr_name)
+            except Exception:
+                continue
+            if isinstance(val, torch.Tensor) and val.is_cuda and val.device != target:
+                setattr(req, attr_name, val.to(target))
+            elif isinstance(val, list) and val and isinstance(val[0], torch.Tensor):
+                setattr(
+                    req,
+                    attr_name,
+                    [
+                        t.to(target) if t.is_cuda and t.device != target else t
+                        for t in val
+                    ],
+                )
+
+    def _init_pool_mode_sockets(self):
+        """Initialize ZMQ sockets for pool mode (DiffusionServer-mediated).
+        Only rank 0 creates ZMQ sockets. Non-rank-0 processes participate
+        via NCCL broadcast from rank 0 (see _pool_mode_recv_work).
+        """
+        if self.gpu_id != 0:
+            logger.info(
+                "Pool mode %s rank %d: no ZMQ sockets (non-rank-0)",
+                self._disagg_role.value.upper(),
+                self.gpu_id,
+            )
+            return
+
+        sa = self.server_args
+
+        # PULL: receive work from DiffusionServer
+        # Port must match what DiffusionServer connects to, so we retry the
+        # same port (with sleep) rather than incrementing to a new one.
+        import time as _time
+
+        last_exc = None
+        for _attempt in range(5):
+            try:
+                self._pool_work_pull, _ = get_zmq_socket(
+                    self.context,
+                    zmq.PULL,
+                    sa.pool_work_endpoint,
+                    bind=True,
+                    max_bind_retries=1,
+                )
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                logger.warning(
+                    "Pool work bind attempt %d failed (%s), retrying in 1s...",
+                    _attempt + 1,
+                    e,
+                )
+                _time.sleep(1)
+        if last_exc is not None:
+            raise last_exc
+        # PUSH: send results to DiffusionServer
+        self._pool_result_push, _ = get_zmq_socket(
+            self.context, zmq.PUSH, sa.pool_result_endpoint, bind=False
+        )
+        logger.info(
+            "Pool mode %s rank 0: work_pull=%s, result_push=%s",
+            self._disagg_role.value.upper(),
+            sa.pool_work_endpoint,
+            sa.pool_result_endpoint,
+        )
+
+    def _init_p2p_transfer_manager(self):
+        """Initialize TransferManager for P2P mode (rank 0 only).
+        Creates a TransferTensorBuffer (pinned memory pool) and a
+        BaseTransferEngine, then wraps them in a DiffusionTransferManager.
+        Also sends a p2p_register message to DiffusionServer.
+        """
+        if self.gpu_id != 0:
+            return
+        from sglang.multimodal_gen.runtime.disaggregation.transport.rdma.transfer_buffer import (
+            TransferTensorBuffer,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.transport.rdma.transfer_engine import (
+            create_transfer_engine,
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.transport.rdma.transfer_manager import (
+            DiffusionTransferManager,
+        )
+
+        sa = self.server_args
+
+        # Pool size: configurable, default 256 MiB
+        pool_size = getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
+
+        # Create pinned memory buffer
+        buffer = TransferTensorBuffer(pool_size=pool_size)
+
+        # Create transfer engine
+        hostname = getattr(sa, "disagg_p2p_hostname", "127.0.0.1")
+        ib_device = getattr(sa, "disagg_ib_device", None)
+        engine = create_transfer_engine(
+            hostname=hostname,
+            gpu_id=self.gpu_id,
+            ib_device=ib_device,
+        )
+
+        # Create transfer manager
+        self._transfer_manager = DiffusionTransferManager(engine=engine, buffer=buffer)
+
+        # Register with DiffusionServer
+        register_msg = P2PRegisterMsg(
+            role=self._disagg_role.value,
+            instance_idx=0,  # Set by launcher; single instance per process
+            session_id=self._transfer_manager.session_id,
+            pool_ptr=self._transfer_manager.pool_data_ptr,
+            pool_size=self._transfer_manager.pool_size,
+        )
+        self._pool_result_push.send_multipart(encode_p2p_msg(register_msg))
+        logger.info(
+            "P2P %s: registered with DS (session=%s, pool=%d bytes)",
+            self._disagg_role.value.upper(),
+            self._transfer_manager.session_id,
+            pool_size,
+        )
+
+    def _pool_mode_recv_work(self) -> list[bytes] | None:
+        """Receive work frames in pool mode, with multi-rank broadcast.
+        Rank 0: recv from ZMQ PULL socket, broadcast to other ranks.
+        Non-rank-0: receive via NCCL broadcast from rank 0.
+        Returns list of bytes frames, or None on shutdown.
+        """
+        is_rank0 = self.gpu_id == 0
+        sa = self.server_args
+
+        if is_rank0:
+            # Rank 0: receive from DiffusionServer
+            raw_frames = self._pool_work_pull.recv_multipart()
+            # Convert zmq.Frame to bytes for pickling
+            frames = [bytes(f) for f in raw_frames]
+        else:
+            frames = None
+
+        # Broadcast to all ranks if multi-GPU
+        if sa.sp_degree != 1:
+            frames = broadcast_pyobj(
+                frames,
+                self.worker.sp_group.rank,
+                self.worker.sp_cpu_group,
+                src=self.worker.sp_group.ranks[0],
+            )
+
+        if sa.enable_cfg_parallel:
+            frames = broadcast_pyobj(
+                frames,
+                self.worker.cfg_group.rank,
+                self.worker.cfg_cpu_group,
+                src=self.worker.cfg_group.ranks[0],
+            )
+
+        if sa.tp_size > 1:
+            frames = broadcast_pyobj(
+                frames,
+                self.worker.tp_group.rank,
+                self.worker.tp_cpu_group,
+                src=self.worker.tp_group.ranks[0],
+            )
+
+        return frames
+
+    def _pool_mode_event_loop(self) -> None:
+        """Event loop for all roles in pool mode (DiffusionServer-mediated).
+        Multi-rank support (Phase 7c):
+        - Rank 0 receives from ZMQ, broadcasts to other ranks via NCCL
+        - All ranks process work (execute_forward with SP/TP sharding)
+        - Only rank 0 sends results back to DiffusionServer
+        In relay mode:
+        - Encoder: receives [request_id, pickled_req], sends tensor multipart
+        - Denoiser: receives tensor multipart, sends tensor multipart
+        - Decoder: receives tensor multipart, sends tensor multipart
+        In P2P mode (Phase 7b):
+        - P2P control messages (p2p_alloc, p2p_push) are rank-0-only.
+        - p2p_ready is broadcast to all ranks for compute.
+        """
+        role_name = self._disagg_role.value.upper()
+        is_rank0 = self.gpu_id == 0
+        # P2P mode: rank 0 has transfer_manager, non-rank-0 still needs to
+        # detect P2P frames so they participate in p2p_ready compute.
+        p2p = self._p2p_mode
+        is_multi_rank = (
+            self.server_args.sp_degree != 1
+            or self.server_args.tp_size > 1
+            or self.server_args.enable_cfg_parallel
+        )
+        logger.info(
+            "Pool mode %s rank %d event loop started (p2p=%s, multi_rank=%s)",
+            role_name,
+            self.gpu_id,
+            p2p,
+            is_multi_rank,
+        )
+
+        while self._running:
+            try:
+                # All ranks receive work (rank 0 via ZMQ, others via broadcast)
+                frames = self._pool_mode_recv_work()
+
+                # P2P dispatch: check on ALL ranks (frames are broadcast)
+                if p2p and self._is_p2p_frames(frames):
+                    if is_rank0:
+                        # Rank 0: handle all P2P messages
+                        self._handle_p2p_message(frames)
+                    else:
+                        # Non-rank-0: only participate in p2p_ready compute
+                        self._handle_p2p_non_rank0(frames)
+                    # Continue to next iteration after P2P handling
+                elif self._disagg_role == RoleType.ENCODER:
+                    self._pool_mode_encoder_step(
+                        send_tensors,
+                        _extract_tensor_fields,
+                        _extract_scalar_fields,
+                        ENCODER_TO_DENOISER_TENSOR_FIELDS,
+                        ENCODER_TO_DENOISER_SCALAR_FIELDS,
+                        frames=frames,
+                    )
+                elif self._disagg_role == RoleType.DENOISER:
+                    self._pool_mode_denoiser_step(
+                        send_tensors,
+                        build_req_from_frames,
+                        _extract_tensor_fields,
+                        _extract_scalar_fields,
+                        DENOISER_TO_DECODER_TENSOR_FIELDS,
+                        DENOISER_TO_DECODER_SCALAR_FIELDS,
+                        frames=frames,
+                    )
+                elif self._disagg_role == RoleType.DECODER:
+                    self._pool_mode_decoder_step(
+                        send_tensors,
+                        build_req_from_frames,
+                        frames=frames,
+                    )
+
+                self._consecutive_error_count = 0
+
+            except Exception as e:
+                self._consecutive_error_count += 1
+                logger.error(
+                    "Pool %s rank %d: error (attempt %d/%d): %s",
+                    role_name,
+                    self.gpu_id,
+                    self._consecutive_error_count,
+                    self._max_consecutive_errors,
+                    e,
+                    exc_info=True,
+                )
+                if self._consecutive_error_count >= self._max_consecutive_errors:
+                    raise RuntimeError(
+                        f"Pool {role_name} rank {self.gpu_id} terminated after "
+                        f"{self._max_consecutive_errors} consecutive errors: {e}"
+                    ) from e
+
+        # Cleanup (rank 0 only has sockets/transfer manager)
+        if self._transfer_manager is not None:
+            self._transfer_manager.cleanup()
+        if self._pool_work_pull is not None:
+            self._pool_work_pull.close()
+        if self._pool_result_push is not None:
+            self._pool_result_push.close()
+
+    # ------------------------------------------------------------------
+    # P2P message handling (Phase 7b)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_p2p_frames(frames: list) -> bool:
+        """Check if ZMQ multipart frames carry a P2P control message."""
+        return is_p2p_message(frames)
+
+    def _handle_p2p_message(self, frames: list) -> None:
+        """Dispatch a P2P control message to the appropriate handler (rank 0)."""
+        msg = decode_p2p_msg(frames)
+        msg_type = msg.get("msg_type", "")
+        request_id = msg.get("request_id", "")
+
+        logger.debug(
+            "P2P %s: received %s for %s",
+            self._disagg_role.value.upper(),
+            msg_type,
+            request_id,
+        )
+
+        if msg_type == P2PMsgType.ALLOC:
+            self._handle_p2p_alloc(msg)
+        elif msg_type == P2PMsgType.PUSH:
+            self._handle_p2p_push_cmd(msg)
+        elif msg_type == P2PMsgType.READY:
+            self._handle_p2p_ready(msg)
+        else:
+            logger.warning(
+                "P2P %s: unknown message type %s",
+                self._disagg_role.value.upper(),
+                msg_type,
+            )
+
+    def _handle_p2p_non_rank0(self, frames: list) -> None:
+        """Handle P2P messages on non-rank-0 workers.
+        Only p2p_ready requires non-rank-0 participation (for compute).
+        p2p_alloc and p2p_push are rank-0-only operations — skip them.
+        """
+        msg = decode_p2p_msg(frames)
+        msg_type = msg.get("msg_type", "")
+
+        if msg_type == P2PMsgType.READY:
+            # Participate in compute — but non-rank-0 has no TransferManager.
+            # Rank 0 loads tensors and broadcasts; non-rank-0 gets them
+            # via the execute_forward's internal NCCL sync.
+            # For now, non-rank-0 reconstructs the Req from scalar fields
+            # (no tensor data — pipeline broadcasts internally).
+            self._handle_p2p_ready_non_rank0(msg)
+        # else: p2p_alloc, p2p_push — skip (rank-0-only operations)
+
+    def _handle_p2p_ready_non_rank0(self, msg: dict) -> None:
+        """Non-rank-0 handling of p2p_ready: participate in compute only.
+        Rank 0 loads tensors from the transfer buffer and runs compute.
+        The pipeline's forward() internally uses NCCL to broadcast/scatter
+        tensors to all SP/TP ranks. Non-rank-0 needs to enter execute_forward
+        with a minimal Req so the NCCL collectives match.
+        """
+        request_id = msg.get("request_id", "")
+        scalar_fields = msg.get("scalar_fields", {})
+
+        # Build a minimal Req with scalar fields only.
+        # Tensor fields will be received via NCCL inside execute_forward.
+        req = self._build_req_from_p2p(scalar_fields, {})
+
+        if self._disagg_role == RoleType.DENOISER:
+            # Initialize scheduler timesteps (same as rank 0)
+            scheduler_mod = self.worker.pipeline.get_module("scheduler")
+            num_steps = getattr(req, "num_inference_steps", None)
+            if scheduler_mod is not None and num_steps is not None:
+                device = torch.device(f"cuda:{self.worker.local_rank}")
+                scheduler_mod.set_timesteps(num_steps, device=device)
+
+            self.worker.execute_forward([req], return_req=True)
+
+        elif self._disagg_role == RoleType.DECODER:
+            req.save_output = False
+            req.return_file_paths_only = False
+            self.worker.execute_forward([req])
+
+    def _handle_p2p_alloc(self, msg: dict) -> None:
+        """Handle p2p_alloc: allocate a receive slot and reply with p2p_allocated."""
+        request_id = msg["request_id"]
+        data_size = msg.get("data_size", 0)
+
+        pending = self._transfer_manager.allocate_receive_slot(request_id, data_size)
+        if pending is None:
+            logger.error(
+                "P2P %s: failed to allocate receive slot for %s (%d bytes)",
+                self._disagg_role.value.upper(),
+                request_id,
+                data_size,
+            )
+            return
+
+        allocated_msg = P2PAllocatedMsg(
+            request_id=request_id,
+            session_id=self._transfer_manager.session_id,
+            pool_ptr=self._transfer_manager.pool_data_ptr,
+            slot_offset=pending.slot.offset,
+            slot_size=pending.slot.size,
+        )
+        self._pool_result_push.send_multipart(encode_p2p_msg(allocated_msg))
+
+        logger.debug(
+            "P2P %s: allocated receive slot for %s (offset=%d, size=%d)",
+            self._disagg_role.value.upper(),
+            request_id,
+            pending.slot.offset,
+            pending.slot.size,
+        )
+
+    def _handle_p2p_push_cmd(self, msg: dict) -> None:
+        """Handle p2p_push: RDMA push staged data to peer, reply with p2p_pushed."""
+        request_id = msg["request_id"]
+        dest_session_id = msg.get("dest_session_id", "")
+        dest_addr = msg.get("dest_addr", 0)
+        transfer_size = msg.get("transfer_size", 0)
+
+        success = self._transfer_manager.push_to_peer(
+            request_id=request_id,
+            dest_session_id=dest_session_id,
+            dest_addr=dest_addr,
+            transfer_size=transfer_size,
+        )
+
+        if success:
+            # Free local staged slot after successful push
+            self._transfer_manager.free_staged(request_id)
+
+        pushed_msg = P2PPushedMsg(request_id=request_id)
+        self._pool_result_push.send_multipart(encode_p2p_msg(pushed_msg))
+
+        if not success:
+            logger.error(
+                "P2P %s: RDMA push failed for %s",
+                self._disagg_role.value.upper(),
+                request_id,
+            )
+
+    def _handle_p2p_ready(self, msg: dict) -> None:
+        """Handle p2p_ready: load tensors from buffer, run compute, send result.
+        This is the main P2P compute handler. After the RDMA data arrives:
+        1. Load tensors from the receive slot (H2D)
+        2. Reconstruct a Req from scalar fields + tensors
+        3. Run the role's compute (denoising or decoding)
+        4. Send p2p_done to DS (with staged info for next role if applicable)
+        """
+
+        request_id = msg["request_id"]
+        manifest = msg.get("manifest", {})
+        scalar_fields = msg.get("scalar_fields", {})
+        role_name = self._disagg_role.value.upper()
+
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_start(request_id)
+
+        # 1. Load tensors from receive buffer (H2D)
+        local_device = f"cuda:{self.worker.local_rank}"
+        tensors = self._transfer_manager.load_tensors(
+            request_id, manifest, device=local_device
+        )
+
+        # Free receive slot after loading to GPU
+        self._transfer_manager.free_receive_slot(request_id)
+
+        # 2. Reconstruct Req from scalar fields + loaded tensors
+        req = self._build_req_from_p2p(scalar_fields, tensors)
+
+        if self._disagg_role == RoleType.DENOISER:
+            self._p2p_denoiser_compute(req, request_id, role_name)
+        elif self._disagg_role == RoleType.DECODER:
+            self._p2p_decoder_compute(req, request_id, role_name)
+
+    def _build_req_from_p2p(self, scalar_fields: dict, tensors: dict) -> "Req":
+        """Reconstruct a Req from P2P scalar fields and loaded GPU tensors.
+        Initializes all dataclass field defaults first, then overlays
+        scalar and tensor fields from the P2P message.
+        """
+        req = object.__new__(Req)
+        # Initialize all dataclass fields with their defaults
+        for f in dataclasses.fields(Req):
+            if f.default is not dataclasses.MISSING:
+                object.__setattr__(req, f.name, f.default)
+            elif f.default_factory is not dataclasses.MISSING:
+                object.__setattr__(req, f.name, f.default_factory())
+        # Ensure sampling_params is not None so __getattr__ delegation works
+        object.__setattr__(req, "sampling_params", SamplingParams())
+        # Overlay scalar fields from the P2P message
+        req.__dict__.update(scalar_fields)
+        # Set tensor fields
+        for key, value in tensors.items():
+            setattr(req, key, value)
+        # Recreate torch.Generator from seed (not serializable over P2P)
+        seed = scalar_fields.get("seed")
+        if seed is not None:
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(seed))
+            req.generator = gen
+        return req
+
+    def _p2p_denoiser_compute(
+        self, req: "Req", request_id: str, role_name: str
+    ) -> None:
+        """Run denoiser compute in P2P mode, then stage output for decoder."""
+        # Initialize scheduler timesteps
+        scheduler_mod = self.worker.pipeline.get_module("scheduler")
+        num_steps = getattr(req, "num_inference_steps", None)
+        if scheduler_mod is not None and num_steps is not None:
+            device = torch.device(f"cuda:{self.worker.local_rank}")
+            scheduler_mod.set_timesteps(num_steps, device=device)
+
+        # Run denoising
+        start_time = time.monotonic()
+        result = self.worker.execute_forward([req], return_req=True)
+        duration_s = time.monotonic() - start_time
+
+        if not isinstance(result, Req):
+            error_msg = getattr(result, "error", "denoiser error")
+            done_msg = P2PDoneMsg(request_id=request_id, error=str(error_msg))
+            self._pool_result_push.send_multipart(encode_p2p_msg(done_msg))
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_failed(request_id)
+            return
+
+        # Stage denoiser output for decoder transfer
+        tensor_fields = _extract_tensor_fields(
+            result, DENOISER_TO_DECODER_TENSOR_FIELDS
+        )
+        scalar_fields = _extract_scalar_fields(
+            result, DENOISER_TO_DECODER_SCALAR_FIELDS
+        )
+
+        staged = self._transfer_manager.stage_tensors(
+            request_id=request_id,
+            tensor_fields=tensor_fields,
+            scalar_fields=scalar_fields,
+        )
+
+        if staged is None:
+            done_msg = P2PDoneMsg(
+                request_id=request_id,
+                error="Failed to stage denoiser output for decoder",
+            )
+            self._pool_result_push.send_multipart(encode_p2p_msg(done_msg))
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_failed(request_id)
+            return
+
+        # Send p2p_done with staged info so DS can route to decoder
+        done_data = {
+            "msg_type": "p2p_done",
+            "request_id": request_id,
+            "staged_for_decoder": True,
+            "session_id": self._transfer_manager.session_id,
+            "pool_ptr": self._transfer_manager.pool_data_ptr,
+            "slot_offset": staged.slot.offset if staged.slot else 0,
+            "data_size": staged.slot.size if staged.slot else 0,
+            "manifest": staged.manifest,
+            "scalar_fields": staged.scalar_fields,
+        }
+
+        self._pool_result_push.send_multipart(
+            [P2P_MAGIC, json.dumps(done_data, separators=(",", ":")).encode("utf-8")]
+        )
+
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_complete(request_id)
+
+        logger.debug(
+            "P2P DENOISER: processed %s in %.2f s, staged for decoder",
+            request_id,
+            duration_s,
+        )
+
+    def _p2p_decoder_compute(self, req: "Req", request_id: str, role_name: str) -> None:
+        """Run decoder compute in P2P mode, send result to DS.
+        Decoder result is sent as raw ZMQ multipart frames (same format as
+        relay mode) so DiffusionServer handles it via _handle_decoder_result_frames
+        without hex/JSON overhead.
+        """
+
+        # Check for upstream error
+        disagg_error = getattr(req, "_disagg_error", None)
+        if disagg_error:
+            if self._pool_result_push is not None:
+                send_tensors(
+                    self._pool_result_push,
+                    {},
+                    {
+                        "request_id": request_id,
+                        "error": f"Upstream error: {disagg_error}",
+                    },
+                )
+            return
+
+        req.save_output = False
+        req.return_file_paths_only = False
+
+        start_time = time.monotonic()
+        output_batch = self.worker.execute_forward([req])
+        duration_s = time.monotonic() - start_time
+
+        # Send result as raw ZMQ frames (no P2P_MAGIC prefix).
+        # DiffusionServer will route it through _handle_decoder_result_frames,
+        # the same path as relay mode.
+        tensor_fields = {}
+        scalar_fields = {"request_id": request_id}
+        if output_batch.output is not None:
+            tensor_fields["output"] = output_batch.output
+        if output_batch.audio is not None:
+            tensor_fields["audio"] = output_batch.audio
+        if output_batch.audio_sample_rate is not None:
+            scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
+        if output_batch.error is not None:
+            scalar_fields["error"] = output_batch.error
+
+        if self._pool_result_push is not None:
+            send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
+
+        if self._disagg_metrics:
+            if output_batch.error:
+                self._disagg_metrics.record_request_failed(request_id)
+            else:
+                self._disagg_metrics.record_request_complete(request_id)
+
+        logger.debug("P2P DECODER: processed %s in %.2f s", request_id, duration_s)
+
+    def _pool_mode_encoder_step(
+        self,
+        send_tensors_fn,
+        extract_tensor,
+        extract_scalar,
+        tensor_field_names,
+        scalar_field_names,
+        frames=None,
+    ):
+        """Single encoder step in pool mode."""
+        # Receive: [request_id_bytes, pickled_req_bytes]
+        if frames is None:
+            frames = self._pool_work_pull.recv_multipart()
+        pickled_req = frames[-1]
+        reqs = pickle.loads(pickled_req)
+        if not isinstance(reqs, list):
+            reqs = [reqs]
+
+        req = reqs[0]
+        request_id = getattr(req, "request_id", "unknown")
+
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_start(request_id)
+
+        # Run encoder stages
+        req_result = self.worker.execute_forward(reqs, return_req=True)
+
+        if not isinstance(req_result, Req):
+            # Error — send error via scalar fields (rank 0 only)
+            if self._pool_result_push is not None:
+                error_msg = getattr(req_result, "error", "encoder error")
+                send_tensors_fn(
+                    self._pool_result_push,
+                    {},
+                    {"request_id": request_id, "_disagg_error": str(error_msg)},
+                )
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_failed(request_id)
+            return
+
+        # Pack and send encoder output (rank 0 only sends)
+        tensor_fields = extract_tensor(req_result, tensor_field_names)
+        scalar_fields = extract_scalar(req_result, scalar_field_names)
+
+        if self._pool_result_push is not None:
+            if self._p2p_mode and self._transfer_manager is not None:
+                # P2P mode: stage tensors to TransferBuffer, send p2p_staged
+                self._pool_mode_encoder_p2p_stage(
+                    request_id, tensor_fields, scalar_fields
+                )
+            else:
+                # Relay mode: send tensor multipart directly
+                send_tensors_fn(self._pool_result_push, tensor_fields, scalar_fields)
+
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_complete(request_id)
+
+        logger.debug("Pool ENCODER: processed %s", request_id)
+
+    def _pool_mode_encoder_p2p_stage(
+        self, request_id: str, tensor_fields: dict, scalar_fields: dict
+    ) -> None:
+        """Stage encoder output and send p2p_staged to DS."""
+        staged = self._transfer_manager.stage_tensors(
+            request_id=request_id,
+            tensor_fields=tensor_fields,
+            scalar_fields=scalar_fields,
+        )
+
+        if staged is None:
+            # Staging failed — send error via relay as fallback
+            send_tensors(
+                self._pool_result_push,
+                {},
+                {"request_id": request_id, "_disagg_error": "P2P staging failed"},
+            )
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_failed(request_id)
+            return
+
+        staged_data = {
+            "msg_type": "p2p_staged",
+            "request_id": request_id,
+            "data_size": staged.slot.size if staged.slot else 0,
+            "manifest": staged.manifest,
+            "session_id": self._transfer_manager.session_id,
+            "pool_ptr": self._transfer_manager.pool_data_ptr,
+            "slot_offset": staged.slot.offset if staged.slot else 0,
+            "scalar_fields": staged.scalar_fields,
+        }
+        self._pool_result_push.send_multipart(
+            [P2P_MAGIC, json.dumps(staged_data, separators=(",", ":")).encode("utf-8")]
+        )
+
+    def _pool_mode_denoiser_step(
+        self,
+        send_tensors_fn,
+        build_req_fn,
+        extract_tensor,
+        extract_scalar,
+        tensor_field_names,
+        scalar_field_names,
+        frames=None,
+    ):
+        """Single denoiser step in pool mode."""
+        # Receive tensor multipart from DiffusionServer relay
+        if frames is None:
+            frames = self._pool_work_pull.recv_multipart(copy=False)
+        local_device = f"cuda:{self.worker.local_rank}"
+        req = build_req_fn(frames, "encoder_to_denoiser", device=local_device)
+        request_id = getattr(req, "request_id", "unknown")
+
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_start(request_id)
+
+        # Initialize scheduler timesteps
+        scheduler_mod = self.worker.pipeline.get_module("scheduler")
+        num_steps = getattr(req, "num_inference_steps", None)
+        if scheduler_mod is not None and num_steps is not None:
+            device = torch.device(local_device)
+            scheduler_mod.set_timesteps(num_steps, device=device)
+
+        # Run denoising
+        result = self.worker.execute_forward([req], return_req=True)
+
+        if isinstance(result, Req):
+            tensor_fields = extract_tensor(result, tensor_field_names)
+            scalar_fields = extract_scalar(result, scalar_field_names)
+            if self._pool_result_push is not None:
+                send_tensors_fn(self._pool_result_push, tensor_fields, scalar_fields)
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_complete(request_id)
+        else:
+            if self._pool_result_push is not None:
+                error_msg = getattr(result, "error", "denoiser error")
+                send_tensors_fn(
+                    self._pool_result_push,
+                    {},
+                    {"request_id": request_id, "_disagg_error": str(error_msg)},
+                )
+            if self._disagg_metrics:
+                self._disagg_metrics.record_request_failed(request_id)
+
+        logger.debug("Pool DENOISER: processed %s", request_id)
+
+    def _pool_mode_decoder_step(self, send_tensors_fn, build_req_fn, frames=None):
+        """Single decoder step in pool mode."""
+        # Receive tensor multipart from DiffusionServer relay
+        if frames is None:
+            frames = self._pool_work_pull.recv_multipart(copy=False)
+        local_device = f"cuda:{self.worker.local_rank}"
+        req = build_req_fn(frames, "denoiser_to_decoder", device=local_device)
+        request_id = getattr(req, "request_id", "unknown")
+
+        # Check for upstream error
+        disagg_error = getattr(req, "_disagg_error", None)
+        if disagg_error:
+            if self._pool_result_push is not None:
+                send_tensors_fn(
+                    self._pool_result_push,
+                    {},
+                    {
+                        "request_id": request_id,
+                        "error": f"Denoiser error: {disagg_error}",
+                    },
+                )
+            return
+
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_start(request_id)
+
+        req.save_output = False
+        req.return_file_paths_only = False
+
+        output_batch = self.worker.execute_forward([req])
+
+        # Pack result
+        tensor_fields = {}
+        scalar_fields = {"request_id": request_id}
+        if output_batch.output is not None:
+            tensor_fields["output"] = output_batch.output
+        if output_batch.audio is not None:
+            tensor_fields["audio"] = output_batch.audio
+        if output_batch.audio_sample_rate is not None:
+            scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
+        if output_batch.error is not None:
+            scalar_fields["error"] = output_batch.error
+
+        if self._pool_result_push is not None:
+            send_tensors_fn(self._pool_result_push, tensor_fields, scalar_fields)
+
+        if self._disagg_metrics:
+            if output_batch.error:
+                self._disagg_metrics.record_request_failed(request_id)
+            else:
+                self._disagg_metrics.record_request_complete(request_id)
+
+        logger.debug("Pool DECODER: processed %s", request_id)
 
     def event_loop(self) -> None:
         """
@@ -295,11 +1177,19 @@ class Scheduler:
         Handles abortion
         """
 
+        # Pool mode: all roles use the pool event loop
+        if self._disagg_role != RoleType.MONOLITHIC:
+            self._pool_mode_event_loop()
+            return
+        
         logger.debug(
             f"Rank 0 scheduler listening on tcp://*:{self.server_args.scheduler_port}"
         )
 
         while self._running:
+            # Update queue depth for metrics
+            if self._disagg_metrics:
+                self._disagg_metrics.update_queue_depth(len(self.waiting_queue))
             # 1: receive requests
             try:
                 new_reqs = self.recv_reqs()
@@ -335,6 +1225,10 @@ class Scheduler:
 
             try:
                 processed_req = reqs[0]
+                is_warmup = (
+                    processed_req.is_warmup if isinstance(processed_req, Req) else False
+                )
+
                 handler = self.request_handlers.get(type(processed_req))
                 if handler:
                     output_batch = handler(reqs)
@@ -348,11 +1242,7 @@ class Scheduler:
                     exc_info=True,
                 )
                 # Determine appropriate error response format
-                output_batch = (
-                    OutputBatch(error=str(e))
-                    if reqs and isinstance(reqs[0], Req)
-                    else OutputBatch(error=str(e))
-                )
+                output_batch = OutputBatch(error=str(e))
 
             # 3. return results
             try:
@@ -389,6 +1279,7 @@ class Scheduler:
 
         if self.receiver is not None:
             self.receiver.close()
+        self._cleanup_disagg_connectors()
         self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:

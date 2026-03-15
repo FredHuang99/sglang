@@ -128,6 +128,12 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+    
+    @property
+    def role_affinity(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        return RoleType.DENOISER
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """

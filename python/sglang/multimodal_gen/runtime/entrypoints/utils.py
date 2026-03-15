@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import dataclasses
 from typing import Any, Callable, Optional, Sequence
 
 import imageio
@@ -91,6 +92,13 @@ def _pick_audio_sample_rate(
         except Exception:
             pass
     return selected_sr
+
+
+@dataclass
+class GetDisaggStatsReq:
+    """Request to get disagg pipeline metrics from the scheduler."""
+
+    pass
 
 
 def _resolve_ffmpeg_exe() -> str:

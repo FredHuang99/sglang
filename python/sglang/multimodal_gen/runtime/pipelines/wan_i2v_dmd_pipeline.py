@@ -48,6 +48,7 @@ class WanImageToVideoDmdPipeline(LoRAPipeline, ComposedPipelineBase):
         "image_encoder",
         "image_processor",
     ]
+    _encoder_required_config_modules = ["vae"]
 
     def initialize_pipeline(self, server_args: ServerArgs):
         self.modules["scheduler"] = FlowMatchEulerDiscreteScheduler(

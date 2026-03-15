@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.utils.common import (
     is_port_available,
     is_valid_ipv6_address,
@@ -251,6 +252,7 @@ class ServerArgs:
 
     # Parallelism
     num_gpus: int = 1
+    base_gpu_id: int = 0
     tp_size: int = -1
     sp_degree: int = -1
     # sequence parallelism
@@ -348,6 +350,35 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
+    disagg_role: RoleType = RoleType.MONOLITHIC
+    disagg_timeout: int = 600  # seconds, timeout for pending disagg requests
+    disagg_dispatch_policy: str = "round_robin"  # "round_robin" or "max_free_slots"
+    disagg_pool_mode: bool = False  # True when running as a pool mode instance
+    disagg_p2p_mode: bool = False  # True for P2P transfer (RDMA/TransferEngine)
+    disagg_transfer_pool_size: int = (
+        256 * 1024 * 1024
+    )  # P2P transfer buffer size (bytes)
+    disagg_p2p_hostname: str = "127.0.0.1"  # Hostname for P2P transfer engine
+    disagg_ib_device: str | None = None  # InfiniBand device for mooncake RDMA
+    disagg_server_addr: str | None = (
+        None  # DS head address for role instances (tcp://host:port)
+    )
+    # Remote instance URLs for --disagg-role server (semicolon-separated)
+    encoder_urls: str | None = None
+    denoiser_urls: str | None = None
+    decoder_urls: str | None = None
+    # Per-role parallelism overrides (None = auto-derive from num_gpus)
+    encoder_tp: int | None = None
+    denoiser_tp: int | None = None
+    denoiser_sp: int | None = None
+    denoiser_ulysses: int | None = None
+    denoiser_ring: int | None = None
+    decoder_tp: int | None = None
+    # Pool mode endpoints (set by launcher, per-instance)
+    pool_work_endpoint: str | None = None  # Instance PULL socket (receives work)
+    pool_result_endpoint: str | None = None  # Instance PUSH socket (sends results)
+
     # Logging
     log_level: str = "info"
 
@@ -427,6 +458,10 @@ class ServerArgs:
     def __post_init__(self):
         # configure logger before use
         configure_logger(server_args=self)
+
+         # Convert string disagg_role to enum (from CLI/config)
+        if isinstance(self.disagg_role, str):
+            self.disagg_role = RoleType.from_string(self.disagg_role)
 
         self.adjust_offload()
 
@@ -538,6 +573,13 @@ class ServerArgs:
             help="The number of GPUs to use.",
         )
         parser.add_argument(
+            "--base-gpu-id",
+            type=int,
+            default=ServerArgs.base_gpu_id,
+            help="The starting GPU ID for this instance. Used with --disagg-role "
+            "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
+        )
+        parser.add_argument(
             "--tp-size",
             type=int,
             default=ServerArgs.tp_size,
@@ -594,6 +636,159 @@ class ServerArgs:
             default=ServerArgs.dist_timeout,
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
+        )
+
+        # Disaggregation (pool mode — launched via Python API launch_pool_disagg_server())
+        parser.add_argument(
+            "--disagg-role",
+            type=str,
+            default=ServerArgs.disagg_role.value,
+            choices=RoleType.choices(),
+            help="Role for disaggregated pipeline. "
+            "'monolithic' (default): load all components, run as single server. "
+            "'encoder': run as encoder role instance. "
+            "'denoising': run as denoiser role instance. "
+            "'decoder': run as decoder role instance. "
+            "'server': run as DiffusionServer head node (no GPU, routes requests). "
+            "Role instances require --disagg-server-addr. "
+            "Server requires --encoder-urls, --denoiser-urls, --decoder-urls.",
+        )
+        parser.add_argument(
+            "--disagg-timeout",
+            type=int,
+            default=ServerArgs.disagg_timeout,
+            help="Timeout in seconds for pending disagg requests. "
+            "Encoder returns an error if the decoder result is not received "
+            "within this period. Also used as recv timeout for denoiser/decoder. "
+            "Default: 600.",
+        )
+        parser.add_argument(
+            "--disagg-dispatch-policy",
+            type=str,
+            default=ServerArgs.disagg_dispatch_policy,
+            choices=["round_robin", "max_free_slots"],
+            help="Dispatch policy for pool mode disagg routing. "
+            "'round_robin' cycles across instances; "
+            "'max_free_slots' dispatches to the least-loaded instance. "
+            "Default: round_robin.",
+        )
+        parser.add_argument(
+            "--disagg-p2p-mode",
+            action="store_true",
+            default=False,
+            help="Enable P2P transfer mode (RDMA/TransferEngine). "
+            "Role instances transfer tensors directly instead of relaying "
+            "through DiffusionServer. Requires mooncake-transfer-engine or "
+            "falls back to in-process mock for testing.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-pool-size",
+            type=int,
+            default=256 * 1024 * 1024,
+            help="Size of the P2P transfer buffer pool in bytes (default: 256 MiB).",
+        )
+        parser.add_argument(
+            "--disagg-p2p-hostname",
+            type=str,
+            default="127.0.0.1",
+            help="Hostname for P2P transfer engine (default: 127.0.0.1).",
+        )
+        parser.add_argument(
+            "--disagg-ib-device",
+            type=str,
+            default=None,
+            help="InfiniBand device for P2P RDMA transfers (e.g., mlx5_0, mlx5_roce0). "
+            "Required for mooncake transfer engine on multi-machine deployments.",
+        )
+        parser.add_argument(
+            "--disagg-server-addr",
+            type=str,
+            default=None,
+            help="DiffusionServer head node address for per-role launch mode. "
+            "Format: tcp://HOST:PORT (e.g., tcp://192.168.1.1:5655). "
+            "The role instance derives its result endpoint from this address.",
+        )
+
+        # Remote instance URLs for --disagg-role server
+        parser.add_argument(
+            "--encoder-urls",
+            type=str,
+            default=None,
+            help="Encoder instance work endpoints for DiffusionServer head mode. "
+            "Semicolon-separated. Example: 'tcp://10.0.0.1:35000;tcp://10.0.0.2:35000'.",
+        )
+        parser.add_argument(
+            "--denoiser-urls",
+            type=str,
+            default=None,
+            help="Denoiser instance work endpoints for DiffusionServer head mode. "
+            "Semicolon-separated. Example: 'tcp://10.0.0.3:35000;tcp://10.0.0.4:35000'.",
+        )
+        parser.add_argument(
+            "--decoder-urls",
+            type=str,
+            default=None,
+            help="Decoder instance work endpoints for DiffusionServer head mode. "
+            "Semicolon-separated. Example: 'tcp://10.0.0.5:35000;tcp://10.0.0.6:35000'.",
+        )
+
+        # Per-role parallelism overrides
+        parser.add_argument(
+            "--encoder-tp",
+            type=int,
+            default=None,
+            help="Tensor parallelism for encoder role. Default: auto-derive from encoder GPU count.",
+        )
+        parser.add_argument(
+            "--denoiser-tp",
+            type=int,
+            default=None,
+            help="Tensor parallelism for denoiser role. Default: auto-derive from denoiser GPU count.",
+        )
+        parser.add_argument(
+            "--denoiser-sp",
+            type=int,
+            default=None,
+            help="Sequence parallelism for denoiser role. Default: auto-derive from denoiser GPU count.",
+        )
+        parser.add_argument(
+            "--denoiser-ulysses",
+            type=int,
+            default=None,
+            help="Ulysses SP degree for denoiser role.",
+        )
+        parser.add_argument(
+            "--denoiser-ring",
+            type=int,
+            default=None,
+            help="Ring SP degree for denoiser role.",
+        )
+        parser.add_argument(
+            "--decoder-tp",
+            type=int,
+            default=None,
+            help="Tensor parallelism for decoder role. Default: auto-derive from decoder GPU count.",
+        )
+        parser.add_argument(
+            "--encoder-to-denoiser-endpoint",
+            type=str,
+            default=None,
+            help="ZMQ endpoint for encoder->denoiser transfer (e.g., tcp://127.0.0.1:6001). "
+            "Auto-assigned if not specified.",
+        )
+        parser.add_argument(
+            "--denoiser-to-decoder-endpoint",
+            type=str,
+            default=None,
+            help="ZMQ endpoint for denoiser->decoder transfer (e.g., tcp://127.0.0.1:6002). "
+            "Auto-assigned if not specified.",
+        )
+        parser.add_argument(
+            "--decoder-to-encoder-endpoint",
+            type=str,
+            default=None,
+            help="ZMQ endpoint for decoder->encoder result return (e.g., tcp://127.0.0.1:6003). "
+            "Auto-assigned if not specified.",
         )
 
         # Prompt text file for batch processing
@@ -881,6 +1076,10 @@ class ServerArgs:
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
+
+        # Convert disagg_role string to enum if necessary
+        if "disagg_role" in kwargs and isinstance(kwargs["disagg_role"], str):
+            kwargs["disagg_role"] = RoleType.from_string(kwargs["disagg_role"])
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
