@@ -12,7 +12,7 @@ This playbook is for profiling `Wan-AI/Wan2.2-TI2V-5B-Diffusers` on SGLang-Diffu
 The examples below assume:
 
 ```bash
-export MODEL="Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+export MODEL="/workspace/models/Wan2_2-TI2V-5B-Diffusers"
 export PROMPT="A cinematic science-fiction city with reflective rain streets."
 export OUT_DIR="./wan22_ti2v5b_profile"
 mkdir -p "${OUT_DIR}"

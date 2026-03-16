@@ -40,7 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (  # noqa: E402
     TextEncodingStage,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs  # noqa: E402
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, set_global_server_args  # noqa: E402
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (  # noqa: E402
     maybe_download_model,
     verify_model_config_and_directory,
@@ -346,8 +346,24 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
 
 
 def maybe_init_runtime_distributed(server_args: ServerArgs, args: argparse.Namespace) -> None:
-    if args.device != "cuda" or server_args.num_gpus <= 1:
+    if args.device != "cuda":
         return
+
+    # For GPU mode, always initialize distributed (with TP=1 for single GPU)
+    # This is needed for the custom text encoder to work properly
+
+    # Set up environment variables for single GPU case if not already set
+    if "WORLD_SIZE" not in os.environ:
+        os.environ["WORLD_SIZE"] = str(server_args.num_gpus)
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+    if "LOCAL_RANK" not in os.environ:
+        os.environ["LOCAL_RANK"] = "0"
+    if "MASTER_ADDR" not in os.environ:
+        os.environ["MASTER_ADDR"] = "127.0.0.1"
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = str(server_args.master_port)
+
     if int(os.environ.get("WORLD_SIZE", "1")) != server_args.num_gpus:
         raise RuntimeError(
             "Multi-GPU profiling expects torchrun to provide WORLD_SIZE equal to "
@@ -498,6 +514,57 @@ def profile_encoder_stage(
     model_path: str,
     model_index: dict[str, Any],
 ) -> dict[str, Any]:
+    stage_device = stage_device_from_arg(args.device)
+
+    # For CPU mode, load text encoder directly without the complex distributed path
+    if stage_device.type == "cpu":
+        from transformers import T5EncoderModel, T5TokenizerFast
+
+        text_encoder_path = os.path.join(model_path, "text_encoder")
+        tokenizer_path = os.path.join(model_path, "tokenizer")
+
+        text_encoder = T5EncoderModel.from_pretrained(text_encoder_path, dtype=torch.bfloat16)
+        tokenizer = T5TokenizerFast.from_pretrained(tokenizer_path)
+
+        text_encoder = text_encoder.to(stage_device)
+        text_encoder.eval()
+
+        iteration_timings_ms: list[float] = []
+        output_shape: list[int] | None = None
+
+        for iteration in range(args.warmup_iters + args.profile_iters):
+            synchronize_device(stage_device)
+            start = time.perf_counter()
+
+            # Simple encoding for CPU mode
+            input_ids = tokenizer(args.prompt, return_tensors="pt", padding="max_length", max_length=512).input_ids
+            input_ids = input_ids.to(stage_device)
+
+            with torch.no_grad():
+                output = text_encoder(input_ids)
+                prompt_embeds = output.last_hidden_state
+
+            synchronize_device(stage_device)
+            duration_ms = (time.perf_counter() - start) * 1000.0
+            if iteration >= args.warmup_iters:
+                iteration_timings_ms.append(duration_ms)
+            if output_shape is None:
+                output_shape = list(prompt_embeds.shape)
+
+        peak_memory_mb = maybe_collect_peak_memory_mb(stage_device)
+        extra = {
+            "encoder_parallel_mode": args.encoder_parallel_mode,
+        }
+        return finalize_stage_result(
+            args=args,
+            server_args=server_args,
+            iteration_timings_ms=iteration_timings_ms,
+            output_shape=output_shape,
+            peak_memory_mb=peak_memory_mb,
+            extra=extra,
+        )
+
+    # GPU mode - use the standard path
     components = load_requested_components(
         model_path=model_path,
         model_index=model_index,
@@ -507,10 +574,11 @@ def profile_encoder_stage(
 
     text_encoder = components["text_encoder"]
     tokenizer = components["tokenizer"]
-    stage_device = stage_device_from_arg(args.device)
     text_encoder = text_encoder.to(stage_device)
 
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import TextEncodingStage
     stage = TextEncodingStage(text_encoders=[text_encoder], tokenizers=[tokenizer])
+
     iteration_timings_ms: list[float] = []
     output_shape: list[int] | None = None
 
@@ -803,6 +871,7 @@ def main() -> int:
         return emit_legal_combo_report(args)
 
     server_args = build_server_args(args)
+    set_global_server_args(server_args)
     maybe_init_runtime_distributed(server_args, args)
 
     model_path, model_index = resolve_model_path(server_args.model_path)

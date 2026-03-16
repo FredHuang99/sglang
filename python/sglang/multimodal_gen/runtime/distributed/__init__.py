@@ -7,6 +7,7 @@ from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
     get_local_torch_device,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    _TP,
     cleanup_dist_env_and_memory,
     get_dp_group,
     get_dp_rank,
@@ -68,4 +69,9 @@ def _get_folding_tp_group(
             return get_sp_group().ulysses_group
         elif config.parallel_folding_mode == "ring":
             return get_sp_group().ring_group
+    # Return None if TP group is not initialized (e.g., in CPU mode or single GPU)
+    # Import here to avoid circular import issues
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import _TP as TP_STATE
+    if TP_STATE is None:
+        return None
     return get_tp_group()
