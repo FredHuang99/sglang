@@ -57,6 +57,47 @@ class RequestTimings:
         }
 
 
+@lru_cache(maxsize=1)
+def get_sync_stage_profiling_mode() -> str:
+    """Parse stage profiling sync mode from the environment.
+
+    Supported values:
+    - off: disable explicit CUDA sync
+    - denoising: sync denoising steps only (backward-compatible)
+    - all: sync every profiled stage
+    """
+
+    raw_value = os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0")
+    normalized = raw_value.strip().lower()
+
+    if normalized in ("", "0", "false", "no", "off"):
+        return "off"
+    if normalized in ("1", "true", "yes", "on", "denoising"):
+        return "denoising"
+    if normalized in ("all", "full", "stages", "stage"):
+        return "all"
+
+    logger.warning(
+        "Unknown SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=%r; falling back to 'off'",
+        raw_value,
+    )
+    return "off"
+
+
+def should_sync_stage_profiling(stage_name: str) -> bool:
+    """Return whether the given stage should synchronize CUDA for timing."""
+
+    if not torch.cuda.is_available():
+        return False
+
+    mode = get_sync_stage_profiling_mode()
+    if mode == "all":
+        return True
+    if mode == "denoising":
+        return stage_name.startswith("denoising_step_")
+    return False
+
+
 def get_diffusion_perf_log_dir() -> str:
     """
     Determines the directory for performance logs.
@@ -150,11 +191,7 @@ class StageProfiler:
             self.logger.info(f"[{self.stage_name}] started...")
 
         if (self.log_timing and self.timings) or self.log_stage_start_end:
-            if (
-                os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-                and self.stage_name.startswith("denoising_step_")
-                and torch.cuda.is_available()
-            ):
+            if should_sync_stage_profiling(self.stage_name):
                 torch.cuda.synchronize()
             self.start_time = time.perf_counter()
 
@@ -164,11 +201,7 @@ class StageProfiler:
         if not ((self.log_timing and self.timings) or self.log_stage_start_end):
             return False
 
-        if (
-            os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
-            and self.stage_name.startswith("denoising_step_")
-            and torch.cuda.is_available()
-        ):
+        if should_sync_stage_profiling(self.stage_name):
             torch.cuda.synchronize()
         execution_time_s = time.perf_counter() - self.start_time
 
@@ -218,26 +251,7 @@ class PerformanceLogger:
         Static method to dump a standardized benchmark report to a file.
         Eliminates duplicate logic in CLI/Client code.
         """
-        formatted_steps = [
-            {"name": name, "duration_ms": duration_ms}
-            for name, duration_ms in timings.stages.items()
-        ]
-
-        denoise_steps_ms = [
-            {"step": idx, "duration_ms": duration_ms}
-            for idx, duration_ms in enumerate(timings.steps)
-        ]
-
-        report = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "request_id": timings.request_id,
-            "commit_hash": get_git_commit_hash(),
-            "tag": tag,
-            "total_duration_ms": timings.total_duration_ms,
-            "steps": formatted_steps,
-            "denoise_steps_ms": denoise_steps_ms,
-            "meta": meta or {},
-        }
+        report = cls.build_benchmark_report(timings=timings, meta=meta, tag=tag)
 
         try:
             abs_path = os.path.abspath(file_path)
@@ -247,6 +261,85 @@ class PerformanceLogger:
             logger.info(f"Metrics dumped to: {abs_path}")
         except IOError as e:
             logger.error(f"Failed to dump metrics to {abs_path}: {e}")
+
+        return report
+
+    @classmethod
+    def build_benchmark_report(
+        cls,
+        timings: "RequestTimings",
+        meta: Optional[Dict[str, Any]] = None,
+        tag: str = "benchmark_dump",
+    ) -> Dict[str, Any]:
+        formatted_stages = [
+            {"name": name, "duration_ms": duration_ms}
+            for name, duration_ms in timings.stages.items()
+        ]
+
+        denoise_steps_ms = [
+            {"step": idx, "duration_ms": duration_ms}
+            for idx, duration_ms in enumerate(timings.steps)
+        ]
+
+        return {
+            "timestamp": datetime.now(UTC).isoformat(),
+            "request_id": timings.request_id,
+            "commit_hash": get_git_commit_hash(),
+            "tag": tag,
+            "total_duration_ms": timings.total_duration_ms,
+            # Backward-compatible key kept for existing consumers.
+            "steps": formatted_stages,
+            "stages_ms": formatted_stages,
+            "denoise_steps_ms": denoise_steps_ms,
+            "meta": meta or {},
+        }
+
+    @classmethod
+    def format_benchmark_summary(
+        cls,
+        timings: "RequestTimings",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        lines = ["Performance summary:"]
+
+        meta = meta or {}
+        model_name = meta.get("model")
+        if model_name:
+            lines.append(f"  model: {model_name}")
+
+        prompt = meta.get("prompt")
+        if isinstance(prompt, str):
+            prompt_preview = prompt.strip().replace("\n", " ")
+            if len(prompt_preview) > 96:
+                prompt_preview = prompt_preview[:93] + "..."
+            lines.append(f"  prompt: {prompt_preview}")
+
+        lines.append(f"  total: {timings.total_duration_ms:.2f} ms")
+
+        if timings.stages:
+            lines.append("  stages:")
+            for name, duration_ms in timings.stages.items():
+                lines.append(f"    - {name}: {duration_ms:.2f} ms")
+
+        if timings.steps:
+            avg_ms = sum(timings.steps) / len(timings.steps)
+            min_ms = min(timings.steps)
+            max_ms = max(timings.steps)
+            lines.append(
+                "  denoise steps: "
+                f"count={len(timings.steps)}, avg={avg_ms:.2f} ms, "
+                f"min={min_ms:.2f} ms, max={max_ms:.2f} ms"
+            )
+
+        return "\n".join(lines)
+
+    @classmethod
+    def log_benchmark_summary(
+        cls,
+        timings: "RequestTimings",
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        logger.info("\n%s", cls.format_benchmark_summary(timings=timings, meta=meta))
 
     @classmethod
     def log_request_summary(

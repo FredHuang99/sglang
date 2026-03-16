@@ -63,8 +63,10 @@ To diagnose performance bottlenecks, SGLang-Diffusion supports profiling tools:
 
 - **PyTorch Profiler**: Built-in Python profiling
 - **Nsight Systems**: GPU kernel-level analysis
+- **Wan2.2-TI2V-5B Playbook**: Ready-to-run stage profiling matrix for encoder, DiT, and VAE
 
 See [Profiling Guide](profiling.md) for detailed instructions.
+For a model-specific workflow, see [Wan2.2-TI2V-5B Profiling Playbook](wan2_2_ti2v_5b_profiling.md).
 
 ## References
 

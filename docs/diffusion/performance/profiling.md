@@ -78,6 +78,16 @@ sglang generate \
   --perf-dump-path perf.json
 ```
 
+For more accurate stage wall times on CUDA, set:
+
+```bash
+SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=all
+```
+
+This forces synchronization for every profiled stage before timing is recorded. The CLI will also print a concise summary to stdout when `--perf-dump-path` is used.
+
+For a complete stage-by-stage workflow on `Wan-AI/Wan2.2-TI2V-5B-Diffusers`, including pure CPU encoder/VAE timing and the full `(ulysses, ring)` sweep, see [Wan2.2-TI2V-5B Profiling Playbook](wan2_2_ti2v_5b_profiling.md).
+
 ## Nsight Systems
 
 Nsight Systems provides low-level CUDA profiling with kernel details, register usage, and memory access patterns.

@@ -86,6 +86,13 @@ def maybe_dump_performance(args: argparse.Namespace, server_args, prompt: str, r
         },
         tag="cli_generate",
     )
+    PerformanceLogger.log_benchmark_summary(
+        timings=timings,
+        meta={
+            "prompt": prompt,
+            "model": server_args.model_path,
+        },
+    )
 
 
 def generate_cmd(args: argparse.Namespace):
