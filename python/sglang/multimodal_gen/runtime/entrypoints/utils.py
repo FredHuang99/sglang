@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-import dataclasses
+from dataclasses import dataclass
 from typing import Any, Callable, Optional, Sequence
 
 import imageio

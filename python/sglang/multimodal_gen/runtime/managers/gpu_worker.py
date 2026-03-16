@@ -225,8 +225,6 @@ class GPUWorker:
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            if output_batch.metrics is not None:
-                output_batch.metrics.total_duration_ms = duration_ms
             if output_batch.timings is not None:
                 output_batch.timings.total_duration_ms = duration_ms
 

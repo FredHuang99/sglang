@@ -41,7 +41,6 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.role_connector impor
     build_req_from_frames,
 )
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    GetDisaggStatsReq,
     ListLorasReq,
     MergeLoraWeightsReq,
     SetLoraReq,
@@ -50,6 +49,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -108,7 +108,6 @@ class Scheduler:
 
         worker = GPUWorker(
             local_rank=local_rank,
-            local_rank=gpu_id,
             master_port=port_args.master_port,
             rank=gpu_id,
             server_args=server_args,
@@ -1279,7 +1278,6 @@ class Scheduler:
 
         if self.receiver is not None:
             self.receiver.close()
-        self._cleanup_disagg_connectors()
         self.context.destroy(linger=0)
 
     def _broadcast_task(self, payload: dict[str, Any]) -> None:
