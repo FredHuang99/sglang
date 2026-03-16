@@ -24,6 +24,7 @@ if str(PYTHON_ROOT) not in sys.path:
     sys.path.insert(0, str(PYTHON_ROOT))
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.distributed import (  # noqa: E402
     cleanup_dist_env_and_memory,
@@ -86,6 +87,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=704)
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--num-frames", type=int, default=121)
+    parser.add_argument(
+        "--vae-encode-input-frames",
+        type=int,
+        default=1,
+        help="Synthetic frame count used only for --stage vae-encode. "
+        "For TI2V/I2V tasks, this defaults to 1 regardless of this value.",
+    )
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--warmup-iters", type=int, default=1)
     parser.add_argument("--profile-iters", type=int, default=3)
@@ -126,6 +134,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Pure CPU profiling only supports --num-gpus 1.")
     if args.list_legal_dit_combos and args.stage != "dit":
         raise ValueError("--list-legal-dit-combos can only be used with --stage dit.")
+    if args.num_frames < 1:
+        raise ValueError(f"--num-frames must be >= 1, got {args.num_frames}")
+    if args.vae_encode_input_frames < 1:
+        raise ValueError(f"--vae-encode-input-frames must be >= 1, got {args.vae_encode_input_frames}")
 
 
 def synchronize_device(device: torch.device) -> None:
@@ -349,9 +361,6 @@ def maybe_init_runtime_distributed(server_args: ServerArgs, args: argparse.Names
     if args.device != "cuda":
         return
 
-    # For GPU mode, always initialize distributed (with TP=1 for single GPU)
-    # This is needed for the custom text encoder to work properly
-
     # Set up environment variables for single GPU case if not already set
     if "WORLD_SIZE" not in os.environ:
         os.environ["WORLD_SIZE"] = str(server_args.num_gpus)
@@ -397,11 +406,22 @@ def build_vae_input(args: argparse.Namespace, device: torch.device) -> torch.Ten
     )
 
 
+def resolve_vae_encode_input_frames(args, server_args) -> int:
+    """Resolve the actual frame count to use for VAE encode.
+
+    For I2V/TI2V tasks, always use 1 frame (the condition image).
+    Otherwise, use the user-specified --vae-encode-input-frames value.
+    """
+    if server_args.pipeline_config.task_type in (ModelTaskType.I2V, ModelTaskType.TI2V):
+        return 1
+    return args.vae_encode_input_frames
+
+
 def build_vae_latents(
     server_args: ServerArgs,
     args: argparse.Namespace,
     device: torch.device,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int, int]:
     batch = prepare_request(
         server_args=server_args,
         sampling_params=SamplingParams.from_user_sampling_params_args(
@@ -415,21 +435,23 @@ def build_vae_latents(
             num_inference_steps=args.num_inference_steps,
         ),
     )
-    latent_num_frames = (args.num_frames - 1) // (
-        server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
-    ) + 1
+    # Use effective video frame count (after request adjustment) instead of args.num_frames
+    temporal_compression_ratio = server_args.pipeline_config.vae_config.arch_config.temporal_compression_ratio
+    effective_video_num_frames = int(batch.num_frames)
+    latent_num_frames = (effective_video_num_frames - 1) // temporal_compression_ratio + 1
     latent_shape = server_args.pipeline_config.prepare_latent_shape(
         batch,
         batch_size=1,
         num_frames=latent_num_frames,
     )
     generator = synthetic_generator(args.seed, device)
-    return torch.randn(
+    latents = torch.randn(
         latent_shape,
         generator=generator,
         device=device,
         dtype=torch.float32,
     )
+    return latents, effective_video_num_frames, latent_num_frames
 
 
 def summarize_result(result: dict[str, Any]) -> str:
@@ -634,7 +656,12 @@ def profile_vae_encode_stage(
     stage_device = stage_device_from_arg(args.device)
     vae = vae.to(stage_device)
 
-    sample = build_vae_input(args, stage_device)
+    # Resolve actual encode input frames (for TI2V/I2V, always use 1)
+    encode_input_frames = resolve_vae_encode_input_frames(args, server_args)
+    # Create args with encode-specific frame count
+    encode_args = argparse.Namespace(**vars(args))
+    encode_args.num_frames = encode_input_frames
+    sample = build_vae_input(encode_args, stage_device)
     vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
     autocast_enabled = vae_dtype != torch.float32 and not server_args.disable_autocast
 
@@ -668,6 +695,7 @@ def profile_vae_encode_stage(
         iteration_timings_ms=iteration_timings_ms,
         output_shape=output_shape,
         peak_memory_mb=maybe_collect_peak_memory_mb(stage_device),
+        extra={"vae_encode_input_frames": encode_input_frames},
     )
 
 
@@ -711,7 +739,9 @@ def profile_vae_decode_stage(
     stage_device = stage_device_from_arg(args.device)
     vae = vae.to(stage_device)
 
-    latents = build_vae_latents(server_args, args, stage_device)
+    latents, effective_video_num_frames, latent_num_frames = build_vae_latents(
+        server_args, args, stage_device
+    )
     latents = scale_and_shift_latents(latents, server_args, vae)
     latents = server_args.pipeline_config.preprocess_decoding(
         latents,
@@ -754,6 +784,10 @@ def profile_vae_decode_stage(
         iteration_timings_ms=iteration_timings_ms,
         output_shape=output_shape,
         peak_memory_mb=maybe_collect_peak_memory_mb(stage_device),
+        extra={
+            "effective_video_num_frames": effective_video_num_frames,
+            "latent_num_frames": latent_num_frames,
+        },
     )
 
 
