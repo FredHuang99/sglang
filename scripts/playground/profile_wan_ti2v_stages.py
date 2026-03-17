@@ -292,6 +292,13 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
         sp_degree = args.sp_degree or num_gpus
         ulysses_degree = args.ulysses_degree
         ring_degree = args.ring_degree
+    elif args.stage == "vae-decode":
+        # VAE decode uses same parallel config as DiT (sp for spatial tiling)
+        num_gpus = args.num_gpus
+        tp_size = 1
+        sp_degree = args.sp_degree or num_gpus
+        ulysses_degree = args.ulysses_degree or 1
+        ring_degree = args.ring_degree or 1
     elif args.stage == "encoder":
         if args.device == "cpu":
             num_gpus = tp_size = sp_degree = ulysses_degree = ring_degree = 1
@@ -721,6 +728,85 @@ def scale_and_shift_latents(
     return latents
 
 
+def profile_vae_decode_stage_v2(
+    args: argparse.Namespace,
+    server_args: ServerArgs,
+    model_path: str,
+) -> dict[str, Any]:
+    """
+    Profile VAE decode stage using the same method as DiT profiling.
+
+    This loads the full pipeline and runs it, only measuring DecodingStage time.
+    This is aligned with how DiT profiling works - loads full pipeline,
+    runs pipeline.forward(), and extracts specific stage timing.
+    """
+    # Configure VAE to only load decoder (same as DiT profiling)
+    server_args.pipeline_config.vae_config.load_encoder = False
+    server_args.pipeline_config.vae_config.load_decoder = True
+
+    # Import here to avoid circular imports
+    from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+    model_info = get_model_info(model_path, backend=server_args.backend)
+    pipeline = model_info.pipeline_cls(
+        model_path,
+        server_args,
+        executor=SyncExecutor(server_args=server_args),
+    )
+
+    iteration_timings_ms: list[float] = []
+    output_shape: list[int] | None = None
+    stage_device = stage_device_from_arg(args.device)
+
+    for iteration in range(args.warmup_iters + args.profile_iters):
+        if stage_device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(stage_device)
+
+        sampling_params = SamplingParams.from_user_sampling_params_args(
+            model_path,
+            server_args=server_args,
+            prompt=args.prompt,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            seed=args.seed + iteration,
+            num_inference_steps=args.num_inference_steps,
+            perf_dump_path="inline_profile.json",
+            enable_sequence_shard=server_args.sp_degree > 1,
+            save_output=False,
+        )
+        req = prepare_request(server_args=server_args, sampling_params=sampling_params)
+        req.suppress_logs = True
+
+        # Run full pipeline (same as DiT profiling)
+        start = time.perf_counter()
+        output_batch = pipeline.forward(req, server_args)
+        synchronize_device(stage_device)
+        output_batch.timings.total_duration_ms = (time.perf_counter() - start) * 1000.0
+
+        # Only measure DecodingStage time (aligned with DiT using DenoisingStage)
+        stage_duration_ms = get_stage_duration_ms(
+            output_batch.timings.stages,
+            preferred_names=["DecodingStage", "decoding_stage"],
+        )
+        stage_duration_ms = reduce_max_scalar(stage_duration_ms, stage_device)
+
+        if iteration >= args.warmup_iters:
+            iteration_timings_ms.append(stage_duration_ms)
+
+        if output_shape is None and output_batch.output is not None:
+            output_shape = extract_output_shape(output_batch.output)
+
+    return finalize_stage_result(
+        args=args,
+        server_args=server_args,
+        iteration_timings_ms=iteration_timings_ms,
+        output_shape=output_shape,
+        peak_memory_mb=maybe_collect_peak_memory_mb(stage_device),
+        extra={},
+    )
+
+
 def profile_vae_decode_stage(
     args: argparse.Namespace,
     server_args: ServerArgs,
@@ -739,9 +825,42 @@ def profile_vae_decode_stage(
     stage_device = stage_device_from_arg(args.device)
     vae = vae.to(stage_device)
 
-    latents, effective_video_num_frames, latent_num_frames = build_vae_latents(
-        server_args, args, stage_device
+    # Build latents with correct z_dim from VAE model (not from hardcoded config)
+    vae_z_dim = vae.config.arch_config.z_dim
+    batch = prepare_request(
+        server_args=server_args,
+        sampling_params=SamplingParams.from_user_sampling_params_args(
+            server_args.model_path,
+            server_args=server_args,
+            prompt=args.prompt,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            seed=args.seed,
+            num_inference_steps=args.num_inference_steps,
+        ),
     )
+    temporal_compression_ratio = vae.config.arch_config.temporal_compression_ratio
+    effective_video_num_frames = int(batch.num_frames)
+    latent_num_frames = (effective_video_num_frames - 1) // temporal_compression_ratio + 1
+
+    # Use VAE's actual z_dim and spatial scale for latent shape
+    spatial_scale = vae.config.arch_config.scale_factor_spatial
+    latent_shape = (
+        1,
+        vae_z_dim,
+        latent_num_frames,
+        batch.height // spatial_scale,
+        batch.width // spatial_scale,
+    )
+    generator = synthetic_generator(args.seed, stage_device)
+    latents = torch.randn(
+        latent_shape,
+        generator=generator,
+        device=stage_device,
+        dtype=torch.float32,
+    )
+
     latents = scale_and_shift_latents(latents, server_args, vae)
     latents = server_args.pipeline_config.preprocess_decoding(
         latents,
@@ -923,11 +1042,11 @@ def main() -> int:
                 model_index,
             )
         elif args.stage == "vae-decode":
-            result = profile_vae_decode_stage(
+            # Use v2 function that aligns with DiT profiling method
+            result = profile_vae_decode_stage_v2(
                 args,
                 server_args,
                 model_path,
-                model_index,
             )
         else:
             result = profile_dit_stage(args, server_args, model_path)
