@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-txt", type=str, default=None)
     parser.add_argument("--disable-autocast", action="store_true", default=False)
     parser.add_argument(
+        "--vae-cpu-offload",
+        action="store_true",
+        default=False,
+        help="Use CPU offload for VAE decoder (other components remain on GPU)",
+    )
+    parser.add_argument(
         "--list-legal-dit-combos",
         action="store_true",
         default=False,
@@ -330,7 +336,7 @@ def build_server_args(args: argparse.Namespace) -> ServerArgs:
         dit_cpu_offload=False,
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
-        vae_cpu_offload=False,
+        vae_cpu_offload=args.vae_cpu_offload,
         warmup=False,
     )
 

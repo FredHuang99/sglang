@@ -124,8 +124,13 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
-        latents = latents.to(get_local_torch_device())
+        # If vae_cpu_offload is enabled, keep VAE on CPU and only move latents to VAE device
+        if server_args.vae_cpu_offload:
+            vae_device = self.vae.device
+            latents = latents.to(vae_device)
+        else:
+            self.vae = self.vae.to(get_local_torch_device())
+            latents = latents.to(get_local_torch_device())
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
