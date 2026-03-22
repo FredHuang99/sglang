@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
+    TransferMetaBuffer,
     TransferTensorBuffer,
 )
 
@@ -33,9 +34,10 @@ class TestTransferTensorBuffer(unittest.TestCase):
         h3 = buf.allocate(size=1 << 20, request_id="req-3")
         self.assertIsNotNone(h3)
 
-    def test_pool_is_pinned(self):
+    def test_pool_uses_shared_memory(self):
         buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
-        self.assertTrue(buf._pool.is_pinned())
+        self.assertTrue(buf.uses_shared_memory)
+        self.assertIsNotNone(buf.shared_memory_name)
 
     def test_pool_data_ptr(self):
         buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
@@ -290,6 +292,37 @@ class TestTransferEngineGPUDirect(unittest.TestCase):
 
         engine = MockTransferEngine()
         self.assertFalse(engine.supports_gpu_direct)
+
+
+class TestTransferMetaBuffer(unittest.TestCase):
+    def test_roundtrip_scalar_and_manifest_metadata(self):
+        buf = TransferMetaBuffer(slot_count=2, slot_size=4096, role_name="meta")
+        handle = buf.allocate("req-1")
+        manifest = {
+            "latents": [
+                {"offset": 0, "shape": [1, 4, 8, 8], "dtype": "float32", "nbytes": 1024}
+            ]
+        }
+        scalar_fields = {
+            "request_id": "req-1",
+            "guidance_scale": 7.5,
+            "timesteps": [999.0, 950.0, 900.0],
+        }
+
+        written = buf.write_metadata(handle, manifest, scalar_fields)
+        self.assertGreater(written, 0)
+
+        loaded_manifest, loaded_scalars = buf.read_metadata(handle)
+        self.assertEqual(loaded_manifest, manifest)
+        self.assertEqual(loaded_scalars["request_id"], "req-1")
+        self.assertEqual(loaded_scalars["guidance_scale"], 7.5)
+        self.assertEqual(loaded_scalars["timesteps"], [999.0, 950.0, 900.0])
+
+    def test_slot_count_and_shared_memory_descriptor(self):
+        buf = TransferMetaBuffer(slot_count=3, slot_size=1024, role_name="meta")
+        self.assertEqual(buf.slot_count, 3)
+        self.assertEqual(buf.pool_size, buf.slot_count * buf.slot_size)
+        self.assertIsNotNone(buf.shared_memory_name)
 
 
 if __name__ == "__main__":

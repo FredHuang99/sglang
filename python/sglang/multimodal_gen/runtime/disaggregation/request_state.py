@@ -138,6 +138,26 @@ class RequestTracker:
         with self._lock:
             return self._requests.get(request_id)
 
+    def update_instances(
+        self,
+        request_id: str,
+        *,
+        encoder_instance: int | None = None,
+        denoiser_instance: int | None = None,
+        decoder_instance: int | None = None,
+    ) -> RequestRecord:
+        with self._lock:
+            record = self._requests.get(request_id)
+            if record is None:
+                raise ValueError(f"Unknown request_id: {request_id}")
+            if encoder_instance is not None:
+                record.encoder_instance = encoder_instance
+            if denoiser_instance is not None:
+                record.denoiser_instance = denoiser_instance
+            if decoder_instance is not None:
+                record.decoder_instance = decoder_instance
+            return record
+
     def remove(self, request_id: str) -> RequestRecord | None:
         with self._lock:
             return self._requests.pop(request_id, None)

@@ -97,6 +97,11 @@ class TestRoundRobinCapacity(unittest.TestCase):
         self.assertIn(1, results)
         self.assertIn(2, results)
 
+    def test_respects_excluded_instances(self):
+        policy = RoundRobin(num_instances=3)
+        result = policy.select_with_capacity([1, 1, 1], excluded_instances={0, 1})
+        self.assertEqual(result, 2)
+
 
 class TestMaxFreeSlotsFirstCapacity(unittest.TestCase):
     """Test MaxFreeSlotsFirst.select_with_capacity."""
@@ -118,6 +123,11 @@ class TestMaxFreeSlotsFirstCapacity(unittest.TestCase):
             r = policy.select_with_capacity([2, 2, 2])
             results.add(r)
         self.assertGreater(len(results), 1)
+
+    def test_respects_excluded_instances(self):
+        policy = MaxFreeSlotsFirst(num_instances=3, max_slots_per_instance=4)
+        result = policy.select_with_capacity([3, 2, 1], excluded_instances={0, 1})
+        self.assertEqual(result, 2)
 
 
 class TestCreateDispatchPolicy(unittest.TestCase):

@@ -47,6 +47,13 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
+_ENCODER_NEEDS_DECODER_TASKS = {
+    "i2i",
+    "ti2i",
+    "i2v",
+    "ti2v",
+}
+
 
 class ComposedPipelineBase(ABC):
     """
@@ -103,8 +110,14 @@ class ComposedPipelineBase(ABC):
         # Filter modules based on disaggregation role
         if self._disagg_role != RoleType.MONOLITHIC:
             original_modules = list(self._required_config_modules)
+            task_name = self.server_args.pipeline_config.task_type.name.lower()
             self._required_config_modules = filter_modules_for_role(
-                self._required_config_modules, self._disagg_role
+                self._required_config_modules,
+                self._disagg_role,
+                allow_encoder_decoder_modules=(
+                    self._disagg_role == RoleType.ENCODER
+                    and task_name in _ENCODER_NEEDS_DECODER_TASKS
+                ),
             )
             skipped = set(original_modules) - set(self._required_config_modules)
             if skipped:

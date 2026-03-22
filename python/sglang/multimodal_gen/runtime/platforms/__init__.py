@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/platforms/__init__.py
 
+import os
 import traceback
 from typing import TYPE_CHECKING
 
@@ -149,6 +150,23 @@ builtin_platform_plugins = {
 
 
 def resolve_current_platform_cls_qualname() -> str:
+    forced_platform = os.environ.get("SGLANG_DIFFUSION_PLATFORM_OVERRIDE", "").strip()
+    if forced_platform:
+        forced_map = {
+            "cpu": "sglang.multimodal_gen.runtime.platforms.cpu.CpuPlatform",
+            "cuda": "sglang.multimodal_gen.runtime.platforms.cuda.CudaPlatform",
+            "rocm": "sglang.multimodal_gen.runtime.platforms.rocm.RocmPlatform",
+            "mps": "sglang.multimodal_gen.runtime.platforms.mps.MpsPlatform",
+            "npu": "sglang.multimodal_gen.runtime.platforms.npu.NPUPlatformBase",
+            "musa": "sglang.multimodal_gen.runtime.platforms.musa.MusaPlatform",
+        }
+        qualname = forced_map.get(forced_platform.lower())
+        if qualname is None:
+            raise ValueError(
+                f"Unsupported SGLANG_DIFFUSION_PLATFORM_OVERRIDE={forced_platform!r}"
+            )
+        return qualname
+
     # TODO(will): if we need to support other platforms, we should consider if
     # vLLM's plugin architecture is suitable for our needs.
 

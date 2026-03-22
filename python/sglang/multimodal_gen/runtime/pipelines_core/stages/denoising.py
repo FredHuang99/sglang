@@ -795,7 +795,13 @@ class DenoisingStage(PipelineStage):
         if get_sp_world_size() <= 1:
             return
 
-        if batch.latents is not None:
+        pre_sharded_fields = set(
+            getattr(batch, "_disagg_pre_sharded_fields", ()) or ()
+        )
+
+        if "latents" in pre_sharded_fields:
+            batch.did_sp_shard_latents = True
+        elif batch.latents is not None:
             (
                 batch.latents,
                 did_shard,
@@ -806,7 +812,7 @@ class DenoisingStage(PipelineStage):
 
         # image_latent must be sharded consistently with latents when it is
         # concatenated along the sequence dimension in the denoising loop.
-        if batch.image_latent is not None:
+        if batch.image_latent is not None and "image_latent" not in pre_sharded_fields:
             batch.image_latent, _ = server_args.pipeline_config.shard_latents_for_sp(
                 batch, batch.image_latent
             )

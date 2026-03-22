@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import addict
 import yaml
@@ -217,8 +217,13 @@ class ServerArgs:
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 600  # seconds, timeout for pending disagg requests
+    disagg_downstream_wait_timeout: int = 120  # seconds, wait for downstream slot
     disagg_dispatch_policy: str = "round_robin"  # "round_robin" or "max_free_slots"
     disagg_mode: bool = False  # True when running as a disaggregated instance
+    disagg_instance_id: int = 0  # Stable per-role instance ID inside a pool
+    disagg_max_slots_per_instance: int = 2
+    disagg_transfer_redundancy: float = 1.25
+    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
     disagg_transfer_pool_size: int = (
         256 * 1024 * 1024
     )  # P2P transfer buffer size (bytes)
@@ -241,6 +246,8 @@ class ServerArgs:
     # Pool mode endpoints (set by launcher, per-instance)
     pool_work_endpoint: str | None = None  # Instance PULL socket (receives work)
     pool_result_endpoint: str | None = None  # Instance PUSH socket (sends results)
+    pool_control_endpoint: str | None = None  # Instance PULL socket (peer control)
+    pool_control_advertised_endpoint: str | None = None  # Reachable peer control URL
 
     # Logging
     log_level: str = "info"
@@ -301,6 +308,22 @@ class ServerArgs:
         Binds on 0.0.0.0 using the instance's own scheduler_port.
         """
         return f"tcp://0.0.0.0:{self.scheduler_port}"
+
+    def derive_pool_control_endpoint(self) -> str:
+        """Derive the peer-control PULL bind endpoint for a standalone role instance."""
+        return f"tcp://0.0.0.0:{self.scheduler_port + 1}"
+
+    def derive_pool_control_advertised_endpoint(self) -> str:
+        """Derive the reachable peer-control endpoint advertised to upstream/downstream peers."""
+        host = self.host or self.disagg_p2p_hostname or "127.0.0.1"
+        if host == "0.0.0.0":
+            host = self.disagg_p2p_hostname or "127.0.0.1"
+        return f"tcp://{host}:{self.scheduler_port + 1}"
+
+    def resolved_role_device(self) -> Literal["cpu", "cuda"]:
+        if self.disagg_role_device == "auto":
+            return "cpu" if self.num_gpus <= 0 else "cuda"
+        return self.disagg_role_device
 
     @property
     def broker_port(self) -> int:
@@ -762,6 +785,14 @@ class ServerArgs:
             "Default: 600.",
         )
         parser.add_argument(
+            "--disagg-downstream-wait-timeout",
+            type=int,
+            default=ServerArgs.disagg_downstream_wait_timeout,
+            help="Timeout in seconds for a request whose upstream role has already "
+            "staged output but is still waiting for a downstream role to accept a slot. "
+            "Shared by encoder->denoiser and denoiser->decoder handoff. Default: 120.",
+        )
+        parser.add_argument(
             "--disagg-dispatch-policy",
             type=str,
             default=ServerArgs.disagg_dispatch_policy,
@@ -770,6 +801,31 @@ class ServerArgs:
             "'round_robin' cycles across instances; "
             "'max_free_slots' dispatches to the least-loaded instance. "
             "Default: round_robin.",
+        )
+        parser.add_argument(
+            "--disagg-instance-id",
+            type=int,
+            default=ServerArgs.disagg_instance_id,
+            help="Stable per-role instance ID used by DiffusionServer registration and peer-to-peer control.",
+        )
+        parser.add_argument(
+            "--disagg-max-slots-per-instance",
+            type=int,
+            default=ServerArgs.disagg_max_slots_per_instance,
+            help="Maximum concurrent transfer/computation slots tracked for each disagg instance.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-redundancy",
+            type=float,
+            default=ServerArgs.disagg_transfer_redundancy,
+            help="Redundancy factor used when sizing transfer buffers from warmup output bytes.",
+        )
+        parser.add_argument(
+            "--disagg-role-device",
+            type=str,
+            default=ServerArgs.disagg_role_device,
+            choices=["auto", "cpu", "cuda"],
+            help="Per-role device override. 'cpu' is currently intended for same-machine encoder roles.",
         )
         parser.add_argument(
             "--disagg-transfer-pool-size",

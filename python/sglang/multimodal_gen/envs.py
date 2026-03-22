@@ -245,6 +245,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Optional override for diffusion disaggregation outbound send queue count.
+    # When unset, the runtime keeps the existing single-queue behavior.
+    "SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE"
+    ),
+    # Optional override for diffusion disaggregation outbound transfer worker
+    # threads. When unset, the runtime falls back to the existing
+    # send_concurrency-derived worker count.
+    "SGLANG_DIFFUSION_DISAGG_SEND_THREAD_POOL_SIZE": _lazy_int(
+        "SGLANG_DIFFUSION_DISAGG_SEND_THREAD_POOL_SIZE"
+    ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
     ),

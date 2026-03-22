@@ -92,7 +92,12 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
+        role_device = self.server_args.resolved_role_device()
+        if role_device == "cpu":
+            os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
+        else:
+            os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cuda"
+            torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -155,10 +160,14 @@ class GPUWorker:
                         )
 
         logger.info(
-            f"Worker {self.rank}: Initialized device, model, and distributed environment."
+            "Worker %s: Initialized device=%s, model, and distributed environment.",
+            self.rank,
+            role_device,
         )
 
     def do_mem_analysis(self, output_batch: OutputBatch):
+        if not (current_platform.is_cuda_alike() or current_platform.is_npu()):
+            return
         final_snapshot = capture_memory_snapshot()
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
@@ -222,7 +231,9 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
-            if self.rank == 0:
+            if self.rank == 0 and (
+                current_platform.is_cuda_alike() or current_platform.is_npu()
+            ):
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
@@ -261,7 +272,11 @@ class GPUWorker:
                     "after_forward", peak_snapshot
                 )
 
-            if self.rank == 0 and not req.suppress_logs:
+            if (
+                self.rank == 0
+                and not req.suppress_logs
+                and (current_platform.is_cuda_alike() or current_platform.is_npu())
+            ):
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000

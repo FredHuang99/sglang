@@ -24,6 +24,14 @@ class CpuPlatform(Platform):
     dispatch_key = "CPU"
 
     @classmethod
+    def get_local_torch_device(cls) -> torch.device:
+        return torch.device("cpu")
+
+    @classmethod
+    def get_torch_distributed_backend_str(cls) -> str:
+        return "gloo"
+
+    @classmethod
     def get_cpu_architecture(cls) -> CpuArchEnum:
         """Get the CPU architecture."""
         machine = platform.machine().lower()

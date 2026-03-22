@@ -58,7 +58,12 @@ def get_module_role(module_name: str) -> "RoleType | None":
     return None
 
 
-def filter_modules_for_role(module_names: list[str], role: "RoleType") -> list[str]:
+def filter_modules_for_role(
+    module_names: list[str],
+    role: "RoleType",
+    *,
+    allow_encoder_decoder_modules: bool = False,
+) -> list[str]:
     """Filter module names to only those needed by the given role."""
     if role in (RoleType.MONOLITHIC, RoleType.SERVER):
         return module_names
@@ -71,8 +76,11 @@ def filter_modules_for_role(module_names: list[str], role: "RoleType") -> list[s
             filtered.append(name)
         elif module_role == role:
             filtered.append(name)
-        elif role == RoleType.ENCODER and module_role == RoleType.DECODER:
-            # Encoder also needs VAE for ImageVAEEncoding stages
+        elif (
+            role == RoleType.ENCODER
+            and module_role == RoleType.DECODER
+            and allow_encoder_decoder_modules
+        ):
             filtered.append(name)
 
     return filtered

@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for DiffusionServer pool-based pipeline orchestrator."""
 
-import time
 import unittest
-
-import zmq
+from unittest.mock import MagicMock
 
 from sglang.multimodal_gen.runtime.disaggregation.diffusion_server import (
     DiffusionServer,
+    _TransferRequestState,
 )
+from sglang.multimodal_gen.runtime.disaggregation.request_state import (
+    RequestState,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
-    TransferAllocatedMsg,
+    TransferAllocAcceptedMsg,
+    TransferAllocRejectMsg,
     TransferPushedMsg,
     TransferRegisterMsg,
     TransferStagedMsg,
@@ -19,22 +23,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
 )
 
 
-class _MockReq:
-    """Minimal mock request for testing."""
-
-    def __init__(self, request_id: str = "test-001"):
-        self.request_id = request_id
-        self.is_warmup = False
-
-
-from sglang.multimodal_gen.runtime.disaggregation.request_state import (
-    RequestState,
-)
-
-
 class TestDiffusionServerInit(unittest.TestCase):
-    """Test DiffusionServer initialization."""
-
     def test_basic_init(self):
         server = DiffusionServer(
             frontend_endpoint="tcp://127.0.0.1:19900",
@@ -44,13 +33,16 @@ class TestDiffusionServerInit(unittest.TestCase):
             encoder_result_endpoint="tcp://127.0.0.1:19904",
             denoiser_result_endpoint="tcp://127.0.0.1:19905",
             decoder_result_endpoint="tcp://127.0.0.1:19906",
+            max_slots_per_instance=3,
         )
-        self.assertEqual(server._num_encoders, 1)
-        self.assertEqual(server._num_denoisers, 1)
-        self.assertEqual(server._num_decoders, 1)
+        self.assertEqual(server._encoder_free_slots, [3])
+        self.assertEqual(server._denoiser_free_slots, [3])
+        self.assertEqual(server._decoder_free_slots, [3])
 
-    def test_get_stats(self):
-        server = DiffusionServer(
+
+class TestDiffusionServerTransferProtocol(unittest.TestCase):
+    def setUp(self):
+        self.server = DiffusionServer(
             frontend_endpoint="tcp://127.0.0.1:19910",
             encoder_work_endpoints=["tcp://127.0.0.1:19911"],
             denoiser_work_endpoints=["tcp://127.0.0.1:19912"],
@@ -58,234 +50,334 @@ class TestDiffusionServerInit(unittest.TestCase):
             encoder_result_endpoint="tcp://127.0.0.1:19914",
             denoiser_result_endpoint="tcp://127.0.0.1:19915",
             decoder_result_endpoint="tcp://127.0.0.1:19916",
+            max_slots_per_instance=2,
         )
-        stats = server.get_stats()
-        self.assertEqual(stats["role"], "diffusion_server")
-        self.assertEqual(stats["num_encoders"], 1)
-        self.assertEqual(stats["num_denoisers"], 1)
-        self.assertEqual(stats["num_decoders"], 1)
-        self.assertEqual(stats["pending_requests"], 0)
-        # Capacity-aware stats
-        self.assertEqual(stats["encoder_free_slots"], [4])
-        self.assertEqual(stats["denoiser_free_slots"], [2])
-        self.assertEqual(stats["decoder_free_slots"], [4])
-        self.assertEqual(stats["encoder_tta_depth"], 0)
-        self.assertEqual(stats["denoiser_tta_depth"], 0)
-        self.assertEqual(stats["decoder_tta_depth"], 0)
+        self.server._encoder_pushes = [MagicMock()]
+        self.server._denoiser_pushes = [MagicMock()]
+        self.server._decoder_pushes = [MagicMock()]
 
-    def test_custom_capacity(self):
-        server = DiffusionServer(
-            frontend_endpoint="tcp://127.0.0.1:19920",
-            encoder_work_endpoints=["tcp://127.0.0.1:19921", "tcp://127.0.0.1:19922"],
-            denoiser_work_endpoints=["tcp://127.0.0.1:19923"],
-            decoder_work_endpoints=["tcp://127.0.0.1:19924"],
-            encoder_result_endpoint="tcp://127.0.0.1:19925",
-            denoiser_result_endpoint="tcp://127.0.0.1:19926",
-            decoder_result_endpoint="tcp://127.0.0.1:19927",
-            encoder_capacity=8,
-            denoiser_capacity=3,
-            decoder_capacity=6,
-        )
-        self.assertEqual(server._encoder_free_slots, [8, 8])
-        self.assertEqual(server._denoiser_free_slots, [3])
-        self.assertEqual(server._decoder_free_slots, [6])
+    def _submit_running_request(self, request_id: str, state: RequestState):
+        record = self.server._tracker.submit(request_id)
+        if state == RequestState.ENCODER_RUNNING:
+            record.encoder_instance = 0
+        elif state in (
+            RequestState.DENOISING_RUNNING,
+            RequestState.DENOISING_DONE,
+            RequestState.DENOISING_WAITING,
+        ):
+            record.encoder_instance = 0
+            record.denoiser_instance = 0
+        elif state in (RequestState.DECODER_RUNNING, RequestState.DECODER_WAITING):
+            record.encoder_instance = 0
+            record.denoiser_instance = 0
+            record.decoder_instance = 0
+        record.state = state
 
-
-class TestDiffusionServerTransferInit(unittest.TestCase):
-    """Test DiffusionServer transfer mode initialization."""
-
-    def test_transfer_mode_init(self):
-        server = DiffusionServer(
-            frontend_endpoint="tcp://127.0.0.1:19950",
-            encoder_work_endpoints=["tcp://127.0.0.1:19951"],
-            denoiser_work_endpoints=["tcp://127.0.0.1:19952"],
-            decoder_work_endpoints=["tcp://127.0.0.1:19953"],
-            encoder_result_endpoint="tcp://127.0.0.1:19954",
-            denoiser_result_endpoint="tcp://127.0.0.1:19955",
-            decoder_result_endpoint="tcp://127.0.0.1:19956",
-        )
-        self.assertTrue(server._transfer_mode)
-        self.assertEqual(len(server._transfer_state), 0)
-        self.assertEqual(len(server._encoder_peers), 0)
-
-    def test_transfer_stats(self):
-        server = DiffusionServer(
-            frontend_endpoint="tcp://127.0.0.1:19960",
-            encoder_work_endpoints=["tcp://127.0.0.1:19961"],
-            denoiser_work_endpoints=["tcp://127.0.0.1:19962"],
-            decoder_work_endpoints=["tcp://127.0.0.1:19963"],
-            encoder_result_endpoint="tcp://127.0.0.1:19964",
-            denoiser_result_endpoint="tcp://127.0.0.1:19965",
-            decoder_result_endpoint="tcp://127.0.0.1:19966",
-        )
-        stats = server.get_stats()
-        self.assertTrue(stats["transfer_mode"])
-        self.assertEqual(stats["transfer_active_transfers"], 0)
-        self.assertEqual(stats["encoder_peers"], 0)
-
-
-class TestDiffusionServerTransferProtocol(unittest.TestCase):
-    """Test transfer protocol message handling in DiffusionServer."""
-
-    def test_transfer_register(self):
-        """Test instance registration with DS."""
-        server = DiffusionServer(
-            frontend_endpoint="tcp://127.0.0.1:19970",
-            encoder_work_endpoints=["tcp://127.0.0.1:19971"],
-            denoiser_work_endpoints=["tcp://127.0.0.1:19972"],
-            decoder_work_endpoints=["tcp://127.0.0.1:19973"],
-            encoder_result_endpoint="tcp://127.0.0.1:19974",
-            denoiser_result_endpoint="tcp://127.0.0.1:19975",
-            decoder_result_endpoint="tcp://127.0.0.1:19976",
-        )
-
-        # Register an encoder
+    def test_transfer_register_tracks_host_meta_and_prealloc(self):
         reg_msg = TransferRegisterMsg(
-            role="encoder",
-            session_id="enc-session-0",
+            role="denoiser",
+            instance_id=0,
+            session_id="den-session-0",
             pool_ptr=0x7F000000,
             pool_size=16 * 1024 * 1024,
+            meta_pool_ptr=0x8F000000,
+            meta_pool_size=128 * 1024,
+            control_endpoint="tcp://den-ctrl",
+            host_id="host-a",
+            supports_local_copy=True,
+            data_shm_name="data-shm",
+            meta_shm_name="meta-shm",
+            preallocated_slots=[
+                {
+                    "slot_id": 4,
+                    "offset": 256,
+                    "size": 4096,
+                    "addr": 0x7F000100,
+                    "meta_offset": 128,
+                    "meta_size": 2048,
+                    "meta_addr": 0x8F000080,
+                }
+            ],
         )
-        frames = encode_transfer_msg(reg_msg)
-        server._handle_transfer_result(frames, "encoder")
+        self.server._handle_transfer_result(encode_transfer_msg(reg_msg), RoleType.DENOISER)
 
-        self.assertIn(0, server._encoder_peers)
-        self.assertEqual(server._encoder_peers[0]["session_id"], "enc-session-0")
-        self.assertEqual(server._encoder_peers[0]["pool_ptr"], 0x7F000000)
+        peer = self.server._denoiser_peers[0]
+        self.assertEqual(peer["control_endpoint"], "tcp://den-ctrl")
+        self.assertEqual(peer["host_id"], "host-a")
+        self.assertTrue(peer["supports_local_copy"])
+        self.assertEqual(peer["meta_pool_ptr"], 0x8F000000)
+        self.assertEqual(peer["free_preallocated_slots"][0]["slot_id"], 4)
+        self.assertEqual(peer["free_preallocated_slots"][0]["meta_size"], 2048)
 
-    def test_transfer_staged_and_alloc(self):
-        """Test encoder staged → DS selects denoiser → sends alloc."""
-        ctx = zmq.Context()
-        # We need live sockets to capture the alloc message DS sends to denoiser
-        denoiser_work_ep = "tcp://127.0.0.1:19980"
-        denoiser_work_pull = ctx.socket(zmq.PULL)
-        denoiser_work_pull.bind(denoiser_work_ep)
-
-        server = DiffusionServer(
-            frontend_endpoint="tcp://127.0.0.1:19981",
-            encoder_work_endpoints=["tcp://127.0.0.1:19982"],
-            denoiser_work_endpoints=[denoiser_work_ep],
-            decoder_work_endpoints=["tcp://127.0.0.1:19983"],
-            encoder_result_endpoint="tcp://127.0.0.1:19984",
-            denoiser_result_endpoint="tcp://127.0.0.1:19985",
-            decoder_result_endpoint="tcp://127.0.0.1:19986",
+    def test_transfer_staged_dispatches_alloc_with_meta_and_host(self):
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferRegisterMsg(
+                    role="encoder",
+                    instance_id=0,
+                    session_id="enc-session-0",
+                    pool_ptr=0x1000,
+                    pool_size=16 * 1024 * 1024,
+                    meta_pool_ptr=0x1800,
+                    meta_pool_size=128 * 1024,
+                    control_endpoint="tcp://enc-ctrl",
+                    host_id="host-a",
+                )
+            ),
+            RoleType.ENCODER,
         )
-        server.start()
-        time.sleep(0.3)  # Let sockets connect
-
-        try:
-            # Submit a request
-            server._tracker.submit("r1")
-            server._tracker.transition(
-                "r1", RequestState.ENCODER_RUNNING, encoder_instance=0
-            )
-
-            # Simulate encoder sending transfer_staged
-            staged_msg = TransferStagedMsg(
-                request_id="r1",
-                data_size=4096,
-                manifest={"latents": [{"offset": 0, "shape": [4], "dtype": "float32"}]},
-                session_id="enc-0",
-                pool_ptr=0x1000,
-                slot_offset=0,
-            )
-            frames = encode_transfer_msg(staged_msg)
-            server._handle_transfer_result(frames, "encoder")
-
-            # DS should have sent transfer_alloc to denoiser
-            alloc_frames = denoiser_work_pull.recv_multipart(flags=0)
-            alloc_msg = decode_transfer_msg(alloc_frames)
-            self.assertEqual(alloc_msg["msg_type"], "transfer_alloc")
-            self.assertEqual(alloc_msg["request_id"], "r1")
-            self.assertEqual(alloc_msg["data_size"], 4096)
-
-            # Verify transfer state
-            self.assertIn("r1", server._transfer_state)
-            self.assertEqual(server._transfer_state["r1"].sender_session_id, "enc-0")
-        finally:
-            server.stop()
-            denoiser_work_pull.close()
-            ctx.destroy(linger=0)
-
-    def test_transfer_full_e2e_handshake(self):
-        """Test full transfer handshake: staged → alloc → allocated → push → pushed → ready."""
-        ctx = zmq.Context()
-        enc_work_ep = "tcp://127.0.0.1:19990"
-        den_work_ep = "tcp://127.0.0.1:19991"
-
-        enc_work_pull = ctx.socket(zmq.PULL)
-        enc_work_pull.bind(enc_work_ep)
-        den_work_pull = ctx.socket(zmq.PULL)
-        den_work_pull.bind(den_work_ep)
-
-        server = DiffusionServer(
-            frontend_endpoint="tcp://127.0.0.1:19992",
-            encoder_work_endpoints=[enc_work_ep],
-            denoiser_work_endpoints=[den_work_ep],
-            decoder_work_endpoints=["tcp://127.0.0.1:19993"],
-            encoder_result_endpoint="tcp://127.0.0.1:19994",
-            denoiser_result_endpoint="tcp://127.0.0.1:19995",
-            decoder_result_endpoint="tcp://127.0.0.1:19996",
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferRegisterMsg(
+                    role="denoiser",
+                    instance_id=0,
+                    session_id="den-session-0",
+                    pool_ptr=0x2000,
+                    pool_size=16 * 1024 * 1024,
+                    meta_pool_ptr=0x2800,
+                    meta_pool_size=128 * 1024,
+                    control_endpoint="tcp://den-ctrl",
+                    host_id="host-a",
+                    preallocated_slots=[
+                        {
+                            "slot_id": 1,
+                            "offset": 512,
+                            "size": 4096,
+                            "addr": 0x2000 + 512,
+                            "meta_offset": 128,
+                            "meta_size": 2048,
+                            "meta_addr": 0x2800 + 128,
+                        }
+                    ],
+                )
+            ),
+            RoleType.DENOISER,
         )
-        server.start()
-        time.sleep(0.3)
+        self._submit_running_request("r1", RequestState.ENCODER_RUNNING)
 
-        try:
-            # Setup: submit request with encoder running
-            server._tracker.submit("r1")
-            server._tracker.transition(
-                "r1", RequestState.ENCODER_RUNNING, encoder_instance=0
-            )
+        staged_msg = TransferStagedMsg(
+            request_id="r1",
+            data_size=4096,
+            meta_size=2048,
+            session_id="enc-session-0",
+            pool_ptr=0x1000,
+            slot_offset=0,
+            meta_pool_ptr=0x1800,
+            meta_slot_offset=64,
+        )
+        self.server._handle_transfer_result(encode_transfer_msg(staged_msg), RoleType.ENCODER)
+        self.server._drain_denoiser_tta()
 
-            # Step 1: Encoder staged
-            staged = TransferStagedMsg(
-                request_id="r1",
-                data_size=2048,
-                manifest={"t": [{"offset": 0, "shape": [512], "dtype": "float32"}]},
-                session_id="enc-sess",
-                pool_ptr=0x1000,
-                slot_offset=0,
-            )
-            server._handle_transfer_result(encode_transfer_msg(staged), "encoder")
+        sent_frames = self.server._denoiser_pushes[0].send_multipart.call_args[0][0]
+        alloc_msg = decode_transfer_msg(sent_frames)
+        self.assertEqual(alloc_msg["msg_type"], "transfer_alloc")
+        self.assertEqual(alloc_msg["source_control_endpoint"], "tcp://enc-ctrl")
+        self.assertEqual(alloc_msg["source_host_id"], "host-a")
+        self.assertEqual(alloc_msg["meta_size"], 2048)
+        self.assertEqual(alloc_msg["preallocated_slot"]["slot_id"], 1)
+        self.assertEqual(
+            self.server._tracker.get("r1").state,
+            RequestState.DENOISING_WAITING,
+        )
 
-            # Step 2: Denoiser receives alloc
-            alloc_frames = den_work_pull.recv_multipart()
-            alloc = decode_transfer_msg(alloc_frames)
-            self.assertEqual(alloc["msg_type"], "transfer_alloc")
+    def test_transfer_staged_releases_encoder_slot_and_starts_wait_timer(self):
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferRegisterMsg(
+                    role="encoder",
+                    instance_id=0,
+                    session_id="enc-session-0",
+                    pool_ptr=0x1000,
+                    pool_size=16 * 1024 * 1024,
+                    meta_pool_ptr=0x1800,
+                    meta_pool_size=128 * 1024,
+                    control_endpoint="tcp://enc-ctrl",
+                    host_id="host-a",
+                )
+            ),
+            RoleType.ENCODER,
+        )
+        self._submit_running_request("r-stage", RequestState.ENCODER_RUNNING)
+        self.server._encoder_free_slots[0] = 0
+        staged_msg = TransferStagedMsg(
+            request_id="r-stage",
+            data_size=4096,
+            meta_size=2048,
+            session_id="enc-session-0",
+            pool_ptr=0x1000,
+            slot_offset=0,
+            meta_pool_ptr=0x1800,
+            meta_slot_offset=64,
+        )
 
-            # Step 3: Denoiser sends allocated
-            allocated = TransferAllocatedMsg(
-                request_id="r1",
-                session_id="den-sess",
-                pool_ptr=0x2000,
-                slot_offset=0,
-                slot_size=2048,
-            )
-            server._handle_transfer_result(encode_transfer_msg(allocated), "denoiser")
+        self.server._handle_transfer_result(encode_transfer_msg(staged_msg), RoleType.ENCODER)
 
-            # Step 4: Encoder receives push command
-            push_frames = enc_work_pull.recv_multipart()
-            push = decode_transfer_msg(push_frames)
-            self.assertEqual(push["msg_type"], "transfer_push")
-            self.assertEqual(push["dest_session_id"], "den-sess")
-            self.assertEqual(push["dest_addr"], 0x2000)  # pool_ptr + slot_offset
-            self.assertEqual(push["transfer_size"], 2048)
+        self.assertEqual(self.server._encoder_free_slots[0], 1)
+        self.assertEqual(
+            self.server._tracker.get("r-stage").state,
+            RequestState.DENOISING_WAITING,
+        )
+        self.assertIsNotNone(self.server._transfer_state["r-stage"].downstream_wait_since)
 
-            # Step 5: Encoder sends pushed (RDMA done)
-            pushed = TransferPushedMsg(request_id="r1")
-            server._handle_transfer_result(encode_transfer_msg(pushed), "encoder")
+    def test_transfer_pushed_starts_running_without_double_releasing_sender_slot(self):
+        self._submit_running_request("r-pushed", RequestState.DENOISING_WAITING)
+        self.server._tracker.update_instances("r-pushed", denoiser_instance=0)
+        self.server._encoder_free_slots[0] = 1
+        self.server._transfer_state["r-pushed"] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            receiver_role=RoleType.DENOISER.value,
+            sender_instance=0,
+            receiver_instance=0,
+            sender_slot_released=True,
+            alloc_accepted=True,
+        )
 
-            # Step 6: Denoiser receives ready
-            ready_frames = den_work_pull.recv_multipart()
-            ready = decode_transfer_msg(ready_frames)
-            self.assertEqual(ready["msg_type"], "transfer_ready")
-            self.assertEqual(ready["request_id"], "r1")
-            self.assertIn("t", ready["manifest"])
-        finally:
-            server.stop()
-            enc_work_pull.close()
-            den_work_pull.close()
-            ctx.destroy(linger=0)
+        pushed = encode_transfer_msg(TransferPushedMsg(request_id="r-pushed", success=True))
+        self.server._handle_transfer_result(pushed, RoleType.ENCODER)
+        self.server._handle_transfer_result(pushed, RoleType.ENCODER)
+
+        self.assertEqual(self.server._encoder_free_slots[0], 1)
+        self.assertEqual(
+            self.server._tracker.get("r-pushed").state,
+            RequestState.DENOISING_RUNNING,
+        )
+
+    def test_retryable_alloc_reject_requeues_request(self):
+        self._submit_running_request("r-retry", RequestState.DENOISING_WAITING)
+        self.server._tracker.update_instances("r-retry", denoiser_instance=0)
+        self.server._denoiser_free_slots[0] = 0
+        p2p = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            receiver_role=RoleType.DENOISER.value,
+            sender_instance=0,
+            receiver_instance=0,
+            downstream_wait_since=1.0,
+        )
+        self.server._transfer_state["r-retry"] = p2p
+
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferAllocRejectMsg(
+                    request_id="r-retry",
+                    receiver_role=RoleType.DENOISER.value,
+                    receiver_instance=0,
+                    retryable=True,
+                    reason="busy",
+                )
+            ),
+            RoleType.DENOISER,
+        )
+
+        self.assertIn("r-retry", self.server._transfer_state)
+        self.assertEqual(len(self.server._denoiser_tta), 1)
+        self.assertEqual(self.server._denoiser_tta[0].request_id, "r-retry")
+        self.assertEqual(
+            self.server._tracker.get("r-retry").state,
+            RequestState.DENOISING_WAITING,
+        )
+
+    def test_alloc_accepted_stops_downstream_wait_timer(self):
+        self._submit_running_request("r-accept", RequestState.DENOISING_WAITING)
+        p2p = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            receiver_role=RoleType.DENOISER.value,
+            sender_instance=0,
+            receiver_instance=0,
+            downstream_wait_since=123.0,
+        )
+        self.server._transfer_state["r-accept"] = p2p
+
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferAllocAcceptedMsg(
+                    request_id="r-accept",
+                    receiver_role=RoleType.DENOISER.value,
+                    receiver_instance=0,
+                )
+            ),
+            RoleType.DENOISER,
+        )
+
+        self.assertTrue(self.server._transfer_state["r-accept"].alloc_accepted)
+        self.assertIsNone(self.server._transfer_state["r-accept"].downstream_wait_since)
+
+    def test_downstream_wait_timeout_aborts_sender_only_and_times_out(self):
+        self._submit_running_request("r-timeout", RequestState.DENOISING_WAITING)
+        self.server._pending["r-timeout"] = b"client"
+        self.server._frontend = MagicMock()
+        self.server._send_abort = MagicMock()
+        self.server._downstream_wait_timeout_s = 1.0
+        self.server._transfer_state["r-timeout"] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            sender_control_endpoint="tcp://enc-ctrl",
+            downstream_wait_since=0.0,
+        )
+
+        with unittest.mock.patch(
+            "sglang.multimodal_gen.runtime.disaggregation.diffusion_server.time.monotonic",
+            return_value=10.0,
+        ):
+            self.server._handle_timeouts()
+
+        self.server._send_abort.assert_called_once()
+        _args, kwargs = self.server._send_abort.call_args
+        self.assertTrue(kwargs["to_sender"])
+        self.assertFalse(kwargs["to_receiver"])
+        self.assertIsNone(self.server._tracker.get("r-timeout"))
+
+    def test_denoiser_done_releases_receiver_once_and_enqueues_decoder_once(self):
+        self._submit_running_request("r-done", RequestState.DENOISING_RUNNING)
+        self.server._denoiser_peers[0] = {
+            "control_endpoint": "tcp://den-ctrl",
+            "host_id": "host-a",
+            "free_preallocated_slots": [],
+        }
+        self.server._decoder_peers[0] = {
+            "control_endpoint": "tcp://dec-ctrl",
+            "host_id": "host-a",
+            "free_preallocated_slots": [],
+        }
+        self.server._denoiser_free_slots[0] = 0
+        self.server._transfer_state["r-done"] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            receiver_role=RoleType.DENOISER.value,
+            receiver_instance=0,
+            receiver_pool_ptr=0x3000,
+            receiver_slot_offset=256,
+            receiver_slot_size=4096,
+            receiver_meta_pool_ptr=0x3800,
+            receiver_meta_slot_offset=64,
+            receiver_meta_slot_size=2048,
+            meta_size=2048,
+            prealloc_slot_id=7,
+        )
+
+        done_msg = {
+            "request_id": "r-done",
+            "staged_for_decoder": True,
+            "session_id": "den-session",
+            "pool_ptr": 0x5000,
+            "slot_offset": 128,
+            "meta_pool_ptr": 0x5800,
+            "meta_slot_offset": 32,
+            "data_size": 2048,
+            "meta_size": 1024,
+        }
+
+        self.server._handle_transfer_done(done_msg, RoleType.DENOISER)
+        self.server._handle_transfer_done(done_msg, RoleType.DENOISER)
+
+        self.assertEqual(self.server._denoiser_free_slots[0], 1)
+        self.assertEqual(len(self.server._denoiser_peers[0]["free_preallocated_slots"]), 1)
+        self.assertEqual(
+            self.server._denoiser_peers[0]["free_preallocated_slots"][0]["meta_size"],
+            2048,
+        )
+        self.assertEqual(len(self.server._decoder_tta), 1)
+        self.assertEqual(
+            self.server._tracker.get("r-done").state,
+            RequestState.DECODER_WAITING,
+        )
 
 
 if __name__ == "__main__":

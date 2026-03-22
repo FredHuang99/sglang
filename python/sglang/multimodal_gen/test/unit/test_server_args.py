@@ -211,5 +211,20 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
         self.assertEqual(server_args.pipeline_config.resolution, 768)
 
 
+class TestDisaggTimeoutArgs(unittest.TestCase):
+    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-downstream-wait-timeout",
+            "45",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
+
+
 if __name__ == "__main__":
     unittest.main()

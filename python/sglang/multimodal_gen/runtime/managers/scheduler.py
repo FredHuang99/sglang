@@ -120,13 +120,16 @@ class Scheduler(SchedulerDisaggMixin):
         self._warmup_total = 0
         self._warmup_processed = 0
 
-        self.prepare_server_warmup_reqs()
-
         # Maximum consecutive errors before terminating the event loop
         self._max_consecutive_errors = 3
         self._consecutive_error_count = 0
 
         self._init_disagg_state(server_args, local_rank)
+        if self._disagg_role != RoleType.MONOLITHIC:
+            self._run_disagg_startup_warmup(self.build_server_warmup_reqs())
+            self.warmed_up = True
+        else:
+            self.prepare_server_warmup_reqs()
 
     def get_disagg_metrics(self) -> dict | None:
         """Return disagg role metrics snapshot, or None if not in disagg mode."""
@@ -218,51 +221,58 @@ class Scheduler(SchedulerDisaggMixin):
 
         return [item]
 
-    def prepare_server_warmup_reqs(self):
-        if (
-            self.server_args.warmup
-            and not self.warmed_up
-            and self.server_args.warmup_resolutions is not None
-        ):
-            # insert warmup reqs constructed with each warmup-resolution
-            self._warmup_total = len(self.server_args.warmup_resolutions)
-            self._warmup_processed = 0
+    def build_server_warmup_reqs(self) -> list[Req]:
+        if self.warmed_up or not self.server_args.warmup:
+            return []
 
-            for resolution in self.server_args.warmup_resolutions:
+        resolutions = self.server_args.warmup_resolutions or [None]
+        self._warmup_total = len(resolutions)
+        self._warmup_processed = 0
+        task_type = self.server_args.pipeline_config.task_type
+        warmup_reqs: list[Req] = []
+
+        for resolution in resolutions:
+            width = height = None
+            if resolution is not None:
                 width, height = _parse_size(resolution)
-                task_type = self.server_args.pipeline_config.task_type
 
-                if task_type in (
-                    ModelTaskType.I2I,
-                    ModelTaskType.TI2I,
-                    ModelTaskType.I2V,
-                    ModelTaskType.TI2V,
-                ):
-                    uploads_dir = os.path.join("outputs", "uploads")
-                    os.makedirs(uploads_dir, exist_ok=True)
-                    input_path = asyncio.run(
-                        save_image_to_path(
-                            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                            os.path.join(uploads_dir, "warmup_image.jpg"),
-                        )
+            req_kwargs = {
+                "data_type": task_type.data_type(),
+                "prompt": "",
+            }
+            if width is not None:
+                req_kwargs["width"] = width
+            if height is not None:
+                req_kwargs["height"] = height
+
+            if task_type in (
+                ModelTaskType.I2I,
+                ModelTaskType.TI2I,
+                ModelTaskType.I2V,
+                ModelTaskType.TI2V,
+            ):
+                uploads_dir = os.path.join("outputs", "uploads")
+                os.makedirs(uploads_dir, exist_ok=True)
+                input_path = asyncio.run(
+                    save_image_to_path(
+                        MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+                        os.path.join(uploads_dir, "warmup_image.jpg"),
                     )
-                    req = Req(
-                        data_type=task_type.data_type(),
-                        width=width,
-                        height=height,
-                        prompt="",
-                        negative_prompt="",
-                        image_path=[input_path],
-                    )
-                else:
-                    req = Req(
-                        data_type=task_type.data_type(),
-                        width=width,
-                        height=height,
-                        prompt="",
-                    )
-                req.set_as_warmup(self.server_args.warmup_steps)
-                self.waiting_queue.append((None, req))
+                )
+                req_kwargs["negative_prompt"] = ""
+                req_kwargs["image_path"] = [input_path]
+
+            req = Req(**req_kwargs)
+            req.set_as_warmup(self.server_args.warmup_steps)
+            warmup_reqs.append(req)
+
+        return warmup_reqs
+
+    def prepare_server_warmup_reqs(self):
+        warmup_reqs = self.build_server_warmup_reqs()
+        for req in warmup_reqs:
+            self.waiting_queue.append((None, req))
+        if warmup_reqs:
             # if server is warmed-up, set this flag to avoid req-based warmup
             self.warmed_up = True
 

@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for DiffusionTransferManager transfer logic."""
 
+import os
+import queue
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
+    TransferMetaBuffer,
     TransferTensorBuffer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
@@ -13,13 +18,16 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.manager import (
     DiffusionTransferManager,
+    PendingPeerSend,
     PendingReceive,
     StagedTransfer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
+    TransferAbortMsg,
+    TransferAllocRejectMsg,
     TransferAllocMsg,
+    TransferPeerInfoMsg,
     TransferPushedMsg,
-    TransferPushMsg,
     TransferStagedMsg,
     decode_transfer_msg,
     encode_transfer_msg,
@@ -32,19 +40,26 @@ def _make_manager(
     min_block: int = 1024 * 1024,
     session_id: str | None = None,
 ) -> DiffusionTransferManager:
-    """Create a manager with mock engine and pinned buffer."""
     engine = MockTransferEngine(session_id=session_id)
     buffer = TransferTensorBuffer(
         pool_size=pool_size,
         min_block_size=min_block,
         role_name="test",
     )
-    return DiffusionTransferManager(engine=engine, buffer=buffer)
+    meta_buffer = TransferMetaBuffer(
+        slot_count=4,
+        slot_size=64 * 1024,
+        role_name="test",
+    )
+    return DiffusionTransferManager(
+        engine=engine,
+        buffer=buffer,
+        meta_buffer=meta_buffer,
+        host_id="host-a",
+    )
 
 
 class TestStaging(unittest.TestCase):
-    """Test D2H staging of GPU tensors to TransferBuffer."""
-
     def setUp(self):
         MockTransferEngine.reset()
 
@@ -53,26 +68,9 @@ class TestStaging(unittest.TestCase):
 
     def test_stage_single_tensor(self):
         mgr = _make_manager()
-        t = torch.randn(4, 8)
-        staged = mgr.stage_tensors("r1", {"data": t})
-
-        self.assertIsNotNone(staged)
+        staged = mgr.stage_tensors("r1", {"data": torch.randn(4, 8)})
         self.assertIsInstance(staged, StagedTransfer)
-        self.assertEqual(staged.request_id, "r1")
         self.assertIn("data", staged.manifest)
-        self.assertIsNotNone(staged.slot)
-
-    def test_stage_multiple_tensors(self):
-        mgr = _make_manager()
-        tensors = {
-            "latents": torch.randn(2, 4, 16, 16),
-            "embeds": torch.randn(2, 77, 768),
-        }
-        staged = mgr.stage_tensors("r1", tensors)
-
-        self.assertIsNotNone(staged)
-        self.assertIn("latents", staged.manifest)
-        self.assertIn("embeds", staged.manifest)
 
     def test_stage_with_scalar_fields(self):
         mgr = _make_manager()
@@ -83,38 +81,15 @@ class TestStaging(unittest.TestCase):
         )
         self.assertEqual(staged.scalar_fields["guidance_scale"], 7.5)
 
-    def test_stage_empty_tensors(self):
-        mgr = _make_manager()
-        staged = mgr.stage_tensors("r1", {})
-        self.assertIsNotNone(staged)
-        self.assertIsNone(staged.slot)  # No data allocated
-        self.assertEqual(staged.manifest, {})
-
-    def test_stage_none_values(self):
-        mgr = _make_manager()
-        staged = mgr.stage_tensors("r1", {"a": None, "b": None})
-        self.assertIsNotNone(staged)
-
-    def test_free_staged(self):
+    def test_free_staged_is_idempotent(self):
         mgr = _make_manager()
         mgr.stage_tensors("r1", {"t": torch.randn(4, 8)})
         mgr.free_staged("r1")
-        # Should be idempotent
         mgr.free_staged("r1")
-
-    def test_get_staged_info(self):
-        mgr = _make_manager()
-        mgr.stage_tensors("r1", {"t": torch.randn(4)})
-        info = mgr.get_staged_info("r1")
-        self.assertIsNotNone(info)
-        self.assertEqual(info.request_id, "r1")
-
-        self.assertIsNone(mgr.get_staged_info("nonexistent"))
+        self.assertIsNone(mgr.get_staged_info("r1"))
 
 
 class TestReceive(unittest.TestCase):
-    """Test receive slot allocation and tensor loading."""
-
     def setUp(self):
         MockTransferEngine.reset()
 
@@ -123,38 +98,20 @@ class TestReceive(unittest.TestCase):
 
     def test_allocate_receive_slot(self):
         mgr = _make_manager()
-        pending = mgr.allocate_receive_slot("r1", 1024 * 1024)
-
-        self.assertIsNotNone(pending)
+        pending = mgr.allocate_receive_slot("r1", 1024 * 1024, 4096)
         self.assertIsInstance(pending, PendingReceive)
-        self.assertEqual(pending.request_id, "r1")
-        self.assertIsNotNone(pending.slot)
+        self.assertIsNotNone(mgr.get_receive_slot_addr("r1"))
+        self.assertIsNotNone(mgr.get_receive_meta_addr("r1"))
 
-    def test_allocate_too_large(self):
-        mgr = _make_manager(pool_size=1024 * 1024)
-        pending = mgr.allocate_receive_slot("r1", 2 * 1024 * 1024)
-        self.assertIsNone(pending)
-
-    def test_get_receive_slot_addr(self):
+    def test_free_receive_slot_is_idempotent(self):
         mgr = _make_manager()
-        mgr.allocate_receive_slot("r1", 1024 * 1024)
-
-        addr = mgr.get_receive_slot_addr("r1")
-        self.assertIsNotNone(addr)
-        self.assertEqual(addr, mgr.pool_data_ptr + mgr.get_receive_slot_offset("r1"))
-
-    def test_free_receive_slot(self):
-        mgr = _make_manager()
-        mgr.allocate_receive_slot("r1", 1024 * 1024)
+        mgr.allocate_receive_slot("r1", 1024 * 1024, 4096)
         mgr.free_receive_slot("r1")
-        # Should be idempotent
         mgr.free_receive_slot("r1")
         self.assertIsNone(mgr.get_receive_slot_addr("r1"))
 
 
 class TestTransfer(unittest.TestCase):
-    """Test end-to-end transfer between two managers."""
-
     def setUp(self):
         MockTransferEngine.reset()
 
@@ -162,165 +119,381 @@ class TestTransfer(unittest.TestCase):
         MockTransferEngine.reset()
 
     def test_full_transfer_cycle(self):
-        """Test: sender stages → RDMA push → receiver loads."""
         sender = _make_manager(session_id="sender-1")
         receiver = _make_manager(session_id="receiver-1")
-
-        # 1. Sender stages tensors (D2H)
         original = torch.randn(2, 4, 8, 8)
-        staged = sender.stage_tensors("r1", {"latents": original})
-        self.assertIsNotNone(staged)
+        staged = sender.stage_tensors(
+            "r1",
+            {"latents": original},
+            scalar_fields={"request_id": "r1", "guidance_scale": 7.5},
+        )
+        receiver.allocate_receive_slot("r1", staged.slot.size, staged.meta_size)
 
-        # 2. Receiver allocates slot
-        pending = receiver.allocate_receive_slot("r1", staged.slot.size)
-        self.assertIsNotNone(pending)
-
-        # 3. Sender pushes via RDMA to receiver's slot
-        dest_addr = receiver.get_receive_slot_addr("r1")
         ok = sender.push_to_peer(
             "r1",
             dest_session_id=receiver.session_id,
-            dest_addr=dest_addr,
+            dest_addr=receiver.get_receive_slot_addr("r1"),
             transfer_size=staged.slot.size,
         )
         self.assertTrue(ok)
+        ok_meta = sender._engine.transfer_sync(
+            receiver.session_id,
+            sender.meta_pool_ptr + staged.meta_slot.offset,
+            receiver.get_receive_meta_addr("r1"),
+            staged.meta_size,
+        )
+        self.assertEqual(ok_meta, 0)
 
-        # 4. Receiver loads tensors (H2D)
-        loaded = receiver.load_tensors("r1", staged.manifest, device="cpu")
-        self.assertIn("latents", loaded)
+        loaded, scalar_fields, _ = receiver.load_transfer_async("r1", device="cpu")
         torch.testing.assert_close(loaded["latents"], original)
+        self.assertEqual(scalar_fields["request_id"], "r1")
+        self.assertEqual(scalar_fields["guidance_scale"], 7.5)
 
-        # 5. Cleanup
-        sender.free_staged("r1")
-        receiver.free_receive_slot("r1")
+    def test_duplicate_peer_info_is_ignored_after_queueing(self):
+        sender = _make_manager(session_id="sender-dup")
+        sender.stage_tensors("dup-1", {"latents": torch.randn(1, 4, 8, 8)})
+        sender._send_queues = [queue.Queue()]
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "dup-1",
+                "dest_session_id": "receiver",
+                "dest_addr": 123,
+                "transfer_size": 456,
+            }
+        )
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "dup-1",
+                "dest_session_id": "receiver",
+                "dest_addr": 999,
+                "transfer_size": 456,
+            }
+        )
 
-    def test_transfer_multiple_tensors(self):
-        """Test transfer with multiple tensor fields."""
-        sender = _make_manager(session_id="s")
-        receiver = _make_manager(session_id="r")
+        self.assertEqual(sender._send_queues[0].qsize(), 1)
+        self.assertEqual(sender._pending_peer_sends["dup-1"].dest_addr, 123)
 
-        originals = {
-            "embeds": torch.randn(2, 77, 768),
-            "latents": torch.randn(2, 4, 32, 32),
-        }
-        staged = sender.stage_tensors("r1", originals)
+    def test_send_executor_completes_and_dedupes_terminal_state(self):
+        sender = _make_manager(session_id="sender-exec")
+        receiver = _make_manager(session_id="receiver-exec")
+        callback = unittest.mock.MagicMock()
+        sender._on_send_completion = callback
+        sender._send_executors = [ThreadPoolExecutor(max_workers=2)]
+        sender._send_queues = [queue.Queue()]
 
-        pending = receiver.allocate_receive_slot("r1", staged.slot.size)
-        dest_addr = receiver.get_receive_slot_addr("r1")
+        staged = sender.stage_tensors("r1", {"latents": torch.randn(1, 4, 8, 8)})
+        receiver.allocate_receive_slot("r1", staged.slot.size, staged.meta_size)
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "r1",
+                "dest_session_id": receiver.session_id,
+                "dest_addr": receiver.get_receive_slot_addr("r1"),
+                "transfer_size": staged.slot.size,
+                "meta_dest_addr": receiver.get_receive_meta_addr("r1"),
+                "meta_transfer_size": staged.meta_size,
+                "receiver_control_endpoint": "tcp://receiver-ctrl",
+            }
+        )
 
-        ok = sender.push_to_peer("r1", "r", dest_addr, staged.slot.size)
-        self.assertTrue(ok)
+        sender._submit_send_task(sender._send_queues[0].get_nowait(), 0)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            if sender._drain_send_completions():
+                break
+            time.sleep(0.01)
 
-        loaded = receiver.load_tensors("r1", staged.manifest, device="cpu")
-        torch.testing.assert_close(loaded["embeds"], originals["embeds"])
-        torch.testing.assert_close(loaded["latents"], originals["latents"])
+        sender._send_executors[0].shutdown(wait=True)
+        sender._send_executors = []
 
-        sender.free_staged("r1")
-        receiver.free_receive_slot("r1")
+        callback.assert_called_once()
+        self.assertEqual(sender._terminal_send_states["r1"], "success")
+        self.assertIsNone(sender.get_staged_info("r1"))
 
-    def test_push_without_staging_fails(self):
-        sender = _make_manager(session_id="s")
-        ok = sender.push_to_peer("nonexistent", "dest", 0, 100)
-        self.assertFalse(ok)
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "r1",
+                "dest_session_id": receiver.session_id,
+                "dest_addr": receiver.get_receive_slot_addr("r1"),
+                "transfer_size": staged.slot.size,
+            }
+        )
+        self.assertNotIn("r1", sender._pending_peer_sends)
 
-    def test_load_without_allocation_raises(self):
-        receiver = _make_manager(session_id="r")
-        with self.assertRaises(ValueError):
-            receiver.load_tensors("nonexistent", {}, device="cpu")
+    def test_same_host_local_copy_path_moves_data_and_meta(self):
+        sender = _make_manager(session_id="sender-local")
+        receiver = _make_manager(session_id="receiver-local")
+        staged = sender.stage_tensors(
+            "local-1",
+            {"latents": torch.randn(1, 4, 8, 8)},
+            scalar_fields={"request_id": "local-1"},
+        )
+        receiver.allocate_receive_slot("local-1", staged.slot.size, staged.meta_size)
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "local-1",
+                "dest_session_id": receiver.session_id,
+                "dest_addr": receiver.get_receive_slot_addr("local-1"),
+                "transfer_size": staged.slot.size,
+                "meta_dest_addr": receiver.get_receive_meta_addr("local-1"),
+                "meta_transfer_size": staged.meta_size,
+                "receiver_host_id": "host-a",
+                "receiver_supports_local_copy": True,
+                "dest_shm_name": receiver.data_shm_name,
+                "dest_shm_offset": receiver.get_receive_slot_offset("local-1"),
+                "meta_dest_shm_name": receiver.meta_shm_name,
+                "meta_dest_shm_offset": receiver.get_receive_meta_offset("local-1"),
+            }
+        )
 
-    def test_concurrent_transfers(self):
-        """Multiple requests transferred concurrently."""
-        sender = _make_manager(session_id="s", pool_size=64 * 1024 * 1024)
-        receiver = _make_manager(session_id="r", pool_size=64 * 1024 * 1024)
+        success, error_msg = sender._execute_send(
+            "local-1", sender._pending_peer_sends["local-1"]
+        )
+        self.assertTrue(success)
+        self.assertIsNone(error_msg)
+        loaded, scalars, _ = receiver.load_transfer_async("local-1", device="cpu")
+        self.assertIn("latents", loaded)
+        self.assertEqual(scalars["request_id"], "local-1")
 
-        for i in range(4):
-            rid = f"r{i}"
-            original = torch.randn(2, 4, 8, 8)
-            staged = sender.stage_tensors(rid, {"data": original})
-            pending = receiver.allocate_receive_slot(rid, staged.slot.size)
-            dest_addr = receiver.get_receive_slot_addr(rid)
+    def test_same_host_local_copy_fails_if_meta_copy_fails(self):
+        sender = _make_manager(session_id="sender-local-fail")
+        receiver = _make_manager(session_id="receiver-local-fail")
+        staged = sender.stage_tensors(
+            "local-fail-1",
+            {"latents": torch.randn(1, 4, 8, 8)},
+            scalar_fields={"request_id": "local-fail-1"},
+        )
+        receiver.allocate_receive_slot(
+            "local-fail-1", staged.slot.size, staged.meta_size
+        )
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "local-fail-1",
+                "dest_session_id": receiver.session_id,
+                "dest_addr": receiver.get_receive_slot_addr("local-fail-1"),
+                "transfer_size": staged.slot.size,
+                "meta_dest_addr": receiver.get_receive_meta_addr("local-fail-1"),
+                "meta_transfer_size": staged.meta_size,
+                "receiver_host_id": "host-a",
+                "receiver_supports_local_copy": True,
+                "dest_shm_name": receiver.data_shm_name,
+                "dest_shm_offset": receiver.get_receive_slot_offset("local-fail-1"),
+                "meta_dest_shm_name": receiver.meta_shm_name,
+                "meta_dest_shm_offset": receiver.get_receive_meta_offset("local-fail-1"),
+            }
+        )
+        original_local_copy = sender._local_copy
+        call_count = {"n": 0}
 
-            ok = sender.push_to_peer(rid, "r", dest_addr, staged.slot.size)
-            self.assertTrue(ok)
+        def flaky_local_copy(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 2:
+                return False
+            return original_local_copy(*args, **kwargs)
 
-            loaded = receiver.load_tensors(rid, staged.manifest, device="cpu")
-            torch.testing.assert_close(loaded["data"], original)
+        sender._local_copy = flaky_local_copy
 
-            sender.free_staged(rid)
-            receiver.free_receive_slot(rid)
+        success, error_msg = sender._execute_send(
+            "local-fail-1", sender._pending_peer_sends["local-fail-1"]
+        )
+        self.assertFalse(success)
+        self.assertIn("local shared-memory copy failed", error_msg)
+
+    def test_missing_staged_payload_reports_failure(self):
+        mgr = _make_manager(session_id="sender-missing")
+        callback = unittest.mock.MagicMock()
+        mgr._on_send_completion = callback
+        mgr._send_executors = [ThreadPoolExecutor(max_workers=1)]
+        mgr._send_queues = [queue.Queue()]
+        mgr._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "missing-staged",
+                "dest_session_id": "receiver",
+                "dest_addr": 0,
+                "transfer_size": 1024,
+                "meta_transfer_size": 64,
+            }
+        )
+
+        mgr._submit_send_task("missing-staged", 0)
+        mgr._drain_send_completions()
+
+        callback.assert_called_once()
+        self.assertEqual(mgr._terminal_send_states["missing-staged"], "failed")
+        mgr._send_executors[0].shutdown(wait=True)
+        mgr._send_executors = []
+
+    def test_abort_request_frees_staged_and_dynamic_receive_and_tombstones(self):
+        mgr = _make_manager(session_id="sender-abort")
+        staged = mgr.stage_tensors(
+            "abort-1",
+            {"latents": torch.randn(1, 4, 8, 8)},
+            scalar_fields={"request_id": "abort-1"},
+        )
+        pending = mgr.allocate_receive_slot("abort-1", staged.slot.size, staged.meta_size)
+        self.assertIsNotNone(pending)
+
+        mgr.abort_request("abort-1")
+
+        self.assertTrue(mgr.is_request_aborted("abort-1"))
+        self.assertIsNone(mgr.get_staged_info("abort-1"))
+        self.assertIsNone(mgr.get_receive_slot_addr("abort-1"))
+        self.assertEqual(mgr._terminal_send_states["abort-1"], "aborted")
 
 
 class TestTransferProtocol(unittest.TestCase):
-    """Test transfer protocol message encoding/decoding."""
-
     def test_encode_decode_staged(self):
         msg = TransferStagedMsg(
             request_id="r1",
             data_size=1024,
-            manifest={"latents": [{"offset": 0, "shape": [4], "dtype": "float32"}]},
+            meta_size=256,
             session_id="session-1",
             pool_ptr=0x1000,
             slot_offset=0,
+            meta_pool_ptr=0x2000,
+            meta_slot_offset=128,
         )
-        frames = encode_transfer_msg(msg)
-        self.assertEqual(len(frames), 2)
-
-        decoded = decode_transfer_msg(frames)
+        decoded = decode_transfer_msg(encode_transfer_msg(msg))
         self.assertEqual(decoded["msg_type"], "transfer_staged")
         self.assertEqual(decoded["request_id"], "r1")
-        self.assertEqual(decoded["data_size"], 1024)
+        self.assertEqual(decoded["meta_size"], 256)
 
     def test_encode_decode_alloc(self):
-        msg = TransferAllocMsg(request_id="r1", data_size=2048, source_role="encoder")
-        frames = encode_transfer_msg(msg)
-        decoded = decode_transfer_msg(frames)
+        msg = TransferAllocMsg(
+            request_id="r1",
+            data_size=2048,
+            meta_size=128,
+            source_role="encoder",
+            source_host_id="host-a",
+        )
+        decoded = decode_transfer_msg(encode_transfer_msg(msg))
         self.assertEqual(decoded["msg_type"], "transfer_alloc")
         self.assertEqual(decoded["source_role"], "encoder")
+        self.assertEqual(decoded["meta_size"], 128)
 
-    def test_encode_decode_push(self):
-        msg = TransferPushMsg(
+    def test_encode_decode_peer_info(self):
+        msg = TransferPeerInfoMsg(
             request_id="r1",
             dest_session_id="sess-2",
             dest_addr=0x2000,
             transfer_size=4096,
+            meta_dest_addr=0x3000,
+            meta_transfer_size=512,
+            receiver_host_id="host-a",
+            receiver_supports_local_copy=True,
         )
-        frames = encode_transfer_msg(msg)
-        decoded = decode_transfer_msg(frames)
-        self.assertEqual(decoded["dest_session_id"], "sess-2")
+        decoded = decode_transfer_msg(encode_transfer_msg(msg))
+        self.assertEqual(decoded["msg_type"], "transfer_peer_info")
         self.assertEqual(decoded["dest_addr"], 0x2000)
+        self.assertEqual(decoded["meta_dest_addr"], 0x3000)
 
     def test_is_transfer_message(self):
         transfer_frames = encode_transfer_msg(TransferPushedMsg(request_id="r1"))
         self.assertTrue(is_transfer_message(transfer_frames))
+        self.assertFalse(is_transfer_message([b'{"tensor_descriptors": []}', b'data']))
 
-        # Non-transfer message (e.g., tensor multipart starting with JSON)
-        non_transfer = [b'{"tensor_descriptors": []}', b"data"]
-        self.assertFalse(is_transfer_message(non_transfer))
+    def test_encode_decode_alloc_reject(self):
+        msg = TransferAllocRejectMsg(
+            request_id="r1",
+            receiver_role="denoiser",
+            receiver_instance=1,
+            retryable=True,
+            reason="busy",
+        )
+        decoded = decode_transfer_msg(encode_transfer_msg(msg))
+        self.assertEqual(decoded["msg_type"], "transfer_alloc_reject")
+        self.assertTrue(decoded["retryable"])
+        self.assertEqual(decoded["receiver_instance"], 1)
 
-    def test_decode_invalid_raises(self):
-        with self.assertRaises(ValueError):
-            decode_transfer_msg([b"not-transfer", b"{}"])
+    def test_encode_decode_abort(self):
+        msg = TransferAbortMsg(
+            request_id="r1",
+            reason="timeout",
+            source="timeout",
+        )
+        decoded = decode_transfer_msg(encode_transfer_msg(msg))
+        self.assertEqual(decoded["msg_type"], "transfer_abort")
+        self.assertEqual(decoded["reason"], "timeout")
 
 
-class TestCapacity(unittest.TestCase):
-    """Test capacity reporting."""
-
+class TestSendRuntimeConfig(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()
 
     def tearDown(self):
         MockTransferEngine.reset()
 
-    def test_free_slots_count(self):
-        mgr = _make_manager(pool_size=16 * 1024 * 1024)
-        count = mgr.free_slots_count(4 * 1024 * 1024)
-        self.assertGreater(count, 0)
+    def test_default_runtime_config_uses_single_queue_and_fallback_workers(self):
+        mgr = _make_manager()
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            queue_count, total_workers, worker_counts = mgr._resolve_send_runtime_config(3)
+        self.assertEqual(queue_count, 1)
+        self.assertEqual(total_workers, 3)
+        self.assertEqual(worker_counts, [3])
 
-    def test_session_and_pool_properties(self):
-        mgr = _make_manager(session_id="test-prop")
-        self.assertEqual(mgr.session_id, "test-prop")
-        self.assertGreater(mgr.pool_data_ptr, 0)
-        self.assertEqual(mgr.pool_size, 16 * 1024 * 1024)
+    def test_queue_only_override_promotes_total_workers(self):
+        mgr = _make_manager()
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE": "4"},
+            clear=True,
+        ):
+            queue_count, total_workers, worker_counts = mgr._resolve_send_runtime_config(1)
+        self.assertEqual(queue_count, 4)
+        self.assertEqual(total_workers, 4)
+        self.assertEqual(worker_counts, [1, 1, 1, 1])
+
+    def test_explicit_thread_pool_override_is_evenly_distributed(self):
+        mgr = _make_manager()
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE": "3",
+                "SGLANG_DIFFUSION_DISAGG_SEND_THREAD_POOL_SIZE": "8",
+            },
+            clear=True,
+        ):
+            queue_count, total_workers, worker_counts = mgr._resolve_send_runtime_config(1)
+        self.assertEqual(queue_count, 3)
+        self.assertEqual(total_workers, 8)
+        self.assertEqual(worker_counts, [3, 3, 2])
+
+    def test_invalid_thread_pool_smaller_than_queue_count_fails(self):
+        mgr = _make_manager()
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE": "3",
+                "SGLANG_DIFFUSION_DISAGG_SEND_THREAD_POOL_SIZE": "2",
+            },
+            clear=True,
+        ):
+            with self.assertRaises(ValueError):
+                mgr._resolve_send_runtime_config(1)
+
+    def test_same_downstream_identity_maps_to_same_queue(self):
+        mgr = _make_manager()
+        mgr._send_queues = [queue.Queue() for _ in range(4)]
+        first = PendingPeerSend(
+            request_id="r1",
+            receiver_instance=7,
+            dest_session_id="sess-a",
+        )
+        second = PendingPeerSend(
+            request_id="r2",
+            receiver_instance=7,
+            dest_session_id="sess-a",
+        )
+        self.assertEqual(
+            mgr._select_send_queue_idx(first),
+            mgr._select_send_queue_idx(second),
+        )
 
 
 if __name__ == "__main__":

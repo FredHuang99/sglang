@@ -18,14 +18,17 @@ TRANSFER_MAGIC = b"__transfer__"
 class TransferMsgType:
     # Instance → DiffusionServer
     STAGED = "transfer_staged"
-    ALLOCATED = "transfer_allocated"
     PUSHED = "transfer_pushed"
     DONE = "transfer_done"
+    ALLOC_ACCEPTED = "transfer_alloc_accepted"
+    ALLOC_REJECT = "transfer_alloc_reject"
 
     # DiffusionServer → Instance
     ALLOC = "transfer_alloc"
-    PUSH = "transfer_push"
+    PEER_INFO = "transfer_peer_info"
     READY = "transfer_ready"
+    FAILED = "transfer_failed"
+    ABORT = "transfer_abort"
 
     # Registration
     REGISTER = "transfer_register"
@@ -37,14 +40,12 @@ class TransferStagedMsg:
     msg_type: str = TransferMsgType.STAGED
     request_id: str = ""
     data_size: int = 0
-    manifest: dict = None
+    meta_size: int = 0
     session_id: str = ""
     pool_ptr: int = 0
     slot_offset: int = 0
-
-    def __post_init__(self):
-        if self.manifest is None:
-            self.manifest = {}
+    meta_pool_ptr: int = 0
+    meta_slot_offset: int = 0
 
 
 @dataclass
@@ -52,47 +53,86 @@ class TransferAllocMsg:
     msg_type: str = TransferMsgType.ALLOC
     request_id: str = ""
     data_size: int = 0
+    meta_size: int = 0
     source_role: str = ""
-
-
-@dataclass
-class TransferAllocatedMsg:
-    msg_type: str = TransferMsgType.ALLOCATED
-    request_id: str = ""
-    session_id: str = ""
-    pool_ptr: int = 0
-    slot_offset: int = 0
-    slot_size: int = 0
-
-
-@dataclass
-class TransferPushMsg:
-    msg_type: str = TransferMsgType.PUSH
-    request_id: str = ""
-    dest_session_id: str = ""
-    dest_addr: int = 0
-    transfer_size: int = 0
+    source_instance: int = -1
+    source_control_endpoint: str = ""
+    source_host_id: str = ""
+    preallocated_slot: dict | None = None
 
 
 @dataclass
 class TransferPushedMsg:
     msg_type: str = TransferMsgType.PUSHED
     request_id: str = ""
+    success: bool = True
+    error: str | None = None
+
+
+@dataclass
+class TransferAllocAcceptedMsg:
+    msg_type: str = TransferMsgType.ALLOC_ACCEPTED
+    request_id: str = ""
+    receiver_role: str = ""
+    receiver_instance: int = -1
+    prealloc_slot_id: int | None = None
+
+
+@dataclass
+class TransferAllocRejectMsg:
+    msg_type: str = TransferMsgType.ALLOC_REJECT
+    request_id: str = ""
+    receiver_role: str = ""
+    receiver_instance: int = -1
+    retryable: bool = True
+    reason: str = ""
+    prealloc_slot_id: int | None = None
+
+
+@dataclass
+class TransferPeerInfoMsg:
+    msg_type: str = TransferMsgType.PEER_INFO
+    request_id: str = ""
+    dest_session_id: str = ""
+    dest_addr: int = 0
+    transfer_size: int = 0
+    meta_dest_addr: int = 0
+    meta_transfer_size: int = 0
+    receiver_role: str = ""
+    receiver_instance: int = -1
+    receiver_control_endpoint: str = ""
+    receiver_host_id: str = ""
+    receiver_supports_local_copy: bool = False
+    dest_shm_name: str | None = None
+    dest_shm_offset: int = 0
+    meta_dest_shm_name: str | None = None
+    meta_dest_shm_offset: int = 0
+    prealloc_slot_id: int | None = None
 
 
 @dataclass
 class TransferReadyMsg:
     msg_type: str = TransferMsgType.READY
     request_id: str = ""
-    manifest: dict = None
-    slot_offset: int = 0
-    scalar_fields: dict = None
+    prealloc_slot_id: int | None = None
 
-    def __post_init__(self):
-        if self.manifest is None:
-            self.manifest = {}
-        if self.scalar_fields is None:
-            self.scalar_fields = {}
+
+@dataclass
+class TransferFailedMsg:
+    msg_type: str = TransferMsgType.FAILED
+    request_id: str = ""
+    error: str = ""
+    receiver_role: str = ""
+    receiver_instance: int = -1
+    prealloc_slot_id: int | None = None
+
+
+@dataclass
+class TransferAbortMsg:
+    msg_type: str = TransferMsgType.ABORT
+    request_id: str = ""
+    reason: str = ""
+    source: str = "server_discard"
 
 
 @dataclass
@@ -101,16 +141,37 @@ class TransferDoneMsg:
     request_id: str = ""
     result_frames: list[bytes] | None = None
     error: str | None = None
+    staged_for_decoder: bool = False
+    session_id: str = ""
+    pool_ptr: int = 0
+    slot_offset: int = 0
+    meta_pool_ptr: int = 0
+    meta_slot_offset: int = 0
+    data_size: int = 0
+    meta_size: int = 0
 
 
 @dataclass
 class TransferRegisterMsg:
     msg_type: str = TransferMsgType.REGISTER
     role: str = ""
+    instance_id: int = 0
     session_id: str = ""
     pool_ptr: int = 0
     pool_size: int = 0
-    # Pre-allocated receive slots: [{"offset": int, "size": int, "slot_id": int, "addr": int}]
+    control_endpoint: str = ""
+    work_endpoint: str = ""
+    rank0_only: bool = True
+    role_device: str = "auto"
+    host_id: str = ""
+    supports_local_copy: bool = False
+    data_shm_name: str | None = None
+    meta_pool_ptr: int = 0
+    meta_pool_size: int = 0
+    meta_shm_name: str | None = None
+    # Pre-allocated receive slots:
+    # [{"slot_id": int, "offset": int, "size": int, "addr": int,
+    #   "meta_offset": int, "meta_size": int, "meta_addr": int}]
     preallocated_slots: list = field(default_factory=list)
 
 

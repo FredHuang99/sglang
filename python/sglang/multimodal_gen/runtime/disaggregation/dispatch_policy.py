@@ -21,9 +21,14 @@ class DispatchPolicy(abc.ABC):
     @abc.abstractmethod
     def select(self, active_counts: list[int] | None = None) -> int: ...
 
-    def select_with_capacity(self, free_slots: list[int]) -> int | None:
+    def select_with_capacity(
+        self,
+        free_slots: list[int],
+        excluded_instances: set[int] | None = None,
+    ) -> int | None:
         """Select an instance that has free capacity, or None if all full."""
-        if not any(s > 0 for s in free_slots):
+        excluded_instances = excluded_instances or set()
+        if not any(i not in excluded_instances and s > 0 for i, s in enumerate(free_slots)):
             return None
         return self.select(active_counts=None)
 
@@ -43,11 +48,18 @@ class RoundRobin(DispatchPolicy):
             self._next = (self._next + 1) % self._num_instances
         return chosen
 
-    def select_with_capacity(self, free_slots: list[int]) -> int | None:
+    def select_with_capacity(
+        self,
+        free_slots: list[int],
+        excluded_instances: set[int] | None = None,
+    ) -> int | None:
+        excluded_instances = excluded_instances or set()
         with self._lock:
             for _ in range(self._num_instances):
                 idx = self._next
                 self._next = (self._next + 1) % self._num_instances
+                if idx in excluded_instances:
+                    continue
                 if free_slots[idx] > 0:
                     return idx
             return None
@@ -93,11 +105,18 @@ class MaxFreeSlotsFirst(DispatchPolicy):
 
             return best_id
 
-    def select_with_capacity(self, free_slots: list[int]) -> int | None:
+    def select_with_capacity(
+        self,
+        free_slots: list[int],
+        excluded_instances: set[int] | None = None,
+    ) -> int | None:
+        excluded_instances = excluded_instances or set()
         with self._lock:
             best_id = -1
             best_free = 0
             for i in range(self._num_instances):
+                if i in excluded_instances:
+                    continue
                 if free_slots[i] > best_free:
                     best_free = free_slots[i]
                     best_id = i
@@ -121,16 +140,22 @@ class PoolDispatcher:
         num_denoisers: int,
         num_decoders: int,
         policy_name: str = "round_robin",
-        **kwargs,
+        max_slots_per_instance: int = 1,
     ):
         self.encoder_policy = create_dispatch_policy(
-            policy_name, num_encoders, **kwargs
+            policy_name,
+            num_encoders,
+            max_slots_per_instance=max_slots_per_instance,
         )
         self.denoiser_policy = create_dispatch_policy(
-            policy_name, num_denoisers, **kwargs
+            policy_name,
+            num_denoisers,
+            max_slots_per_instance=max_slots_per_instance,
         )
         self.decoder_policy = create_dispatch_policy(
-            policy_name, num_decoders, **kwargs
+            policy_name,
+            num_decoders,
+            max_slots_per_instance=max_slots_per_instance,
         )
 
     def select_encoder(self, active_counts: list[int] | None = None) -> int:
@@ -142,14 +167,32 @@ class PoolDispatcher:
     def select_decoder(self, active_counts: list[int] | None = None) -> int:
         return self.decoder_policy.select(active_counts)
 
-    def select_encoder_with_capacity(self, free_slots: list[int]) -> int | None:
-        return self.encoder_policy.select_with_capacity(free_slots)
+    def select_encoder_with_capacity(
+        self,
+        free_slots: list[int],
+        excluded_instances: set[int] | None = None,
+    ) -> int | None:
+        return self.encoder_policy.select_with_capacity(
+            free_slots, excluded_instances=excluded_instances
+        )
 
-    def select_denoiser_with_capacity(self, free_slots: list[int]) -> int | None:
-        return self.denoiser_policy.select_with_capacity(free_slots)
+    def select_denoiser_with_capacity(
+        self,
+        free_slots: list[int],
+        excluded_instances: set[int] | None = None,
+    ) -> int | None:
+        return self.denoiser_policy.select_with_capacity(
+            free_slots, excluded_instances=excluded_instances
+        )
 
-    def select_decoder_with_capacity(self, free_slots: list[int]) -> int | None:
-        return self.decoder_policy.select_with_capacity(free_slots)
+    def select_decoder_with_capacity(
+        self,
+        free_slots: list[int],
+        excluded_instances: set[int] | None = None,
+    ) -> int | None:
+        return self.decoder_policy.select_with_capacity(
+            free_slots, excluded_instances=excluded_instances
+        )
 
 
 def create_dispatch_policy(name: str, num_instances: int, **kwargs) -> DispatchPolicy:

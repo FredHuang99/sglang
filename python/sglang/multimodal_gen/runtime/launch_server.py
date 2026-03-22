@@ -262,6 +262,24 @@ def launch_pool_disagg_server(
         decoder_work_endpoints.append(f"tcp://{host}:{p}")
         port_cursor = p + 1
 
+    encoder_control_endpoints = []
+    for i in range(num_encoders):
+        p = find_port(port_cursor)
+        encoder_control_endpoints.append(f"tcp://{host}:{p}")
+        port_cursor = p + 1
+
+    denoiser_control_endpoints = []
+    for i in range(num_denoisers):
+        p = find_port(port_cursor)
+        denoiser_control_endpoints.append(f"tcp://{host}:{p}")
+        port_cursor = p + 1
+
+    decoder_control_endpoints = []
+    for i in range(num_decoders):
+        p = find_port(port_cursor)
+        decoder_control_endpoints.append(f"tcp://{host}:{p}")
+        port_cursor = p + 1
+
     # Per-role-type result endpoints (DS binds PULL, instances connect PUSH)
     # Use deterministic convention: scheduler_port + {1,2,3}
     base_port = server_args.scheduler_port
@@ -278,19 +296,39 @@ def launch_pool_disagg_server(
     all_processes = []
 
     role_configs = [
-        (RoleType.ENCODER, encoder_gpus, encoder_work_endpoints, encoder_result_ep),
+        (
+            RoleType.ENCODER,
+            encoder_gpus,
+            encoder_work_endpoints,
+            encoder_control_endpoints,
+            encoder_result_ep,
+        ),
         (
             RoleType.DENOISER,
             denoiser_gpus,
             denoiser_work_endpoints,
+            denoiser_control_endpoints,
             denoiser_result_ep,
         ),
-        (RoleType.DECODER, decoder_gpus, decoder_work_endpoints, decoder_result_ep),
+        (
+            RoleType.DECODER,
+            decoder_gpus,
+            decoder_work_endpoints,
+            decoder_control_endpoints,
+            decoder_result_ep,
+        ),
     ]
 
-    for role_type, gpu_lists, work_eps, result_ep in role_configs:
+    for role_type, gpu_lists, work_eps, control_eps, result_ep in role_configs:
         for inst_idx, gpu_ids in enumerate(gpu_lists):
-            num_role_gpus = len(gpu_ids)
+            is_cpu_instance = role_type == RoleType.ENCODER and len(gpu_ids) == 0
+            if len(gpu_ids) == 0 and not is_cpu_instance:
+                raise ValueError(
+                    f"Empty GPU list is only supported for encoder CPU instances, got {role_type.value}[{inst_idx}]"
+                )
+
+            num_role_workers = 1 if is_cpu_instance else len(gpu_ids)
+            role_device = "cpu" if is_cpu_instance else server_args.disagg_role_device
 
             # Per-role parallelism: use explicit overrides if set, else None (auto-derive)
             role_par = server_args.get_role_parallelism(role_type)
@@ -298,9 +336,13 @@ def launch_pool_disagg_server(
             role_overrides = {
                 "disagg_role": role_type,
                 "disagg_mode": True,
+                "disagg_instance_id": inst_idx,
+                "disagg_role_device": role_device,
                 "pool_work_endpoint": work_eps[inst_idx],
+                "pool_control_endpoint": control_eps[inst_idx],
+                "pool_control_advertised_endpoint": control_eps[inst_idx],
                 "pool_result_endpoint": result_ep,
-                "num_gpus": num_role_gpus,
+                "num_gpus": num_role_workers,
                 "warmup": role_type == RoleType.ENCODER,
                 "scheduler_port": find_port(port_cursor),
                 "master_port": find_port(port_cursor + 100),
@@ -322,13 +364,15 @@ def launch_pool_disagg_server(
 
             pool_ctx = mp.get_context("spawn")
 
-            for rank_idx in range(num_role_gpus):
+            worker_ids = [0] if is_cpu_instance else gpu_ids
+
+            for rank_idx in range(num_role_workers):
                 reader, writer = pool_ctx.Pipe(duplex=False)
-                gpu_id = gpu_ids[rank_idx]
+                worker_id = worker_ids[rank_idx]
 
                 process = pool_ctx.Process(
                     target=_run_disagg_role_process,
-                    args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+                    args=(worker_id, rank_idx, rank_idx, role_args, writer, [], []),
                     name=f"sglang-pool-{role_type.value}-{inst_idx}-r{rank_idx}",
                     daemon=True,
                 )
@@ -353,11 +397,13 @@ def launch_pool_disagg_server(
                 reader.close()
 
             logger.info(
-                "Pool %s[%d] ready on GPU(s) %s (work=%s)",
+                "Pool %s[%d] ready on %s %s (work=%s, control=%s)",
                 role_type.value.upper(),
                 inst_idx,
-                gpu_ids,
+                "CPU worker(s)" if is_cpu_instance else "GPU(s)",
+                worker_ids,
                 work_eps[inst_idx],
+                control_eps[inst_idx],
             )
 
     logger.info("All pool role instances ready")
@@ -375,6 +421,8 @@ def launch_pool_disagg_server(
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
+        max_slots_per_instance=server_args.disagg_max_slots_per_instance,
     )
     diffusion_server.start()
 
@@ -500,6 +548,8 @@ def launch_disagg_server(server_args: ServerArgs):
         decoder_result_endpoint=decoder_result_ep,
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
+        downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
+        max_slots_per_instance=server_args.disagg_max_slots_per_instance,
     )
     diffusion_server.start()
 
@@ -529,6 +579,8 @@ def launch_disagg_role(server_args: ServerArgs):
 
     # Derive endpoints
     work_endpoint = server_args.derive_pool_work_endpoint()
+    control_endpoint = server_args.derive_pool_control_endpoint()
+    control_advertised_endpoint = server_args.derive_pool_control_advertised_endpoint()
     result_endpoint = server_args.derive_pool_result_endpoint()
 
     logger.info(
@@ -537,6 +589,7 @@ def launch_disagg_role(server_args: ServerArgs):
         server_args.num_gpus,
     )
     logger.info("  Work endpoint (bind): %s", work_endpoint)
+    logger.info("  Control endpoint (bind/advertise): %s / %s", control_endpoint, control_advertised_endpoint)
     logger.info("  Result endpoint (connect): %s", result_endpoint)
     logger.info(
         "  P2P: hostname=%s, ib_device=%s, pool_size=%d",
@@ -563,6 +616,8 @@ def launch_disagg_role(server_args: ServerArgs):
         "disagg_role": role_type,
         "disagg_mode": True,
         "pool_work_endpoint": work_endpoint,
+        "pool_control_endpoint": control_endpoint,
+        "pool_control_advertised_endpoint": control_advertised_endpoint,
         "pool_result_endpoint": result_endpoint,
         "warmup": role_type == RoleType.ENCODER,
         "scheduler_port": internal_scheduler_port,
@@ -581,18 +636,19 @@ def launch_disagg_role(server_args: ServerArgs):
     role_args = ServerArgs.from_kwargs(**base_dict)
 
     # Spawn GPU worker processes
-    num_gpus = server_args.num_gpus
+    is_cpu_role = role_type == RoleType.ENCODER and role_args.resolved_role_device() == "cpu"
+    num_workers = 1 if is_cpu_role else max(server_args.num_gpus, 1)
     base_gpu_id = server_args.base_gpu_id
     pool_ctx = mp.get_context("spawn")
     processes = []
 
-    for rank_idx in range(num_gpus):
+    for rank_idx in range(num_workers):
         reader, writer = pool_ctx.Pipe(duplex=False)
-        gpu_id = base_gpu_id + rank_idx
+        worker_id = rank_idx if is_cpu_role else base_gpu_id + rank_idx
 
         process = pool_ctx.Process(
             target=_run_disagg_role_process,
-            args=(gpu_id, rank_idx, rank_idx, role_args, writer, [], []),
+            args=(worker_id, rank_idx, rank_idx, role_args, writer, [], []),
             name=f"sglang-{role_type.value}-r{rank_idx}",
             daemon=True,
         )
@@ -615,10 +671,12 @@ def launch_disagg_role(server_args: ServerArgs):
         reader.close()
 
     logger.info(
-        "Role %s ready (%d GPU(s), work=%s)",
+        "Role %s ready (%d worker(s), work=%s, control=%s, device=%s)",
         role_type.value.upper(),
-        num_gpus,
+        num_workers,
         work_endpoint,
+        control_endpoint,
+        role_args.resolved_role_device(),
     )
 
     # Block until interrupted
