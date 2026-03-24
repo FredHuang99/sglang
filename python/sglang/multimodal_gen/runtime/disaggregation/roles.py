@@ -37,13 +37,19 @@ def get_module_role(module_name: str) -> "RoleType | None":
         "image_processor",
         "processor",
         "connectors",
+        "vision_language_encoder",
     )
     if any(
         module_name == p or module_name.startswith(p + "_") for p in encoder_prefixes
     ):
         return RoleType.ENCODER
 
-    denoising_prefixes = ("transformer",)
+    denoising_prefixes = (
+        "transformer",
+        "video_dit",
+        "audio_dit",
+        "dual_tower_bridge",
+    )
     if any(
         module_name == p or module_name.startswith(p + "_") for p in denoising_prefixes
     ):
@@ -62,12 +68,13 @@ def filter_modules_for_role(
     module_names: list[str],
     role: "RoleType",
     *,
-    allow_encoder_decoder_modules: bool = False,
+    extra_allowed_modules: set[str] | None = None,
 ) -> list[str]:
     """Filter module names to only those needed by the given role."""
     if role in (RoleType.MONOLITHIC, RoleType.SERVER):
         return module_names
 
+    extra_allowed_modules = extra_allowed_modules or set()
     filtered = []
     for name in module_names:
         module_role = get_module_role(name)
@@ -76,11 +83,7 @@ def filter_modules_for_role(
             filtered.append(name)
         elif module_role == role:
             filtered.append(name)
-        elif (
-            role == RoleType.ENCODER
-            and module_role == RoleType.DECODER
-            and allow_encoder_decoder_modules
-        ):
+        elif name in extra_allowed_modules:
             filtered.append(name)
 
     return filtered

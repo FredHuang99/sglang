@@ -21,6 +21,7 @@ import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_world_group,
@@ -155,6 +156,10 @@ class MOVADenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._torch_compiled = False
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DENOISER
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -886,6 +891,10 @@ class MOVADecodingStage(PipelineStage):
         super().__init__()
         self.video_vae = video_vae
         self.audio_vae = audio_vae
+
+    @property
+    def role_affinity(self) -> RoleType:
+        return RoleType.DECODER
 
     @property
     def parallelism_type(self) -> StageParallelismType:

@@ -19,6 +19,7 @@ import torch.nn as nn
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.loader.fsdp_load import (
     load_model_from_full_model_state_dict,
     set_default_torch_dtype,
@@ -57,6 +58,14 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         "hy3dshape_conditioner",
         "hy3dshape_image_processor",
     ]
+
+    #TODO: add disaggregationsupport for Hunyuan3D2Pipeline
+    def validate_disagg_role(self, role: RoleType) -> None:
+        if role != RoleType.MONOLITHIC:
+            raise ValueError(
+                "Hunyuan3D2Pipeline currently supports only the monolithic "
+                "disaggregation role."
+            )
 
     def _load_config(self) -> dict[str, Any]:
         return {

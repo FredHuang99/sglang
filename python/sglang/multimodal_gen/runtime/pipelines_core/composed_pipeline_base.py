@@ -47,13 +47,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-_ENCODER_NEEDS_DECODER_TASKS = {
-    "i2i",
-    "ti2i",
-    "i2v",
-    "ti2v",
-}
-
 
 class ComposedPipelineBase(ABC):
     """
@@ -95,6 +88,7 @@ class ComposedPipelineBase(ABC):
         """
         self.server_args = server_args
         self._disagg_role = server_args.disagg_role
+        self.validate_disagg_role(self._disagg_role)
 
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
@@ -114,9 +108,8 @@ class ComposedPipelineBase(ABC):
             self._required_config_modules = filter_modules_for_role(
                 self._required_config_modules,
                 self._disagg_role,
-                allow_encoder_decoder_modules=(
-                    self._disagg_role == RoleType.ENCODER
-                    and task_name in _ENCODER_NEEDS_DECODER_TASKS
+                extra_allowed_modules=self._get_extra_allowed_modules_for_role(
+                    self._disagg_role, task_name
                 ),
             )
             skipped = set(original_modules) - set(self._required_config_modules)
@@ -201,6 +194,44 @@ class ComposedPipelineBase(ABC):
         Initialize the pipeline.
         """
         return
+
+    def validate_disagg_role(self, role: RoleType) -> None:
+        """Validate whether the requested disaggregation role is supported."""
+        return
+
+    def _get_extra_allowed_modules_for_role(
+        self, role: RoleType, task_name: str
+    ) -> set[str]:
+        role_to_pipeline_modules: dict[RoleType, dict[str, set[str]]] = {
+            RoleType.ENCODER: {
+                "Flux2Pipeline": {"vae"},
+                "Flux2KleinPipeline": {"vae"},
+                "QwenImageEditPipeline": {"vae"},
+                "QwenImageEditPlusPipeline": {"vae"},
+                "QwenImageLayeredPipeline": {"vae", "transformer"},
+                "GlmImagePipeline": {"vae", "transformer"},
+                "WanImageToVideoPipeline": {"vae"},
+                "WanImageToVideoDmdPipeline": {"vae"},
+                "MOVA": {"video_vae", "audio_vae"},
+                "MOVAPipeline": {"video_vae", "audio_vae"},
+            },
+            RoleType.DENOISER: {},
+            RoleType.DECODER: {},
+        }
+        extra_allowed_modules = set(
+            role_to_pipeline_modules.get(role, {}).get(self.pipeline_name, set())
+        )
+
+        if role == RoleType.DENOISER and task_name == "ti2v":
+            if self.pipeline_name in {
+                "WanImageToVideoPipeline",
+                "WanImageToVideoDmdPipeline",
+            }:
+                extra_allowed_modules.add("vae")
+            elif self.pipeline_name == "LTX2Pipeline":
+                extra_allowed_modules.update({"vae", "audio_vae"})
+
+        return extra_allowed_modules
 
     # --- Config-name → pipeline_config attribute mapping ---
     _CONFIG_ATTR_MAP: dict[str, str] = {

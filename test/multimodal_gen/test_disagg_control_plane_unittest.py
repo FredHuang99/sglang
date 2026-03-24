@@ -121,7 +121,7 @@ class TestDisaggControlPlane(unittest.TestCase):
         filtered_with_decoder = filter_modules_for_role(
             module_names,
             RoleType.ENCODER,
-            allow_encoder_decoder_modules=True,
+            extra_allowed_modules={"vae"},
         )
 
         self.assertEqual(filtered_default, ["text_encoder", "scheduler"])
