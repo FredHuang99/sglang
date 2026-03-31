@@ -45,6 +45,10 @@ class TestGetModuleRole(unittest.TestCase):
         self.assertEqual(
             get_module_role("vision_language_encoder"), RoleType.ENCODER
         )
+        self.assertEqual(get_module_role("hy3dshape_conditioner"), RoleType.ENCODER)
+        self.assertEqual(
+            get_module_role("hy3dshape_image_processor"), RoleType.ENCODER
+        )
 
     def test_denoiser_modules(self):
         self.assertEqual(get_module_role("transformer"), RoleType.DENOISER)
@@ -53,15 +57,18 @@ class TestGetModuleRole(unittest.TestCase):
         self.assertEqual(get_module_role("video_dit_2"), RoleType.DENOISER)
         self.assertEqual(get_module_role("audio_dit"), RoleType.DENOISER)
         self.assertEqual(get_module_role("dual_tower_bridge"), RoleType.DENOISER)
+        self.assertEqual(get_module_role("hy3dshape_model"), RoleType.DENOISER)
 
     def test_decoder_modules(self):
         self.assertEqual(get_module_role("vae"), RoleType.DECODER)
         self.assertEqual(get_module_role("audio_vae"), RoleType.DECODER)
         self.assertEqual(get_module_role("video_vae"), RoleType.DECODER)
         self.assertEqual(get_module_role("vocoder"), RoleType.DECODER)
+        self.assertEqual(get_module_role("hy3dshape_vae"), RoleType.DECODER)
 
     def test_shared_modules(self):
         self.assertIsNone(get_module_role("scheduler"))
+        self.assertIsNone(get_module_role("hy3dshape_scheduler"))
 
 
 class TestFilterModulesForRole(unittest.TestCase):

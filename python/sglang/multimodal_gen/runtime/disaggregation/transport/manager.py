@@ -75,6 +75,9 @@ class PendingPeerSend:
     meta_dest_shm_name: str | None = None
     meta_dest_shm_offset: int = 0
     prealloc_slot_id: int | None = None
+    send_attempts: int = 0
+    max_send_retries: int = 2
+    last_error: str | None = None
     state: str = "waiting_stage"
 
 
@@ -107,11 +110,13 @@ class DiffusionTransferManager:
         meta_buffer: TransferMetaBuffer,
         *,
         host_id: str = "",
+        send_retry_limit: int = 2,
     ):
         self._engine = engine
         self._buffer = buffer
         self._meta_buffer = meta_buffer
         self._host_id = host_id
+        self._send_retry_limit = max(0, int(send_retry_limit))
         self._lock = threading.Lock()
 
         self._engine.register_buffer(self._buffer.pool_data_ptr, self._buffer.pool_size)
@@ -652,6 +657,15 @@ class DiffusionTransferManager:
         with self._lock:
             return self._staged.get(request_id)
 
+    def has_active_transfers(self) -> bool:
+        with self._lock:
+            return bool(
+                self._staged
+                or self._pending_receives
+                or self._pending_peer_sends
+                or self._send_futures
+            )
+
     def free_slots_count(self, typical_size: int = 64 * 1024 * 1024) -> int:
         return self._buffer.free_slots_count(typical_size)
 
@@ -770,6 +784,7 @@ class DiffusionTransferManager:
                 meta_dest_shm_name=msg.get("meta_dest_shm_name"),
                 meta_dest_shm_offset=msg.get("meta_dest_shm_offset", 0),
                 prealloc_slot_id=msg.get("prealloc_slot_id"),
+                max_send_retries=self._send_retry_limit,
                 state="waiting_stage",
             )
             self._pending_peer_sends[request_id] = pending
@@ -820,6 +835,7 @@ class DiffusionTransferManager:
                 )
                 return
 
+            peer_info.send_attempts += 1
             peer_info.state = "inflight"
             future = executor.submit(self._execute_send, request_id, peer_info)
             self._send_futures[request_id] = future
@@ -916,7 +932,8 @@ class DiffusionTransferManager:
     def _process_send_completion(self, completion: SendCompletion) -> None:
         request_id = completion.request_id
         peer_info = completion.peer_info
-        terminal_state = "success" if completion.success else "failed"
+        retry_request = False
+        retry_queue_idx = 0
 
         with self._lock:
             self._prune_aborted_locked()
@@ -927,11 +944,36 @@ class DiffusionTransferManager:
                 self._send_futures.pop(request_id, None)
                 return
 
-            self._terminal_send_states[request_id] = terminal_state
-            pending = self._pending_peer_sends.pop(request_id, None)
-            if pending is not None:
-                pending.state = terminal_state
             self._send_futures.pop(request_id, None)
+            pending = self._pending_peer_sends.get(request_id)
+
+            if completion.success:
+                self._terminal_send_states[request_id] = "success"
+                pending = self._pending_peer_sends.pop(request_id, None)
+                if pending is not None:
+                    pending.state = "success"
+            else:
+                retry_peer = pending or peer_info
+                if retry_peer is not None:
+                    retry_peer.last_error = completion.error_msg
+                can_retry = (
+                    retry_peer is not None
+                    and retry_peer.send_attempts <= retry_peer.max_send_retries
+                )
+                if can_retry:
+                    retry_request = True
+                    retry_queue_idx = self._select_send_queue_idx(retry_peer)
+                    retry_peer.state = "waiting_retry"
+                else:
+                    self._terminal_send_states[request_id] = "failed"
+                    pending = self._pending_peer_sends.pop(request_id, None)
+                    if pending is not None:
+                        pending.state = "failed"
+                        pending.last_error = completion.error_msg
+
+        if retry_request:
+            self._send_queues[retry_queue_idx].put(request_id)
+            return
 
         if self._on_send_completion is not None and peer_info is not None:
             self._on_send_completion(

@@ -44,6 +44,9 @@ def get_module_role(module_name: str) -> "RoleType | None":
     ):
         return RoleType.ENCODER
 
+    if module_name in {"hy3dshape_conditioner", "hy3dshape_image_processor"}:
+        return RoleType.ENCODER
+
     denoising_prefixes = (
         "transformer",
         "video_dit",
@@ -55,10 +58,16 @@ def get_module_role(module_name: str) -> "RoleType | None":
     ):
         return RoleType.DENOISER
 
+    if module_name == "hy3dshape_model":
+        return RoleType.DENOISER
+
     decoder_prefixes = ("vae", "audio_vae", "video_vae", "vocoder")
     if any(
         module_name == p or module_name.startswith(p + "_") for p in decoder_prefixes
     ):
+        return RoleType.DECODER
+
+    if module_name == "hy3dshape_vae":
         return RoleType.DECODER
 
     return None

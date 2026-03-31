@@ -216,12 +216,12 @@ class ServerArgs:
 
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
-    disagg_timeout: int = 600  # seconds, timeout for pending disagg requests
-    disagg_downstream_wait_timeout: int = 120  # seconds, wait for downstream slot
+    disagg_timeout: int = 1200  # seconds, timeout for pending disagg requests
+    disagg_downstream_wait_timeout: int = 600  # seconds, wait for downstream slot
     disagg_dispatch_policy: str = "round_robin"  # "round_robin" or "max_free_slots"
     disagg_mode: bool = False  # True when running as a disaggregated instance
     disagg_instance_id: int = 0  # Stable per-role instance ID inside a pool
-    disagg_max_slots_per_instance: int = 2
+    disagg_max_slots_per_instance: int = 8
     disagg_transfer_redundancy: float = 1.25
     disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
     disagg_transfer_pool_size: int = (
@@ -242,6 +242,7 @@ class ServerArgs:
     denoiser_sp: int | None = None
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
+    decoder_sp: int | None = None
     decoder_tp: int | None = None
     # Pool mode endpoints (set by launcher, per-instance)
     pool_work_endpoint: str | None = None  # Instance PULL socket (receives work)
@@ -257,7 +258,8 @@ class ServerArgs:
 
         Returns a dict with keys tp_size, sp_degree, ulysses_degree, ring_degree.
         Values are None if not explicitly set (auto-derive from num_gpus).
-        Encoder and decoder only support tp_size override; denoiser supports all four.
+        Encoder supports tp_size; decoder uses sp_degree for VAE parallel decode;
+        denoiser supports all four.
         """
         _none = {
             "tp_size": None,
@@ -275,7 +277,7 @@ class ServerArgs:
                 "ring_degree": self.denoiser_ring,
             }
         elif role_type == RoleType.DECODER:
-            return {**_none, "tp_size": self.decoder_tp}
+            return {**_none, "sp_degree": self.decoder_sp}
         return _none
 
     # Port offsets for disagg result endpoints (deterministic convention)
@@ -342,6 +344,7 @@ class ServerArgs:
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        self._adjust_disagg_parallelism_aliases()
         self._adjust_offload()
         self._adjust_path()
         self._adjust_quant_config()
@@ -353,6 +356,21 @@ class ServerArgs:
         self._adjust_platform_specific()
         self._adjust_autocast()
         self.adjust_pipeline_config()
+
+    def _adjust_disagg_parallelism_aliases(self):
+        if self.decoder_tp is None:
+            return
+        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
+            raise ValueError(
+                "decoder_tp is deprecated in favor of decoder_sp; "
+                "please set only one of them or keep the same value."
+            )
+        if self.decoder_sp is None:
+            logger.warning(
+                "decoder_tp is deprecated and is treated as decoder_sp for "
+                "decoder/VAE parallel decode. Please use decoder_sp instead."
+            )
+            self.decoder_sp = self.decoder_tp
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -910,10 +928,16 @@ class ServerArgs:
             help="Ring SP degree for denoiser role.",
         )
         parser.add_argument(
+            "--decoder-sp",
+            type=int,
+            default=None,
+            help="Sequence parallelism for decoder role. Default: auto-derive from decoder GPU count.",
+        )
+        parser.add_argument(
             "--decoder-tp",
             type=int,
             default=None,
-            help="Tensor parallelism for decoder role. Default: auto-derive from decoder GPU count.",
+            help="Deprecated alias for --decoder-sp. Kept for backward compatibility.",
         )
         parser.add_argument(
             "--encoder-to-denoiser-endpoint",

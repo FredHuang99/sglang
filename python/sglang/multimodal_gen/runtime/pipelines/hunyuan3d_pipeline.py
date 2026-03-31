@@ -59,12 +59,19 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         "hy3dshape_image_processor",
     ]
 
-    #TODO: add disaggregationsupport for Hunyuan3D2Pipeline
     def validate_disagg_role(self, role: RoleType) -> None:
-        if role != RoleType.MONOLITHIC:
+        if role == RoleType.MONOLITHIC:
+            return
+        config = self.server_args.pipeline_config
+        if not isinstance(config, Hunyuan3D2PipelineConfig):
+            raise TypeError(
+                "Hunyuan3D2Pipeline requires Hunyuan3D2PipelineConfig, "
+                f"got {type(config)}"
+            )
+        if config.paint_enable:
             raise ValueError(
-                "Hunyuan3D2Pipeline currently supports only the monolithic "
-                "disaggregation role."
+                "Hunyuan3D2Pipeline only supports shape-only disaggregation. "
+                "Disable paint_enable when launching encoder/denoiser/decoder roles."
             )
 
     def _load_config(self) -> dict[str, Any]:
@@ -366,6 +373,8 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         config = server_args.pipeline_config
         assert isinstance(config, Hunyuan3D2PipelineConfig)
+        latent_shape = tuple(config.vae_config.arch_config.latent_shape)
+        guidance_embed = bool(config.dit_config.arch_config.guidance_embed)
 
         # Shape: 4 stages
         self.add_stage(
@@ -373,10 +382,10 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
             stage=Hunyuan3DShapeBeforeDenoisingStage(
                 image_processor=self.get_module("hy3dshape_image_processor"),
                 conditioner=self.get_module("hy3dshape_conditioner"),
-                vae=self.get_module("hy3dshape_vae"),
-                model=self.get_module("hy3dshape_model"),
                 scheduler=self.get_module("hy3dshape_scheduler"),
                 config=config,
+                latent_shape=latent_shape,
+                guidance_embed=guidance_embed,
             ),
         )
         self.add_stage(

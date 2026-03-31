@@ -2,6 +2,7 @@
 """Unit tests for Scheduler transfer integration."""
 
 import json
+import pickle
 import queue
 import unittest
 from collections import deque
@@ -61,7 +62,13 @@ class _SchedulerHarness:
         scheduler._compute_ready_queue = queue.Queue()
         scheduler._swap_out_queue = deque()
         scheduler._send_ready_queue = deque()
-        scheduler._transfer_stream = None
+        scheduler._swap_in_stream = None
+        scheduler._compute_stream = None
+        scheduler._swap_out_stream = None
+        scheduler._pending_transfer_reconfigure = None
+        scheduler._transfer_reconfigured = False
+        scheduler._warmup_inbound_sizes = {}
+        scheduler._aborted_request_ids = {}
         scheduler._running = True
         scheduler.gpu_id = 0
         scheduler.worker = SimpleNamespace(
@@ -78,6 +85,21 @@ class _SchedulerHarness:
             resolved_role_device=lambda: "cpu",
         )
         return scheduler
+
+
+class _TrackedStreamContext:
+    def __init__(self, state, stream):
+        self._state = state
+        self._stream = stream
+
+    def __enter__(self):
+        self._state["active"] = True
+        self._state["stream"] = self._stream
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._state["active"] = False
+        return False
 
 
 class TestSchedulerTransferAlloc(unittest.TestCase):
@@ -252,7 +274,7 @@ class TestSchedulerTransferReady(unittest.TestCase):
                 prealloc_slot_id=None,
             )
         )
-        self.scheduler._wait_transfer_event = MagicMock()
+        self.scheduler._wait_transfer_event_on_compute_stream = MagicMock()
         self.scheduler._run_prefetched_compute_item = MagicMock()
         self.scheduler._transferring_queue = None
 
@@ -264,10 +286,342 @@ class TestSchedulerTransferReady(unittest.TestCase):
 
         self.scheduler._handle_transfer_ready(msg)
 
-        self.scheduler._wait_transfer_event.assert_called_once()
+        self.scheduler._wait_transfer_event_on_compute_stream.assert_called_once()
         self.scheduler._run_prefetched_compute_item.assert_called_once()
         item = self.scheduler._run_prefetched_compute_item.call_args[0][0]
         self.assertEqual(item.request_id, "ready-direct")
+
+
+class TestSchedulerTransferStreams(unittest.TestCase):
+    def test_wait_transfer_event_on_compute_stream_binds_event_to_compute_stream(self):
+        scheduler = _SchedulerHarness.make(RoleType.DECODER)
+        scheduler.server_args.resolved_role_device = lambda: "cuda"
+        scheduler._compute_stream = object()
+        stream_state = {"active": False, "stream": None}
+        current_stream = MagicMock()
+
+        def _wait_event(event):
+            self.assertTrue(stream_state["active"])
+            self.assertIs(stream_state["stream"], scheduler._compute_stream)
+
+        current_stream.wait_event.side_effect = _wait_event
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.torch.cuda.stream",
+            side_effect=lambda stream: _TrackedStreamContext(stream_state, stream),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.torch.cuda.current_stream",
+            return_value=current_stream,
+        ):
+            scheduler._wait_transfer_event_on_compute_stream(object())
+
+        current_stream.wait_event.assert_called_once()
+
+    def test_prefetch_uses_swap_in_stream(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler._swap_in_stream = object()
+        scheduler._transfer_manager = MagicMock()
+        scheduler._transfer_manager.load_transfer_async.return_value = ({}, {}, None)
+
+        scheduler._prefetch_transfer_ready({"request_id": "stream-in-1"})
+
+        scheduler._transfer_manager.load_transfer_async.assert_called_once_with(
+            "stream-in-1",
+            device="cpu",
+            stream=scheduler._swap_in_stream,
+        )
+
+    def test_encoder_staging_uses_swap_out_stream(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler._swap_out_stream = object()
+        scheduler._transfer_manager = MagicMock()
+        scheduler._transfer_manager.stage_tensors_async.return_value = (
+            SimpleNamespace(
+                transfer_size=1,
+                meta_size=1,
+                scalar_fields={},
+                slot=None,
+                meta_slot=None,
+            ),
+            None,
+        )
+
+        scheduler._disagg_encoder_transfer_stage(
+            "stream-out-1",
+            {"latents": torch.randn(1, 4, 4, 4)},
+            {"request_id": "stream-out-1"},
+        )
+
+        scheduler._transfer_manager.stage_tensors_async.assert_called_once_with(
+            request_id="stream-out-1",
+            tensor_fields=unittest.mock.ANY,
+            scalar_fields={"request_id": "stream-out-1"},
+            stream=scheduler._swap_out_stream,
+        )
+
+    def test_encoder_forward_runs_on_compute_stream(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler.server_args.resolved_role_device = lambda: "cuda"
+        scheduler._compute_stream = object()
+        scheduler._swap_out_stream = object()
+        scheduler._transfer_manager = MagicMock()
+        scheduler._transfer_manager.stage_tensors_async.return_value = (
+            SimpleNamespace(
+                transfer_size=1,
+                meta_size=1,
+                scalar_fields={},
+                slot=None,
+                meta_slot=None,
+            ),
+            None,
+        )
+        stream_state = {"active": False, "stream": None}
+
+        def _forward(batch, return_req=False):
+            self.assertTrue(stream_state["active"])
+            self.assertIs(stream_state["stream"], scheduler._compute_stream)
+            return batch[0]
+
+        scheduler.worker.execute_forward = MagicMock(side_effect=_forward)
+        req = Req(request_id="enc-compute")
+        frames = [b"enc-compute", pickle.dumps([req])]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.torch.cuda.stream",
+            side_effect=lambda stream: _TrackedStreamContext(stream_state, stream),
+        ):
+            scheduler._disagg_encoder_step(MagicMock(), frames=frames)
+
+        scheduler.worker.execute_forward.assert_called_once()
+        scheduler._transfer_manager.stage_tensors_async.assert_called_once()
+
+    def test_encoder_abort_after_stage_cleans_local_transfer_state(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler._transfer_manager = MagicMock()
+        scheduler._transfer_manager.stage_tensors_async.return_value = (
+            SimpleNamespace(
+                transfer_size=1,
+                meta_size=1,
+                scalar_fields={},
+                slot=None,
+                meta_slot=None,
+            ),
+            None,
+        )
+        scheduler._is_request_aborted = MagicMock(return_value=True)
+        scheduler._warmup_inbound_sizes["enc-abort"] = (32, 16)
+        scheduler.worker.execute_forward = MagicMock(
+            return_value=Req(request_id="enc-abort")
+        )
+        frames = [b"enc-abort", pickle.dumps([Req(request_id="enc-abort")])]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.extract_transfer_fields",
+            return_value=({"latents": torch.randn(1, 1)}, {"request_id": "enc-abort"}),
+        ):
+            scheduler._disagg_encoder_step(MagicMock(), frames=frames)
+
+        scheduler._transfer_manager.abort_request.assert_called_once_with("enc-abort")
+        self.assertNotIn("enc-abort", scheduler._warmup_inbound_sizes)
+
+    def test_denoiser_abort_after_stage_cleans_local_transfer_state(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler._transfer_manager = MagicMock()
+        scheduler._transfer_manager.stage_tensors_async.return_value = (
+            SimpleNamespace(
+                transfer_size=1,
+                meta_size=1,
+                scalar_fields={},
+                slot=None,
+                meta_slot=None,
+            ),
+            None,
+        )
+        scheduler._enqueue_outbound_transfer = MagicMock()
+        scheduler._is_request_aborted = MagicMock(side_effect=[False, True])
+        scheduler._warmup_inbound_sizes["den-abort"] = (64, 32)
+        scheduler.worker.execute_forward = MagicMock(
+            return_value=Req(request_id="den-abort")
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.extract_transfer_fields",
+            return_value=({"latents": torch.randn(1, 1)}, {"request_id": "den-abort"}),
+        ):
+            scheduler._disagg_denoiser_compute(
+                Req(request_id="den-abort"),
+                "den-abort",
+                "DENOISER",
+            )
+
+        scheduler._transfer_manager.abort_request.assert_called_once_with("den-abort")
+        scheduler._enqueue_outbound_transfer.assert_not_called()
+        self.assertNotIn("den-abort", scheduler._warmup_inbound_sizes)
+
+    def test_decoder_forward_runs_on_compute_stream_and_waits_before_send(self):
+        scheduler = _SchedulerHarness.make(RoleType.DECODER)
+        scheduler.server_args.resolved_role_device = lambda: "cuda"
+        scheduler._compute_stream = object()
+        stream_state = {"active": False, "stream": None}
+        current_stream = MagicMock()
+
+        def _forward(batch):
+            self.assertTrue(stream_state["active"])
+            self.assertIs(stream_state["stream"], scheduler._compute_stream)
+            return SimpleNamespace(
+                output=torch.zeros(1),
+                audio=None,
+                audio_sample_rate=None,
+                error=None,
+            )
+
+        scheduler.worker.execute_forward = MagicMock(side_effect=_forward)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.torch.cuda.stream",
+            side_effect=lambda stream: _TrackedStreamContext(stream_state, stream),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.torch.cuda.current_stream",
+            return_value=current_stream,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.send_tensors"
+        ) as mock_send_tensors:
+            scheduler._disagg_decoder_compute(
+                Req(request_id="dec-compute"),
+                "dec-compute",
+                "DECODER",
+            )
+
+        current_stream.wait_stream.assert_called_once_with(scheduler._compute_stream)
+        mock_send_tensors.assert_called_once()
+
+    def test_follower_compute_uses_compute_stream(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler.server_args.resolved_role_device = lambda: "cuda"
+        scheduler._compute_stream = object()
+        stream_state = {"active": False, "stream": None}
+
+        def _forward(batch, return_req=False):
+            self.assertTrue(stream_state["active"])
+            self.assertIs(stream_state["stream"], scheduler._compute_stream)
+            return batch[0]
+
+        scheduler.worker.execute_forward = MagicMock(side_effect=_forward)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.torch.cuda.stream",
+            side_effect=lambda stream: _TrackedStreamContext(stream_state, stream),
+        ):
+            scheduler._disagg_compute_non_rank0({"request_id": "follower-compute"})
+
+        scheduler.worker.execute_forward.assert_called_once()
+
+
+class TestSchedulerWarmupCalibration(unittest.TestCase):
+    def test_schedule_transfer_reconfigure_keeps_max_sizes(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler._transfer_manager = MagicMock()
+
+        scheduler._schedule_transfer_reconfigure(128, 32)
+        scheduler._schedule_transfer_reconfigure(64, 256)
+
+        self.assertEqual(
+            scheduler._pending_transfer_reconfigure,
+            {"transfer_bytes": 128, "meta_bytes": 256},
+        )
+
+    def test_apply_pending_transfer_reconfigure_rebuilds_idle_manager(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        manager = MagicMock()
+        manager.has_active_transfers.return_value = False
+        scheduler._transfer_manager = manager
+        scheduler._pending_transfer_reconfigure = {
+            "transfer_bytes": 4096,
+            "meta_bytes": 1024,
+        }
+        scheduler._preallocated_slots = {"stale": object()}
+        scheduler._init_disagg_transfer_manager = MagicMock()
+
+        rebuilt = scheduler._maybe_apply_pending_transfer_reconfigure()
+
+        self.assertTrue(rebuilt)
+        manager.cleanup.assert_called_once()
+        scheduler._init_disagg_transfer_manager.assert_called_once_with(
+            measured_transfer_bytes=4096,
+            measured_meta_bytes=1024,
+        )
+        self.assertIsNone(scheduler._pending_transfer_reconfigure)
+        self.assertTrue(scheduler._transfer_reconfigured)
+        self.assertEqual(scheduler._preallocated_slots, {})
+
+    def test_encoder_warmup_send_completion_schedules_reconfigure(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler._transfer_manager = MagicMock()
+        scheduler._transfer_manager.send_direct_message = MagicMock()
+        scheduler._schedule_transfer_reconfigure = MagicMock()
+
+        scheduler._on_direct_send_completion(
+            "warmup-enc",
+            SimpleNamespace(
+                receiver_control_endpoint="tcp://receiver",
+                prealloc_slot_id=3,
+            ),
+            SimpleNamespace(
+                scalar_fields={"is_warmup": True},
+                transfer_size=8192,
+                meta_size=512,
+            ),
+            True,
+            None,
+        )
+
+        scheduler._schedule_transfer_reconfigure.assert_called_once_with(8192, 512)
+
+    def test_denoiser_warmup_send_completion_uses_max_inbound_and_outbound(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler._transfer_manager = MagicMock()
+        scheduler._transfer_manager.send_direct_message = MagicMock()
+        scheduler._schedule_transfer_reconfigure = MagicMock()
+        scheduler._warmup_inbound_sizes["warmup-den"] = (2048, 1024)
+
+        scheduler._on_direct_send_completion(
+            "warmup-den",
+            SimpleNamespace(
+                receiver_control_endpoint="tcp://receiver",
+                prealloc_slot_id=5,
+            ),
+            SimpleNamespace(
+                scalar_fields={"is_warmup": True},
+                transfer_size=4096,
+                meta_size=256,
+            ),
+            True,
+            None,
+        )
+
+        scheduler._schedule_transfer_reconfigure.assert_called_once_with(4096, 1024)
+        self.assertNotIn("warmup-den", scheduler._warmup_inbound_sizes)
+
+    def test_decoder_warmup_compute_schedules_reconfigure_from_inbound_sizes(self):
+        scheduler = _SchedulerHarness.make(RoleType.DECODER)
+        scheduler._release_pending_receive = MagicMock()
+        scheduler._build_disagg_compute_req = MagicMock(return_value=Req(request_id="warmup-dec"))
+        scheduler._disagg_decoder_compute = MagicMock()
+        scheduler._schedule_transfer_reconfigure = MagicMock()
+        scheduler._warmup_inbound_sizes["warmup-dec"] = (1536, 384)
+        item = _PendingInboundTransfer(
+            request_id="warmup-dec",
+            role_name="DECODER",
+            scalar_fields={"is_warmup": True},
+            tensors={"latents": torch.randn(1, 4, 4, 4)},
+            load_event=None,
+            prealloc_slot_id=9,
+        )
+
+        scheduler._run_prefetched_compute_item(item, is_multi_rank=False)
+
+        scheduler._schedule_transfer_reconfigure.assert_called_once_with(1536, 384)
+        self.assertNotIn("warmup-dec", scheduler._warmup_inbound_sizes)
 
 
 class TestSchedulerTensorDistribution(unittest.TestCase):

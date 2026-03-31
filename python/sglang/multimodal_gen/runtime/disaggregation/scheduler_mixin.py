@@ -8,6 +8,7 @@ All transfer, compute, and event-loop logic for disaggregated roles
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import math
@@ -26,6 +27,8 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferMetaBuffer,
     TransferTensorBuffer,
+    estimate_transfer_bytes,
+    estimate_transfer_manifest,
     estimate_transfer_meta_bytes,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
@@ -312,6 +315,16 @@ class SchedulerDisaggMixin:
         if hasattr(event, "synchronize"):
             event.synchronize()
 
+    def _wait_transfer_event_on_compute_stream(self: Scheduler, event) -> None:
+        if event is None:
+            return
+        if self._disagg_uses_cuda():
+            with self._compute_stream_context():
+                torch.cuda.current_stream().wait_event(event)
+            return
+        if hasattr(event, "synchronize"):
+            event.synchronize()
+
     def _transfer_event_ready(self: Scheduler, event) -> bool:
         if event is None:
             return True
@@ -323,6 +336,20 @@ class SchedulerDisaggMixin:
         if hasattr(event, "is_set"):
             return bool(event.is_set())
         return False
+
+    def _compute_stream_context(self: Scheduler):
+        if self._disagg_uses_cuda() and self._compute_stream is not None:
+            return torch.cuda.stream(self._compute_stream)
+        return contextlib.nullcontext()
+
+    def _make_current_stream_wait_for_compute(self: Scheduler) -> None:
+        if self._disagg_uses_cuda() and self._compute_stream is not None:
+            torch.cuda.current_stream().wait_stream(self._compute_stream)
+
+    def _cleanup_aborted_staged_request(self: Scheduler, request_id: str) -> None:
+        self._warmup_inbound_sizes.pop(request_id, None)
+        if self._transfer_manager is not None:
+            self._transfer_manager.abort_request(request_id)
 
     def _broadcast_tensor_payload_to_all_ranks(
         self: Scheduler,
@@ -500,7 +527,9 @@ class SchedulerDisaggMixin:
         self._pool_work_pull = None
         self._pool_result_push = None
         self._transfer_manager = None
-        self._transfer_stream = None
+        self._swap_in_stream = None
+        self._compute_stream = None
+        self._swap_out_stream = None
         self._control_queue = None
         self._transferring_queue = None
         self._prefetch_queue = None
@@ -511,18 +540,19 @@ class SchedulerDisaggMixin:
         self._preallocated_slots = {}
         self._aborted_request_ids = {}
         self._aborted_request_ttl_s = max(60.0, self._disagg_timeout_s * 2.0)
+        self._pending_transfer_reconfigure = None
+        self._transfer_reconfigured = False
+        self._warmup_inbound_sizes = {}
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
             if self._disagg_uses_cuda():
                 device = torch.device(f"cuda:{local_rank}")
-                self._transfer_stream = torch.cuda.Stream(device=device)
+                self._swap_in_stream = torch.cuda.Stream(device=device)
+                self._compute_stream = torch.cuda.Stream(device=device)
+                self._swap_out_stream = torch.cuda.Stream(device=device)
             self._init_disagg_sockets()
-            if not (
-                self._disagg_role == RoleType.ENCODER
-                and getattr(server_args, "warmup", False)
-            ):
-                self._init_disagg_transfer_manager()
+            self._init_disagg_transfer_manager()
 
     def _init_disagg_sockets(self: Scheduler):
         """Initialize ZMQ sockets for disaggregated mode (DiffusionServer-mediated).
@@ -716,24 +746,66 @@ class SchedulerDisaggMixin:
     def _run_disagg_startup_warmup(
         self: Scheduler, warmup_reqs: list[Req]
     ) -> None:
-        """Run startup warmup before creating the encoder transfer manager."""
-        if self._transfer_manager is not None:
+        """Transfer sizing calibration is deferred to an end-to-end warmup request."""
+        if self._disagg_role == RoleType.MONOLITHIC or not warmup_reqs:
             return
-        measured_transfer_bytes = None
-        measured_meta_bytes = None
-        if self._disagg_role == RoleType.ENCODER and warmup_reqs:
-            for req in warmup_reqs:
-                req_result = self.worker.execute_forward([req], return_req=True)
-                if isinstance(req_result, Req):
-                    tensor_fields, scalar_fields = extract_transfer_fields(req_result)
-                    measured_transfer_bytes = estimate_transfer_bytes(tensor_fields)
-                    measured_meta_bytes = estimate_transfer_meta_bytes(
-                        estimate_transfer_manifest(tensor_fields), scalar_fields
-                    )
-        self._init_disagg_transfer_manager(
-            measured_transfer_bytes,
-            measured_meta_bytes,
+        logger.info(
+            "Transfer %s: startup warmup defers transfer sizing to end-to-end disagg calibration",
+            self._disagg_role.value.upper(),
         )
+
+    def _schedule_transfer_reconfigure(
+        self: Scheduler,
+        measured_transfer_bytes: int | None,
+        measured_meta_bytes: int | None,
+    ) -> None:
+        if self._transfer_manager is None or measured_transfer_bytes is None:
+            return
+        if measured_transfer_bytes <= 0:
+            return
+        pending = self._pending_transfer_reconfigure or {
+            "transfer_bytes": 0,
+            "meta_bytes": 0,
+        }
+        pending["transfer_bytes"] = max(
+            int(pending["transfer_bytes"]), int(measured_transfer_bytes)
+        )
+        pending["meta_bytes"] = max(int(pending["meta_bytes"]), int(measured_meta_bytes or 0))
+        self._pending_transfer_reconfigure = pending
+
+    def _maybe_apply_pending_transfer_reconfigure(self: Scheduler) -> bool:
+        pending = self._pending_transfer_reconfigure
+        if (
+            self.gpu_id != 0
+            or pending is None
+            or self._transfer_manager is None
+            or self._transfer_manager.has_active_transfers()
+        ):
+            return False
+
+        measured_transfer_bytes = int(pending["transfer_bytes"])
+        measured_meta_bytes = int(pending["meta_bytes"]) or None
+        if measured_transfer_bytes <= 0:
+            self._pending_transfer_reconfigure = None
+            return False
+
+        logger.info(
+            "Transfer %s: rebuilding transfer manager after warmup calibration "
+            "(data=%d bytes, meta=%s bytes)",
+            self._disagg_role.value.upper(),
+            measured_transfer_bytes,
+            measured_meta_bytes if measured_meta_bytes is not None else "auto",
+        )
+        self._transfer_manager.cleanup()
+        self._transfer_manager = None
+        self._preallocated_slots = {}
+        self._init_disagg_transfer_manager(
+            measured_transfer_bytes=measured_transfer_bytes,
+            measured_meta_bytes=measured_meta_bytes,
+        )
+        self._pending_transfer_reconfigure = None
+        self._transfer_reconfigured = True
+        return True
 
     # ------------------------------------------------------------------
     # Background threads
@@ -789,6 +861,8 @@ class SchedulerDisaggMixin:
         if not self._role_has_outbound_transfer():
             return
         if not success or staged is None:
+            if self._disagg_role == RoleType.DENOISER:
+                self._warmup_inbound_sizes.pop(request_id, None)
             failed_msg = TransferFailedMsg(
                 request_id=request_id,
                 error=error_msg or "transfer_sync failed",
@@ -849,6 +923,18 @@ class SchedulerDisaggMixin:
                 TransferPushedMsg(request_id=request_id, success=True, error=None)
             )
         )
+        if staged.scalar_fields.get("is_warmup"):
+            if self._disagg_role == RoleType.ENCODER:
+                self._schedule_transfer_reconfigure(
+                    staged.transfer_size,
+                    staged.meta_size,
+                )
+            elif self._disagg_role == RoleType.DENOISER:
+                inbound_sizes = self._warmup_inbound_sizes.pop(request_id, (0, 0))
+                self._schedule_transfer_reconfigure(
+                    max(int(inbound_sizes[0]), int(staged.transfer_size)),
+                    max(int(inbound_sizes[1]), int(staged.meta_size)),
+                )
 
     def _prefetch_transfer_ready(self: Scheduler, msg: dict) -> _PendingInboundTransfer:
         """Start receiver-side H2D/load and stash loaded tensors for later distribution."""
@@ -863,8 +949,15 @@ class SchedulerDisaggMixin:
         tensors, scalar_fields, load_event = self._transfer_manager.load_transfer_async(
             request_id,
             device=local_device,
-            stream=self._transfer_stream,
+            stream=self._swap_in_stream,
         )
+        if scalar_fields.get("is_warmup"):
+            transfer_bytes = estimate_transfer_bytes(tensors)
+            meta_bytes = estimate_transfer_meta_bytes(
+                estimate_transfer_manifest(tensors),
+                scalar_fields,
+            )
+            self._warmup_inbound_sizes[request_id] = (transfer_bytes, meta_bytes)
 
         return _PendingInboundTransfer(
             request_id=request_id,
@@ -886,7 +979,7 @@ class SchedulerDisaggMixin:
             return
         self._transfer_manager.free_receive_slot(request_id)
 
-    def _drain_transfer_control_socket(self: Scheduler) -> int:
+    def _drain_disagg_work_socket(self: Scheduler) -> int:
         if self.gpu_id != 0 or self._pool_work_pull is None or self._control_queue is None:
             return 0
 
@@ -916,6 +1009,9 @@ class SchedulerDisaggMixin:
             drained += 1
 
         return drained
+
+    def _drain_transfer_control_socket(self: Scheduler) -> int:
+        return self._drain_disagg_work_socket()
 
     def _process_transfer_control_queue(self: Scheduler) -> bool:
         if self._control_queue is None:
@@ -1004,6 +1100,12 @@ class SchedulerDisaggMixin:
             self._disagg_denoiser_compute(req, item.request_id, item.role_name)
         elif self._disagg_role == RoleType.DECODER:
             self._disagg_decoder_compute(req, item.request_id, item.role_name)
+            if item.scalar_fields.get("is_warmup"):
+                inbound_sizes = self._warmup_inbound_sizes.pop(item.request_id, (0, 0))
+                self._schedule_transfer_reconfigure(
+                    inbound_sizes[0],
+                    inbound_sizes[1],
+                )
 
     def _process_compute_ready_queue_once(self: Scheduler, is_multi_rank: bool) -> bool:
         if self._compute_ready_queue is None:
@@ -1175,7 +1277,7 @@ class SchedulerDisaggMixin:
         while self._running:
             try:
                 handled_work = False
-                handled_work |= self._drain_transfer_control_socket() > 0
+                handled_work |= self._drain_disagg_work_socket() > 0
                 handled_work |= self._process_transfer_control_queue()
                 handled_work |= self._process_prefetch_queue_once()
                 handled_work |= self._process_swapping_queue_once()
@@ -1183,6 +1285,7 @@ class SchedulerDisaggMixin:
                 handled_work |= computed
                 handled_work |= self._process_swap_out_queue_once()
                 handled_work |= self._process_send_ready_queue_once()
+                handled_work |= self._maybe_apply_pending_transfer_reconfigure()
 
                 if is_multi_rank and not computed:
                     self._broadcast_to_all_ranks(("skip",))
@@ -1271,6 +1374,7 @@ class SchedulerDisaggMixin:
 
                 handled_work |= self._process_swap_out_queue_once()
                 handled_work |= self._process_send_ready_queue_once()
+                handled_work |= self._maybe_apply_pending_transfer_reconfigure()
 
                 if not handled_work:
                     time.sleep(0.001)
@@ -1652,7 +1756,7 @@ class SchedulerDisaggMixin:
             return
 
         item = self._prefetch_transfer_ready(msg)
-        self._wait_transfer_event(item.load_event)
+        self._wait_transfer_event_on_compute_stream(item.load_event)
         self._run_prefetched_compute_item(item, is_multi_rank=False)
 
     # ------------------------------------------------------------------
@@ -1664,12 +1768,15 @@ class SchedulerDisaggMixin:
         req = self._build_disagg_compute_req(scalar_fields, None)
 
         if self._disagg_role == RoleType.DENOISER:
-            self.worker.execute_forward([req], return_req=True)
+            with self._compute_stream_context():
+                self.worker.execute_forward([req], return_req=True)
 
         elif self._disagg_role == RoleType.DECODER:
             req.save_output = False
             req.return_file_paths_only = False
-            self.worker.execute_forward([req])
+            with self._compute_stream_context():
+                self.worker.execute_forward([req])
+            self._make_current_stream_wait_for_compute()
 
     def _build_disagg_req(self: Scheduler, scalar_fields: dict, tensors: dict) -> Req:
         """Reconstruct a Req from transfer scalar fields and loaded GPU tensors.
@@ -1712,13 +1819,26 @@ class SchedulerDisaggMixin:
             return
         # Run denoising
         start_time = time.monotonic()
-        result = self.worker.execute_forward([req], return_req=True)
+        staged = None
+        stage_event = None
+        with self._compute_stream_context():
+            result = self.worker.execute_forward([req], return_req=True)
+            if isinstance(result, Req):
+                tensor_fields, scalar_fields = extract_transfer_fields(result)
+                staged, stage_event = self._transfer_manager.stage_tensors_async(
+                    request_id=request_id,
+                    tensor_fields=tensor_fields,
+                    scalar_fields=scalar_fields,
+                    stream=self._swap_out_stream,
+                )
         duration_s = time.monotonic() - start_time
 
         if self._is_request_aborted(request_id):
+            self._cleanup_aborted_staged_request(request_id)
             return
 
         if not isinstance(result, Req):
+            self._warmup_inbound_sizes.pop(request_id, None)
             error_msg = getattr(result, "error", "denoiser error")
             done_msg = TransferDoneMsg(request_id=request_id, error=str(error_msg))
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
@@ -1726,16 +1846,8 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
-        # Stage denoiser output for decoder transfer (async staging)
-        tensor_fields, scalar_fields = extract_transfer_fields(result)
-        staged, stage_event = self._transfer_manager.stage_tensors_async(
-            request_id=request_id,
-            tensor_fields=tensor_fields,
-            scalar_fields=scalar_fields,
-            stream=self._transfer_stream,
-        )
-
         if staged is None:
+            self._warmup_inbound_sizes.pop(request_id, None)
             done_msg = TransferDoneMsg(
                 request_id=request_id,
                 error="Failed to stage denoiser output for decoder",
@@ -1792,7 +1904,9 @@ class SchedulerDisaggMixin:
             return
 
         start_time = time.monotonic()
-        output_batch = self.worker.execute_forward([req])
+        with self._compute_stream_context():
+            output_batch = self.worker.execute_forward([req])
+        self._make_current_stream_wait_for_compute()
         duration_s = time.monotonic() - start_time
 
         if self._is_request_aborted(request_id):
@@ -1844,9 +1958,23 @@ class SchedulerDisaggMixin:
             self._disagg_metrics.record_request_start(request_id)
 
         # Run encoder stages
-        req_result = self.worker.execute_forward(reqs, return_req=True)
+        staged = None
+        stage_event = None
+        scalar_fields = None
+        with self._compute_stream_context():
+            req_result = self.worker.execute_forward(reqs, return_req=True)
+            if isinstance(req_result, Req) and self._pool_result_push is not None:
+                if self._transfer_manager is not None:
+                    tensor_fields, scalar_fields = extract_transfer_fields(req_result)
+                    staged, stage_event = self._transfer_manager.stage_tensors_async(
+                        request_id=request_id,
+                        tensor_fields=tensor_fields,
+                        scalar_fields=scalar_fields,
+                        stream=self._swap_out_stream,
+                    )
 
         if self._is_request_aborted(request_id):
+            self._cleanup_aborted_staged_request(request_id)
             return
 
         if not isinstance(req_result, Req):
@@ -1862,14 +1990,13 @@ class SchedulerDisaggMixin:
                 self._disagg_metrics.record_request_failed(request_id)
             return
 
-        # Pack and send encoder output (rank 0 only sends)
-        tensor_fields, scalar_fields = extract_transfer_fields(req_result)
-
         if self._pool_result_push is not None:
             if self._transfer_manager is not None:
                 # Transfer mode: stage tensors to TransferBuffer, send transfer_staged
-                self._disagg_encoder_transfer_stage(
-                    request_id, tensor_fields, scalar_fields
+                self._finalize_disagg_encoder_stage(
+                    request_id,
+                    staged,
+                    stage_event,
                 )
             else:
                 # Fallback: send error (transfer manager not initialized)
@@ -1884,21 +2011,9 @@ class SchedulerDisaggMixin:
 
         logger.debug("Pool ENCODER: processed %s", request_id)
 
-    def _disagg_encoder_transfer_stage(
-        self: Scheduler, request_id: str, tensor_fields: dict, scalar_fields: dict
+    def _finalize_disagg_encoder_stage(
+        self: Scheduler, request_id: str, staged, stage_event
     ) -> None:
-        """Stage encoder output and send transfer_staged to DS.
-
-        The actual server notification is delayed until the per-request D2H event
-        becomes ready, so the sender can trigger dispatch at request granularity.
-        """
-        staged, stage_event = self._transfer_manager.stage_tensors_async(
-            request_id=request_id,
-            tensor_fields=tensor_fields,
-            scalar_fields=scalar_fields,
-            stream=self._transfer_stream,
-        )
-
         if self._is_request_aborted(request_id):
             if self._transfer_manager is not None:
                 self._transfer_manager.abort_request(request_id)
@@ -1921,3 +2036,20 @@ class SchedulerDisaggMixin:
             stage_event,
             msg_type=TransferMsgType.STAGED,
         )
+
+    def _disagg_encoder_transfer_stage(
+        self: Scheduler, request_id: str, tensor_fields: dict, scalar_fields: dict
+    ) -> None:
+        """Stage encoder output and send transfer_staged to DS.
+
+        The actual server notification is delayed until the per-request D2H event
+        becomes ready, so the sender can trigger dispatch at request granularity.
+        """
+        with self._compute_stream_context():
+            staged, stage_event = self._transfer_manager.stage_tensors_async(
+                request_id=request_id,
+                tensor_fields=tensor_fields,
+                scalar_fields=scalar_fields,
+                stream=self._swap_out_stream,
+            )
+        self._finalize_disagg_encoder_stage(request_id, staged, stage_event)

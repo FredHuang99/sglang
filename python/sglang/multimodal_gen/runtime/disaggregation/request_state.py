@@ -31,6 +31,14 @@ class RequestState(enum.Enum):
     TIMED_OUT = "timed_out"
 
 
+class TransferPhase(enum.Enum):
+    WAITING_FOR_DOWNSTREAM_SLOT = "waiting_for_downstream_slot"
+    WAITING_ALLOC_RESULT = "waiting_alloc_result"
+    SENDING = "sending"
+    RUNNING_DOWNSTREAM = "running_downstream"
+    ABORTING = "aborting"
+
+
 _TERMINAL_STATES = {RequestState.DONE, RequestState.FAILED, RequestState.TIMED_OUT}
 _ACTIVE_STATES = set(RequestState) - _TERMINAL_STATES
 

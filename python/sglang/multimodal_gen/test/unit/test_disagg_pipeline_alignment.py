@@ -2,7 +2,13 @@
 """Unit tests for pipeline-specific disagg role alignment."""
 
 import unittest
+from types import SimpleNamespace
 
+import torch
+
+from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
+    Hunyuan3D2PipelineConfig,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -29,6 +35,11 @@ from sglang.multimodal_gen.runtime.pipelines.wan_i2v_pipeline import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_denoising import (
     HeliosChunkedDenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.hunyuan3d_shape import (
+    Hunyuan3DShapeBeforeDenoisingStage,
+    Hunyuan3DShapeExportStage,
+    Hunyuan3DShapeSaveStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.mova import (
     MOVADecodingStage,
@@ -169,6 +180,27 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
 
 
 class TestStageAffinityAndValidation(unittest.TestCase):
+    def _make_hunyuan_pipeline(
+        self, role: RoleType, *, paint_enable: bool
+    ) -> Hunyuan3D2Pipeline:
+        pipeline = object.__new__(Hunyuan3D2Pipeline)
+        pipeline.server_args = SimpleNamespace(
+            pipeline_config=Hunyuan3D2PipelineConfig(paint_enable=paint_enable)
+        )
+        pipeline._disagg_role = role
+        pipeline.modules = {
+            "hy3dshape_image_processor": object(),
+            "hy3dshape_conditioner": object(),
+            "hy3dshape_scheduler": object(),
+            "hy3dshape_model": SimpleNamespace(
+                parameters=lambda: iter([torch.nn.Parameter(torch.zeros(1))])
+            ),
+            "hy3dshape_vae": object(),
+        }
+        pipeline._stages = []
+        pipeline._stage_name_mapping = {}
+        return pipeline
+
     def test_helios_denoising_stage_is_denoiser_affine(self):
         stage = object.__new__(HeliosChunkedDenoisingStage)
         self.assertEqual(stage.role_affinity, RoleType.DENOISER)
@@ -181,13 +213,79 @@ class TestStageAffinityAndValidation(unittest.TestCase):
         stage = object.__new__(MOVADecodingStage)
         self.assertEqual(stage.role_affinity, RoleType.DECODER)
 
-    def test_hunyuan3d_rejects_non_monolithic_roles(self):
-        pipeline = object.__new__(Hunyuan3D2Pipeline)
+    def test_hunyuan3d_shape_only_disagg_accepts_non_monolithic_roles(self):
+        pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=False)
+        pipeline.validate_disagg_role(RoleType.ENCODER)
+        pipeline.validate_disagg_role(RoleType.MONOLITHIC)
 
-        with self.assertRaisesRegex(ValueError, "monolithic"):
+    def test_hunyuan3d_disagg_rejects_paint_pipeline(self):
+        pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=True)
+        with self.assertRaisesRegex(ValueError, "shape-only disaggregation"):
             pipeline.validate_disagg_role(RoleType.ENCODER)
 
-        pipeline.validate_disagg_role(RoleType.MONOLITHIC)
+    def test_hunyuan3d_shape_export_and_save_are_decoder_affine(self):
+        export_stage = Hunyuan3DShapeExportStage(
+            vae=object(),
+            config=Hunyuan3D2PipelineConfig(paint_enable=False),
+        )
+        save_stage = Hunyuan3DShapeSaveStage(
+            config=Hunyuan3D2PipelineConfig(paint_enable=False),
+        )
+
+        self.assertEqual(export_stage.role_affinity, RoleType.DECODER)
+        self.assertEqual(save_stage.role_affinity, RoleType.DECODER)
+
+    def test_hunyuan3d_stage_filtering_matches_shape_only_roles(self):
+        expected = {
+            RoleType.ENCODER: ["shape_before_denoising"],
+            RoleType.DENOISER: ["shape_denoising"],
+            RoleType.DECODER: ["shape_export", "shape_save"],
+        }
+
+        for role, stage_names in expected.items():
+            pipeline = self._make_hunyuan_pipeline(role, paint_enable=False)
+            pipeline.create_pipeline_stages(pipeline.server_args)
+            self.assertEqual(list(pipeline._stage_name_mapping.keys()), stage_names)
+
+    def test_hunyuan3d_shape_stage_no_longer_stores_model_dtype(self):
+        pipeline = self._make_hunyuan_pipeline(RoleType.ENCODER, paint_enable=False)
+        pipeline.create_pipeline_stages(pipeline.server_args)
+        stage = pipeline._stage_name_mapping["shape_before_denoising"]
+        self.assertIsInstance(stage, Hunyuan3DShapeBeforeDenoisingStage)
+        self.assertFalse(hasattr(stage, "model_dtype"))
+
+
+class TestHunyuan3DShapeStageRuntimeDtype(unittest.TestCase):
+    def test_conditioner_parameter_dtype_wins_over_sample_dtype(self):
+        conditioner = torch.nn.Linear(4, 4, bias=False).to(dtype=torch.float32)
+        stage = Hunyuan3DShapeBeforeDenoisingStage(
+            image_processor=object(),
+            conditioner=conditioner,
+            scheduler=SimpleNamespace(init_noise_sigma=1.0),
+            config=Hunyuan3D2PipelineConfig(),
+            latent_shape=(1, 2, 2),
+            guidance_embed=False,
+        )
+
+        self.assertEqual(
+            stage._resolve_runtime_dtype(torch.zeros(1, dtype=torch.float16)),
+            torch.float32,
+        )
+
+    def test_runtime_dtype_falls_back_to_sample_tensor_without_module_dtype(self):
+        stage = Hunyuan3DShapeBeforeDenoisingStage(
+            image_processor=object(),
+            conditioner=object(),
+            scheduler=SimpleNamespace(init_noise_sigma=1.0),
+            config=Hunyuan3D2PipelineConfig(),
+            latent_shape=(1, 2, 2),
+            guidance_embed=False,
+        )
+
+        self.assertEqual(
+            stage._resolve_runtime_dtype(torch.zeros(1, dtype=torch.bfloat16)),
+            torch.bfloat16,
+        )
 
 
 if __name__ == "__main__":

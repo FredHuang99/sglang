@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
 from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
     RequestTracker,
+    TransferPhase,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
@@ -74,9 +75,15 @@ class _TransferRequestState:
     decoder_dispatch_enqueued: bool = False
     transfer_completion_processed: bool = False
     alloc_accepted: bool = False
+    transfer_phase: TransferPhase = TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT
+    handoff_started_at: float | None = None
+    phase_started_at: float | None = None
     downstream_wait_since: float | None = None
     downstream_tta_enqueued: bool = False
     rejected_instances: dict[int, int] = field(default_factory=dict)
+    send_attempts: int = 0
+    max_send_retries: int = 2
+    last_send_error: str | None = None
     sender_abort_sent: bool = False
     receiver_abort_sent: bool = False
 
@@ -121,6 +128,7 @@ class DiffusionServer:
         self._num_decoders = len(decoder_work_endpoints)
         self._timeout_s = timeout_s
         self._downstream_wait_timeout_s = downstream_wait_timeout_s
+        self._alloc_result_timeout_s = min(self._downstream_wait_timeout_s, 5.0)
 
         self._tracker = RequestTracker()
         self._dispatcher = PoolDispatcher(
@@ -158,6 +166,16 @@ class DiffusionServer:
         self._encoder_peers: dict[int, dict] = {}
         self._denoiser_peers: dict[int, dict] = {}
         self._decoder_peers: dict[int, dict] = {}
+
+    @staticmethod
+    def _set_transfer_phase(
+        p2p: _TransferRequestState, phase: TransferPhase, *, now: float | None = None
+    ) -> None:
+        timestamp = time.monotonic() if now is None else now
+        p2p.transfer_phase = phase
+        p2p.phase_started_at = timestamp
+        if p2p.handoff_started_at is None:
+            p2p.handoff_started_at = timestamp
 
     @property
     def tracker(self) -> RequestTracker:
@@ -536,7 +554,7 @@ class DiffusionServer:
             OutputBatch,
         )
 
-        logger.error("DiffusionServer: %s 鈥?%s", request_id, error_msg)
+        logger.error("DiffusionServer: request %s failed: %s", request_id, error_msg)
 
         try:
             self._tracker.transition(request_id, terminal_state, error=error_msg)
@@ -567,20 +585,49 @@ class DiffusionServer:
     def _handle_timeouts(self) -> None:
         now = time.monotonic()
         wait_timed_out = []
-        for request_id, p2p in self._transfer_state.items():
-            if p2p.alloc_accepted:
-                continue
-            if p2p.downstream_wait_since is None:
-                continue
-            if (now - p2p.downstream_wait_since) > self._downstream_wait_timeout_s:
+        alloc_phase_timed_out = []
+        for request_id, p2p in list(self._transfer_state.items()):
+            if (
+                p2p.handoff_started_at is not None
+                and (now - p2p.handoff_started_at) > self._downstream_wait_timeout_s
+            ):
                 wait_timed_out.append(request_id)
+                continue
+            if (
+                p2p.transfer_phase == TransferPhase.WAITING_ALLOC_RESULT
+                and p2p.phase_started_at is not None
+                and (now - p2p.phase_started_at) > self._alloc_result_timeout_s
+            ):
+                alloc_phase_timed_out.append(request_id)
+
+        for request_id in alloc_phase_timed_out:
+            p2p = self._transfer_state.get(request_id)
+            if p2p is None or p2p.transfer_phase != TransferPhase.WAITING_ALLOC_RESULT:
+                continue
+            if not p2p.receiver_role or p2p.receiver_instance < 0:
+                continue
+            record = self._tracker.get(request_id)
+            role_enum = RoleType.from_string(p2p.receiver_role)
+            rejected_instance = p2p.receiver_instance
+            self._release_receiver_slot_if_needed(p2p, record, update_epoch=False)
+            self._recycle_prealloc_slot(p2p, role_enum)
+            self._clear_receiver_dispatch(p2p)
+            self._requeue_downstream_transfer(
+                request_id,
+                p2p,
+                role_enum=role_enum,
+                rejected_instance=rejected_instance,
+                now=now,
+            )
 
         for request_id in wait_timed_out:
             record = self._tracker.get(request_id)
             p2p = self._transfer_state.pop(request_id, None)
             if p2p is None:
                 continue
+            self._set_transfer_phase(p2p, TransferPhase.ABORTING, now=now)
             if record is not None:
+                self._release_sender_slot_if_needed(p2p, record, update_epoch=False)
                 self._release_receiver_slot_if_needed(
                     p2p, record, update_epoch=False
                 )
@@ -593,7 +640,7 @@ class DiffusionServer:
                 request_id,
                 p2p,
                 to_sender=True,
-                to_receiver=False,
+                to_receiver=bool(p2p.receiver_control_endpoint),
                 reason=(
                     f"Downstream wait timeout after {self._downstream_wait_timeout_s}s"
                 ),
@@ -613,11 +660,12 @@ class DiffusionServer:
             record = self._tracker.get(request_id)
             p2p = self._transfer_state.pop(request_id, None)
             if p2p is not None and record is not None:
+                self._set_transfer_phase(p2p, TransferPhase.ABORTING, now=now)
                 self._send_abort(
                     request_id,
                     p2p,
                     to_sender=True,
-                    to_receiver=p2p.alloc_accepted,
+                    to_receiver=bool(p2p.receiver_control_endpoint),
                     reason=f"Global timeout after {self._timeout_s}s",
                     source="timeout",
                 )
@@ -732,6 +780,7 @@ class DiffusionServer:
     ) -> None:
         if p2p.downstream_tta_enqueued:
             return
+        self._set_transfer_phase(p2p, TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT)
         queue_obj.append(_RoleTTAEntry(request_id=request_id, transfer_state=p2p))
         p2p.downstream_tta_enqueued = True
 
@@ -838,6 +887,7 @@ class DiffusionServer:
         self._role_pushes(receiver_role)[receiver_idx].send_multipart(
             encode_transfer_msg(alloc_msg)
         )
+        self._set_transfer_phase(p2p, TransferPhase.WAITING_ALLOC_RESULT)
 
     def _release_sender_slot_if_needed(
         self,
@@ -981,15 +1031,15 @@ class DiffusionServer:
         self._clear_receiver_dispatch(p2p)
 
         if msg.get("retryable", True):
-            p2p.rejected_instances[receiver_instance] = self._current_capacity_epoch(
-                role_enum, receiver_instance
+            self._requeue_downstream_transfer(
+                request_id,
+                p2p,
+                role_enum=role_enum,
+                rejected_instance=receiver_instance,
             )
-            if role_enum == RoleType.DENOISER:
-                self._enqueue_role_wait(self._denoiser_tta, request_id, p2p)
-            else:
-                self._enqueue_role_wait(self._decoder_tta, request_id, p2p)
             return
 
+        self._set_transfer_phase(p2p, TransferPhase.ABORTING)
         self._send_abort(
             request_id,
             p2p,
@@ -998,6 +1048,7 @@ class DiffusionServer:
             reason=msg.get("reason", "fatal downstream allocation failure"),
             source="alloc_failed",
         )
+        self._release_sender_slot_if_needed(p2p, record, update_epoch=False)
         self._complete_terminal(
             request_id,
             RequestState.FAILED,
@@ -1208,6 +1259,29 @@ class DiffusionServer:
         p2p.receiver_prealloc_recycled = False
         p2p.alloc_accepted = False
         p2p.receiver_abort_sent = False
+        p2p.transfer_completion_processed = False
+
+    def _requeue_downstream_transfer(
+        self,
+        request_id: str,
+        p2p: _TransferRequestState,
+        *,
+        role_enum: RoleType,
+        rejected_instance: int,
+        now: float | None = None,
+    ) -> None:
+        p2p.rejected_instances[rejected_instance] = self._current_capacity_epoch(
+            role_enum, rejected_instance
+        )
+        if p2p.handoff_started_at is not None:
+            p2p.downstream_wait_since = p2p.handoff_started_at
+        self._set_transfer_phase(
+            p2p, TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT, now=now
+        )
+        if role_enum == RoleType.DENOISER:
+            self._enqueue_role_wait(self._denoiser_tta, request_id, p2p)
+        else:
+            self._enqueue_role_wait(self._decoder_tta, request_id, p2p)
 
     def _handle_alloc_accepted(self, msg: dict) -> None:
         request_id = msg.get("request_id", "")
@@ -1225,6 +1299,7 @@ class DiffusionServer:
 
         p2p.alloc_accepted = True
         p2p.downstream_wait_since = None
+        self._set_transfer_phase(p2p, TransferPhase.SENDING)
         if p2p.prealloc_slot_id is not None and msg.get("prealloc_slot_id") is None:
             self._recycle_prealloc_slot(
                 p2p, RoleType.from_string(p2p.receiver_role)
@@ -1253,10 +1328,12 @@ class DiffusionServer:
             data_size=msg.get("data_size", 0),
             meta_size=msg.get("meta_size", 0),
             sender_instance=encoder_idx,
+            transfer_phase=TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT,
+            handoff_started_at=time.monotonic(),
+            phase_started_at=time.monotonic(),
             downstream_wait_since=time.monotonic(),
         )
         self._transfer_state[request_id] = p2p
-        self._release_sender_slot_if_needed(p2p, record, update_epoch=False)
 
         try:
             self._tracker.transition(request_id, RequestState.ENCODER_DONE)
@@ -1284,12 +1361,14 @@ class DiffusionServer:
         record = self._tracker.get(request_id)
         p2p.transfer_completion_processed = True
         if not msg.get("success", True):
+            p2p.last_send_error = msg.get("error") or "transfer push failed"
+            self._set_transfer_phase(p2p, TransferPhase.ABORTING)
             self._send_abort(
                 request_id,
                 p2p,
                 to_sender=True,
-                to_receiver=p2p.alloc_accepted,
-                reason=msg.get("error") or "transfer push failed",
+                to_receiver=bool(p2p.receiver_control_endpoint),
+                reason=p2p.last_send_error,
                 source="transfer_failed",
             )
             if record is not None:
@@ -1308,6 +1387,7 @@ class DiffusionServer:
             return
 
         self._release_sender_slot_if_needed(p2p, record)
+        self._set_transfer_phase(p2p, TransferPhase.RUNNING_DOWNSTREAM)
         if record is None:
             return
 
@@ -1329,7 +1409,8 @@ class DiffusionServer:
 
             if p2p is not None:
                 self._recycle_prealloc_slot(p2p, RoleType.DENOISER)
-                self._release_receiver_slot_if_needed(p2p, record)
+                if error or not msg.get("staged_for_decoder"):
+                    self._release_receiver_slot_if_needed(p2p, record)
 
             if error:
                 self._complete_terminal(
@@ -1362,12 +1443,17 @@ class DiffusionServer:
                 p2p.data_size = msg.get("data_size", 0)
                 p2p.meta_size = msg.get("meta_size", 0)
                 p2p.sender_instance = denoiser_idx
-                p2p.sender_slot_released = True
+                p2p.sender_slot_released = False
                 p2p.transfer_completion_processed = False
                 p2p.alloc_accepted = False
+                p2p.handoff_started_at = time.monotonic()
+                p2p.phase_started_at = p2p.handoff_started_at
+                p2p.transfer_phase = TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT
                 p2p.downstream_wait_since = time.monotonic()
                 p2p.downstream_tta_enqueued = False
                 p2p.rejected_instances.clear()
+                p2p.send_attempts = 0
+                p2p.last_send_error = None
                 p2p.sender_abort_sent = False
                 p2p.receiver_abort_sent = False
                 p2p.decoder_dispatch_enqueued = True

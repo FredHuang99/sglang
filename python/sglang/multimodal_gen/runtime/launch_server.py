@@ -1,21 +1,31 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import dataclasses
+import asyncio
 import multiprocessing as mp
 import os
+import pickle
 import signal
 import sys
 import threading
+import time
 
 import psutil
 import uvicorn
+import zmq
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.diffusion_server import (
     DiffusionServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
+    _parse_size,
+    save_image_to_path,
+)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     prepare_server_args,
@@ -23,6 +33,90 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
+
+MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+
+
+def _build_disagg_calibration_reqs(server_args: ServerArgs) -> list[Req]:
+    if not server_args.warmup:
+        return []
+
+    resolutions = server_args.warmup_resolutions or [None]
+    task_type = server_args.pipeline_config.task_type
+    warmup_reqs: list[Req] = []
+
+    for resolution in resolutions:
+        width = height = None
+        if resolution is not None:
+            width, height = _parse_size(resolution)
+
+        req_kwargs = {
+            "data_type": task_type.data_type(),
+            "prompt": "",
+        }
+        if width is not None:
+            req_kwargs["width"] = width
+        if height is not None:
+            req_kwargs["height"] = height
+
+        if task_type in (
+            ModelTaskType.I2I,
+            ModelTaskType.TI2I,
+            ModelTaskType.I2V,
+            ModelTaskType.TI2V,
+            ModelTaskType.I2M,
+        ):
+            uploads_dir = os.path.join("outputs", "uploads")
+            os.makedirs(uploads_dir, exist_ok=True)
+            input_path = asyncio.run(
+                save_image_to_path(
+                    MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+                    os.path.join(uploads_dir, "warmup_image.jpg"),
+                )
+            )
+            req_kwargs["negative_prompt"] = ""
+            req_kwargs["image_path"] = [input_path]
+
+        req = Req(**req_kwargs)
+        req.set_as_warmup(server_args.warmup_steps)
+        warmup_reqs.append(req)
+
+    return warmup_reqs
+
+
+def _run_disagg_startup_calibration(
+    frontend_endpoint: str,
+    server_args: ServerArgs,
+) -> None:
+    warmup_reqs = _build_disagg_calibration_reqs(server_args)
+    if not warmup_reqs:
+        return
+
+    context = zmq.Context(io_threads=1)
+    sock = context.socket(zmq.REQ)
+    sock.setsockopt(zmq.RCVTIMEO, max(1000, int(server_args.disagg_timeout * 1000)))
+    sock.setsockopt(zmq.SNDTIMEO, 10000)
+    sock.connect(frontend_endpoint)
+
+    try:
+        for idx, req in enumerate(warmup_reqs, start=1):
+            logger.info(
+                "Running disagg startup calibration request %d/%d via %s",
+                idx,
+                len(warmup_reqs),
+                frontend_endpoint,
+            )
+            sock.send(pickle.dumps([req]))
+            reply = sock.recv_multipart()
+            output_batch = pickle.loads(reply[-1]) if reply else None
+            if getattr(output_batch, "error", None):
+                raise RuntimeError(
+                    f"Disagg startup calibration failed: {output_batch.error}"
+                )
+            time.sleep(0.5)
+    finally:
+        sock.close(linger=0)
+        context.destroy(linger=0)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -425,6 +519,8 @@ def launch_pool_disagg_server(
         max_slots_per_instance=server_args.disagg_max_slots_per_instance,
     )
     diffusion_server.start()
+    if server_args.warmup:
+        _run_disagg_startup_calibration(frontend_endpoint, server_args)
 
     if launch_http_server:
         logger.info(
@@ -552,6 +648,8 @@ def launch_disagg_server(server_args: ServerArgs):
         max_slots_per_instance=server_args.disagg_max_slots_per_instance,
     )
     diffusion_server.start()
+    if server_args.warmup:
+        _run_disagg_startup_calibration(frontend_endpoint, server_args)
 
     logger.info(
         "Starting HTTP server (connected to DiffusionServer at port %d).",

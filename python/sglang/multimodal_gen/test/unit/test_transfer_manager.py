@@ -223,6 +223,82 @@ class TestTransfer(unittest.TestCase):
         )
         self.assertNotIn("r1", sender._pending_peer_sends)
 
+    def test_send_failure_retries_before_terminal_success(self):
+        sender = _make_manager(session_id="sender-retry")
+        callback = unittest.mock.MagicMock()
+        sender._on_send_completion = callback
+        sender._send_executors = [ThreadPoolExecutor(max_workers=1)]
+        sender._send_queues = [queue.Queue()]
+        sender.stage_tensors("retry-1", {"latents": torch.randn(1, 4, 8, 8)})
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "retry-1",
+                "dest_session_id": "receiver",
+                "dest_addr": 0x1234,
+                "transfer_size": 4096,
+            }
+        )
+
+        attempts = {"count": 0}
+
+        def flaky_send(request_id, peer_info):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                return False, "transient failure"
+            return True, None
+
+        sender._execute_send = flaky_send
+
+        while callback.call_count == 0:
+            if sender._send_queues[0].qsize() > 0:
+                sender._submit_send_task(sender._send_queues[0].get_nowait(), 0)
+            sender._drain_send_completions()
+            if attempts["count"] > 5:
+                break
+            time.sleep(0.01)
+
+        sender._send_executors[0].shutdown(wait=True)
+        sender._send_executors = []
+
+        self.assertEqual(attempts["count"], 3)
+        callback.assert_called_once()
+        self.assertTrue(callback.call_args[0][3])
+        self.assertEqual(sender._terminal_send_states["retry-1"], "success")
+
+    def test_send_failure_exhausts_retries_before_terminal_failure(self):
+        sender = _make_manager(session_id="sender-retry-fail")
+        callback = unittest.mock.MagicMock()
+        sender._on_send_completion = callback
+        sender._send_executors = [ThreadPoolExecutor(max_workers=1)]
+        sender._send_queues = [queue.Queue()]
+        sender.stage_tensors("retry-fail-1", {"latents": torch.randn(1, 4, 8, 8)})
+        sender._register_peer_send(
+            {
+                "msg_type": "transfer_peer_info",
+                "request_id": "retry-fail-1",
+                "dest_session_id": "receiver",
+                "dest_addr": 0x1234,
+                "transfer_size": 4096,
+            }
+        )
+
+        sender._execute_send = lambda request_id, peer_info: (False, "hard failure")
+
+        while callback.call_count == 0:
+            if sender._send_queues[0].qsize() > 0:
+                sender._submit_send_task(sender._send_queues[0].get_nowait(), 0)
+            sender._drain_send_completions()
+            time.sleep(0.01)
+
+        sender._send_executors[0].shutdown(wait=True)
+        sender._send_executors = []
+
+        callback.assert_called_once()
+        self.assertFalse(callback.call_args[0][3])
+        self.assertEqual(sender._terminal_send_states["retry-fail-1"], "failed")
+        self.assertIsNone(sender.get_staged_info("retry-fail-1"))
+
     def test_same_host_local_copy_path_moves_data_and_meta(self):
         sender = _make_manager(session_id="sender-local")
         receiver = _make_manager(session_id="receiver-local")
