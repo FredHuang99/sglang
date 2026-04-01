@@ -122,6 +122,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
     --context-length "${CTX_LEN}"
     --mem-fraction-static "${MEM_FRACTION_STATIC}"
     --tp-size "${TP}"
+    --disable-piecewise-cuda-graph
   )
 
   #if [[ -n "${CHUNKED_PREFILL_SIZE:-}" ]]; then
