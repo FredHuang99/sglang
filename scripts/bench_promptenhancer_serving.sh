@@ -16,6 +16,8 @@ OUTPUT_LEN="${OUTPUT_LEN:-256 384 512 640 768 896 1024 1152 1280 1408 1536 1664 
 #CTX_LEN="${CTX_LEN:-128000}"
 CTX_LEN="${CTX_LEN:-32768}" 
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-5}"
+READY_CHECK_TIMEOUT="${READY_CHECK_TIMEOUT:-600}"
+SERVER_BOOTSTRAP_GRACE_SEC="${SERVER_BOOTSTRAP_GRACE_SEC:-5}"
 SEED="${SEED:-42}"
 
 # Tune these to maximize KV pool and let runtime split large batches.
@@ -48,70 +50,36 @@ cleanup() {
   fi
 }
 
-wait_server_ready() {
-  local url="$1"
-  local timeout_s="${2:-600}"
-  local pid="${3:-}"
-  local log_path="${4:-}"
-  local start_ts
-  start_ts="$(date +%s)"
+print_server_log_tail() {
+  local log_path="$1"
 
-  while true; do
-    if curl -fsS "${url}" >/dev/null 2>&1; then
-      return 0
-    fi
-    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
-      echo "Server process exited before becoming ready." >&2
-      if [[ -n "${log_path}" ]] && [[ -f "${log_path}" ]]; then
-        echo "Last 200 lines of ${log_path}:" >&2
-        tail -n 200 "${log_path}" >&2 || true
-      fi
-      return 1
-    fi
-    if (( "$(date +%s)" - start_ts >= timeout_s )); then
-      if [[ -n "${log_path}" ]] && [[ -f "${log_path}" ]]; then
-        echo "Timed out waiting for server. Last 200 lines of ${log_path}:" >&2
-        tail -n 200 "${log_path}" >&2 || true
-      fi
-      return 1
-    fi
-    sleep 1
-  done
+  if [[ -n "${log_path}" ]] && [[ -f "${log_path}" ]]; then
+    echo "Last 200 lines of ${log_path}:" >&2
+    tail -n 200 "${log_path}" >&2 || true
+  fi
 }
 
-wait_generate_ready() {
-  local base_url="$1"
-  local timeout_s="${2:-600}"
-  local pid="${3:-}"
-  local log_path="${4:-}"
-  local start_ts
-  start_ts="$(date +%s)"
+ensure_server_bootstrapped() {
+  local grace_s="$1"
+  local pid="${2:-}"
+  local log_path="${3:-}"
 
-  while true; do
-    if curl -fsS "${base_url}/generate" \
-      -H "Content-Type: application/json" \
-      --data-raw '{"text":"hi","sampling_params":{"temperature":0,"max_new_tokens":1}}' \
-      >/dev/null 2>&1; then
-      return 0
-    fi
+  for ((sec = 1; sec <= grace_s; sec++)); do
     if [[ -n "${pid}" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
-      echo "Server process exited before generate probe succeeded." >&2
-      if [[ -n "${log_path}" ]] && [[ -f "${log_path}" ]]; then
-        echo "Last 200 lines of ${log_path}:" >&2
-        tail -n 200 "${log_path}" >&2 || true
-      fi
-      return 1
-    fi
-    if (( "$(date +%s)" - start_ts >= timeout_s )); then
-      echo "Timed out waiting for generate probe." >&2
-      if [[ -n "${log_path}" ]] && [[ -f "${log_path}" ]]; then
-        echo "Last 200 lines of ${log_path}:" >&2
-        tail -n 200 "${log_path}" >&2 || true
-      fi
+      echo "Server process exited during bootstrap grace window." >&2
+      print_server_log_tail "${log_path}"
       return 1
     fi
     sleep 1
   done
+
+  if [[ -n "${pid}" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
+    echo "Server process exited before benchmark handoff." >&2
+    print_server_log_tail "${log_path}"
+    return 1
+  fi
+
+  return 0
 }
 
 trap cleanup EXIT INT TERM
@@ -157,8 +125,9 @@ for TP in "${TP_SIZE_LIST[@]}"; do
     --context-length "${CTX_LEN}"
     --mem-fraction-static "${MEM_FRACTION_STATIC}"
     --tp-size "${TP}"
+    --skip-server-warmup
+    --disable-cuda-graph
     --disable-piecewise-cuda-graph
-    --cuda-graph-max-bs 32
   )
 
   #if [[ -n "${CHUNKED_PREFILL_SIZE:-}" ]]; then
@@ -186,14 +155,10 @@ for TP in "${TP_SIZE_LIST[@]}"; do
   python "${SERVER_ARGS[@]}" > "${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
 
-  if ! wait_server_ready "http://${HOST}:${PORT}/model_info" 600 "${SERVER_PID}" "${SERVER_LOG}"; then
-    echo "Server failed to become ready at /model_info. See ${SERVER_LOG}" >&2
-    stop_server
-    exit 1
-  fi
+  echo "Server launched, handing off readiness to bench_serving after ${SERVER_BOOTSTRAP_GRACE_SEC}s bootstrap grace."
 
-  if ! wait_generate_ready "http://${HOST}:${PORT}" 600 "${SERVER_PID}" "${SERVER_LOG}"; then
-    echo "Server failed generate probe. See ${SERVER_LOG}" >&2
+  if ! ensure_server_bootstrapped "${SERVER_BOOTSTRAP_GRACE_SEC}" "${SERVER_PID}" "${SERVER_LOG}"; then
+    echo "Server failed during bootstrap grace window. See ${SERVER_LOG}" >&2
     stop_server
     exit 1
   fi
@@ -213,6 +178,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
         echo "TP: ${TP}, input: ${IL}, output: ${OL}, bs: ${BS}"
         echo "Client log: ${CLIENT_LOG}"
         echo "Profile root: ${PROFILE_ROOT}"
+        echo "bench_serving is waiting for /v1/models with timeout ${READY_CHECK_TIMEOUT}s"
         echo "----------------------------------------"
 
         CLIENT_ARGS=(
@@ -227,6 +193,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
           --random-output-len "${OL}"
           --request-rate inf
           --max-concurrency "${BS}"
+          --ready-check-timeout-sec "${READY_CHECK_TIMEOUT}"
           --warmup-requests "${WARMUP_REQUESTS}"
           --seed "${SEED}"
           --output-file "${RESULT_JSONL}"
