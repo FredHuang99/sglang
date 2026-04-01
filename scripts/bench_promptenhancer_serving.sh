@@ -11,6 +11,7 @@ MODEL_PATH="${MODEL_PATH:-/home/heyang/models/promptenhancer-7b}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 DATASET_NAME="${DATASET_NAME:-random-ids}"
+RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1.0}"
 
 INPUT_LEN="${INPUT_LEN:-128 256}"
 OUTPUT_LEN="${OUTPUT_LEN:-256 384 512 640 768 896 1024 1152 1280 1408 1536 1664 1792 1920 2048}"
@@ -219,6 +220,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
         echo "----------------------------------------"
         echo "TP: ${TP}, input: ${IL}, output: ${OL}, bs: ${BS}"
         echo "Dataset: ${DATASET_NAME}"
+        echo "Random range ratio: ${RANDOM_RANGE_RATIO}"
         echo "Client log: ${CLIENT_LOG}"
         echo "Profile root: ${PROFILE_ROOT}"
         echo "bench_serving is waiting for /v1/models with timeout ${READY_CHECK_TIMEOUT}s"
@@ -234,6 +236,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
           --num-prompts "${BS}"
           --random-input-len "${IL}"
           --random-output-len "${OL}"
+          --random-range-ratio "${RANDOM_RANGE_RATIO}"
           --request-rate inf
           --max-concurrency "${BS}"
           --ready-check-timeout-sec "${READY_CHECK_TIMEOUT}"
