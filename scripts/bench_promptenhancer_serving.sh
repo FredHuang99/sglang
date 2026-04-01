@@ -10,6 +10,7 @@ set -euo pipefail
 MODEL_PATH="${MODEL_PATH:-/home/heyang/models/promptenhancer-7b}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
+DATASET_NAME="${DATASET_NAME:-random-ids}"
 
 INPUT_LEN="${INPUT_LEN:-128 256}"
 OUTPUT_LEN="${OUTPUT_LEN:-256 384 512 640 768 896 1024 1152 1280 1408 1536 1664 1792 1920 2048}"
@@ -31,7 +32,8 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 TP_SIZE="${TP_SIZE:-1}"
 BS_LIST_STRING="${BS_LIST:-1 2 4 8 16 32}"
 
-ENABLE_PROFILE="${ENABLE_PROFILE:-1}"
+ENABLE_PROFILE="${ENABLE_PROFILE:-0}"
+#DISABLE_TQDM="${DISABLE_TQDM:-1}"
 PROFILE_ACTIVITIES="${PROFILE_ACTIVITIES:-CPU GPU}"
 PROFILE_NUM_STEPS="${PROFILE_NUM_STEPS:-}"
 PROFILE_BY_STAGE="${PROFILE_BY_STAGE:-0}"
@@ -40,6 +42,7 @@ PROFILE_STAGES="${PROFILE_STAGES:-}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${RUN_ROOT:-/home/heyang/profile_output/${RUN_ID}}"
 RESULT_JSONL="${RUN_ROOT}/bench_serving_results.jsonl"
+SUMMARY_CSV="${RUN_ROOT}/bench_serving_summary.csv"
 
 SERVER_PID=""
 
@@ -86,6 +89,7 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "${RUN_ROOT}"
 : > "${RESULT_JSONL}"
+printf '%s\n' 'tp,isl,osl,bs,mean_ttft_ms,median_ttft_ms,min_ttft_ms,max_ttft_ms,mean_tpot_ms,median_tpot_ms,min_tpot_ms,max_tpot_ms' > "${SUMMARY_CSV}"
 
 read -r -a INPUT_LEN_LIST <<< "${INPUT_LEN}"
 read -r -a OUTPUT_LEN_LIST <<< "${OUTPUT_LEN}"
@@ -109,6 +113,44 @@ stop_server() {
   fi
 }
 
+append_summary_csv_row() {
+  local jsonl_path="$1"
+  local csv_path="$2"
+  local tp="$3"
+  local isl="$4"
+  local osl="$5"
+  local bs="$6"
+
+  python -c '
+import csv
+import json
+import pathlib
+import sys
+
+jsonl_path, csv_path, tp, isl, osl, bs = sys.argv[1:]
+lines = pathlib.Path(jsonl_path).read_text(encoding="utf-8").splitlines()
+if not lines:
+    raise SystemExit("No benchmark results found in JSONL file.")
+row = json.loads(lines[-1])
+values = [
+    tp,
+    isl,
+    osl,
+    bs,
+    row.get("mean_ttft_ms", ""),
+    row.get("median_ttft_ms", ""),
+    row.get("min_ttft_ms", ""),
+    row.get("max_ttft_ms", ""),
+    row.get("mean_tpot_ms", ""),
+    row.get("median_tpot_ms", ""),
+    row.get("min_tpot_ms", ""),
+    row.get("max_tpot_ms", ""),
+]
+with open(csv_path, "a", newline="", encoding="utf-8") as f:
+    csv.writer(f).writerow(values)
+' "${jsonl_path}" "${csv_path}" "${tp}" "${isl}" "${osl}" "${bs}"
+}
+
 for TP in "${TP_SIZE_LIST[@]}"; do
   TP_DIR="${RUN_ROOT}/tp${TP}"
   SERVER_LOG="${TP_DIR}/server.log"
@@ -126,7 +168,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
     --mem-fraction-static "${MEM_FRACTION_STATIC}"
     --tp-size "${TP}"
     --skip-server-warmup
-    --disable-cuda-graph
+    #--disable-cuda-graph
     --disable-piecewise-cuda-graph
   )
 
@@ -176,6 +218,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
         echo
         echo "----------------------------------------"
         echo "TP: ${TP}, input: ${IL}, output: ${OL}, bs: ${BS}"
+        echo "Dataset: ${DATASET_NAME}"
         echo "Client log: ${CLIENT_LOG}"
         echo "Profile root: ${PROFILE_ROOT}"
         echo "bench_serving is waiting for /v1/models with timeout ${READY_CHECK_TIMEOUT}s"
@@ -187,7 +230,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
           --host "${HOST}"
           --port "${PORT}"
           --model "${MODEL_PATH}"
-          --dataset-name random
+          --dataset-name "${DATASET_NAME}"
           --num-prompts "${BS}"
           --random-input-len "${IL}"
           --random-output-len "${OL}"
@@ -196,8 +239,13 @@ for TP in "${TP_SIZE_LIST[@]}"; do
           --ready-check-timeout-sec "${READY_CHECK_TIMEOUT}"
           --warmup-requests "${WARMUP_REQUESTS}"
           --seed "${SEED}"
+          --tag "tp=${TP},isl=${IL},osl=${OL},bs=${BS}"
           --output-file "${RESULT_JSONL}"
         )
+
+        if [[ "${DISABLE_TQDM}" == "1" ]]; then
+          CLIENT_ARGS+=(--disable-tqdm)
+        fi
 
         if [[ "${ENABLE_PROFILE}" == "1" ]]; then
           CLIENT_ARGS+=(
@@ -221,6 +269,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
         fi
 
         python "${CLIENT_ARGS[@]}" | tee "${CLIENT_LOG}"
+        append_summary_csv_row "${RESULT_JSONL}" "${SUMMARY_CSV}" "${TP}" "${IL}" "${OL}" "${BS}"
       done
     done
   done
@@ -233,3 +282,4 @@ echo
 echo "Done."
 echo "Run root: ${RUN_ROOT}"
 echo "Summary JSONL: ${RESULT_JSONL}"
+echo "Summary CSV: ${SUMMARY_CSV}"
