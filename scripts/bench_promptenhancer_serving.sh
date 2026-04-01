@@ -79,6 +79,41 @@ wait_server_ready() {
   done
 }
 
+wait_generate_ready() {
+  local base_url="$1"
+  local timeout_s="${2:-600}"
+  local pid="${3:-}"
+  local log_path="${4:-}"
+  local start_ts
+  start_ts="$(date +%s)"
+
+  while true; do
+    if curl -fsS "${base_url}/generate" \
+      -H "Content-Type: application/json" \
+      --data-raw '{"text":"hi","sampling_params":{"temperature":0,"max_new_tokens":1}}' \
+      >/dev/null 2>&1; then
+      return 0
+    fi
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" >/dev/null 2>&1; then
+      echo "Server process exited before generate probe succeeded." >&2
+      if [[ -n "${log_path}" ]] && [[ -f "${log_path}" ]]; then
+        echo "Last 200 lines of ${log_path}:" >&2
+        tail -n 200 "${log_path}" >&2 || true
+      fi
+      return 1
+    fi
+    if (( "$(date +%s)" - start_ts >= timeout_s )); then
+      echo "Timed out waiting for generate probe." >&2
+      if [[ -n "${log_path}" ]] && [[ -f "${log_path}" ]]; then
+        echo "Last 200 lines of ${log_path}:" >&2
+        tail -n 200 "${log_path}" >&2 || true
+      fi
+      return 1
+    fi
+    sleep 1
+  done
+}
+
 trap cleanup EXIT INT TERM
 
 mkdir -p "${RUN_ROOT}"
@@ -151,8 +186,14 @@ for TP in "${TP_SIZE_LIST[@]}"; do
   python "${SERVER_ARGS[@]}" > "${SERVER_LOG}" 2>&1 &
   SERVER_PID=$!
 
-  if ! wait_server_ready "http://${HOST}:${PORT}/get_server_info" 600 "${SERVER_PID}" "${SERVER_LOG}"; then
-    echo "Server failed to become ready. See ${SERVER_LOG}" >&2
+  if ! wait_server_ready "http://${HOST}:${PORT}/model_info" 600 "${SERVER_PID}" "${SERVER_LOG}"; then
+    echo "Server failed to become ready at /model_info. See ${SERVER_LOG}" >&2
+    stop_server
+    exit 1
+  fi
+
+  if ! wait_generate_ready "http://${HOST}:${PORT}" 600 "${SERVER_PID}" "${SERVER_LOG}"; then
+    echo "Server failed generate probe. See ${SERVER_LOG}" >&2
     stop_server
     exit 1
   fi
