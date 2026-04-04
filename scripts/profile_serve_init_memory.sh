@@ -15,13 +15,14 @@ SERVER_BOOTSTRAP_GRACE_SEC="${SERVER_BOOTSTRAP_GRACE_SEC:-5}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 RUN_ROOT="${RUN_ROOT:-/home/heyang/profile_output/${RUN_ID}}"
 
-# Leave these unset by default so we can observe SGLang's own init-time search.
+# Leave these empty by default so we can observe SGLang's own init-time search
+# unless the caller explicitly overrides them.
 MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
-#CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
-#CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
-#MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-}"
-#MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
-#MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
+CHUNKED_PREFILL_SIZE="${CHUNKED_PREFILL_SIZE:-}"
+CUDA_GRAPH_MAX_BS="${CUDA_GRAPH_MAX_BS:-}"
+MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-}"
+MAX_TOTAL_TOKENS="${MAX_TOTAL_TOKENS:-}"
+MAX_RUNNING_REQUESTS="${MAX_RUNNING_REQUESTS:-}"
 
 SERVER_PID=""
 
