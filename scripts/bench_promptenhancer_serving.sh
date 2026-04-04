@@ -204,12 +204,17 @@ def fmt_float(value):
     except Exception:
         return str(value)
 
+request_throughput = fmt_float(row.get("request_throughput"))
+input_throughput = fmt_float(row.get("input_throughput"))
+output_throughput = fmt_float(row.get("output_throughput"))
+total_throughput = fmt_float(row.get("total_throughput"))
+
 print(
     "Summary: "
-    f"req/s={fmt_float(row.get(\"request_throughput\"))}, "
-    f"input tok/s={fmt_float(row.get(\"input_throughput\"))}, "
-    f"output tok/s={fmt_float(row.get(\"output_throughput\"))}, "
-    f"total tok/s={fmt_float(row.get(\"total_throughput\"))}, "
+    f"req/s={request_throughput}, "
+    f"input tok/s={input_throughput}, "
+    f"output tok/s={output_throughput}, "
+    f"total tok/s={total_throughput}, "
     f"prefill batches={main_prefill_batch_count}, "
     f"new_seq_per_batch={prefill_new_seq or []}"
 )
