@@ -7,14 +7,14 @@ set -euo pipefail
 # unique run directory so repeated runs do not overwrite each other.
 
 # /home/heyang/models/promptenhancer-32b
-MODEL_PATH="${MODEL_PATH:-/home/heyang/models/promptenhancer-7b}"
+MODEL_PATH="${MODEL_PATH:-/home/heyang/models/promptenhancer-32b}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 DATASET_NAME="${DATASET_NAME:-random-ids}"
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1.0}"
 
 INPUT_LEN="${INPUT_LEN:-128 256}"
-OUTPUT_LEN="${OUTPUT_LEN:-256 384 512 640 768 896 1024 1152 1280 1408 1536 1664 1792 1920 2048}"
+OUTPUT_LEN="${OUTPUT_LEN:-384 512 640 768 896 1024 1152}"
 #CTX_LEN="${CTX_LEN:-128000}"
 CTX_LEN="${CTX_LEN:-32768}" 
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-5}"
@@ -30,7 +30,7 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 #MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-}"
 
 #TP_SIZE="${TP_SIZE:-1 2 4 8}"
-TP_SIZE="${TP_SIZE:-2}"
+TP_SIZE="${TP_SIZE:-1 2 4}"
 BS_LIST_STRING="${BS_LIST:-1 2 4 8 16 32}"
 
 ENABLE_PROFILE="${ENABLE_PROFILE:-0}"
@@ -90,7 +90,7 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "${RUN_ROOT}"
 : > "${RESULT_JSONL}"
-printf '%s\n' 'tp,isl,osl,bs,mean_ttft_ms,median_ttft_ms,min_ttft_ms,max_ttft_ms,mean_tpot_ms,median_tpot_ms,min_tpot_ms,max_tpot_ms' > "${SUMMARY_CSV}"
+printf '%s\n' 'tp,isl,osl,bs,completed,request_throughput_req_s,input_throughput_tok_s,output_throughput_tok_s,total_throughput_tok_s,mean_ttft_ms,median_ttft_ms,min_ttft_ms,max_ttft_ms,mean_tpot_ms,median_tpot_ms,min_tpot_ms,max_tpot_ms,main_prefill_batch_count,main_prefill_total_new_seq,main_prefill_new_seq_per_batch,main_prefill_new_token_per_batch' > "${SUMMARY_CSV}"
 
 read -r -a INPUT_LEN_LIST <<< "${INPUT_LEN}"
 read -r -a OUTPUT_LEN_LIST <<< "${OUTPUT_LEN}"
@@ -117,27 +117,69 @@ stop_server() {
 append_summary_csv_row() {
   local jsonl_path="$1"
   local csv_path="$2"
-  local tp="$3"
-  local isl="$4"
-  local osl="$5"
-  local bs="$6"
+  local server_log_path="$3"
+  local server_log_offset="$4"
+  local tp="$5"
+  local isl="$6"
+  local osl="$7"
+  local bs="$8"
 
   python -c '
 import csv
 import json
 import pathlib
+import re
 import sys
 
-jsonl_path, csv_path, tp, isl, osl, bs = sys.argv[1:]
+jsonl_path, csv_path, server_log_path, server_log_offset, tp, isl, osl, bs = sys.argv[1:]
 lines = pathlib.Path(jsonl_path).read_text(encoding="utf-8").splitlines()
 if not lines:
     raise SystemExit("No benchmark results found in JSONL file.")
 row = json.loads(lines[-1])
+
+server_log = pathlib.Path(server_log_path)
+offset = int(server_log_offset)
+if server_log.exists():
+    with server_log.open("rb") as f:
+        f.seek(offset)
+        segment = f.read().decode("utf-8", errors="replace")
+else:
+    segment = ""
+
+segment_lines = segment.splitlines()
+flush_idx = -1
+for idx, line in enumerate(segment_lines):
+    if "/flush_cache" in line and "200" in line:
+        flush_idx = idx
+
+main_lines = segment_lines[flush_idx + 1 :] if flush_idx >= 0 else segment_lines
+prefill_pattern = re.compile(
+    r"Prefill batch(?: \[\d+\])?,\s+#new-seq:\s*(?P<new_seq>\d+),\s+#new-token:\s*(?P<new_token>\d+)"
+)
+
+prefill_new_seq = []
+prefill_new_token = []
+for line in main_lines:
+    match = prefill_pattern.search(line)
+    if match:
+        prefill_new_seq.append(int(match.group("new_seq")))
+        prefill_new_token.append(int(match.group("new_token")))
+
+main_prefill_batch_count = len(prefill_new_seq)
+main_prefill_total_new_seq = sum(prefill_new_seq)
+prefill_new_seq_str = "|".join(str(x) for x in prefill_new_seq)
+prefill_new_token_str = "|".join(str(x) for x in prefill_new_token)
+
 values = [
     tp,
     isl,
     osl,
     bs,
+    row.get("completed", ""),
+    row.get("request_throughput", ""),
+    row.get("input_throughput", ""),
+    row.get("output_throughput", ""),
+    row.get("total_throughput", ""),
     row.get("mean_ttft_ms", ""),
     row.get("median_ttft_ms", ""),
     row.get("min_ttft_ms", ""),
@@ -146,10 +188,32 @@ values = [
     row.get("median_tpot_ms", ""),
     row.get("min_tpot_ms", ""),
     row.get("max_tpot_ms", ""),
+    main_prefill_batch_count,
+    main_prefill_total_new_seq,
+    prefill_new_seq_str,
+    prefill_new_token_str,
 ]
 with open(csv_path, "a", newline="", encoding="utf-8") as f:
     csv.writer(f).writerow(values)
-' "${jsonl_path}" "${csv_path}" "${tp}" "${isl}" "${osl}" "${bs}"
+
+def fmt_float(value):
+    if value in (None, ""):
+        return "n/a"
+    try:
+        return f"{float(value):.2f}"
+    except Exception:
+        return str(value)
+
+print(
+    "Summary: "
+    f"req/s={fmt_float(row.get(\"request_throughput\"))}, "
+    f"input tok/s={fmt_float(row.get(\"input_throughput\"))}, "
+    f"output tok/s={fmt_float(row.get(\"output_throughput\"))}, "
+    f"total tok/s={fmt_float(row.get(\"total_throughput\"))}, "
+    f"prefill batches={main_prefill_batch_count}, "
+    f"new_seq_per_batch={prefill_new_seq or []}"
+)
+' "${jsonl_path}" "${csv_path}" "${server_log_path}" "${server_log_offset}" "${tp}" "${isl}" "${osl}" "${bs}"
 }
 
 for TP in "${TP_SIZE_LIST[@]}"; do
@@ -226,6 +290,11 @@ for TP in "${TP_SIZE_LIST[@]}"; do
         echo "bench_serving is waiting for /v1/models with timeout ${READY_CHECK_TIMEOUT}s"
         echo "----------------------------------------"
 
+        SERVER_LOG_OFFSET_BEFORE=0
+        if [[ -f "${SERVER_LOG}" ]]; then
+          SERVER_LOG_OFFSET_BEFORE=$(wc -c < "${SERVER_LOG}")
+        fi
+
         CLIENT_ARGS=(
           -m sglang.bench_serving
           --backend sglang
@@ -241,6 +310,7 @@ for TP in "${TP_SIZE_LIST[@]}"; do
           --max-concurrency "${BS}"
           --ready-check-timeout-sec "${READY_CHECK_TIMEOUT}"
           --warmup-requests "${WARMUP_REQUESTS}"
+          --flush-cache
           --seed "${SEED}"
           --tag "tp=${TP},isl=${IL},osl=${OL},bs=${BS}"
           --output-file "${RESULT_JSONL}"
@@ -272,7 +342,8 @@ for TP in "${TP_SIZE_LIST[@]}"; do
         fi
 
         python "${CLIENT_ARGS[@]}" | tee "${CLIENT_LOG}"
-        append_summary_csv_row "${RESULT_JSONL}" "${SUMMARY_CSV}" "${TP}" "${IL}" "${OL}" "${BS}"
+        sleep 1
+        append_summary_csv_row "${RESULT_JSONL}" "${SUMMARY_CSV}" "${SERVER_LOG}" "${SERVER_LOG_OFFSET_BEFORE}" "${TP}" "${IL}" "${OL}" "${BS}"
       done
     done
   done
