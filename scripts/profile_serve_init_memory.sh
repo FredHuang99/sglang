@@ -81,7 +81,17 @@ wait_for_models_ready() {
   start_ts="$(date +%s)"
 
   while true; do
-    if curl -fsS "${base_url}/v1/models" >/dev/null 2>&1; then
+    if python - "$base_url" <<'PY' >/dev/null 2>&1
+import sys
+import urllib.request
+
+base_url = sys.argv[1].rstrip("/")
+with urllib.request.urlopen(f"{base_url}/v1/models", timeout=2) as resp:
+    if 200 <= resp.status < 300:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+    then
       return 0
     fi
 
@@ -372,11 +382,6 @@ read -r -a TP_SIZE_LIST <<< "${TP_SIZE}"
 
 if ! command -v python >/dev/null 2>&1; then
   echo "python not found in PATH." >&2
-  exit 1
-fi
-
-if ! command -v curl >/dev/null 2>&1; then
-  echo "curl not found in PATH." >&2
   exit 1
 fi
 
