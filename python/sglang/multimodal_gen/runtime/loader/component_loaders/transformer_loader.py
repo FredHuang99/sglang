@@ -75,6 +75,15 @@ class TransformerLoader(ComponentLoader):
 
         return safetensors_list
 
+    def get_loaded_weight_paths(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        transformers_or_diffusers: str,
+    ) -> list[str]:
+        return self.get_list_of_safetensors_to_load(server_args, component_model_path)
+
     def _resolve_quant_config(
         self,
         hf_config: Dict[str, List[str]],

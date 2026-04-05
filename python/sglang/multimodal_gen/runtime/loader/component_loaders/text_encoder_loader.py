@@ -172,6 +172,20 @@ class TextEncoderLoader(ComponentLoader):
         for source in secondary_weights:
             yield from self._get_weights_iterator(source, to_cpu)
 
+    def get_loaded_weight_paths(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        transformers_or_diffusers: str,
+    ) -> list[str]:
+        _, hf_weights_files, _ = self._prepare_weights(
+            component_model_path,
+            fall_back_to_pt=True,
+            allow_patterns_overrides=None,
+        )
+        return hf_weights_files
+
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):

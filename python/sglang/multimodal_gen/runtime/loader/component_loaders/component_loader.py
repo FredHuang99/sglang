@@ -29,6 +29,18 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _round_metric(value: float) -> float:
+    return round(float(value), 2)
+
+
+def _sum_file_sizes_gb(paths: list[str]) -> float:
+    total_bytes = 0
+    for path in paths:
+        if path and os.path.isfile(path):
+            total_bytes += os.path.getsize(path)
+    return total_bytes / (1024**3)
+
+
 class ComponentLoader(ABC):
     """Base class for loading a specific type of model component."""
 
@@ -67,13 +79,22 @@ class ComponentLoader(ABC):
         else:
             return get_local_torch_device()
 
+    def get_loaded_weight_paths(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        transformers_or_diffusers: str,
+    ) -> list[str]:
+        return []
+
     def load(
         self,
         component_model_path: str,
         server_args: ServerArgs,
         component_name: str,
         transformers_or_diffusers: str,
-    ) -> tuple[AutoModel, float]:
+    ) -> tuple[AutoModel, dict[str, Any]]:
         """
         Template method that standardizes logging around the core load implementation.
         The priority of loading method is:
@@ -83,6 +104,9 @@ class ComponentLoader(ABC):
 
         """
         gpu_mem_before_loading = current_platform.get_available_gpu_memory()
+        final_module_size_gb: float | None = None
+        loaded_weight_paths: list[str] = []
+        loaded_weight_file_size_gb: float | None = None
         logger.info(
             "Loading %s from %s. avail mem: %.2f GB",
             component_name,
@@ -125,17 +149,51 @@ class ComponentLoader(ABC):
             if isinstance(component, nn.Module):
                 component = component.eval()
             current_gpu_mem = current_platform.get_available_gpu_memory()
-            model_size = get_memory_usage_of_component(component) or "NA"
+            final_module_size_gb = get_memory_usage_of_component(component)
             consumed = gpu_mem_before_loading - current_gpu_mem
+            try:
+                loaded_weight_paths = self.get_loaded_weight_paths(
+                    component_model_path,
+                    server_args,
+                    component_name,
+                    transformers_or_diffusers,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to determine loaded weight paths for %s: %s",
+                    component_name,
+                    e,
+                )
+            loaded_weight_file_size_gb = (
+                _round_metric(_sum_file_sizes_gb(loaded_weight_paths))
+                if loaded_weight_paths
+                else None
+            )
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
+                "Loaded %s: %s (%s version). final module size: %s GB, loaded weight files: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
                 component_name,
                 component.__class__.__name__,
-                model_size,
+                source,
+                final_module_size_gb if final_module_size_gb is not None else "NA",
+                (
+                    loaded_weight_file_size_gb
+                    if loaded_weight_file_size_gb is not None
+                    else "NA"
+                ),
                 consumed,
                 current_gpu_mem,
             )
-        return component, consumed
+        return component, {
+            "gpu_load_consumed_gb": _round_metric(consumed),
+            "loaded_weight_file_size_gb": loaded_weight_file_size_gb,
+            "final_module_size_gb": (
+                _round_metric(final_module_size_gb)
+                if final_module_size_gb is not None
+                else None
+            ),
+            "source": source if component is not None else "unknown",
+            "loaded_weight_files": loaded_weight_paths if component is not None else [],
+        }
 
     def load_native(
         self,

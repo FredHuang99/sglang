@@ -57,6 +57,15 @@ class VAELoader(ComponentLoader):
     ):
         return server_args.vae_cpu_offload
 
+    def get_loaded_weight_paths(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        transformers_or_diffusers: str,
+    ) -> list[str]:
+        return _list_safetensors_files(component_model_path)
+
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):

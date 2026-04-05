@@ -201,11 +201,26 @@ class GPUWorker:
             for name, usage in getattr(self.pipeline, "memory_usages", {}).items()
         }
 
-    def _build_component_param_size_gb(self) -> dict[str, float | None]:
+    def _build_component_loaded_weight_file_size_gb(self) -> dict[str, float | None]:
+        metric_map = getattr(self.pipeline, "component_loaded_weight_file_sizes_gb", {})
+        if not isinstance(metric_map, dict):
+            return {}
+        return {
+            name: (self._round_metric(value) if value is not None else None)
+            for name, value in metric_map.items()
+        }
+
+    def _build_component_final_module_size_gb(self) -> dict[str, float | None]:
+        metric_map = getattr(self.pipeline, "component_final_module_sizes_gb", {})
+        if isinstance(metric_map, dict) and metric_map:
+            return {
+                name: (self._round_metric(value) if value is not None else None)
+                for name, value in metric_map.items()
+            }
+
         module_map = getattr(self.pipeline, "modules", {})
         if not isinstance(module_map, dict):
             return {}
-
         result: dict[str, float | None] = {}
         for name, component in module_map.items():
             usage = get_memory_usage_of_component(component)
@@ -315,7 +330,9 @@ class GPUWorker:
             "pipeline_memory_usages_gb": self._build_component_weight_profile_gb(),
             "component_gpu_load_consumed_gb": self._build_component_weight_profile_gb(),
             "component_weight_profile_gb": self._build_component_weight_profile_gb(),
-            "component_param_size_gb": self._build_component_param_size_gb(),
+            "component_loaded_weight_file_size_gb": self._build_component_loaded_weight_file_size_gb(),
+            "component_final_module_size_gb": self._build_component_final_module_size_gb(),
+            "component_param_size_gb": self._build_component_final_module_size_gb(),
             "stage_component_map": self._build_stage_component_map(),
             "before_build_pipeline": before_build,
             "after_build_pipeline": after_build,

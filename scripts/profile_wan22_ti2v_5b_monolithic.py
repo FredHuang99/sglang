@@ -615,6 +615,90 @@ def summarize_series(values: list[float]) -> dict[str, float]:
     }
 
 
+def describe_memory_snapshot_capture_points(
+    records: list[dict[str, Any]],
+) -> dict[str, str]:
+    snapshot_keys: set[str] = set()
+    for record in records:
+        snapshot_keys.update((record.get("memory_snapshots", {}) or {}).keys())
+
+    descriptions: dict[str, str] = {}
+    for key in sorted(snapshot_keys):
+        if key == "before_forward":
+            descriptions[key] = (
+                "Captured immediately before the request enters pipeline.forward(). "
+                "This is the pre-request baseline for the first profiled request."
+            )
+        elif key == "after_forward":
+            descriptions[key] = (
+                "Captured immediately after pipeline.forward() returns for the request."
+            )
+        elif key == "mem_analysis":
+            descriptions[key] = (
+                "Captured in GPUWorker.do_mem_analysis() after request execution has finished."
+            )
+        elif key.startswith("after_"):
+            stage_name = key[len("after_") :]
+            descriptions[key] = (
+                f"Captured immediately after {stage_name} finishes."
+            )
+        else:
+            descriptions[key] = "Captured at a runtime-defined profiling checkpoint."
+    return descriptions
+
+
+def aggregate_pre_forward_baseline(records: list[dict[str, Any]]) -> dict[str, Any]:
+    reserved_values: list[float] = []
+    allocated_values: list[float] = []
+    first_snapshot: dict[str, Any] | None = None
+
+    for record in records:
+        snapshot = (record.get("memory_snapshots", {}) or {}).get("before_forward")
+        if not snapshot:
+            continue
+        if first_snapshot is None:
+            first_snapshot = snapshot
+        reserved_values.append(float(snapshot.get("reserved_mb", 0.0)))
+        allocated_values.append(float(snapshot.get("allocated_mb", 0.0)))
+
+    reserved_summary = summarize_series(reserved_values)
+    allocated_summary = summarize_series(allocated_values)
+    first_reserved_mb = (
+        round_float(float(first_snapshot.get("reserved_mb", 0.0)))
+        if first_snapshot
+        else 0.0
+    )
+    first_allocated_mb = (
+        round_float(float(first_snapshot.get("allocated_mb", 0.0)))
+        if first_snapshot
+        else 0.0
+    )
+    return {
+        "request_baseline_reserved_mb_mean": reserved_summary["mean"],
+        "request_baseline_reserved_mb_median": reserved_summary["median"],
+        "request_baseline_reserved_mb_p99": reserved_summary["p99"],
+        "request_baseline_reserved_mb_max": reserved_summary["max"],
+        "request_baseline_reserved_gb_mean": mb_to_gb(reserved_summary["mean"]),
+        "request_baseline_reserved_gb_median": mb_to_gb(reserved_summary["median"]),
+        "request_baseline_reserved_gb_p99": mb_to_gb(reserved_summary["p99"]),
+        "request_baseline_reserved_gb_max": mb_to_gb(reserved_summary["max"]),
+        "request_baseline_allocated_mb_mean": allocated_summary["mean"],
+        "request_baseline_allocated_mb_median": allocated_summary["median"],
+        "request_baseline_allocated_mb_p99": allocated_summary["p99"],
+        "request_baseline_allocated_mb_max": allocated_summary["max"],
+        "request_baseline_allocated_gb_mean": mb_to_gb(allocated_summary["mean"]),
+        "request_baseline_allocated_gb_median": mb_to_gb(
+            allocated_summary["median"]
+        ),
+        "request_baseline_allocated_gb_p99": mb_to_gb(allocated_summary["p99"]),
+        "request_baseline_allocated_gb_max": mb_to_gb(allocated_summary["max"]),
+        "first_request_pre_forward_reserved_mb": first_reserved_mb,
+        "first_request_pre_forward_reserved_gb": mb_to_gb(first_reserved_mb),
+        "first_request_pre_forward_allocated_mb": first_allocated_mb,
+        "first_request_pre_forward_allocated_gb": mb_to_gb(first_allocated_mb),
+    }
+
+
 def aggregate_denoiser_step_memory(records: list[dict[str, Any]]) -> dict[str, Any]:
     per_request_peak_reserved: list[float] = []
     per_request_peak_allocated: list[float] = []
@@ -762,6 +846,9 @@ def aggregate_stage_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     return {
         "records_count": len(records),
+        "memory_snapshot_capture_points": describe_memory_snapshot_capture_points(
+            records
+        ),
         "stage_duration_ms_mean": stage_duration_ms_mean,
         "stage_duration_ms_median": stage_duration_ms_median,
         "stage_duration_ms_p99": stage_duration_ms_p99,
@@ -830,6 +917,7 @@ def aggregate_probe(
         "request_peak_memory_gb_mean": mb_to_gb(request_peak_summary["mean"]),
         "request_peak_memory_gb_median": mb_to_gb(request_peak_summary["median"]),
         "request_peak_memory_gb_max": mb_to_gb(request_peak_summary["max"]),
+        **aggregate_pre_forward_baseline(records),
         **aggregate_stage_metrics(records),
         **aggregate_denoiser_step_memory(records),
     }
@@ -875,6 +963,8 @@ def augment_init_profile_units(init_profile: dict[str, Any]) -> dict[str, Any]:
             init_profile[target_key] = mb_to_gb(float(init_profile[source_key]))
 
     for mapping_key in (
+        "component_loaded_weight_file_size_gb",
+        "component_final_module_size_gb",
         "component_param_size_gb",
         "component_gpu_load_consumed_gb",
         "component_weight_profile_gb",
@@ -891,21 +981,35 @@ def augment_init_profile_units(init_profile: dict[str, Any]) -> dict[str, Any]:
 
 def build_stage_component_size_maps(
     init_profile: dict[str, Any],
-) -> tuple[dict[str, float], dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
     stage_component_map = init_profile.get("stage_component_map", {}) or {}
-    component_param_size_gb = init_profile.get("component_param_size_gb", {}) or {}
+    component_loaded_weight_file_size_gb = (
+        init_profile.get("component_loaded_weight_file_size_gb", {}) or {}
+    )
+    component_final_module_size_gb = (
+        init_profile.get("component_final_module_size_gb", {})
+        or init_profile.get("component_param_size_gb", {})
+        or {}
+    )
     component_gpu_load_consumed_gb = (
         init_profile.get("component_gpu_load_consumed_gb", {}) or {}
     )
 
-    stage_param_size_gb: dict[str, float] = {}
+    stage_loaded_weight_file_size_gb: dict[str, float] = {}
+    stage_final_module_size_gb: dict[str, float] = {}
     stage_gpu_load_consumed_gb: dict[str, float] = {}
     for stage_name, components in stage_component_map.items():
         if not isinstance(components, list):
             continue
-        stage_param_size_gb[stage_name] = round_float(
+        stage_loaded_weight_file_size_gb[stage_name] = round_float(
             sum(
-                float(component_param_size_gb.get(component, 0.0) or 0.0)
+                float(component_loaded_weight_file_size_gb.get(component, 0.0) or 0.0)
+                for component in components
+            )
+        )
+        stage_final_module_size_gb[stage_name] = round_float(
+            sum(
+                float(component_final_module_size_gb.get(component, 0.0) or 0.0)
                 for component in components
             )
         )
@@ -915,7 +1019,11 @@ def build_stage_component_size_maps(
                 for component in components
             )
         )
-    return stage_param_size_gb, stage_gpu_load_consumed_gb
+    return (
+        stage_loaded_weight_file_size_gb,
+        stage_final_module_size_gb,
+        stage_gpu_load_consumed_gb,
+    )
 
 
 def attach_stage_runtime_heuristics(
@@ -928,17 +1036,26 @@ def attach_stage_runtime_heuristics(
     stage_peak_allocated_gb_max = phase_summary.get(
         "stage_peak_allocated_gb_max", {}
     ) or {}
-    stage_param_size_gb, stage_gpu_load_consumed_gb = build_stage_component_size_maps(
-        init_profile
-    )
+    (
+        stage_loaded_weight_file_size_gb,
+        stage_final_module_size_gb,
+        stage_gpu_load_consumed_gb,
+    ) = build_stage_component_size_maps(init_profile)
 
-    phase_summary["stage_component_param_size_gb"] = stage_param_size_gb
+    phase_summary["stage_component_loaded_weight_file_size_gb"] = (
+        stage_loaded_weight_file_size_gb
+    )
+    phase_summary["stage_component_final_module_size_gb"] = (
+        stage_final_module_size_gb
+    )
+    phase_summary["stage_component_param_size_gb"] = stage_final_module_size_gb
     phase_summary["stage_component_gpu_load_consumed_gb"] = stage_gpu_load_consumed_gb
 
     phase_summary["stage_rough_runtime_like_reserved_gb_max"] = {
         stage_name: round_float(
             max(
-                float(peak_gb) - float(stage_param_size_gb.get(stage_name, 0.0)),
+                float(peak_gb)
+                - float(stage_final_module_size_gb.get(stage_name, 0.0)),
                 0.0,
             )
         )
@@ -947,7 +1064,28 @@ def attach_stage_runtime_heuristics(
     phase_summary["stage_rough_runtime_like_allocated_gb_max"] = {
         stage_name: round_float(
             max(
-                float(peak_gb) - float(stage_param_size_gb.get(stage_name, 0.0)),
+                float(peak_gb)
+                - float(stage_final_module_size_gb.get(stage_name, 0.0)),
+                0.0,
+            )
+        )
+        for stage_name, peak_gb in stage_peak_allocated_gb_max.items()
+    }
+    phase_summary["stage_rough_runtime_like_reserved_gb_max_from_loaded_files"] = {
+        stage_name: round_float(
+            max(
+                float(peak_gb)
+                - float(stage_loaded_weight_file_size_gb.get(stage_name, 0.0)),
+                0.0,
+            )
+        )
+        for stage_name, peak_gb in stage_peak_reserved_gb_max.items()
+    }
+    phase_summary["stage_rough_runtime_like_allocated_gb_max_from_loaded_files"] = {
+        stage_name: round_float(
+            max(
+                float(peak_gb)
+                - float(stage_loaded_weight_file_size_gb.get(stage_name, 0.0)),
                 0.0,
             )
         )
@@ -1329,9 +1467,17 @@ def build_metric_definitions() -> dict[str, Any]:
             },
         },
         "init_profile": {
-            "component_param_size_gb": {
+            "component_loaded_weight_file_size_gb": {
+                "source": "Component-specific loader-resolved weight files summed by byte size during initialization.",
+                "meaning": "Byte size of the actual checkpoint files selected by the loader for each component.",
+            },
+            "component_final_module_size_gb": {
                 "source": "python/sglang/multimodal_gen/runtime/loader/utils.py::get_memory_usage_of_component(module)",
-                "meaning": "Component parameter+buffer footprint in GB. This is the accurate intrinsic component-size metric and is not affected by whether the component is CPU-offloaded or left resident on GPU during init.",
+                "meaning": "Size of the final in-memory module object (parameters + buffers) after loading completes.",
+            },
+            "component_param_size_gb": {
+                "source": "Alias of component_final_module_size_gb kept for backward compatibility.",
+                "meaning": "Final in-memory component footprint in GB.",
             },
             "component_gpu_load_consumed_gb": {
                 "source": "python/sglang/multimodal_gen/runtime/loader/component_loaders/component_loader.py::ComponentLoader.load()",
@@ -1346,8 +1492,12 @@ def build_metric_definitions() -> dict[str, Any]:
                 "meaning": "Per-stage component attribution map derived from the actual stage instances built by SGLang. Shared components can appear in multiple stages, so these stage mappings should not be summed directly.",
             },
             "stage_component_param_size_gb": {
-                "source": "Derived in scripts/profile_wan22_ti2v_5b_monolithic.py from stage_component_map + component_param_size_gb",
-                "meaning": "Heuristic per-stage component-weight sum in GB. Shared components can appear in multiple stages, so values across stages should not be summed.",
+                "source": "Derived in scripts/profile_wan22_ti2v_5b_monolithic.py from stage_component_map + component_final_module_size_gb",
+                "meaning": "Heuristic per-stage final-module footprint sum in GB. Shared components can appear in multiple stages, so values across stages should not be summed.",
+            },
+            "stage_component_loaded_weight_file_size_gb": {
+                "source": "Derived in scripts/profile_wan22_ti2v_5b_monolithic.py from stage_component_map + component_loaded_weight_file_size_gb",
+                "meaning": "Heuristic per-stage sum of actual loaded checkpoint-file sizes in GB. Shared components can appear in multiple stages, so values across stages should not be summed.",
             },
             "parameter_reserved_mb": {
                 "formula": "after_build_pipeline.reserved_mb - before_build_pipeline.reserved_mb",
@@ -1387,6 +1537,10 @@ def build_metric_definitions() -> dict[str, Any]:
                 "can_subtract_allocated_from_reserved": "No. reserved_mb - allocated_mb is allocator slack/cache at the sampling point, not a clean decomposition of runtime+others.",
                 "can_subtract_component_weight_from_stage_peak": "Only as a rough heuristic. Stage peak metrics already include request baseline plus cumulative runtime effects up to that stage, so subtraction does not isolate a pure runtime-only term.",
             },
+            "before_forward_*": {
+                "source": "performance.log -> memory_snapshots['before_forward']",
+                "meaning": "Per-request baseline captured immediately before pipeline.forward() starts. The first-request values show the reserved/allocated state before the first profiled request is served.",
+            },
             "stage_duration_ms_*": {
                 "source": "performance.log -> stages[].execution_time_ms",
                 "meaning": "High-level stage execution time in milliseconds, aggregated across requests.",
@@ -1401,8 +1555,13 @@ def build_metric_definitions() -> dict[str, Any]:
             },
             "stage_rough_runtime_like_*": {
                 "source": "Derived in scripts/profile_wan22_ti2v_5b_monolithic.py",
-                "formula": "stage_peak_*_gb_max - stage_component_param_size_gb, clamped at 0",
-                "meaning": "A heuristic runtime-like upper-bound indicator. This is not a strict runtime-only measurement because stage peaks are cumulative and include allocator effects.",
+                "formula": "stage_peak_*_gb_max - stage_component_final_module_size_gb, clamped at 0",
+                "meaning": "A heuristic runtime-like upper-bound indicator based on final in-memory module size. This is not a strict runtime-only measurement because stage peaks are cumulative and include allocator effects.",
+            },
+            "stage_rough_runtime_like_*_from_loaded_files": {
+                "source": "Derived in scripts/profile_wan22_ti2v_5b_monolithic.py",
+                "formula": "stage_peak_*_gb_max - stage_component_loaded_weight_file_size_gb, clamped at 0",
+                "meaning": "A heuristic runtime-like upper-bound indicator using actual loaded checkpoint-file size as the weight estimate.",
             },
         },
         "denoiser_step_level": {
@@ -1525,6 +1684,13 @@ def build_human_run_summary(run: dict[str, Any]) -> dict[str, Any]:
                 "runtime_transient_peak_allocated_gb"
             ),
         },
+        "component_loaded_weight_file_size_gb": init_profile.get(
+            "component_loaded_weight_file_size_gb", {}
+        ),
+        "component_final_module_size_gb": init_profile.get(
+            "component_final_module_size_gb",
+            init_profile.get("component_param_size_gb", {}),
+        ),
         "component_param_size_gb": init_profile.get("component_param_size_gb", {}),
         "component_gpu_load_consumed_gb": init_profile.get(
             "component_gpu_load_consumed_gb",
@@ -1540,6 +1706,12 @@ def build_human_run_summary(run: dict[str, Any]) -> dict[str, Any]:
                 "request_peak_memory_gb_median"
             ),
             "request_peak_memory_gb_max": probe.get("request_peak_memory_gb_max"),
+            "first_request_pre_forward_reserved_gb": probe.get(
+                "first_request_pre_forward_reserved_gb"
+            ),
+            "first_request_pre_forward_allocated_gb": probe.get(
+                "first_request_pre_forward_allocated_gb"
+            ),
             "denoiser_step_peak_reserved_gb_max": probe.get(
                 "denoiser_step_peak_reserved_gb_max"
             ),
@@ -1554,11 +1726,26 @@ def build_human_run_summary(run: dict[str, Any]) -> dict[str, Any]:
             "stage_component_param_size_gb": probe.get(
                 "stage_component_param_size_gb", {}
             ),
+            "stage_component_loaded_weight_file_size_gb": probe.get(
+                "stage_component_loaded_weight_file_size_gb", {}
+            ),
+            "stage_component_final_module_size_gb": probe.get(
+                "stage_component_final_module_size_gb", {}
+            ),
             "stage_rough_runtime_like_reserved_gb_max": probe.get(
                 "stage_rough_runtime_like_reserved_gb_max", {}
             ),
             "stage_rough_runtime_like_allocated_gb_max": probe.get(
                 "stage_rough_runtime_like_allocated_gb_max", {}
+            ),
+            "stage_rough_runtime_like_reserved_gb_max_from_loaded_files": probe.get(
+                "stage_rough_runtime_like_reserved_gb_max_from_loaded_files", {}
+            ),
+            "stage_rough_runtime_like_allocated_gb_max_from_loaded_files": probe.get(
+                "stage_rough_runtime_like_allocated_gb_max_from_loaded_files", {}
+            ),
+            "memory_snapshot_capture_points": probe.get(
+                "memory_snapshot_capture_points", {}
             ),
             "memory_snapshot_semantics": {
                 "sampling_point": "All stage memory snapshots are sampled immediately after the stage finishes.",
@@ -1711,6 +1898,14 @@ def run_single_config(
                 f"{run_config.name}:probe",
             )
             probe_summary = aggregate_probe(probe_records, probe_outputs)
+            logger.info(
+                "[%s] first-request pre-forward baseline: reserved=%.2f GB allocated=%.2f GB",
+                run_config.name,
+                float(probe_summary.get("first_request_pre_forward_reserved_gb", 0.0)),
+                float(
+                    probe_summary.get("first_request_pre_forward_allocated_gb", 0.0)
+                ),
+            )
             logger.info("[%s] probe phase finished successfully", run_config.name)
         except RunConfigError:
             raise

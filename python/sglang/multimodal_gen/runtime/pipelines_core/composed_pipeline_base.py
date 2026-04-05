@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -122,6 +123,9 @@ class ComposedPipelineBase(ABC):
 
         # [module_name, gpu memory usage]
         self.memory_usages: dict[str, float] = {}
+        self.component_loaded_weight_file_sizes_gb: dict[str, float | None] = {}
+        self.component_final_module_sizes_gb: dict[str, float | None] = {}
+        self.component_loaded_weight_files: dict[str, list[str]] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
@@ -435,10 +439,6 @@ class ComposedPipelineBase(ABC):
             if module_name not in required_modules:
                 logger.info("Skipping module %s", module_name)
                 continue
-            if loaded_modules is not None and module_name in loaded_modules:
-                logger.info("Using module %s already provided", module_name)
-                loaded_components[module_name] = loaded_modules[module_name]
-                continue
 
             # we load the module from the extra config module map if it exists
             if module_name in self._extra_config_module_map:
@@ -446,17 +446,39 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
+            if loaded_modules is not None and module_name in loaded_modules:
+                logger.info("Using module %s already provided", module_name)
+                loaded_components[module_name] = loaded_modules[module_name]
+                self.memory_usages[load_module_name] = 0.0
+                self.component_loaded_weight_file_sizes_gb[load_module_name] = None
+                self.component_final_module_sizes_gb[load_module_name] = (
+                    get_memory_usage_of_component(loaded_modules[module_name])
+                )
+                self.component_loaded_weight_files[load_module_name] = []
+                continue
+
             component_model_path = self._resolve_component_path(
                 server_args, module_name, load_module_name
             )
-            module, memory_usage = PipelineComponentLoader.load_component(
+            module, load_stats = PipelineComponentLoader.load_component(
                 component_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
 
-            self.memory_usages[load_module_name] = memory_usage
+            self.memory_usages[load_module_name] = float(
+                load_stats.get("gpu_load_consumed_gb", 0.0) or 0.0
+            )
+            self.component_loaded_weight_file_sizes_gb[load_module_name] = (
+                load_stats.get("loaded_weight_file_size_gb")
+            )
+            self.component_final_module_sizes_gb[load_module_name] = load_stats.get(
+                "final_module_size_gb"
+            )
+            self.component_loaded_weight_files[load_module_name] = list(
+                load_stats.get("loaded_weight_files") or []
+            )
 
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
