@@ -13,6 +13,7 @@ import torch
 from setproctitle import setproctitle
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_group,
     get_tp_rank,
@@ -200,28 +201,47 @@ class GPUWorker:
             for name, usage in getattr(self.pipeline, "memory_usages", {}).items()
         }
 
+    def _build_component_param_size_gb(self) -> dict[str, float | None]:
+        module_map = getattr(self.pipeline, "modules", {})
+        if not isinstance(module_map, dict):
+            return {}
+
+        result: dict[str, float | None] = {}
+        for name, component in module_map.items():
+            usage = get_memory_usage_of_component(component)
+            result[name] = self._round_metric(usage) if usage is not None else None
+        return result
+
     def _build_stage_component_map(self) -> dict[str, list[str]]:
         module_map = getattr(self.pipeline, "modules", {})
         if not isinstance(module_map, dict):
             return {}
 
-        def iter_referenced_objects(value):
+        module_ids_to_names = {
+            id(component_obj): component_name
+            for component_name, component_obj in module_map.items()
+        }
+
+        def iter_direct_component_refs(value):
             if value is None:
                 return
             if isinstance(value, weakref.ReferenceType):
                 deref = value()
-                if deref is not None:
+                if deref is not None and id(deref) in module_ids_to_names:
                     yield deref
                 return
             if isinstance(value, (list, tuple, set)):
                 for item in value:
-                    yield from iter_referenced_objects(item)
+                    if id(item) in module_ids_to_names:
+                        yield item
                 return
             if isinstance(value, dict):
                 for item in value.values():
-                    yield from iter_referenced_objects(item)
+                    if id(item) in module_ids_to_names:
+                        yield item
                 return
-            yield value
+            if id(value) in module_ids_to_names:
+                yield value
 
         result: dict[str, list[str]] = {}
         for stage in getattr(self.pipeline, "stages", []):
@@ -230,10 +250,10 @@ class GPUWorker:
             for attr_name, attr_value in getattr(stage, "__dict__", {}).items():
                 if attr_name.startswith("_"):
                     continue
-                for referenced in iter_referenced_objects(attr_value):
-                    for component_name, component_obj in module_map.items():
-                        if referenced is component_obj and component_name not in matched_components:
-                            matched_components.append(component_name)
+                for referenced in iter_direct_component_refs(attr_value):
+                    component_name = module_ids_to_names.get(id(referenced))
+                    if component_name and component_name not in matched_components:
+                        matched_components.append(component_name)
             result[stage_name] = matched_components
         return result
 
@@ -293,7 +313,9 @@ class GPUWorker:
             "warmup_steps": self.server_args.warmup_steps,
             "enable_torch_compile": self.server_args.enable_torch_compile,
             "pipeline_memory_usages_gb": self._build_component_weight_profile_gb(),
+            "component_gpu_load_consumed_gb": self._build_component_weight_profile_gb(),
             "component_weight_profile_gb": self._build_component_weight_profile_gb(),
+            "component_param_size_gb": self._build_component_param_size_gb(),
             "stage_component_map": self._build_stage_component_map(),
             "before_build_pipeline": before_build,
             "after_build_pipeline": after_build,

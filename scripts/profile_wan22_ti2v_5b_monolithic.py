@@ -873,6 +873,19 @@ def augment_init_profile_units(init_profile: dict[str, Any]) -> dict[str, Any]:
     ):
         if source_key in init_profile:
             init_profile[target_key] = mb_to_gb(float(init_profile[source_key]))
+
+    for mapping_key in (
+        "component_param_size_gb",
+        "component_gpu_load_consumed_gb",
+        "component_weight_profile_gb",
+        "pipeline_memory_usages_gb",
+    ):
+        mapping = init_profile.get(mapping_key)
+        if isinstance(mapping, dict):
+            init_profile[mapping_key] = {
+                name: (round_float(float(value)) if value is not None else None)
+                for name, value in mapping.items()
+            }
     return init_profile
 
 
@@ -1237,13 +1250,21 @@ def build_metric_definitions() -> dict[str, Any]:
             },
         },
         "init_profile": {
+            "component_param_size_gb": {
+                "source": "python/sglang/multimodal_gen/runtime/loader/utils.py::get_memory_usage_of_component(module)",
+                "meaning": "Component parameter+buffer footprint in GB. This is the accurate intrinsic component-size metric and is not affected by whether the component is CPU-offloaded or left resident on GPU during init.",
+            },
+            "component_gpu_load_consumed_gb": {
+                "source": "python/sglang/multimodal_gen/runtime/loader/component_loaders/component_loader.py::ComponentLoader.load()",
+                "meaning": "GPU memory consumed while loading each component during init. This reflects the current offload/load-residency behavior, not the intrinsic parameter size.",
+            },
             "component_weight_profile_gb": {
-                "source": "GPUWorker.finalize_init_profile_after_startup_warmup() -> pipeline.memory_usages",
-                "meaning": "Component-level GPU memory consumed while loading each pipeline component during init. This is the best existing init-time proxy for stage weights without adding invasive runtime instrumentation.",
+                "source": "Alias of component_gpu_load_consumed_gb kept for backward compatibility.",
+                "meaning": "Same value as component_gpu_load_consumed_gb. Prefer component_param_size_gb when you need the intrinsic component weight size.",
             },
             "stage_component_map": {
                 "source": "GPUWorker.finalize_init_profile_after_startup_warmup()",
-                "meaning": "Per-stage component attribution map. Shared components such as VAE can appear in multiple stages, so these stage mappings should not be summed directly.",
+                "meaning": "Per-stage component attribution map derived from the actual stage instances built by SGLang. Shared components can appear in multiple stages, so these stage mappings should not be summed directly.",
             },
             "parameter_reserved_mb": {
                 "formula": "after_build_pipeline.reserved_mb - before_build_pipeline.reserved_mb",
@@ -1275,6 +1296,14 @@ def build_metric_definitions() -> dict[str, Any]:
             },
         },
         "stage_level": {
+            "memory_snapshot_semantics": {
+                "allocated_mb": "Sampled immediately after a stage finishes. This is current live tensor memory after the stage, not before the stage starts.",
+                "reserved_mb": "Sampled immediately after a stage finishes. This is current allocator-reserved VRAM after the stage, not before the stage starts.",
+                "peak_allocated_mb": "Peak allocated memory since the request began (after the request-level reset_peak_memory_stats()), sampled after the stage finishes. It is cumulative up to and including that stage.",
+                "peak_reserved_mb": "Peak reserved memory since the request began (after the request-level reset_peak_memory_stats()), sampled after the stage finishes. It is cumulative up to and including that stage.",
+                "can_subtract_allocated_from_reserved": "No. reserved_mb - allocated_mb is allocator slack/cache at the sampling point, not a clean decomposition of runtime+others.",
+                "can_subtract_component_weight_from_stage_peak": "Only as a rough heuristic. Stage peak metrics already include request baseline plus cumulative runtime effects up to that stage, so subtraction does not isolate a pure runtime-only term.",
+            },
             "stage_duration_ms_*": {
                 "source": "performance.log -> stages[].execution_time_ms",
                 "meaning": "High-level stage execution time in milliseconds, aggregated across requests.",
@@ -1407,6 +1436,11 @@ def build_human_run_summary(run: dict[str, Any]) -> dict[str, Any]:
                 "runtime_transient_peak_allocated_gb"
             ),
         },
+        "component_param_size_gb": init_profile.get("component_param_size_gb", {}),
+        "component_gpu_load_consumed_gb": init_profile.get(
+            "component_gpu_load_consumed_gb",
+            init_profile.get("component_weight_profile_gb", {}),
+        ),
         "component_weight_profile_gb": init_profile.get("component_weight_profile_gb", {}),
         "stage_component_map": init_profile.get("stage_component_map", {}),
         "probe": {
@@ -1428,6 +1462,11 @@ def build_human_run_summary(run: dict[str, Any]) -> dict[str, Any]:
             "stage_peak_allocated_gb_max": probe.get(
                 "stage_peak_allocated_gb_max", {}
             ),
+            "memory_snapshot_semantics": {
+                "sampling_point": "All stage memory snapshots are sampled immediately after the stage finishes.",
+                "peak_scope": "peak_* values are cumulative from request start to the end of that stage.",
+                "note": "reserved-allocated is allocator slack/cache, not a pure runtime+others term.",
+            },
         },
     }
 
