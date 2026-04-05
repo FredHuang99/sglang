@@ -46,10 +46,10 @@ class RunConfig:
     name: str
     mode: str
     num_gpus: int
-    tp_size: int
-    sp_degree: int
-    ulysses_degree: int
-    ring_degree: int
+    tp_size: int | None
+    sp_degree: int | None
+    ulysses_degree: int | None
+    ring_degree: int | None
 
 
 class RunConfigError(RuntimeError):
@@ -85,18 +85,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="1", #"1,2,4,8",
         help="Comma/space separated total GPU counts, e.g. '1,2,4,8'.",
-    )
-    parser.add_argument(
-        "--parallel-degree",
-        type=int,
-        default=None,
-        help="Deprecated single-value override for --parallel-degrees.",
-    )
-    parser.add_argument(
-        "--include-hybrid-tp-sp",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Also try mixed configs where tp=P and sp=P; failures are skipped.",
     )
     parser.add_argument(
         "--num-requests",
@@ -149,9 +137,6 @@ def parse_args() -> argparse.Namespace:
 
 
 def parse_parallel_degrees(args: argparse.Namespace) -> list[int]:
-    if args.parallel_degree is not None:
-        return [args.parallel_degree]
-
     cleaned = (
         args.parallel_degrees.replace("{", "")
         .replace("}", "")
@@ -246,14 +231,13 @@ def factor_pairs(n: int) -> list[tuple[int, int]]:
     return pairs
 
 
-def build_run_configs(
-    parallel_degree: int, include_hybrid_tp_sp: bool
-) -> list[RunConfig]:
+def build_run_configs(parallel_degree: int) -> list[RunConfig]:
     runs: list[RunConfig] = []
-    seen: set[tuple[int, int, int, int]] = set()
+    seen: set[tuple[Any, ...]] = set()
 
     def add_run(run: RunConfig) -> None:
         key = (
+            run.mode,
             run.tp_size,
             run.sp_degree,
             run.ulysses_degree,
@@ -264,47 +248,74 @@ def build_run_configs(
         seen.add(key)
         runs.append(run)
 
-    add_run(
-        RunConfig(
-            name=f"tp{parallel_degree}_sp1_u1_r1",
-            mode="tp",
-            num_gpus=parallel_degree,
-            tp_size=parallel_degree,
-            sp_degree=1,
-            ulysses_degree=1,
-            ring_degree=1,
-        )
-    )
     for ulysses_degree, ring_degree in factor_pairs(parallel_degree):
         add_run(
             RunConfig(
-                name=(
-                    f"tp1_sp{parallel_degree}_u{ulysses_degree}_r{ring_degree}"
-                ),
-                mode="sp",
+                name=f"h_tp{parallel_degree}_sp{parallel_degree}_u{ulysses_degree}_r{ring_degree}",
+                mode="hybrid",
                 num_gpus=parallel_degree,
-                tp_size=1,
+                tp_size=parallel_degree,
                 sp_degree=parallel_degree,
                 ulysses_degree=ulysses_degree,
                 ring_degree=ring_degree,
             )
         )
-    if include_hybrid_tp_sp:
-        for ulysses_degree, ring_degree in factor_pairs(parallel_degree):
+
+    divisors_desc = sorted(
+        [d for d in range(1, parallel_degree + 1) if parallel_degree % d == 0],
+        reverse=True,
+    )
+    for tp_size in divisors_desc:
+        sp_degree = parallel_degree // tp_size
+        if sp_degree == 1:
             add_run(
                 RunConfig(
-                    name=(
-                        f"tp{parallel_degree}_sp{parallel_degree}_u"
-                        f"{ulysses_degree}_r{ring_degree}"
-                    ),
-                    mode="hybrid",
+                    name=f"e_tp{tp_size}_sp{sp_degree}",
+                    mode="explicit",
                     num_gpus=parallel_degree,
-                    tp_size=parallel_degree,
-                    sp_degree=parallel_degree,
+                    tp_size=tp_size,
+                    sp_degree=sp_degree,
+                    ulysses_degree=None,
+                    ring_degree=None,
+                )
+            )
+            continue
+        for ulysses_degree, ring_degree in factor_pairs(sp_degree):
+            add_run(
+                RunConfig(
+                    name=f"e_tp{tp_size}_sp{sp_degree}_u{ulysses_degree}_r{ring_degree}",
+                    mode="explicit",
+                    num_gpus=parallel_degree,
+                    tp_size=tp_size,
+                    sp_degree=sp_degree,
                     ulysses_degree=ulysses_degree,
                     ring_degree=ring_degree,
                 )
             )
+
+    add_run(
+        RunConfig(
+            name=f"a_tp{parallel_degree}",
+            mode="auto_tp",
+            num_gpus=parallel_degree,
+            tp_size=parallel_degree,
+            sp_degree=None,
+            ulysses_degree=None,
+            ring_degree=None,
+        )
+    )
+    for ulysses_degree, ring_degree in factor_pairs(parallel_degree):
+        add_run(
+            RunConfig(
+                name=f"a_sp{parallel_degree}_u{ulysses_degree}_r{ring_degree}",
+                mode="auto_sp",
+                num_gpus=parallel_degree,
+                tp_size=None,
+                sp_degree=parallel_degree,
+                ulysses_degree=ulysses_degree,
+                ring_degree=ring_degree,
+            )
+        )
     return runs
 
 
@@ -670,6 +681,17 @@ def benchmark_outputs_to_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def build_resolved_parallelism(init_profile: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "num_gpus": init_profile.get("num_gpus"),
+        "tp_size": init_profile.get("tp_size"),
+        "sp_degree": init_profile.get("sp_degree"),
+        "ulysses_degree": init_profile.get("ulysses_degree"),
+        "ring_degree": init_profile.get("ring_degree"),
+        "dp_size": init_profile.get("dp_size"),
+    }
+
+
 def build_server_command(
     *,
     model_path: str,
@@ -699,14 +721,6 @@ def build_server_command(
         str(master_port),
         "--num-gpus",
         str(run_config.num_gpus),
-        "--tp-size",
-        str(run_config.tp_size),
-        "--sp-degree",
-        str(run_config.sp_degree),
-        "--ulysses-degree",
-        str(run_config.ulysses_degree),
-        "--ring-degree",
-        str(run_config.ring_degree),
         "--warmup",
         "--warmup-resolutions",
         f"{sampling.width}x{sampling.height}",
@@ -719,6 +733,14 @@ def build_server_command(
         "--log-level",
         "info",
     ]
+    if run_config.tp_size is not None:
+        command.extend(["--tp-size", str(run_config.tp_size)])
+    if run_config.sp_degree is not None:
+        command.extend(["--sp-degree", str(run_config.sp_degree)])
+    if run_config.ulysses_degree is not None:
+        command.extend(["--ulysses-degree", str(run_config.ulysses_degree)])
+    if run_config.ring_degree is not None:
+        command.extend(["--ring-degree", str(run_config.ring_degree)])
     if trust_remote_code:
         command.append("--trust-remote-code")
     return command
@@ -984,7 +1006,12 @@ def build_base_summary(
         "parallel_degree": parallel_degree,
         "graph_mode": "regular",
         "visible_gpu_count": visible_gpu_count,
-        "include_hybrid_tp_sp": args.include_hybrid_tp_sp,
+        "parallel_sweep_policy": {
+            "hybrid": "h_* runs: try tp=P, sp=P first, enumerating all ulysses*ring=P pairs.",
+            "explicit": "e_* runs: try all explicit tp*sp=P combinations; when sp>1, enumerate all ulysses*ring=sp pairs.",
+            "auto_tp": "a_tp* runs: try tp=P with sp omitted so runtime auto-derives sp.",
+            "auto_sp": "a_sp* runs: try sp=P with tp omitted; enumerate all ulysses*ring=P pairs.",
+        },
         "keep_artifacts": args.keep_artifacts,
         "metric_definitions": build_metric_definitions(),
         "runs": [],
@@ -1103,7 +1130,8 @@ def run_single_config(
             raise RunConfigError("init_profile", str(exc)) from exc
 
         return {
-            "parallelism": asdict(run_config),
+            "requested_parallelism": asdict(run_config),
+            "resolved_parallelism": build_resolved_parallelism(init_profile),
             "init_profile": init_profile,
             "probe": probe_summary,
             "offline_burst": {
@@ -1148,7 +1176,7 @@ def main() -> None:
             summary["skipped_configs"].append(
                 {
                     "phase": "precheck",
-                    "parallelism": {"num_gpus": parallel_degree},
+                    "requested_parallelism": {"num_gpus": parallel_degree},
                     "reason": (
                         f"parallel_degree={parallel_degree} requires at least "
                         f"{parallel_degree} visible GPUs, but only "
@@ -1161,7 +1189,7 @@ def main() -> None:
                 safe_rmtree(degree_tmp_root)
             continue
 
-        run_configs = build_run_configs(parallel_degree, args.include_hybrid_tp_sp)
+        run_configs = build_run_configs(parallel_degree)
         for run_config in run_configs:
             logger.info("Profiling gpu=%s config=%s", parallel_degree, run_config.name)
             run_dir = degree_tmp_root / run_config.name
@@ -1181,7 +1209,7 @@ def main() -> None:
                 summary["skipped_configs"].append(
                     {
                         "phase": exc.phase,
-                        "parallelism": asdict(run_config),
+                        "requested_parallelism": asdict(run_config),
                         "reason": str(exc),
                     }
                 )
@@ -1189,7 +1217,7 @@ def main() -> None:
                 summary["skipped_configs"].append(
                     {
                         "phase": "unknown",
-                        "parallelism": asdict(run_config),
+                        "requested_parallelism": asdict(run_config),
                         "reason": str(exc),
                     }
                 )
