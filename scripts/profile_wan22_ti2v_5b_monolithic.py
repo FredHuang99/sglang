@@ -42,6 +42,7 @@ EXPECTED_TASK_TYPE = "TI2V"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXAMPLE_IMAGE = REPO_ROOT / "examples" / "assets" / "example_image.png"
 DEFAULT_TI2V_PROMPT = "The girl turn the body and spin around in place."
+DEFAULT_RUNTIME_BACKEND = "native-fallback"
 
 
 @dataclass(frozen=True)
@@ -864,7 +865,11 @@ def launch_server(
         output_dir=run_dir,
         trust_remote_code=trust_remote_code,
     )
-    logger.info("Launching %s", " ".join(command))
+    logger.info(
+        "Launching %s [runtime_backend=%s]",
+        " ".join(command),
+        DEFAULT_RUNTIME_BACKEND,
+    )
     log_fh = server_log_path.open("w", encoding="utf-8")
     process = subprocess.Popen(
         command,
@@ -965,6 +970,36 @@ def ensure_probe_successful(probe_outputs: list[Any], expected_count: int) -> No
 
 def build_metric_definitions() -> dict[str, Any]:
     return {
+        "runtime_backend": {
+            "selected_backend": DEFAULT_RUNTIME_BACKEND,
+            "meaning": (
+                "Current profiling results should be interpreted under the "
+                "native-fallback backend instead of the CuTeDSL/CUTLASS fused "
+                "norm backend."
+            ),
+            "native_fallback_impl": {
+                "fused_scale_residual_norm_scale_shift": (
+                    "python/sglang/multimodal_gen/runtime/layers/layernorm.py::"
+                    "_ScaleResidualNormScaleShift.forward_native"
+                ),
+                "fused_norm_scale_shift": (
+                    "python/sglang/multimodal_gen/runtime/layers/layernorm.py::"
+                    "_NormScaleShift.forward_native"
+                ),
+            },
+            "composition": [
+                "Residual/gate accumulation uses regular torch tensor ops on CUDA.",
+                "Normalization falls back to existing non-CUTLASS implementations "
+                "(sgl-kernel RMSNorm, Triton one-pass RMSNorm, or torch layer_norm "
+                "depending on norm type and shape).",
+                "Scale/shift modulation still uses the Triton fuse_scale_shift_kernel.",
+            ],
+            "difference_vs_cutedsl": [
+                "More kernel launches instead of one fused CUTLASS kernel.",
+                "More intermediate tensors and usually higher transient memory.",
+                "Lower throughput and typically higher latency.",
+            ],
+        },
         "request_level": {
             "throughput_qps": {
                 "source": "python/sglang/multimodal_gen/benchmarks/bench_serving.py::calculate_metrics()['throughput_qps']",
@@ -1084,12 +1119,14 @@ def build_base_summary(
             "num_requests": args.num_requests,
             "probe_runs": args.probe_runs,
             "online_rps": args.online_rps,
+            "runtime_backend": DEFAULT_RUNTIME_BACKEND,
             "warmup_enabled": True,
             "warmup_resolutions": [f"{sampling.width}x{sampling.height}"],
             "warmup_steps": 1,
         },
         "parallel_degree": parallel_degree,
         "graph_mode": "regular",
+        "runtime_backend": DEFAULT_RUNTIME_BACKEND,
         "visible_gpu_count": visible_gpu_count,
         "parallel_sweep_policy": {
             "hybrid": "h_* runs: try tp=P, sp=P first, enumerating all ulysses*ring=P pairs.",
@@ -1216,6 +1253,7 @@ def run_single_config(
             raise RunConfigError("init_profile", str(exc)) from exc
 
         return {
+            "runtime_backend": DEFAULT_RUNTIME_BACKEND,
             "requested_parallelism": asdict(run_config),
             "resolved_parallelism": build_resolved_parallelism(init_profile),
             "served_model_card": served_model_card,
