@@ -596,6 +596,14 @@ def round_float(value: float) -> float:
     return round(float(value), 4)
 
 
+def mb_to_gb(value: float) -> float:
+    return round_float(float(value) / 1024.0)
+
+
+def ms_to_s(value: float) -> float:
+    return round_float(float(value) / 1000.0)
+
+
 def summarize_series(values: list[float]) -> dict[str, float]:
     if not values:
         return {"mean": 0.0, "median": 0.0, "p99": 0.0, "max": 0.0}
@@ -640,10 +648,26 @@ def aggregate_denoiser_step_memory(records: list[dict[str, Any]]) -> dict[str, A
         "denoiser_step_peak_reserved_mb_median": reserved_summary["median"],
         "denoiser_step_peak_reserved_mb_p99": reserved_summary["p99"],
         "denoiser_step_peak_reserved_mb_max": reserved_summary["max"],
+        "denoiser_step_peak_reserved_gb_mean": mb_to_gb(reserved_summary["mean"]),
+        "denoiser_step_peak_reserved_gb_median": mb_to_gb(
+            reserved_summary["median"]
+        ),
+        "denoiser_step_peak_reserved_gb_p99": mb_to_gb(reserved_summary["p99"]),
+        "denoiser_step_peak_reserved_gb_max": mb_to_gb(reserved_summary["max"]),
         "denoiser_step_peak_allocated_mb_mean": allocated_summary["mean"],
         "denoiser_step_peak_allocated_mb_median": allocated_summary["median"],
         "denoiser_step_peak_allocated_mb_p99": allocated_summary["p99"],
         "denoiser_step_peak_allocated_mb_max": allocated_summary["max"],
+        "denoiser_step_peak_allocated_gb_mean": mb_to_gb(
+            allocated_summary["mean"]
+        ),
+        "denoiser_step_peak_allocated_gb_median": mb_to_gb(
+            allocated_summary["median"]
+        ),
+        "denoiser_step_peak_allocated_gb_p99": mb_to_gb(
+            allocated_summary["p99"]
+        ),
+        "denoiser_step_peak_allocated_gb_max": mb_to_gb(allocated_summary["max"]),
     }
 
 
@@ -674,25 +698,50 @@ def aggregate_stage_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
     stage_duration_ms_median: dict[str, float] = {}
     stage_duration_ms_p99: dict[str, float] = {}
     stage_duration_ms_max: dict[str, float] = {}
+    stage_duration_s_mean: dict[str, float] = {}
+    stage_duration_s_median: dict[str, float] = {}
+    stage_duration_s_p99: dict[str, float] = {}
+    stage_duration_s_max: dict[str, float] = {}
     for stage_name, values in sorted(durations.items()):
         stage_duration_ms_mean[stage_name] = round_float(float(np.mean(values)))
         stage_duration_ms_median[stage_name] = round_float(float(np.median(values)))
         stage_duration_ms_p99[stage_name] = round_float(percentile(values, 99))
         stage_duration_ms_max[stage_name] = round_float(max(values))
+        stage_duration_s_mean[stage_name] = ms_to_s(stage_duration_ms_mean[stage_name])
+        stage_duration_s_median[stage_name] = ms_to_s(
+            stage_duration_ms_median[stage_name]
+        )
+        stage_duration_s_p99[stage_name] = ms_to_s(stage_duration_ms_p99[stage_name])
+        stage_duration_s_max[stage_name] = ms_to_s(stage_duration_ms_max[stage_name])
 
     stage_peak_reserved_mb_mean: dict[str, float] = {}
     stage_peak_reserved_mb_median: dict[str, float] = {}
     stage_peak_reserved_mb_max: dict[str, float] = {}
+    stage_peak_reserved_gb_mean: dict[str, float] = {}
+    stage_peak_reserved_gb_median: dict[str, float] = {}
+    stage_peak_reserved_gb_max: dict[str, float] = {}
     for stage_name, values in sorted(peak_reserved.items()):
         stage_peak_reserved_mb_mean[stage_name] = round_float(float(np.mean(values)))
         stage_peak_reserved_mb_median[stage_name] = round_float(
             float(np.median(values))
         )
         stage_peak_reserved_mb_max[stage_name] = round_float(max(values))
+        stage_peak_reserved_gb_mean[stage_name] = mb_to_gb(
+            stage_peak_reserved_mb_mean[stage_name]
+        )
+        stage_peak_reserved_gb_median[stage_name] = mb_to_gb(
+            stage_peak_reserved_mb_median[stage_name]
+        )
+        stage_peak_reserved_gb_max[stage_name] = mb_to_gb(
+            stage_peak_reserved_mb_max[stage_name]
+        )
 
     stage_peak_allocated_mb_mean: dict[str, float] = {}
     stage_peak_allocated_mb_median: dict[str, float] = {}
     stage_peak_allocated_mb_max: dict[str, float] = {}
+    stage_peak_allocated_gb_mean: dict[str, float] = {}
+    stage_peak_allocated_gb_median: dict[str, float] = {}
+    stage_peak_allocated_gb_max: dict[str, float] = {}
     for stage_name, values in sorted(peak_allocated.items()):
         stage_peak_allocated_mb_mean[stage_name] = round_float(
             float(np.mean(values))
@@ -701,6 +750,15 @@ def aggregate_stage_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
             float(np.median(values))
         )
         stage_peak_allocated_mb_max[stage_name] = round_float(max(values))
+        stage_peak_allocated_gb_mean[stage_name] = mb_to_gb(
+            stage_peak_allocated_mb_mean[stage_name]
+        )
+        stage_peak_allocated_gb_median[stage_name] = mb_to_gb(
+            stage_peak_allocated_mb_median[stage_name]
+        )
+        stage_peak_allocated_gb_max[stage_name] = mb_to_gb(
+            stage_peak_allocated_mb_max[stage_name]
+        )
 
     return {
         "records_count": len(records),
@@ -708,12 +766,22 @@ def aggregate_stage_metrics(records: list[dict[str, Any]]) -> dict[str, Any]:
         "stage_duration_ms_median": stage_duration_ms_median,
         "stage_duration_ms_p99": stage_duration_ms_p99,
         "stage_duration_ms_max": stage_duration_ms_max,
+        "stage_duration_s_mean": stage_duration_s_mean,
+        "stage_duration_s_median": stage_duration_s_median,
+        "stage_duration_s_p99": stage_duration_s_p99,
+        "stage_duration_s_max": stage_duration_s_max,
         "stage_peak_reserved_mb_mean": stage_peak_reserved_mb_mean,
         "stage_peak_reserved_mb_median": stage_peak_reserved_mb_median,
         "stage_peak_reserved_mb_max": stage_peak_reserved_mb_max,
+        "stage_peak_reserved_gb_mean": stage_peak_reserved_gb_mean,
+        "stage_peak_reserved_gb_median": stage_peak_reserved_gb_median,
+        "stage_peak_reserved_gb_max": stage_peak_reserved_gb_max,
         "stage_peak_allocated_mb_mean": stage_peak_allocated_mb_mean,
         "stage_peak_allocated_mb_median": stage_peak_allocated_mb_median,
         "stage_peak_allocated_mb_max": stage_peak_allocated_mb_max,
+        "stage_peak_allocated_gb_mean": stage_peak_allocated_gb_mean,
+        "stage_peak_allocated_gb_median": stage_peak_allocated_gb_median,
+        "stage_peak_allocated_gb_max": stage_peak_allocated_gb_max,
         **aggregate_denoiser_step_memory(records),
     }
 
@@ -740,18 +808,29 @@ def aggregate_probe(
             )
 
     request_peak_summary = summarize_series(request_peak_memory_values)
+    stage_time_mean_ms = {
+        stage_name: round_float(float(np.mean(values)))
+        for stage_name, values in sorted(stage_values.items())
+    }
     return {
         "num_runs": len(records),
-        "stage_time_mean_ms": {
-            stage_name: round_float(float(np.mean(values)))
-            for stage_name, values in sorted(stage_values.items())
+        "stage_time_mean_ms": stage_time_mean_ms,
+        "stage_time_mean_s": {
+            stage_name: ms_to_s(value) for stage_name, value in stage_time_mean_ms.items()
         },
         "total_duration_mean_ms": round_float(float(np.mean(total_durations)))
+        if total_durations
+        else 0.0,
+        "total_duration_mean_s": ms_to_s(float(np.mean(total_durations)))
         if total_durations
         else 0.0,
         "request_peak_memory_mb_mean": request_peak_summary["mean"],
         "request_peak_memory_mb_median": request_peak_summary["median"],
         "request_peak_memory_mb_max": request_peak_summary["max"],
+        "request_peak_memory_gb_mean": mb_to_gb(request_peak_summary["mean"]),
+        "request_peak_memory_gb_median": mb_to_gb(request_peak_summary["median"]),
+        "request_peak_memory_gb_max": mb_to_gb(request_peak_summary["max"]),
+        **aggregate_stage_metrics(records),
         **aggregate_denoiser_step_memory(records),
     }
 
@@ -759,6 +838,42 @@ def aggregate_probe(
 def load_json(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def augment_init_profile_units(init_profile: dict[str, Any]) -> dict[str, Any]:
+    snapshot_keys = [
+        "before_build_pipeline",
+        "after_build_pipeline",
+        "after_startup_warmup",
+    ]
+    for snapshot_key in snapshot_keys:
+        snapshot = init_profile.get(snapshot_key)
+        if not isinstance(snapshot, dict):
+            continue
+        for source_key, target_key in (
+            ("allocated_mb", "allocated_gb"),
+            ("reserved_mb", "reserved_gb"),
+            ("peak_allocated_mb", "peak_allocated_gb"),
+            ("peak_reserved_mb", "peak_reserved_gb"),
+        ):
+            if source_key in snapshot:
+                snapshot[target_key] = mb_to_gb(float(snapshot[source_key]))
+
+    for source_key, target_key in (
+        ("parameter_reserved_mb", "parameter_reserved_gb"),
+        ("parameter_allocated_mb", "parameter_allocated_gb"),
+        ("warmup_persistent_reserved_mb", "warmup_persistent_reserved_gb"),
+        ("warmup_peak_reserved_mb", "warmup_peak_reserved_gb"),
+        ("warmup_peak_allocated_mb", "warmup_peak_allocated_gb"),
+        ("runtime_transient_peak_reserved_mb", "runtime_transient_peak_reserved_gb"),
+        (
+            "runtime_transient_peak_allocated_mb",
+            "runtime_transient_peak_allocated_gb",
+        ),
+    ):
+        if source_key in init_profile:
+            init_profile[target_key] = mb_to_gb(float(init_profile[source_key]))
+    return init_profile
 
 
 def to_builtin(value: Any) -> Any:
@@ -785,12 +900,21 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
 def benchmark_outputs_to_summary(metrics: dict[str, Any]) -> dict[str, Any]:
     return {
         "duration_s": round_float(metrics.get("duration", 0.0)),
+        "duration_ms": round_float(metrics.get("duration", 0.0) * 1000.0),
         "completed_requests": int(metrics.get("completed_requests", 0)),
         "failed_requests": int(metrics.get("failed_requests", 0)),
         "throughput_qps": round_float(metrics.get("throughput_qps", 0.0)),
         "latency_mean": round_float(metrics.get("latency_mean", 0.0)),
         "latency_median": round_float(metrics.get("latency_median", 0.0)),
         "latency_p99": round_float(metrics.get("latency_p99", 0.0)),
+        "latency_mean_ms": round_float(metrics.get("latency_mean", 0.0) * 1000.0),
+        "latency_median_ms": round_float(
+            metrics.get("latency_median", 0.0) * 1000.0
+        ),
+        "latency_p99_ms": round_float(metrics.get("latency_p99", 0.0) * 1000.0),
+        "latency_mean_s": round_float(metrics.get("latency_mean", 0.0)),
+        "latency_median_s": round_float(metrics.get("latency_median", 0.0)),
+        "latency_p99_s": round_float(metrics.get("latency_p99", 0.0)),
         "request_peak_memory_mb_max": round_float(
             metrics.get("peak_memory_mb_max", 0.0)
         ),
@@ -798,6 +922,15 @@ def benchmark_outputs_to_summary(metrics: dict[str, Any]) -> dict[str, Any]:
             metrics.get("peak_memory_mb_mean", 0.0)
         ),
         "request_peak_memory_mb_median": round_float(
+            metrics.get("peak_memory_mb_median", 0.0)
+        ),
+        "request_peak_memory_gb_max": mb_to_gb(
+            metrics.get("peak_memory_mb_max", 0.0)
+        ),
+        "request_peak_memory_gb_mean": mb_to_gb(
+            metrics.get("peak_memory_mb_mean", 0.0)
+        ),
+        "request_peak_memory_gb_median": mb_to_gb(
             metrics.get("peak_memory_mb_median", 0.0)
         ),
     }
@@ -973,13 +1106,28 @@ async def run_probe_phase(
     probe_runs: int,
     phase_name: str,
 ) -> tuple[list[Any], float]:
-    probe_requests = [replace(requests_list[0]) for _ in range(probe_runs)]
-    return await execute_requests(
-        probe_requests,
-        request_rate=float("inf"),
-        max_concurrency=1,
-        phase_name=phase_name,
-    )
+    probe_request = replace(requests_list[0])
+    outputs: list[Any] = []
+    total_duration = 0.0
+    logger.info("[%s] probe requests will run strictly one-by-one", phase_name)
+    for probe_index in range(1, probe_runs + 1):
+        logger.info("[%s] starting probe request %s/%s", phase_name, probe_index, probe_runs)
+        probe_outputs, probe_duration = await execute_requests(
+            [replace(probe_request)],
+            request_rate=float("inf"),
+            max_concurrency=1,
+            phase_name=f"{phase_name}:run{probe_index}",
+        )
+        outputs.extend(probe_outputs)
+        total_duration += probe_duration
+        logger.info(
+            "[%s] finished probe request %s/%s in %.2fs",
+            phase_name,
+            probe_index,
+            probe_runs,
+            probe_duration,
+        )
+    return outputs, total_duration
 
 
 async def run_serving_phase(
@@ -1063,8 +1211,8 @@ def build_metric_definitions() -> dict[str, Any]:
         },
         "request_level": {
             "probe_execution_mode": {
-                "source": "scripts/profile_wan22_ti2v_5b_monolithic.py::execute_requests(max_concurrency=1)",
-                "meaning": "Probe requests are serialized one-by-one because the per-phase asyncio.Semaphore is set to 1. Even though tasks are created eagerly, only one request can enter the actual async HTTP/video generation call at a time.",
+                "source": "scripts/profile_wan22_ti2v_5b_monolithic.py::run_probe_phase()",
+                "meaning": "Probe requests are executed strictly one-by-one. The script launches one probe request, waits for it to finish, and only then starts the next probe run.",
             },
             "throughput_qps": {
                 "source": "python/sglang/multimodal_gen/benchmarks/bench_serving.py::calculate_metrics()['throughput_qps']",
@@ -1089,6 +1237,14 @@ def build_metric_definitions() -> dict[str, Any]:
             },
         },
         "init_profile": {
+            "component_weight_profile_gb": {
+                "source": "GPUWorker.finalize_init_profile_after_startup_warmup() -> pipeline.memory_usages",
+                "meaning": "Component-level GPU memory consumed while loading each pipeline component during init. This is the best existing init-time proxy for stage weights without adding invasive runtime instrumentation.",
+            },
+            "stage_component_map": {
+                "source": "GPUWorker.finalize_init_profile_after_startup_warmup()",
+                "meaning": "Per-stage component attribution map. Shared components such as VAE can appear in multiple stages, so these stage mappings should not be summed directly.",
+            },
             "parameter_reserved_mb": {
                 "formula": "after_build_pipeline.reserved_mb - before_build_pipeline.reserved_mb",
                 "meaning": "Reserved memory attributed to model/pipeline construction.",
@@ -1193,11 +1349,8 @@ def build_base_summary(
             "warmup_resolutions": [f"{sampling.width}x{sampling.height}"],
             "warmup_steps": 1,
             "probe_execution_mode": (
-                "One-by-one. The script submits probe tasks eagerly, but "
-                "execute_requests() wraps every request with an asyncio.Semaphore(1), "
-                "so only one request can enter async_request_video_sglang() at a "
-                "time and the next probe request waits until the previous one "
-                "finishes."
+                "Strictly one-by-one. The script starts one probe request, waits "
+                "for it to finish, then starts the next probe request."
             ),
         },
         "parallel_degree": parallel_degree,
@@ -1211,8 +1364,134 @@ def build_base_summary(
         },
         "keep_artifacts": args.keep_artifacts,
         "metric_definitions": build_metric_definitions(),
+        "human_summary": {},
         "runs": [],
         "skipped_configs": [],
+    }
+
+
+def build_human_run_summary(run: dict[str, Any]) -> dict[str, Any]:
+    requested = run.get("requested_parallelism", {}) or {}
+    resolved = run.get("resolved_parallelism", {}) or {}
+    probe = run.get("probe", {}) or {}
+    init_profile = run.get("init_profile", {}) or {}
+    offline = run.get("offline_burst", {}) or {}
+    online = run.get("online", {}) or {}
+
+    human_run = {
+        "name": requested.get("name"),
+        "effective_pipeline": run.get("effective_pipeline", {}),
+        "parallelism": {
+            "tp": resolved.get("tp_size", requested.get("tp_size")),
+            "sp": resolved.get("sp_degree", requested.get("sp_degree")),
+            "ulysses": resolved.get(
+                "ulysses_degree",
+                requested.get("ulysses_degree") or 1,
+            ),
+            "ring": resolved.get("ring_degree", requested.get("ring_degree") or 1),
+            "num_gpus": resolved.get("num_gpus", requested.get("num_gpus")),
+        },
+        "runtime_backend": run.get("runtime_backend"),
+        "init_memory_gb": {
+            "parameter_reserved_gb": init_profile.get("parameter_reserved_gb"),
+            "parameter_allocated_gb": init_profile.get("parameter_allocated_gb"),
+            "warmup_persistent_reserved_gb": init_profile.get(
+                "warmup_persistent_reserved_gb"
+            ),
+            "warmup_peak_reserved_gb": init_profile.get("warmup_peak_reserved_gb"),
+            "warmup_peak_allocated_gb": init_profile.get("warmup_peak_allocated_gb"),
+            "runtime_transient_peak_reserved_gb": init_profile.get(
+                "runtime_transient_peak_reserved_gb"
+            ),
+            "runtime_transient_peak_allocated_gb": init_profile.get(
+                "runtime_transient_peak_allocated_gb"
+            ),
+        },
+        "component_weight_profile_gb": init_profile.get("component_weight_profile_gb", {}),
+        "stage_component_map": init_profile.get("stage_component_map", {}),
+        "probe": {
+            "num_runs": probe.get("num_runs"),
+            "total_duration_mean_s": probe.get("total_duration_mean_s"),
+            "request_peak_memory_gb_mean": probe.get("request_peak_memory_gb_mean"),
+            "request_peak_memory_gb_median": probe.get(
+                "request_peak_memory_gb_median"
+            ),
+            "request_peak_memory_gb_max": probe.get("request_peak_memory_gb_max"),
+            "denoiser_step_peak_reserved_gb_max": probe.get(
+                "denoiser_step_peak_reserved_gb_max"
+            ),
+            "denoiser_step_peak_allocated_gb_max": probe.get(
+                "denoiser_step_peak_allocated_gb_max"
+            ),
+            "stage_time_mean_s": probe.get("stage_time_mean_s", {}),
+            "stage_peak_reserved_gb_max": probe.get("stage_peak_reserved_gb_max", {}),
+            "stage_peak_allocated_gb_max": probe.get(
+                "stage_peak_allocated_gb_max", {}
+            ),
+        },
+    }
+
+    if not offline.get("skipped", False):
+        human_run["offline_burst"] = {
+            "throughput_qps": offline.get("throughput_qps"),
+            "latency_mean_s": offline.get("latency_mean_s", offline.get("latency_mean")),
+            "latency_median_s": offline.get(
+                "latency_median_s", offline.get("latency_median")
+            ),
+            "latency_p99_s": offline.get("latency_p99_s", offline.get("latency_p99")),
+            "request_peak_memory_gb_max": offline.get("request_peak_memory_gb_max"),
+        }
+    else:
+        human_run["offline_burst"] = {
+            "skipped": True,
+            "reason": offline.get("reason"),
+        }
+
+    if not online.get("skipped", False):
+        human_run["online"] = {
+            "throughput_qps": online.get("throughput_qps"),
+            "latency_mean_s": online.get("latency_mean_s", online.get("latency_mean")),
+            "latency_median_s": online.get(
+                "latency_median_s", online.get("latency_median")
+            ),
+            "latency_p99_s": online.get("latency_p99_s", online.get("latency_p99")),
+            "request_peak_memory_gb_max": online.get("request_peak_memory_gb_max"),
+        }
+    else:
+        human_run["online"] = {
+            "skipped": True,
+            "reason": online.get("reason"),
+        }
+
+    return human_run
+
+
+def refresh_human_summary(summary: dict[str, Any]) -> None:
+    summary["human_summary"] = {
+        "model": summary.get("model"),
+        "model_id": summary.get("model_id"),
+        "parallel_degree": summary.get("parallel_degree"),
+        "graph_mode": summary.get("graph_mode"),
+        "runtime_backend": summary.get("runtime_backend"),
+        "request_setup": {
+            "prompt": summary.get("request_setup", {}).get("prompt"),
+            "input_image": summary.get("request_setup", {}).get("input_image"),
+            "probe_runs": summary.get("request_setup", {}).get("probe_runs"),
+            "run_serving_phases": summary.get("request_setup", {}).get(
+                "run_serving_phases"
+            ),
+        },
+        "completed_runs": [
+            build_human_run_summary(run) for run in summary.get("runs", [])
+        ],
+        "skipped_configs": [
+            {
+                "phase": item.get("phase"),
+                "name": (item.get("requested_parallelism") or {}).get("name"),
+                "reason": item.get("reason"),
+            }
+            for item in summary.get("skipped_configs", [])
+        ],
     }
 
 
@@ -1407,7 +1686,7 @@ def run_single_config(
                 run_config.name,
                 init_profile_path,
             )
-            init_profile = load_json(init_profile_path)
+            init_profile = augment_init_profile_units(load_json(init_profile_path))
         except Exception as exc:
             raise RunConfigError("init_profile", str(exc)) from exc
 
@@ -1416,6 +1695,11 @@ def run_single_config(
             "runtime_backend_reason": DEFAULT_RUNTIME_BACKEND_REASON,
             "requested_parallelism": asdict(run_config),
             "resolved_parallelism": build_resolved_parallelism(init_profile),
+            "effective_pipeline": {
+                "pipeline_class": init_profile.get("pipeline_class"),
+                "pipeline_name": init_profile.get("pipeline_name"),
+                "task_type": init_profile.get("task_type"),
+            },
             "served_model_card": served_model_card,
             "init_profile": init_profile,
             "probe": probe_summary,
@@ -1463,6 +1747,7 @@ def main() -> None:
                     ),
                 }
             )
+            refresh_human_summary(summary)
             save_json(summary_path, summary)
             if not args.keep_artifacts:
                 safe_rmtree(degree_tmp_root)
@@ -1506,10 +1791,12 @@ def main() -> None:
                     }
                 )
             finally:
+                refresh_human_summary(summary)
                 save_json(summary_path, summary)
                 if not args.keep_artifacts:
                     safe_rmtree(run_dir)
 
+        refresh_human_summary(summary)
         save_json(summary_path, summary)
         logger.info("Summary written to %s", summary_path.resolve())
         if not args.keep_artifacts:

@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 import os
 import time
+import weakref
 from typing import List, Union
 
 import torch
@@ -193,6 +194,49 @@ class GPUWorker:
     def _round_metric(value: float) -> float:
         return round(float(value), 2)
 
+    def _build_component_weight_profile_gb(self) -> dict[str, float]:
+        return {
+            name: self._round_metric(usage)
+            for name, usage in getattr(self.pipeline, "memory_usages", {}).items()
+        }
+
+    def _build_stage_component_map(self) -> dict[str, list[str]]:
+        module_map = getattr(self.pipeline, "modules", {})
+        if not isinstance(module_map, dict):
+            return {}
+
+        def iter_referenced_objects(value):
+            if value is None:
+                return
+            if isinstance(value, weakref.ReferenceType):
+                deref = value()
+                if deref is not None:
+                    yield deref
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    yield from iter_referenced_objects(item)
+                return
+            if isinstance(value, dict):
+                for item in value.values():
+                    yield from iter_referenced_objects(item)
+                return
+            yield value
+
+        result: dict[str, list[str]] = {}
+        for stage in getattr(self.pipeline, "stages", []):
+            stage_name = type(stage).__name__
+            matched_components: list[str] = []
+            for attr_name, attr_value in getattr(stage, "__dict__", {}).items():
+                if attr_name.startswith("_"):
+                    continue
+                for referenced in iter_referenced_objects(attr_value):
+                    for component_name, component_obj in module_map.items():
+                        if referenced is component_obj and component_name not in matched_components:
+                            matched_components.append(component_name)
+            result[stage_name] = matched_components
+        return result
+
     def finalize_init_profile_after_startup_warmup(self) -> None:
         if (
             not self._should_dump_init_profile()
@@ -234,6 +278,8 @@ class GPUWorker:
             "model_path": self.server_args.model_path,
             "model_id": self.server_args.model_id,
             "task_type": self.server_args.pipeline_config.task_type.name,
+            "pipeline_class": type(self.pipeline).__name__,
+            "pipeline_name": getattr(self.pipeline, "pipeline_name", type(self.pipeline).__name__),
             "rank": self.rank,
             "local_rank": self.local_rank,
             "num_gpus": self.server_args.num_gpus,
@@ -246,10 +292,9 @@ class GPUWorker:
             "warmup_resolutions": self.server_args.warmup_resolutions,
             "warmup_steps": self.server_args.warmup_steps,
             "enable_torch_compile": self.server_args.enable_torch_compile,
-            "pipeline_memory_usages_gb": {
-                name: self._round_metric(usage)
-                for name, usage in getattr(self.pipeline, "memory_usages", {}).items()
-            },
+            "pipeline_memory_usages_gb": self._build_component_weight_profile_gb(),
+            "component_weight_profile_gb": self._build_component_weight_profile_gb(),
+            "stage_component_map": self._build_stage_component_map(),
             "before_build_pipeline": before_build,
             "after_build_pipeline": after_build,
             "after_startup_warmup": after_warmup_snapshot,
