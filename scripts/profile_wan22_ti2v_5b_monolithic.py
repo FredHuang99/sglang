@@ -889,6 +889,73 @@ def augment_init_profile_units(init_profile: dict[str, Any]) -> dict[str, Any]:
     return init_profile
 
 
+def build_stage_component_size_maps(
+    init_profile: dict[str, Any],
+) -> tuple[dict[str, float], dict[str, float]]:
+    stage_component_map = init_profile.get("stage_component_map", {}) or {}
+    component_param_size_gb = init_profile.get("component_param_size_gb", {}) or {}
+    component_gpu_load_consumed_gb = (
+        init_profile.get("component_gpu_load_consumed_gb", {}) or {}
+    )
+
+    stage_param_size_gb: dict[str, float] = {}
+    stage_gpu_load_consumed_gb: dict[str, float] = {}
+    for stage_name, components in stage_component_map.items():
+        if not isinstance(components, list):
+            continue
+        stage_param_size_gb[stage_name] = round_float(
+            sum(
+                float(component_param_size_gb.get(component, 0.0) or 0.0)
+                for component in components
+            )
+        )
+        stage_gpu_load_consumed_gb[stage_name] = round_float(
+            sum(
+                float(component_gpu_load_consumed_gb.get(component, 0.0) or 0.0)
+                for component in components
+            )
+        )
+    return stage_param_size_gb, stage_gpu_load_consumed_gb
+
+
+def attach_stage_runtime_heuristics(
+    phase_summary: dict[str, Any], init_profile: dict[str, Any]
+) -> dict[str, Any]:
+    if not isinstance(phase_summary, dict):
+        return phase_summary
+
+    stage_peak_reserved_gb_max = phase_summary.get("stage_peak_reserved_gb_max", {}) or {}
+    stage_peak_allocated_gb_max = phase_summary.get(
+        "stage_peak_allocated_gb_max", {}
+    ) or {}
+    stage_param_size_gb, stage_gpu_load_consumed_gb = build_stage_component_size_maps(
+        init_profile
+    )
+
+    phase_summary["stage_component_param_size_gb"] = stage_param_size_gb
+    phase_summary["stage_component_gpu_load_consumed_gb"] = stage_gpu_load_consumed_gb
+
+    phase_summary["stage_rough_runtime_like_reserved_gb_max"] = {
+        stage_name: round_float(
+            max(
+                float(peak_gb) - float(stage_param_size_gb.get(stage_name, 0.0)),
+                0.0,
+            )
+        )
+        for stage_name, peak_gb in stage_peak_reserved_gb_max.items()
+    }
+    phase_summary["stage_rough_runtime_like_allocated_gb_max"] = {
+        stage_name: round_float(
+            max(
+                float(peak_gb) - float(stage_param_size_gb.get(stage_name, 0.0)),
+                0.0,
+            )
+        )
+        for stage_name, peak_gb in stage_peak_allocated_gb_max.items()
+    }
+    return phase_summary
+
+
 def to_builtin(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: to_builtin(v) for k, v in value.items()}
@@ -1001,6 +1068,18 @@ def build_server_command(
         str((output_dir / "uploads").resolve()),
         "--log-level",
         "info",
+        "--dit-cpu-offload",
+        "false",
+        "--dit-layerwise-offload",
+        "false",
+        "--text-encoder-cpu-offload",
+        "false",
+        "--image-encoder-cpu-offload",
+        "false",
+        "--vae-cpu-offload",
+        "false",
+        "--pin-cpu-memory",
+        "false",
     ]
     if model_id:
         command.extend(["--model-id", model_id])
@@ -1266,6 +1345,10 @@ def build_metric_definitions() -> dict[str, Any]:
                 "source": "GPUWorker.finalize_init_profile_after_startup_warmup()",
                 "meaning": "Per-stage component attribution map derived from the actual stage instances built by SGLang. Shared components can appear in multiple stages, so these stage mappings should not be summed directly.",
             },
+            "stage_component_param_size_gb": {
+                "source": "Derived in scripts/profile_wan22_ti2v_5b_monolithic.py from stage_component_map + component_param_size_gb",
+                "meaning": "Heuristic per-stage component-weight sum in GB. Shared components can appear in multiple stages, so values across stages should not be summed.",
+            },
             "parameter_reserved_mb": {
                 "formula": "after_build_pipeline.reserved_mb - before_build_pipeline.reserved_mb",
                 "meaning": "Reserved memory attributed to model/pipeline construction.",
@@ -1315,6 +1398,11 @@ def build_metric_definitions() -> dict[str, Any]:
             "stage_peak_allocated_mb_*": {
                 "source": "performance.log -> memory_snapshots['after_<stage>'].peak_allocated_mb",
                 "meaning": "Request-local cumulative peak allocated memory sampled immediately after each high-level stage.",
+            },
+            "stage_rough_runtime_like_*": {
+                "source": "Derived in scripts/profile_wan22_ti2v_5b_monolithic.py",
+                "formula": "stage_peak_*_gb_max - stage_component_param_size_gb, clamped at 0",
+                "meaning": "A heuristic runtime-like upper-bound indicator. This is not a strict runtime-only measurement because stage peaks are cumulative and include allocator effects.",
             },
         },
         "denoiser_step_level": {
@@ -1377,6 +1465,7 @@ def build_base_summary(
             "warmup_stage_profiling_enabled": False,
             "warmup_resolutions": [f"{sampling.width}x{sampling.height}"],
             "warmup_steps": 1,
+            "offload_policy": "All offload disabled explicitly: dit_cpu_offload=false, dit_layerwise_offload=false, text_encoder_cpu_offload=false, image_encoder_cpu_offload=false, vae_cpu_offload=false, pin_cpu_memory=false.",
             "probe_execution_mode": (
                 "Strictly one-by-one. The script starts one probe request, waits "
                 "for it to finish, then starts the next probe request."
@@ -1461,6 +1550,15 @@ def build_human_run_summary(run: dict[str, Any]) -> dict[str, Any]:
             "stage_peak_reserved_gb_max": probe.get("stage_peak_reserved_gb_max", {}),
             "stage_peak_allocated_gb_max": probe.get(
                 "stage_peak_allocated_gb_max", {}
+            ),
+            "stage_component_param_size_gb": probe.get(
+                "stage_component_param_size_gb", {}
+            ),
+            "stage_rough_runtime_like_reserved_gb_max": probe.get(
+                "stage_rough_runtime_like_reserved_gb_max", {}
+            ),
+            "stage_rough_runtime_like_allocated_gb_max": probe.get(
+                "stage_rough_runtime_like_allocated_gb_max", {}
             ),
             "memory_snapshot_semantics": {
                 "sampling_point": "All stage memory snapshots are sampled immediately after the stage finishes.",
@@ -1726,6 +1824,15 @@ def run_single_config(
                 init_profile_path,
             )
             init_profile = augment_init_profile_units(load_json(init_profile_path))
+            probe_summary = attach_stage_runtime_heuristics(probe_summary, init_profile)
+            if not offline_summary.get("skipped", False):
+                offline_summary = attach_stage_runtime_heuristics(
+                    offline_summary, init_profile
+                )
+            if not online_summary.get("skipped", False):
+                online_summary = attach_stage_runtime_heuristics(
+                    online_summary, init_profile
+                )
         except Exception as exc:
             raise RunConfigError("init_profile", str(exc)) from exc
 
