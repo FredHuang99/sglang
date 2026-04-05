@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import signal
+import site
 import socket
 import subprocess
 import sys
@@ -198,6 +199,39 @@ def find_free_port(host: str) -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
         return s.getsockname()[1]
+
+
+def detect_cutlass_python_packages_dir() -> Path | None:
+    candidates: list[Path] = []
+    try:
+        candidates.extend(Path(path) for path in site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if user_site:
+            candidates.append(Path(user_site))
+    except Exception:
+        pass
+
+    seen: set[Path] = set()
+    for base in candidates:
+        if base in seen:
+            continue
+        seen.add(base)
+        python_packages_dir = base / "nvidia_cutlass_dsl" / "python_packages"
+        if (python_packages_dir / "cutlass").exists():
+            return python_packages_dir.resolve()
+    return None
+
+
+def prepend_pythonpath(env: dict[str, str], path: Path) -> None:
+    existing = env.get("PYTHONPATH", "")
+    parts = [part for part in existing.split(os.pathsep) if part]
+    path_str = str(path)
+    if path_str not in parts:
+        parts.insert(0, path_str)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
 
 
 def tail_text(path: Path, lines: int = 200) -> str:
@@ -805,6 +839,18 @@ def launch_server(
     env["SGLANG_PERF_LOG_DIR"] = str(perf_dir.resolve())
     env["SGLANG_DIFFUSION_DUMP_INIT_PROFILE"] = "1"
     env["SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY"] = "1"
+    cutlass_python_packages_dir = detect_cutlass_python_packages_dir()
+    if cutlass_python_packages_dir is not None:
+        prepend_pythonpath(env, cutlass_python_packages_dir)
+        logger.info(
+            "Added CUTLASS Python packages dir to PYTHONPATH: %s",
+            cutlass_python_packages_dir,
+        )
+    else:
+        logger.warning(
+            "Could not find nvidia_cutlass_dsl/python_packages on sys.path roots. "
+            "If `import cutlass` fails in the server, add that directory to PYTHONPATH."
+        )
 
     command = build_server_command(
         model_path=model_path,

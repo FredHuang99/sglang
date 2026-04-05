@@ -376,10 +376,19 @@ class _ScaleResidualNormScaleShift(CustomOp):
                 stacklevel=2,
             )
             return self.forward_native(residual, x, gate, shift, scale)
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_scale_residual_norm_scale_shift,
+            )
+        except (ImportError, ModuleNotFoundError) as e:
+            import warnings
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_scale_residual_norm_scale_shift,
-        )
+            warnings.warn(
+                "FusedScaleResidualNormScaleShift cutedsl kernel is unavailable "
+                f"({e}); using native fallback",
+                stacklevel=2,
+            )
+            return self.forward_native(residual, x, gate, shift, scale)
 
         if isinstance(gate, int) and gate != 1:
             raise ValueError(
@@ -487,10 +496,19 @@ class _NormScaleShift(CustomOp):
                 stacklevel=2,
             )
             return self.forward_native(x, shift, scale)
+        try:
+            from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
+                fused_norm_scale_shift,
+            )
+        except (ImportError, ModuleNotFoundError) as e:
+            import warnings
 
-        from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
-            fused_norm_scale_shift,
-        )
+            warnings.warn(
+                "FusedNormScaleShift cutedsl kernel is unavailable "
+                f"({e}); using native fallback",
+                stacklevel=2,
+            )
+            return self.forward_native(x, shift, scale)
 
         return fused_norm_scale_shift(
             x.contiguous(),
