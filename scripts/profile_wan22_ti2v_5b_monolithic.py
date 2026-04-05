@@ -36,6 +36,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 DEFAULT_MODEL_PATH = "/home/heyang/models/Wan2_2-TI2V-5B-Diffusers"
+DEFAULT_MODEL_ID = "Wan2.2-TI2V-5B-Diffusers"
+EXPECTED_TASK_TYPE = "TI2V"
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXAMPLE_IMAGE = REPO_ROOT / "examples" / "assets" / "example_image.png"
 DEFAULT_TI2V_PROMPT = "The girl turn the body and spin around in place."
@@ -67,6 +69,15 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=DEFAULT_MODEL_PATH,
         help="Model path or HF repo id.",
+    )
+    parser.add_argument(
+        "--model-id",
+        type=str,
+        default=DEFAULT_MODEL_ID,
+        help=(
+            "Explicit model-id override used by sglang registry to resolve the "
+            "correct config for local model paths."
+        ),
     )
     parser.add_argument(
         "--input-image",
@@ -203,7 +214,8 @@ def wait_for_server_ready(
     init_profile_path: Path,
     server_log_path: Path,
     timeout_s: int,
-) -> None:
+    expected_task_type: str | None = None,
+) -> dict[str, Any]:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         if process.poll() is not None:
@@ -214,7 +226,26 @@ def wait_for_server_ready(
         try:
             resp = requests.get(f"{base_url}/health", timeout=2)
             if resp.status_code == 200 and init_profile_path.exists():
-                return
+                model_resp = requests.get(f"{base_url}/v1/models", timeout=2)
+                if model_resp.status_code != 200:
+                    time.sleep(1)
+                    continue
+
+                model_payload = model_resp.json()
+                model_cards = model_payload.get("data") or []
+                if not model_cards:
+                    time.sleep(1)
+                    continue
+
+                model_card = model_cards[0]
+                task_type = model_card.get("task_type")
+                if expected_task_type and task_type != expected_task_type:
+                    raise RuntimeError(
+                        "Server became healthy but resolved the wrong task type. "
+                        f"Expected {expected_task_type}, got {task_type}. "
+                        f"Model card: {json.dumps(model_card, ensure_ascii=False)}"
+                    )
+                return model_card
         except requests.RequestException:
             pass
         time.sleep(1)
@@ -695,6 +726,7 @@ def build_resolved_parallelism(init_profile: dict[str, Any]) -> dict[str, Any]:
 def build_server_command(
     *,
     model_path: str,
+    model_id: str | None,
     run_config: RunConfig,
     sampling: Wan2_2_TI2V_5B_SamplingParam,
     host: str,
@@ -733,6 +765,8 @@ def build_server_command(
         "--log-level",
         "info",
     ]
+    if model_id:
+        command.extend(["--model-id", model_id])
     if run_config.tp_size is not None:
         command.extend(["--tp-size", str(run_config.tp_size)])
     if run_config.sp_degree is not None:
@@ -749,13 +783,14 @@ def build_server_command(
 def launch_server(
     *,
     model_path: str,
+    model_id: str | None,
     run_config: RunConfig,
     sampling: Wan2_2_TI2V_5B_SamplingParam,
     run_dir: Path,
     host: str,
     timeout_s: int,
     trust_remote_code: bool,
-) -> tuple[subprocess.Popen, str, Path, Path]:
+) -> tuple[subprocess.Popen, str, Path, Path, dict[str, Any]]:
     port = find_free_port(host)
     scheduler_port = find_free_port(host)
     master_port = find_free_port(host)
@@ -773,6 +808,7 @@ def launch_server(
 
     command = build_server_command(
         model_path=model_path,
+        model_id=model_id,
         run_config=run_config,
         sampling=sampling,
         host=host,
@@ -792,12 +828,13 @@ def launch_server(
         env=env,
     )
     try:
-        wait_for_server_ready(
+        model_card = wait_for_server_ready(
             process=process,
             base_url=base_url,
             init_profile_path=init_profile_path,
             server_log_path=server_log_path,
             timeout_s=timeout_s,
+            expected_task_type=EXPECTED_TASK_TYPE,
         )
     except Exception:
         log_fh.flush()
@@ -805,7 +842,7 @@ def launch_server(
         kill_process_tree(process.pid)
         raise
     process._sgl_log_fh = log_fh  # type: ignore[attr-defined]
-    return process, base_url, perf_dir, init_profile_path
+    return process, base_url, perf_dir, init_profile_path, model_card
 
 
 def stop_server(process: subprocess.Popen | None) -> None:
@@ -983,6 +1020,8 @@ def build_base_summary(
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "model": args.model_path,
+        "model_id": args.model_id,
+        "expected_task_type": EXPECTED_TASK_TYPE,
         "sampling_params": {
             "height": sampling.height,
             "width": sampling.width,
@@ -1033,8 +1072,9 @@ def run_single_config(
     process = None
     try:
         try:
-            process, base_url, perf_dir, init_profile_path = launch_server(
+            process, base_url, perf_dir, init_profile_path, served_model_card = launch_server(
                 model_path=model_path,
+                model_id=args.model_id,
                 run_config=run_config,
                 sampling=sampling,
                 run_dir=run_dir,
@@ -1132,6 +1172,7 @@ def run_single_config(
         return {
             "requested_parallelism": asdict(run_config),
             "resolved_parallelism": build_resolved_parallelism(init_profile),
+            "served_model_card": served_model_card,
             "init_profile": init_profile,
             "probe": probe_summary,
             "offline_burst": {
