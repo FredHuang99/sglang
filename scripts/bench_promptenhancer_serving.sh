@@ -7,14 +7,14 @@ set -euo pipefail
 # unique run directory so repeated runs do not overwrite each other.
 
 # /home/heyang/models/promptenhancer-32b
-MODEL_PATH="${MODEL_PATH:-/workspace/models/Hunyuan_PromptEnhancer_7B}"
+MODEL_PATH="${MODEL_PATH:-/workspace/models/Hunyuan_PromptEnhancer_32B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 DATASET_NAME="${DATASET_NAME:-random-ids}"
 RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO:-1.0}"
 
 INPUT_LEN="${INPUT_LEN:-128 256}"
-OUTPUT_LEN="${OUTPUT_LEN:-128 256 384 512 640 768 896 1024 1152 1280 1408 1536 1664 1920 2048 2176}"
+OUTPUT_LEN="${OUTPUT_LEN:-384 512 640 768 896 1024 1152}"
 #CTX_LEN="${CTX_LEN:-128000}"
 CTX_LEN="${CTX_LEN:-32768}" 
 WARMUP_REQUESTS="${WARMUP_REQUESTS:-5}"
@@ -41,7 +41,7 @@ PROFILE_BY_STAGE="${PROFILE_BY_STAGE:-0}"
 PROFILE_STAGES="${PROFILE_STAGES:-}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe7b/run/${RUN_ID}}"
+RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe32b/run/${RUN_ID}}"
 RESULT_JSONL="${RUN_ROOT}/bench_serving_results.jsonl"
 SUMMARY_CSV="${RUN_ROOT}/bench_serving_summary.csv"
 
