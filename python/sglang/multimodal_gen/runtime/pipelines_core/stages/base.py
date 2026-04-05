@@ -199,14 +199,21 @@ class PipelineStage(ABC):
             raise
 
         # Execute the actual stage logic with unified profiling
+        is_warmup_batch = batch.is_warmup
         with StageProfiler(
             stage_name,
             logger=logger,
             metrics=batch.metrics,
-            log_stage_start_end=not batch.is_warmup
+            log_stage_start_end=not is_warmup_batch
             and not (self.server_args and self.server_args.comfyui_mode),
-            perf_dump_path_provided=batch.perf_dump_path is not None,
-            capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
+            # Startup warmup is intentionally excluded from per-stage profiling so
+            # it can run faster while still allowing post-warmup init snapshots.
+            perf_dump_path_provided=(
+                batch.perf_dump_path is not None and not is_warmup_batch
+            ),
+            capture_memory=(
+                envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY and not is_warmup_batch
+            ),
         ):
             result = self.forward(batch, server_args)
 

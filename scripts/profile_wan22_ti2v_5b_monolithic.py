@@ -43,6 +43,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_EXAMPLE_IMAGE = REPO_ROOT / "examples" / "assets" / "example_image.png"
 DEFAULT_TI2V_PROMPT = "The girl turn the body and spin around in place."
 DEFAULT_RUNTIME_BACKEND = "native-fallback"
+DEFAULT_RUNTIME_BACKEND_REASON = (
+    "CuTeDSL/CUTLASS fused norm kernels are not reliably usable in the target "
+    "environment. The observed failures include incomplete cutlass/cutlass.cute "
+    "APIs such as missing Float16 and missing cute.jit, so diffusion fused norm "
+    "ops are forced to use the native fallback path."
+)
+WAIT_LOG_INTERVAL_S = 15
 
 
 @dataclass(frozen=True)
@@ -252,6 +259,9 @@ def wait_for_server_ready(
     expected_task_type: str | None = None,
 ) -> dict[str, Any]:
     deadline = time.time() + timeout_s
+    last_log_time = 0.0
+    health_ready = False
+    init_profile_ready = False
     while time.time() < deadline:
         if process.poll() is not None:
             raise RuntimeError(
@@ -260,7 +270,9 @@ def wait_for_server_ready(
             )
         try:
             resp = requests.get(f"{base_url}/health", timeout=2)
-            if resp.status_code == 200 and init_profile_path.exists():
+            health_ready = resp.status_code == 200
+            init_profile_ready = init_profile_path.exists()
+            if health_ready and init_profile_ready:
                 model_resp = requests.get(f"{base_url}/v1/models", timeout=2)
                 if model_resp.status_code != 200:
                     time.sleep(1)
@@ -280,9 +292,23 @@ def wait_for_server_ready(
                         f"Expected {expected_task_type}, got {task_type}. "
                         f"Model card: {json.dumps(model_card, ensure_ascii=False)}"
                     )
+                logger.info(
+                    "Server ready: /health ok, init_profile.json dumped, /v1/models task_type=%s",
+                    task_type,
+                )
                 return model_card
         except requests.RequestException:
             pass
+        now = time.time()
+        if now - last_log_time >= WAIT_LOG_INTERVAL_S:
+            elapsed = timeout_s - max(deadline - now, 0)
+            logger.info(
+                "Waiting for server readiness / startup warmup... elapsed=%ss health=%s init_profile=%s",
+                int(elapsed),
+                health_ready,
+                init_profile_ready,
+            )
+            last_log_time = now
         time.sleep(1)
     raise TimeoutError(
         f"Server did not become ready within {timeout_s}s.\n{tail_text(server_log_path)}"
@@ -299,33 +325,19 @@ def factor_pairs(n: int) -> list[tuple[int, int]]:
 
 def build_run_configs(parallel_degree: int) -> list[RunConfig]:
     runs: list[RunConfig] = []
-    seen: set[tuple[Any, ...]] = set()
+    seen: set[tuple[int, int, int, int]] = set()
 
     def add_run(run: RunConfig) -> None:
         key = (
-            run.mode,
-            run.tp_size,
-            run.sp_degree,
-            run.ulysses_degree,
-            run.ring_degree,
+            run.tp_size or 1,
+            run.sp_degree or 1,
+            run.ulysses_degree or 1,
+            run.ring_degree or 1,
         )
         if key in seen:
             return
         seen.add(key)
         runs.append(run)
-
-    for ulysses_degree, ring_degree in factor_pairs(parallel_degree):
-        add_run(
-            RunConfig(
-                name=f"h_tp{parallel_degree}_sp{parallel_degree}_u{ulysses_degree}_r{ring_degree}",
-                mode="hybrid",
-                num_gpus=parallel_degree,
-                tp_size=parallel_degree,
-                sp_degree=parallel_degree,
-                ulysses_degree=ulysses_degree,
-                ring_degree=ring_degree,
-            )
-        )
 
     divisors_desc = sorted(
         [d for d in range(1, parallel_degree + 1) if parallel_degree % d == 0],
@@ -358,30 +370,6 @@ def build_run_configs(parallel_degree: int) -> list[RunConfig]:
                     ring_degree=ring_degree,
                 )
             )
-
-    add_run(
-        RunConfig(
-            name=f"a_tp{parallel_degree}",
-            mode="auto_tp",
-            num_gpus=parallel_degree,
-            tp_size=parallel_degree,
-            sp_degree=None,
-            ulysses_degree=None,
-            ring_degree=None,
-        )
-    )
-    for ulysses_degree, ring_degree in factor_pairs(parallel_degree):
-        add_run(
-            RunConfig(
-                name=f"a_sp{parallel_degree}_u{ulysses_degree}_r{ring_degree}",
-                mode="auto_sp",
-                num_gpus=parallel_degree,
-                tp_size=None,
-                sp_degree=parallel_degree,
-                ulysses_degree=ulysses_degree,
-                ring_degree=ring_degree,
-            )
-        )
     return runs
 
 
@@ -472,30 +460,72 @@ async def execute_requests(
     request_rate: float,
     max_concurrency: int,
     seed: int = 42,
+    phase_name: str,
 ) -> tuple[list[Any], float]:
     semaphore = asyncio.Semaphore(max_concurrency)
     rng = np.random.default_rng(seed)
+    total_requests = len(requests_list)
 
-    async def limited_request(req, session):
+    async def limited_request(request_index: int, req, session):
         async with semaphore:
-            return await async_request_video_sglang(req, session)
+            return request_index, await async_request_video_sglang(req, session)
 
     async with aiohttp.ClientSession() as session:
         tasks = []
         start_time = time.perf_counter()
-        for req in requests_list:
+        logger.info(
+            "[%s] submitting %s request(s) with request_rate=%s and max_concurrency=%s",
+            phase_name,
+            total_requests,
+            request_rate,
+            max_concurrency,
+        )
+        for request_index, req in enumerate(requests_list, start=1):
             if request_rate != float("inf"):
                 interval = rng.exponential(1.0 / request_rate)
                 await asyncio.sleep(interval)
-            tasks.append(asyncio.create_task(limited_request(req, session)))
-        outputs = await asyncio.gather(*tasks)
+            logger.info(
+                "[%s] submitted request %s/%s",
+                phase_name,
+                request_index,
+                total_requests,
+            )
+            tasks.append(asyncio.create_task(limited_request(request_index, req, session)))
+
+        outputs: list[Any] = [None] * total_requests
+        completed = 0
+        for future in asyncio.as_completed(tasks):
+            request_index, output = await future
+            outputs[request_index - 1] = output
+            completed += 1
+            if total_requests <= 10 or completed in {1, total_requests} or completed % 5 == 0:
+                logger.info(
+                    "[%s] completed request %s/%s (latest_success=%s)",
+                    phase_name,
+                    completed,
+                    total_requests,
+                    getattr(output, "success", False),
+                )
         total_duration = time.perf_counter() - start_time
+        logger.info(
+            "[%s] all %s request(s) finished in %.2fs",
+            phase_name,
+            total_requests,
+            total_duration,
+        )
     return outputs, total_duration
 
 
-def clear_perf_log(perf_log_path: Path) -> None:
+def clear_perf_log(perf_log_path: Path, phase_name: str) -> None:
     if perf_log_path.exists():
         perf_log_path.unlink()
+        logger.info("[%s] cleared previous performance.log: %s", phase_name, perf_log_path)
+    else:
+        logger.info(
+            "[%s] performance.log does not exist yet; starting fresh at %s",
+            phase_name,
+            perf_log_path,
+        )
 
 
 def read_perf_records(perf_log_path: Path) -> list[dict[str, Any]]:
@@ -515,13 +545,33 @@ def read_perf_records(perf_log_path: Path) -> list[dict[str, Any]]:
 
 
 def wait_for_perf_records(
-    perf_log_path: Path, expected_count: int, timeout_s: int
+    perf_log_path: Path, expected_count: int, timeout_s: int, phase_name: str
 ) -> list[dict[str, Any]]:
     deadline = time.time() + timeout_s
+    last_log_time = 0.0
+    last_count = -1
     while time.time() < deadline:
         records = read_perf_records(perf_log_path)
         if len(records) >= expected_count:
+            logger.info(
+                "[%s] collected %s/%s perf record(s)",
+                phase_name,
+                len(records),
+                expected_count,
+            )
             return records
+        now = time.time()
+        if len(records) != last_count or now - last_log_time >= WAIT_LOG_INTERVAL_S:
+            elapsed = timeout_s - max(deadline - now, 0)
+            logger.info(
+                "[%s] waiting for perf records... current=%s expected=%s elapsed=%ss",
+                phase_name,
+                len(records),
+                expected_count,
+                int(elapsed),
+            )
+            last_count = len(records)
+            last_log_time = now
         time.sleep(1)
     records = read_perf_records(perf_log_path)
     raise TimeoutError(
@@ -915,12 +965,14 @@ def stop_server(process: subprocess.Popen | None) -> None:
 async def run_probe_phase(
     requests_list: list[RequestFuncInput],
     probe_runs: int,
+    phase_name: str,
 ) -> tuple[list[Any], float]:
     probe_requests = [replace(requests_list[0]) for _ in range(probe_runs)]
     return await execute_requests(
         probe_requests,
         request_rate=float("inf"),
         max_concurrency=1,
+        phase_name=phase_name,
     )
 
 
@@ -929,12 +981,14 @@ async def run_serving_phase(
     request_rate: float,
     max_concurrency: int,
     seed: int,
+    phase_name: str,
 ) -> tuple[list[Any], float]:
     return await execute_requests(
         requests_list,
         request_rate=request_rate,
         max_concurrency=max_concurrency,
         seed=seed,
+        phase_name=phase_name,
     )
 
 
@@ -972,6 +1026,7 @@ def build_metric_definitions() -> dict[str, Any]:
     return {
         "runtime_backend": {
             "selected_backend": DEFAULT_RUNTIME_BACKEND,
+            "reason": DEFAULT_RUNTIME_BACKEND_REASON,
             "meaning": (
                 "Current profiling results should be interpreted under the "
                 "native-fallback backend instead of the CuTeDSL/CUTLASS fused "
@@ -1087,6 +1142,7 @@ def build_metric_definitions() -> dict[str, Any]:
 
 
 def safe_rmtree(path: Path) -> None:
+    logger.info("Cleaning temporary artifacts: %s", path)
     shutil.rmtree(path, ignore_errors=True)
 
 
@@ -1120,19 +1176,20 @@ def build_base_summary(
             "probe_runs": args.probe_runs,
             "online_rps": args.online_rps,
             "runtime_backend": DEFAULT_RUNTIME_BACKEND,
+            "runtime_backend_reason": DEFAULT_RUNTIME_BACKEND_REASON,
             "warmup_enabled": True,
+            "warmup_stage_profiling_enabled": False,
             "warmup_resolutions": [f"{sampling.width}x{sampling.height}"],
             "warmup_steps": 1,
         },
         "parallel_degree": parallel_degree,
         "graph_mode": "regular",
         "runtime_backend": DEFAULT_RUNTIME_BACKEND,
+        "runtime_backend_reason": DEFAULT_RUNTIME_BACKEND_REASON,
         "visible_gpu_count": visible_gpu_count,
         "parallel_sweep_policy": {
-            "hybrid": "h_* runs: try tp=P, sp=P first, enumerating all ulysses*ring=P pairs.",
-            "explicit": "e_* runs: try all explicit tp*sp=P combinations; when sp>1, enumerate all ulysses*ring=sp pairs.",
-            "auto_tp": "a_tp* runs: try tp=P with sp omitted so runtime auto-derives sp.",
-            "auto_sp": "a_sp* runs: try sp=P with tp omitted; enumerate all ulysses*ring=P pairs.",
+            "explicit_only": "Only explicit tp*sp=P combinations are profiled; when sp>1, enumerate all ulysses*ring=sp pairs.",
+            "deduplication": "Equivalent (tp, sp, ulysses, ring) combinations are merged so gpu=1 only runs once.",
         },
         "keep_artifacts": args.keep_artifacts,
         "metric_definitions": build_metric_definitions(),
@@ -1155,6 +1212,10 @@ def run_single_config(
     process = None
     try:
         try:
+            logger.info(
+                "[%s] launching server and running startup warmup (stage profiling disabled during warmup)",
+                run_config.name,
+            )
             process, base_url, perf_dir, init_profile_path, served_model_card = launch_server(
                 model_path=model_path,
                 model_id=args.model_id,
@@ -1167,7 +1228,17 @@ def run_single_config(
             )
         except Exception as exc:
             raise RunConfigError("launch", str(exc)) from exc
+        logger.info(
+            "[%s] server ready; startup warmup finished and init profile is available at %s",
+            run_config.name,
+            init_profile_path,
+        )
 
+        logger.info(
+            "[%s] building repeated request set from dataset %s",
+            run_config.name,
+            dataset_path,
+        )
         requests_list = build_requests(
             dataset_path=dataset_path,
             base_url=base_url,
@@ -1176,31 +1247,57 @@ def run_single_config(
             sampling=sampling,
             num_prompts=args.num_requests,
         )
+        logger.info(
+            "[%s] request set ready: probe_runs=%s measured_requests=%s",
+            run_config.name,
+            args.probe_runs,
+            len(requests_list),
+        )
         perf_log_path = perf_dir / "performance.log"
 
         try:
-            clear_perf_log(perf_log_path)
+            logger.info(
+                "[%s] starting probe phase: %s run(s), profiling enabled",
+                run_config.name,
+                args.probe_runs,
+            )
+            clear_perf_log(perf_log_path, f"{run_config.name}:probe")
             probe_outputs, _ = asyncio.run(
-                run_probe_phase(requests_list, probe_runs=args.probe_runs)
+                run_probe_phase(
+                    requests_list,
+                    probe_runs=args.probe_runs,
+                    phase_name=f"{run_config.name}:probe",
+                )
             )
             ensure_probe_successful(probe_outputs, args.probe_runs)
             probe_records = wait_for_perf_records(
-                perf_log_path, args.probe_runs, args.wait_timeout
+                perf_log_path,
+                args.probe_runs,
+                args.wait_timeout,
+                f"{run_config.name}:probe",
             )
             probe_summary = aggregate_probe(probe_records, probe_outputs)
+            logger.info("[%s] probe phase finished successfully", run_config.name)
         except RunConfigError:
             raise
         except Exception as exc:
             raise RunConfigError("probe", str(exc)) from exc
 
         try:
-            clear_perf_log(perf_log_path)
+            logger.info(
+                "[%s] starting offline phase: %s request(s), request_rate=inf, max_concurrency=%s",
+                run_config.name,
+                args.num_requests,
+                args.num_requests,
+            )
+            clear_perf_log(perf_log_path, f"{run_config.name}:offline")
             offline_outputs, offline_duration = asyncio.run(
                 run_serving_phase(
                     requests_list,
                     request_rate=float("inf"),
                     max_concurrency=args.num_requests,
                     seed=42,
+                    phase_name=f"{run_config.name}:offline",
                 )
             )
             offline_metrics = calculate_metrics(
@@ -1214,21 +1311,33 @@ def run_single_config(
                 "offline_burst", offline_metrics, args.num_requests
             )
             offline_records = wait_for_perf_records(
-                perf_log_path, args.num_requests, args.wait_timeout
+                perf_log_path,
+                args.num_requests,
+                args.wait_timeout,
+                f"{run_config.name}:offline",
             )
+            logger.info("[%s] offline phase finished successfully", run_config.name)
         except RunConfigError:
             raise
         except Exception as exc:
             raise RunConfigError("offline_burst", str(exc)) from exc
 
         try:
-            clear_perf_log(perf_log_path)
+            logger.info(
+                "[%s] starting online phase: %s request(s), request_rate=%s, max_concurrency=%s",
+                run_config.name,
+                args.num_requests,
+                args.online_rps,
+                args.num_requests,
+            )
+            clear_perf_log(perf_log_path, f"{run_config.name}:online")
             online_outputs, online_duration = asyncio.run(
                 run_serving_phase(
                     requests_list,
                     request_rate=args.online_rps,
                     max_concurrency=args.num_requests,
                     seed=43,
+                    phase_name=f"{run_config.name}:online",
                 )
             )
             online_metrics = calculate_metrics(
@@ -1240,20 +1349,30 @@ def run_single_config(
             )
             ensure_successful_requests("online", online_metrics, args.num_requests)
             online_records = wait_for_perf_records(
-                perf_log_path, args.num_requests, args.wait_timeout
+                perf_log_path,
+                args.num_requests,
+                args.wait_timeout,
+                f"{run_config.name}:online",
             )
+            logger.info("[%s] online phase finished successfully", run_config.name)
         except RunConfigError:
             raise
         except Exception as exc:
             raise RunConfigError("online", str(exc)) from exc
 
         try:
+            logger.info(
+                "[%s] loading init memory snapshot from %s",
+                run_config.name,
+                init_profile_path,
+            )
             init_profile = load_json(init_profile_path)
         except Exception as exc:
             raise RunConfigError("init_profile", str(exc)) from exc
 
         return {
             "runtime_backend": DEFAULT_RUNTIME_BACKEND,
+            "runtime_backend_reason": DEFAULT_RUNTIME_BACKEND_REASON,
             "requested_parallelism": asdict(run_config),
             "resolved_parallelism": build_resolved_parallelism(init_profile),
             "served_model_card": served_model_card,
@@ -1315,6 +1434,11 @@ def main() -> None:
             continue
 
         run_configs = build_run_configs(parallel_degree)
+        logger.info(
+            "gpu=%s will profile %s unique tp*sp=P configuration(s)",
+            parallel_degree,
+            len(run_configs),
+        )
         for run_config in run_configs:
             logger.info("Profiling gpu=%s config=%s", parallel_degree, run_config.name)
             run_dir = degree_tmp_root / run_config.name
