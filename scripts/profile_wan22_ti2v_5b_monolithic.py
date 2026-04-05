@@ -125,6 +125,12 @@ def parse_args() -> argparse.Namespace:
         help="Number of probe requests to average for stage timing.",
     )
     parser.add_argument(
+        "--run-serving-phases",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Run offline/online serving benchmarks in addition to probe profiling.",
+    )
+    parser.add_argument(
         "--host",
         type=str,
         default="127.0.0.1",
@@ -485,7 +491,7 @@ async def execute_requests(
                 interval = rng.exponential(1.0 / request_rate)
                 await asyncio.sleep(interval)
             logger.info(
-                "[%s] submitted request %s/%s",
+                "[%s] enqueued request %s/%s",
                 phase_name,
                 request_index,
                 total_requests,
@@ -1056,6 +1062,10 @@ def build_metric_definitions() -> dict[str, Any]:
             ],
         },
         "request_level": {
+            "probe_execution_mode": {
+                "source": "scripts/profile_wan22_ti2v_5b_monolithic.py::execute_requests(max_concurrency=1)",
+                "meaning": "Probe requests are serialized one-by-one because the per-phase asyncio.Semaphore is set to 1. Even though tasks are created eagerly, only one request can enter the actual async HTTP/video generation call at a time.",
+            },
             "throughput_qps": {
                 "source": "python/sglang/multimodal_gen/benchmarks/bench_serving.py::calculate_metrics()['throughput_qps']",
                 "meaning": "Completed requests divided by phase wall-clock duration.",
@@ -1175,12 +1185,20 @@ def build_base_summary(
             "num_requests": args.num_requests,
             "probe_runs": args.probe_runs,
             "online_rps": args.online_rps,
+            "run_serving_phases": args.run_serving_phases,
             "runtime_backend": DEFAULT_RUNTIME_BACKEND,
             "runtime_backend_reason": DEFAULT_RUNTIME_BACKEND_REASON,
             "warmup_enabled": True,
             "warmup_stage_profiling_enabled": False,
             "warmup_resolutions": [f"{sampling.width}x{sampling.height}"],
             "warmup_steps": 1,
+            "probe_execution_mode": (
+                "One-by-one. The script submits probe tasks eagerly, but "
+                "execute_requests() wraps every request with an asyncio.Semaphore(1), "
+                "so only one request can enter async_request_video_sglang() at a "
+                "time and the next probe request waits until the previous one "
+                "finishes."
+            ),
         },
         "parallel_degree": parallel_degree,
         "graph_mode": "regular",
@@ -1283,82 +1301,105 @@ def run_single_config(
         except Exception as exc:
             raise RunConfigError("probe", str(exc)) from exc
 
-        try:
-            logger.info(
-                "[%s] starting offline phase: %s request(s), request_rate=inf, max_concurrency=%s",
-                run_config.name,
-                args.num_requests,
-                args.num_requests,
-            )
-            clear_perf_log(perf_log_path, f"{run_config.name}:offline")
-            offline_outputs, offline_duration = asyncio.run(
-                run_serving_phase(
-                    requests_list,
-                    request_rate=float("inf"),
-                    max_concurrency=args.num_requests,
-                    seed=42,
-                    phase_name=f"{run_config.name}:offline",
-                )
-            )
-            offline_metrics = calculate_metrics(
-                offline_outputs,
-                offline_duration,
-                requests_list,
-                SimpleNamespace(slo_scale=3.0),
-                slo_enabled=False,
-            )
-            ensure_successful_requests(
-                "offline_burst", offline_metrics, args.num_requests
-            )
-            offline_records = wait_for_perf_records(
-                perf_log_path,
-                args.num_requests,
-                args.wait_timeout,
-                f"{run_config.name}:offline",
-            )
-            logger.info("[%s] offline phase finished successfully", run_config.name)
-        except RunConfigError:
-            raise
-        except Exception as exc:
-            raise RunConfigError("offline_burst", str(exc)) from exc
+        offline_summary: dict[str, Any] = {
+            "skipped": True,
+            "reason": "Serving benchmarks are disabled by default. Pass --run-serving-phases to enable offline and online benchmarking.",
+        }
+        online_summary: dict[str, Any] = {
+            "skipped": True,
+            "reason": "Serving benchmarks are disabled by default. Pass --run-serving-phases to enable offline and online benchmarking.",
+        }
 
-        try:
-            logger.info(
-                "[%s] starting online phase: %s request(s), request_rate=%s, max_concurrency=%s",
-                run_config.name,
-                args.num_requests,
-                args.online_rps,
-                args.num_requests,
-            )
-            clear_perf_log(perf_log_path, f"{run_config.name}:online")
-            online_outputs, online_duration = asyncio.run(
-                run_serving_phase(
-                    requests_list,
-                    request_rate=args.online_rps,
-                    max_concurrency=args.num_requests,
-                    seed=43,
-                    phase_name=f"{run_config.name}:online",
+        if args.run_serving_phases:
+            try:
+                logger.info(
+                    "[%s] starting offline phase: %s request(s), request_rate=inf, max_concurrency=%s",
+                    run_config.name,
+                    args.num_requests,
+                    args.num_requests,
                 )
+                clear_perf_log(perf_log_path, f"{run_config.name}:offline")
+                offline_outputs, offline_duration = asyncio.run(
+                    run_serving_phase(
+                        requests_list,
+                        request_rate=float("inf"),
+                        max_concurrency=args.num_requests,
+                        seed=42,
+                        phase_name=f"{run_config.name}:offline",
+                    )
+                )
+                offline_metrics = calculate_metrics(
+                    offline_outputs,
+                    offline_duration,
+                    requests_list,
+                    SimpleNamespace(slo_scale=3.0),
+                    slo_enabled=False,
+                )
+                ensure_successful_requests(
+                    "offline_burst", offline_metrics, args.num_requests
+                )
+                offline_records = wait_for_perf_records(
+                    perf_log_path,
+                    args.num_requests,
+                    args.wait_timeout,
+                    f"{run_config.name}:offline",
+                )
+                offline_summary = {
+                    **benchmark_outputs_to_summary(offline_metrics),
+                    **aggregate_stage_metrics(offline_records),
+                }
+                logger.info("[%s] offline phase finished successfully", run_config.name)
+            except RunConfigError:
+                raise
+            except Exception as exc:
+                raise RunConfigError("offline_burst", str(exc)) from exc
+
+            try:
+                logger.info(
+                    "[%s] starting online phase: %s request(s), request_rate=%s, max_concurrency=%s",
+                    run_config.name,
+                    args.num_requests,
+                    args.online_rps,
+                    args.num_requests,
+                )
+                clear_perf_log(perf_log_path, f"{run_config.name}:online")
+                online_outputs, online_duration = asyncio.run(
+                    run_serving_phase(
+                        requests_list,
+                        request_rate=args.online_rps,
+                        max_concurrency=args.num_requests,
+                        seed=43,
+                        phase_name=f"{run_config.name}:online",
+                    )
+                )
+                online_metrics = calculate_metrics(
+                    online_outputs,
+                    online_duration,
+                    requests_list,
+                    SimpleNamespace(slo_scale=3.0),
+                    slo_enabled=False,
+                )
+                ensure_successful_requests("online", online_metrics, args.num_requests)
+                online_records = wait_for_perf_records(
+                    perf_log_path,
+                    args.num_requests,
+                    args.wait_timeout,
+                    f"{run_config.name}:online",
+                )
+                online_summary = {
+                    **benchmark_outputs_to_summary(online_metrics),
+                    **aggregate_stage_metrics(online_records),
+                }
+                logger.info("[%s] online phase finished successfully", run_config.name)
+            except RunConfigError:
+                raise
+            except Exception as exc:
+                raise RunConfigError("online", str(exc)) from exc
+        else:
+            logger.info(
+                "[%s] skipping offline/online serving phases because --run-serving-phases is false",
+                run_config.name,
             )
-            online_metrics = calculate_metrics(
-                online_outputs,
-                online_duration,
-                requests_list,
-                SimpleNamespace(slo_scale=3.0),
-                slo_enabled=False,
-            )
-            ensure_successful_requests("online", online_metrics, args.num_requests)
-            online_records = wait_for_perf_records(
-                perf_log_path,
-                args.num_requests,
-                args.wait_timeout,
-                f"{run_config.name}:online",
-            )
-            logger.info("[%s] online phase finished successfully", run_config.name)
-        except RunConfigError:
-            raise
-        except Exception as exc:
-            raise RunConfigError("online", str(exc)) from exc
 
         try:
             logger.info(
@@ -1378,14 +1419,8 @@ def run_single_config(
             "served_model_card": served_model_card,
             "init_profile": init_profile,
             "probe": probe_summary,
-            "offline_burst": {
-                **benchmark_outputs_to_summary(offline_metrics),
-                **aggregate_stage_metrics(offline_records),
-            },
-            "online": {
-                **benchmark_outputs_to_summary(online_metrics),
-                **aggregate_stage_metrics(online_records),
-            },
+            "offline_burst": offline_summary,
+            "online": online_summary,
         }
     finally:
         stop_server(process)
