@@ -380,7 +380,23 @@ class _ScaleResidualNormScaleShift(CustomOp):
             from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
                 fused_scale_residual_norm_scale_shift,
             )
-        except (ImportError, ModuleNotFoundError) as e:
+            if isinstance(gate, int) and gate != 1:
+                raise ValueError(
+                    f"Only gate value of 1 is supported for int type, but got {gate}"
+                )
+
+            return fused_scale_residual_norm_scale_shift(
+                residual.contiguous(),
+                x.contiguous(),
+                gate.contiguous() if isinstance(gate, torch.Tensor) else None,
+                _ensure_contiguous(getattr(self.norm, "weight", None)),
+                _ensure_contiguous(getattr(self.norm, "bias", None)),
+                scale.contiguous(),
+                shift.contiguous(),
+                self.norm_type,
+                self.eps,
+            )
+        except Exception as e:
             import warnings
 
             warnings.warn(
@@ -389,23 +405,6 @@ class _ScaleResidualNormScaleShift(CustomOp):
                 stacklevel=2,
             )
             return self.forward_native(residual, x, gate, shift, scale)
-
-        if isinstance(gate, int) and gate != 1:
-            raise ValueError(
-                f"Only gate value of 1 is supported for int type, but got {gate}"
-            )
-
-        return fused_scale_residual_norm_scale_shift(
-            residual.contiguous(),
-            x.contiguous(),
-            gate.contiguous() if isinstance(gate, torch.Tensor) else None,
-            _ensure_contiguous(getattr(self.norm, "weight", None)),
-            _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale.contiguous(),
-            shift.contiguous(),
-            self.norm_type,
-            self.eps,
-        )
 
     def forward_hip(self, *args, **kwargs):
         # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
@@ -500,7 +499,16 @@ class _NormScaleShift(CustomOp):
             from sglang.jit_kernel.diffusion.cutedsl.scale_residual_norm_scale_shift import (
                 fused_norm_scale_shift,
             )
-        except (ImportError, ModuleNotFoundError) as e:
+            return fused_norm_scale_shift(
+                x.contiguous(),
+                _ensure_contiguous(getattr(self.norm, "weight", None)),
+                _ensure_contiguous(getattr(self.norm, "bias", None)),
+                scale.contiguous(),
+                shift.contiguous(),
+                self.norm_type,
+                self.eps,
+            )
+        except Exception as e:
             import warnings
 
             warnings.warn(
@@ -509,16 +517,6 @@ class _NormScaleShift(CustomOp):
                 stacklevel=2,
             )
             return self.forward_native(x, shift, scale)
-
-        return fused_norm_scale_shift(
-            x.contiguous(),
-            _ensure_contiguous(getattr(self.norm, "weight", None)),
-            _ensure_contiguous(getattr(self.norm, "bias", None)),
-            scale.contiguous(),
-            shift.contiguous(),
-            self.norm_type,
-            self.eps,
-        )
 
     def forward_hip(self, *args, **kwargs):
         # ROCm does not support CUDA/CUTLASS-based fused kernels yet,
