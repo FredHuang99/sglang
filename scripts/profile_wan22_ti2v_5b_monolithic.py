@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--parallel-degrees",
         type=str,
-        default="1", #"1,2,4,8",
+        default="1,2,4", #"1",
         help="Comma/space separated total GPU counts, e.g. '1,2,4,8'.",
     )
     parser.add_argument(
