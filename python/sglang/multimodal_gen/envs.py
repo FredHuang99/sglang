@@ -32,6 +32,8 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_DIFFUSION_DUMP_INIT_PROFILE: bool = False
+    SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY: bool = False
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
@@ -245,6 +247,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # If set, sgl_diffusion will dump a monolithic init profile JSON after startup
+    # warmup completes.
+    "SGLANG_DIFFUSION_DUMP_INIT_PROFILE": _lazy_bool(
+        "SGLANG_DIFFUSION_DUMP_INIT_PROFILE"
+    ),
+    # If set, sgl_diffusion will capture memory snapshots after each high-level
+    # pipeline stage and store them in the perf log.
+    "SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY": _lazy_bool(
+        "SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY"
+    ),
     # Optional override for diffusion disaggregation outbound send queue count.
     # When unset, the runtime keeps the existing single-queue behavior.
     "SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE": _lazy_int(

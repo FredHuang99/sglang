@@ -10,6 +10,7 @@ import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vision_utils import (
     load_image,
@@ -407,6 +408,7 @@ class LTX2AVDenoisingStage(DenoisingStage):
                         logger=logger,
                         metrics=batch.metrics,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
+                        capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]

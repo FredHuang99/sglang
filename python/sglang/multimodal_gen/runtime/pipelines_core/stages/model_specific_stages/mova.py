@@ -21,6 +21,7 @@ import torch.nn as nn
 from diffusers.utils.torch_utils import randn_tensor
 from tqdm.auto import tqdm
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -435,6 +436,7 @@ class MOVADenoisingStage(PipelineStage):
                     logger=logger,
                     metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
+                    capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
                 ):
                     pair_t = paired_timesteps[idx_step]
                     if getattr(pair_t, "shape", None) == (2,):

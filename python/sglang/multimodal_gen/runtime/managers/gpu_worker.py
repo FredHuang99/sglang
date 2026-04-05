@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import gc
+import json
 import multiprocessing as mp
 import os
 import time
@@ -56,6 +57,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
+    get_diffusion_perf_log_dir,
 )
 from sglang.srt.utils.network import NetworkAddress
 
@@ -80,6 +82,9 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self._init_profile_enabled = bool(envs.SGLANG_DIFFUSION_DUMP_INIT_PROFILE)
+        self._init_profile_dumped = False
+        self._init_profile_ctx: dict[str, dict] | None = None
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -137,7 +142,21 @@ class GPUWorker:
         else:
             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
+        before_build_snapshot = None
+        if self._should_dump_init_profile():
+            before_build_snapshot = capture_memory_snapshot()
+
         self.pipeline = build_pipeline(self.server_args)
+
+        if self._should_dump_init_profile():
+            after_build_snapshot = capture_memory_snapshot()
+            self._init_profile_ctx = {
+                "before_build_pipeline": before_build_snapshot.to_dict()
+                if before_build_snapshot is not None
+                else {},
+                "after_build_pipeline": after_build_snapshot.to_dict(),
+            }
+            torch.get_device_module().reset_peak_memory_stats()
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
@@ -164,6 +183,103 @@ class GPUWorker:
             self.rank,
             role_device,
         )
+
+    def _should_dump_init_profile(self) -> bool:
+        return self._init_profile_enabled and self.rank == 0 and (
+            current_platform.is_cuda_alike() or current_platform.is_npu()
+        )
+
+    @staticmethod
+    def _round_metric(value: float) -> float:
+        return round(float(value), 2)
+
+    def finalize_init_profile_after_startup_warmup(self) -> None:
+        if (
+            not self._should_dump_init_profile()
+            or self._init_profile_dumped
+            or self._init_profile_ctx is None
+        ):
+            return
+
+        after_warmup_snapshot = capture_memory_snapshot().to_dict()
+        before_build = self._init_profile_ctx.get("before_build_pipeline", {})
+        after_build = self._init_profile_ctx.get("after_build_pipeline", {})
+
+        parameter_reserved_mb = max(
+            after_build.get("reserved_mb", 0.0) - before_build.get("reserved_mb", 0.0),
+            0.0,
+        )
+        parameter_allocated_mb = max(
+            after_build.get("allocated_mb", 0.0)
+            - before_build.get("allocated_mb", 0.0),
+            0.0,
+        )
+        warmup_persistent_reserved_mb = max(
+            after_warmup_snapshot.get("reserved_mb", 0.0)
+            - after_build.get("reserved_mb", 0.0),
+            0.0,
+        )
+        runtime_transient_peak_reserved_mb = max(
+            after_warmup_snapshot.get("peak_reserved_mb", 0.0)
+            - after_warmup_snapshot.get("reserved_mb", 0.0),
+            0.0,
+        )
+        runtime_transient_peak_allocated_mb = max(
+            after_warmup_snapshot.get("peak_allocated_mb", 0.0)
+            - after_warmup_snapshot.get("allocated_mb", 0.0),
+            0.0,
+        )
+
+        init_profile = {
+            "model_path": self.server_args.model_path,
+            "model_id": self.server_args.model_id,
+            "task_type": self.server_args.pipeline_config.task_type.name,
+            "rank": self.rank,
+            "local_rank": self.local_rank,
+            "num_gpus": self.server_args.num_gpus,
+            "tp_size": self.server_args.tp_size,
+            "sp_degree": self.server_args.sp_degree,
+            "ulysses_degree": self.server_args.ulysses_degree,
+            "ring_degree": self.server_args.ring_degree,
+            "dp_size": self.server_args.dp_size,
+            "warmup": self.server_args.warmup,
+            "warmup_resolutions": self.server_args.warmup_resolutions,
+            "warmup_steps": self.server_args.warmup_steps,
+            "enable_torch_compile": self.server_args.enable_torch_compile,
+            "pipeline_memory_usages_gb": {
+                name: self._round_metric(usage)
+                for name, usage in getattr(self.pipeline, "memory_usages", {}).items()
+            },
+            "before_build_pipeline": before_build,
+            "after_build_pipeline": after_build,
+            "after_startup_warmup": after_warmup_snapshot,
+            "parameter_reserved_mb": self._round_metric(parameter_reserved_mb),
+            "parameter_allocated_mb": self._round_metric(parameter_allocated_mb),
+            "warmup_persistent_reserved_mb": self._round_metric(
+                warmup_persistent_reserved_mb
+            ),
+            "warmup_peak_reserved_mb": self._round_metric(
+                after_warmup_snapshot.get("peak_reserved_mb", 0.0)
+            ),
+            "warmup_peak_allocated_mb": self._round_metric(
+                after_warmup_snapshot.get("peak_allocated_mb", 0.0)
+            ),
+            "runtime_transient_peak_reserved_mb": self._round_metric(
+                runtime_transient_peak_reserved_mb
+            ),
+            "runtime_transient_peak_allocated_mb": self._round_metric(
+                runtime_transient_peak_allocated_mb
+            ),
+        }
+
+        log_dir = get_diffusion_perf_log_dir()
+        os.makedirs(log_dir, exist_ok=True)
+        out_path = os.path.join(log_dir, "init_profile.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(init_profile, f, indent=2, ensure_ascii=False)
+
+        self._init_profile_dumped = True
+        logger.info("Init profile dumped to %s", out_path)
 
     def do_mem_analysis(self, output_batch: OutputBatch):
         if not (current_platform.is_cuda_alike() or current_platform.is_npu()):

@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -135,6 +136,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 perf_dump_path_provided=(
                     batch.perf_dump_path is not None if batch is not None else False
                 ),
+                capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
             ):
                 timestep = t.expand(batch_size)
                 latent_model_input = latents.to(target_dtype)
@@ -334,6 +336,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     perf_dump_path_provided=(
                         batch.perf_dump_path is not None if batch is not None else False
                     ),
+                    capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
                 ):
                     timestep = t.expand(batch_size)
                     latent_model_input = latents.to(target_dtype)

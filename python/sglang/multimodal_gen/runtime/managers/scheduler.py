@@ -197,7 +197,17 @@ class Scheduler(SchedulerDisaggMixin):
             else:
                 logger.info("Processing warmup req...")
 
-        return self.worker.execute_forward(reqs)
+        output = self.worker.execute_forward(reqs)
+
+        if (
+            warmup_reqs
+            and self._disagg_role == RoleType.MONOLITHIC
+            and self._warmup_total > 0
+            and self._warmup_processed >= self._warmup_total
+        ):
+            self.worker.finalize_init_profile_after_startup_warmup()
+
+        return output
 
     def return_result(
         self,

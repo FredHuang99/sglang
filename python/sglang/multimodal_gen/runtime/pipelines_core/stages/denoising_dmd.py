@@ -4,6 +4,7 @@ import time
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
@@ -104,6 +105,7 @@ class DmdDenoisingStage(DenoisingStage):
                     logger=logger,
                     metrics=batch.metrics,
                     perf_dump_path_provided=batch.perf_dump_path is not None,
+                    capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
                 ):
                     t_int = int(t.item())
                     if self.transformer_2 is not None:

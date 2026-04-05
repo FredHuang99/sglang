@@ -13,6 +13,7 @@ from enum import Enum, auto
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -205,6 +206,7 @@ class PipelineStage(ABC):
             log_stage_start_end=not batch.is_warmup
             and not (self.server_args and self.server_args.comfyui_mode),
             perf_dump_path_provided=batch.perf_dump_path is not None,
+            capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
         ):
             result = self.forward(batch, server_args)
 

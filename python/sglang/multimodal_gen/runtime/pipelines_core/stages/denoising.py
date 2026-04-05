@@ -1031,6 +1031,7 @@ class DenoisingStage(PipelineStage):
                         logger=logger,
                         metrics=batch.metrics,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
+                        capture_memory=envs.SGLANG_DIFFUSION_CAPTURE_STAGE_MEMORY,
                     ):
                         t_int = int(t_host.item())
                         t_device = timesteps[i]
