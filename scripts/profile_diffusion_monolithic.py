@@ -75,7 +75,7 @@ PRESETS: dict[str, ProfilePreset] = {
     "z-image": ProfilePreset(
         name="z-image",
         model_path="/home/heyang/models/Z_Image",
-        model_id="Tongyi-MAI/Z-Image",
+        model_id="Z-Image",
         expected_task_type="T2I",
         task_name="text-to-image",
         request_kind="image",
@@ -158,6 +158,12 @@ def resolve_input_image(args: argparse.Namespace, preset: ProfilePreset) -> Path
 def resolve_output_dir(args: argparse.Namespace, preset: ProfilePreset) -> Path:
     target = args.output_dir or preset.output_dir
     return Path(target).expanduser().resolve()
+
+
+def normalize_model_id(model_id: str | None) -> str | None:
+    if model_id is None:
+        return None
+    return model_id.rstrip("/").split("/")[-1]
 
 
 def build_request_extra_body(sampling: Any) -> dict[str, Any]:
@@ -390,7 +396,7 @@ def main() -> None:
     args = parse_args()
     preset = PRESETS[args.preset]
     args.model_path = args.model_path or preset.model_path
-    args.model_id = args.model_id or preset.model_id
+    args.model_id = normalize_model_id(args.model_id or preset.model_id)
     args.prompt = args.prompt or preset.default_prompt
     ACTIVE_PRESET = preset
     ACTIVE_INPUT_IMAGE = resolve_input_image(args, preset)
