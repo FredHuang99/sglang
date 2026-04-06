@@ -13,6 +13,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
