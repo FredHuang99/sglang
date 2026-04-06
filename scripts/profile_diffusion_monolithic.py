@@ -26,7 +26,10 @@ from sglang.multimodal_gen.benchmarks.bench_serving import (
     async_request_video_sglang,
 )
 from sglang.multimodal_gen.benchmarks.datasets import RequestFuncInput
-from sglang.multimodal_gen.configs.sample.wan import Wan2_2_TI2V_5B_SamplingParam
+from sglang.multimodal_gen.configs.sample.wan import (
+    Wan2_2_TI2V_5B_SamplingParam,
+    WanT2V_1_3B_SamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -61,6 +64,7 @@ class ProfilePreset:
     expected_task_type: str
     task_name: str
     request_kind: str
+    requires_input_image: bool
     output_dir: str
     default_prompt: str
     default_input_image: str | None
@@ -79,6 +83,7 @@ PRESETS: dict[str, ProfilePreset] = {
         expected_task_type="T2I",
         task_name="text-to-image",
         request_kind="image",
+        requires_input_image=False,
         output_dir="/home/heyang/profile_output/z_image",
         default_prompt=(
             "cute anime style girl with massive fluffy fennec ears and a big fluffy "
@@ -97,10 +102,27 @@ PRESETS: dict[str, ProfilePreset] = {
         expected_task_type="TI2V",
         task_name="image-to-video",
         request_kind="video",
+        requires_input_image=True,
         output_dir="/home/heyang/profile_output/wan2_2_ti2v_5b",
         default_prompt="The girl turn the body and spin around in place.",
         default_input_image=str(REPO_ROOT / "examples" / "assets" / "example_image.png"),
         sampling_factory=Wan2_2_TI2V_5B_SamplingParam,
+    ),
+    "wan2.1-t2v-1.3b": ProfilePreset(
+        name="wan2.1-t2v-1.3b",
+        model_path="/home/heyang/models/Wan2_1_T2V_1_3B",
+        model_id="Wan2.1-T2V-1.3B-Diffusers",
+        expected_task_type="T2V",
+        task_name="text-to-video",
+        request_kind="video",
+        requires_input_image=False,
+        output_dir="/home/heyang/profile_output/wan2_1_t2v_1_3b",
+        default_prompt=(
+            "A small corgi walks happily through a sunlit garden, gentle camera "
+            "movement, soft cinematic lighting."
+        ),
+        default_input_image=None,
+        sampling_factory=WanT2V_1_3B_SamplingParams,
     ),
 }
 
@@ -203,7 +225,7 @@ def build_requests(
     preset = ACTIVE_PRESET
     if preset is None:
         raise RuntimeError("ACTIVE_PRESET is not initialized.")
-    if preset.request_kind == "video" and ACTIVE_INPUT_IMAGE is None:
+    if preset.requires_input_image and ACTIVE_INPUT_IMAGE is None:
         raise ValueError(
             f"Preset {preset.name} requires --input-image or a preset default image."
         )
@@ -213,11 +235,7 @@ def build_requests(
         if preset.request_kind == "image"
         else f"{base_url}/v1/videos"
     )
-    image_paths = (
-        None
-        if preset.request_kind == "image"
-        else [str(ACTIVE_INPUT_IMAGE)] if ACTIVE_INPUT_IMAGE is not None else None
-    )
+    image_paths = [str(ACTIVE_INPUT_IMAGE)] if ACTIVE_INPUT_IMAGE is not None else None
     extra_body = build_request_extra_body(sampling)
     requests_list: list[RequestFuncInput] = []
     for _ in range(num_prompts):
