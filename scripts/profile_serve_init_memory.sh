@@ -192,6 +192,169 @@ def last_line_containing(lines, needle):
     return ""
 
 
+def parse_ranked_prefix(line):
+    match = re.match(r"^\[(?P<timestamp>[^\]]+?) (?P<rank>TP\d+)\] (?P<body>.*)$", line)
+    if not match:
+        return None
+    return match.groupdict()
+
+
+def summarize_numeric_field(events, field):
+    values = [event[field] for event in events if event.get(field) is not None]
+    if not values:
+        return None
+    return {
+        "min": round(min(values), 3),
+        "max": round(max(values), 3),
+        "avg": round(sum(values) / len(values), 3),
+        "sum": round(sum(values), 3),
+    }
+
+
+def summarize_ranked_events(events, numeric_fields):
+    summary = {"count": len(events)}
+    for field in numeric_fields:
+        stats = summarize_numeric_field(events, field)
+        if stats is not None:
+            summary[field] = stats
+    return summary
+
+
+def collect_ranked_memory_events(lines):
+    grouped = {
+        "torch_distributed_init": [],
+        "load_weight_begin": [],
+        "load_weight_end": [],
+        "kv_cache_allocation": [],
+        "memory_pool_end": [],
+        "cuda_graph_begin": [],
+        "cuda_graph_end": [],
+    }
+
+    for idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        parsed = parse_ranked_prefix(line)
+        if parsed is None:
+            continue
+
+        rank = parsed["rank"]
+        timestamp = parsed["timestamp"]
+        body = parsed["body"]
+
+        common = {
+            "rank": rank,
+            "timestamp": timestamp,
+            "line_number": idx,
+            "log_line": line,
+        }
+
+        if body.startswith("Init torch distributed ends."):
+            grouped["torch_distributed_init"].append(
+                {
+                    **common,
+                    "elapsed_s": parse_float(r"elapsed=([0-9.]+) s", body),
+                    "mem_usage_gb": parse_float(r"mem usage=([0-9.]+) GB", body),
+                }
+            )
+            continue
+
+        if body.startswith("Load weight begin."):
+            grouped["load_weight_begin"].append(
+                {
+                    **common,
+                    "avail_mem_gb": parse_float(r"avail mem=([0-9.]+) GB", body),
+                }
+            )
+            continue
+
+        if body.startswith("Load weight end."):
+            grouped["load_weight_end"].append(
+                {
+                    **common,
+                    "elapsed_s": parse_float(r"elapsed=([0-9.]+) s", body),
+                    "avail_mem_gb": parse_float(r"avail mem=([0-9.]+) GB", body),
+                    "mem_usage_gb": parse_float(r"mem usage=([0-9.]+) GB", body),
+                    "model_type": (
+                        re.search(r"type=([^,]+)", body).group(1)
+                        if re.search(r"type=([^,]+)", body)
+                        else None
+                    ),
+                }
+            )
+            continue
+
+        if body.startswith("KV Cache is allocated."):
+            k_size_gb = parse_float(r"K size: ([0-9.]+) GB", body)
+            v_size_gb = parse_float(r"V size: ([0-9.]+) GB", body)
+            kv_size_gb = parse_float(r"KV size: ([0-9.]+) GB", body)
+            if kv_size_gb is None and k_size_gb is not None and v_size_gb is not None:
+                kv_size_gb = round(k_size_gb + v_size_gb, 3)
+            grouped["kv_cache_allocation"].append(
+                {
+                    **common,
+                    "num_tokens": parse_int(r"#tokens: (\d+)", body),
+                    "k_size_gb": k_size_gb,
+                    "v_size_gb": v_size_gb,
+                    "kv_size_gb": kv_size_gb,
+                }
+            )
+            continue
+
+        if body.startswith("Memory pool end."):
+            grouped["memory_pool_end"].append(
+                {
+                    **common,
+                    "avail_mem_gb": parse_float(r"avail mem=([0-9.]+) GB", body),
+                }
+            )
+            continue
+
+        if body.startswith("Capture cuda graph begin."):
+            grouped["cuda_graph_begin"].append(
+                {
+                    **common,
+                    "avail_mem_gb": parse_float(r"avail mem=([0-9.]+) GB", body),
+                }
+            )
+            continue
+
+        if body.startswith("Capture cuda graph end."):
+            grouped["cuda_graph_end"].append(
+                {
+                    **common,
+                    "elapsed_s": parse_float(r"Time elapsed: ([0-9.]+) s", body),
+                    "mem_usage_gb": parse_float(r"mem usage=([0-9.]+) GB", body),
+                    "avail_mem_gb": parse_float(r"avail mem=([0-9.]+) GB", body),
+                }
+            )
+
+    aggregates = {
+        "torch_distributed_init": summarize_ranked_events(
+            grouped["torch_distributed_init"], ["elapsed_s", "mem_usage_gb"]
+        ),
+        "load_weight_begin": summarize_ranked_events(
+            grouped["load_weight_begin"], ["avail_mem_gb"]
+        ),
+        "load_weight_end": summarize_ranked_events(
+            grouped["load_weight_end"], ["elapsed_s", "avail_mem_gb", "mem_usage_gb"]
+        ),
+        "kv_cache_allocation": summarize_ranked_events(
+            grouped["kv_cache_allocation"], ["num_tokens", "k_size_gb", "v_size_gb", "kv_size_gb"]
+        ),
+        "memory_pool_end": summarize_ranked_events(
+            grouped["memory_pool_end"], ["avail_mem_gb"]
+        ),
+        "cuda_graph_begin": summarize_ranked_events(
+            grouped["cuda_graph_begin"], ["avail_mem_gb"]
+        ),
+        "cuda_graph_end": summarize_ranked_events(
+            grouped["cuda_graph_end"], ["elapsed_s", "mem_usage_gb", "avail_mem_gb"]
+        ),
+    }
+
+    return {"events": grouped, "aggregates": aggregates}
+
+
 def collect_extra_memory_overheads(lines):
     parsed_items = []
 
@@ -382,6 +545,7 @@ log_path = Path(log_path)
 json_path = Path(json_path)
 text = log_path.read_text(encoding="utf-8", errors="replace")
 lines = text.splitlines()
+ranked_memory = collect_ranked_memory_events(lines)
 
 server_args_line = last_line_containing(lines, "server_args=ServerArgs(")
 scheduler_line = last_line_containing(lines, "max_total_num_tokens=")
@@ -517,6 +681,8 @@ memory = {
     "piecewise_cuda_graph_end_avail_mem_gb": piecewise_cuda_graph_end_avail_mem_gb,
     "token_pool_search_watermark": resolved.get("mem_fraction_static"),
     "reserved_mem_heuristic_gb": compute_reserved_mem_heuristic_gb(resolved),
+    "per_rank_events": ranked_memory["events"],
+    "aggregates": ranked_memory["aggregates"],
     "extra_overheads": collect_extra_memory_overheads(lines),
 }
 
