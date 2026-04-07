@@ -104,6 +104,7 @@ class _TrackedStreamContext:
 class TestSchedulerTransferAlloc(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
         self.engine = MockTransferEngine(session_id="receiver-session")
         self.buffer = TransferTensorBuffer(pool_size=1 * 1024 * 1024, role_name="test")
         self.meta_buffer = TransferMetaBuffer(slot_count=2, slot_size=64 * 1024, role_name="test")
@@ -117,9 +118,6 @@ class TestSchedulerTransferAlloc(unittest.TestCase):
         self.scheduler = _SchedulerHarness.make(RoleType.DENOISER)
         self.scheduler._transfer_manager = self.tm
         self.tm.send_direct_message = MagicMock()
-
-    def tearDown(self):
-        MockTransferEngine.reset()
 
     def test_alloc_sends_peer_info_to_upstream_with_meta_and_local_copy(self):
         msg = {
@@ -755,6 +753,7 @@ class TestDenoisingStagePreShardedInputs(unittest.TestCase):
 class TestSchedulerTransferEncoderStaging(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
         self.engine = MockTransferEngine(session_id="encoder-session")
         self.buffer = TransferTensorBuffer(pool_size=2 * 1024 * 1024, role_name="test")
         self.meta_buffer = TransferMetaBuffer(slot_count=2, slot_size=64 * 1024, role_name="test")
@@ -767,9 +766,6 @@ class TestSchedulerTransferEncoderStaging(unittest.TestCase):
         self.addCleanup(self.tm.cleanup)
         self.scheduler = _SchedulerHarness.make(RoleType.ENCODER)
         self.scheduler._transfer_manager = self.tm
-
-    def tearDown(self):
-        MockTransferEngine.reset()
 
     def test_encoder_transfer_stage_enqueues_then_sends_staged_msg(self):
         tensor_fields = {
