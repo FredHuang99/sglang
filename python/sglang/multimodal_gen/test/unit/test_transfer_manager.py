@@ -66,9 +66,7 @@ def _make_manager(
 class TestStaging(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()
-
-    def tearDown(self):
-        MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
 
     def test_stage_single_tensor(self):
         mgr = _make_manager(self)
@@ -96,9 +94,7 @@ class TestStaging(unittest.TestCase):
 class TestReceive(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()
-
-    def tearDown(self):
-        MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
 
     def test_allocate_receive_slot(self):
         mgr = _make_manager(self)
@@ -118,9 +114,7 @@ class TestReceive(unittest.TestCase):
 class TestTransfer(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()
-
-    def tearDown(self):
-        MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
 
     def test_full_transfer_cycle(self):
         sender = _make_manager(self, session_id="sender-1")
@@ -505,9 +499,7 @@ class TestTransferProtocol(unittest.TestCase):
 class TestSendRuntimeConfig(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()
-
-    def tearDown(self):
-        MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
 
     def test_default_runtime_config_uses_single_queue_and_fallback_workers(self):
         mgr = _make_manager(self)
