@@ -30,7 +30,7 @@ MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-0.90}"
 #MAX_PREFILL_TOKENS="${MAX_PREFILL_TOKENS:-}"
 
 #TP_SIZE="${TP_SIZE:-1 2 4 8}"
-TP_SIZE="${TP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-1 2 4}"
 BS_LIST_STRING="${BS_LIST:-1 2 4 8 16 32}"
 
 ENABLE_PROFILE="${ENABLE_PROFILE:-0}"
@@ -41,7 +41,7 @@ PROFILE_BY_STAGE="${PROFILE_BY_STAGE:-0}"
 PROFILE_STAGES="${PROFILE_STAGES:-}"
 
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe_7b/run/${RUN_ID}}"
+RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe7b/run/${RUN_ID}}"
 RESULT_JSONL="${RUN_ROOT}/bench_serving_results.jsonl"
 SUMMARY_CSV="${RUN_ROOT}/bench_serving_summary.csv"
 
