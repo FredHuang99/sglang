@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for Scheduler transfer integration."""
 
-import json
 import pickle
 import queue
 import unittest
@@ -114,6 +113,7 @@ class TestSchedulerTransferAlloc(unittest.TestCase):
             meta_buffer=self.meta_buffer,
             host_id="host-a",
         )
+        self.addCleanup(self.tm.cleanup)
         self.scheduler = _SchedulerHarness.make(RoleType.DENOISER)
         self.scheduler._transfer_manager = self.tm
         self.tm.send_direct_message = MagicMock()
@@ -154,7 +154,7 @@ class TestSchedulerTransferAlloc(unittest.TestCase):
         self.assertEqual(accepted_msg["receiver_role"], RoleType.DENOISER.value)
         self.assertEqual(accepted_msg["request_id"], "req-alloc-1")
 
-    def test_alloc_failure_reports_alloc_reject(self):
+    def test_missing_source_control_endpoint_reports_non_retryable_alloc_reject(self):
         msg = {
             "msg_type": TransferMsgType.ALLOC,
             "request_id": "req-alloc-2",
@@ -165,12 +165,37 @@ class TestSchedulerTransferAlloc(unittest.TestCase):
         self.scheduler._handle_transfer_alloc(msg)
 
         self.assertIsNone(self.tm.get_receive_slot_addr("req-alloc-2"))
+        self.tm.send_direct_message.assert_not_called()
         self.scheduler._pool_result_push.send_multipart.assert_called_once()
         sent_frames = self.scheduler._pool_result_push.send_multipart.call_args[0][0]
-        reply = json.loads(sent_frames[1])
+        reply = decode_transfer_msg(sent_frames)
+        self.assertEqual(reply["msg_type"], TransferMsgType.ALLOC_REJECT)
+        self.assertFalse(reply["retryable"])
+        self.assertEqual(reply["reason"], "missing source control endpoint")
+        self.assertEqual(reply["request_id"], "req-alloc-2")
+
+    def test_allocate_receive_slot_failure_reports_retryable_alloc_reject(self):
+        self.tm.allocate_receive_slot = MagicMock(return_value=None)
+        msg = {
+            "msg_type": TransferMsgType.ALLOC,
+            "request_id": "req-alloc-3",
+            "data_size": 4096,
+            "meta_size": 512,
+            "source_control_endpoint": "tcp://upstream-ctrl",
+            "source_host_id": "host-a",
+        }
+
+        self.scheduler._handle_transfer_alloc(msg)
+
+        self.assertIsNone(self.tm.get_receive_slot_addr("req-alloc-3"))
+        self.tm.send_direct_message.assert_not_called()
+        self.scheduler._pool_result_push.send_multipart.assert_called_once()
+        sent_frames = self.scheduler._pool_result_push.send_multipart.call_args[0][0]
+        reply = decode_transfer_msg(sent_frames)
         self.assertEqual(reply["msg_type"], TransferMsgType.ALLOC_REJECT)
         self.assertTrue(reply["retryable"])
-        self.assertEqual(reply["request_id"], "req-alloc-2")
+        self.assertEqual(reply["reason"], "receiver failed to allocate slot")
+        self.assertEqual(reply["request_id"], "req-alloc-3")
 
 
 class TestSchedulerPrefetchQueues(unittest.TestCase):
@@ -739,6 +764,7 @@ class TestSchedulerTransferEncoderStaging(unittest.TestCase):
             meta_buffer=self.meta_buffer,
             host_id="host-a",
         )
+        self.addCleanup(self.tm.cleanup)
         self.scheduler = _SchedulerHarness.make(RoleType.ENCODER)
         self.scheduler._transfer_manager = self.tm
 
