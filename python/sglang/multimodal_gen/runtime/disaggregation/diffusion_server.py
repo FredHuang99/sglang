@@ -140,6 +140,7 @@ class DiffusionServer:
         )
 
         self._context = zmq.Context(io_threads=2)
+        self._context_destroyed = False
         self._running = False
         self._thread: threading.Thread | None = None
 
@@ -185,6 +186,25 @@ class DiffusionServer:
     def dispatcher(self) -> PoolDispatcher:
         return self._dispatcher
 
+    def _close_control_push_sockets(self) -> None:
+        for sock in self._control_push_sockets.values():
+            try:
+                sock.close(linger=0)
+            except TypeError:
+                sock.close()
+            except Exception:
+                logger.exception("DiffusionServer: failed to close control push socket")
+        self._control_push_sockets.clear()
+
+    def _destroy_context_if_needed(self) -> None:
+        if self._context_destroyed:
+            return
+        self._context_destroyed = True
+        try:
+            self._context.destroy(linger=0)
+        except Exception:
+            logger.exception("DiffusionServer: failed to destroy ZMQ context")
+
     def start(self) -> None:
         if self._running:
             return
@@ -213,7 +233,14 @@ class DiffusionServer:
         self._running = False
         if self._thread is not None:
             self._thread.join(timeout=5.0)
+            if self._thread.is_alive():
+                logger.warning(
+                    "DiffusionServer: stop timed out while waiting for event loop thread"
+                )
+                return
             self._thread = None
+        self._close_control_push_sockets()
+        self._destroy_context_if_needed()
 
     def _event_loop(self) -> None:
         frontend, _ = get_zmq_socket(
@@ -287,11 +314,9 @@ class DiffusionServer:
             logger.exception("DiffusionServer event loop error")
         finally:
             for sock in all_sockets:
-                sock.close()
-            for sock in self._control_push_sockets.values():
-                sock.close()
-            self._control_push_sockets.clear()
-            self._context.destroy(linger=0)
+                sock.close(linger=0)
+            self._close_control_push_sockets()
+            self._destroy_context_if_needed()
 
     def _handle_role_result(self, result_pull: zmq.Socket, role: RoleType) -> None:
         try:

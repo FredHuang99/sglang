@@ -36,6 +36,7 @@ class TestDiffusionServerInit(unittest.TestCase):
             decoder_result_endpoint="tcp://127.0.0.1:19906",
             max_slots_per_instance=3,
         )
+        self.addCleanup(server.stop)
         self.assertEqual(server._encoder_free_slots, [3])
         self.assertEqual(server._denoiser_free_slots, [3])
         self.assertEqual(server._decoder_free_slots, [3])
@@ -53,6 +54,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             decoder_result_endpoint="tcp://127.0.0.1:19916",
             max_slots_per_instance=2,
         )
+        self.addCleanup(self.server.stop)
         self.server._encoder_pushes = [MagicMock()]
         self.server._denoiser_pushes = [MagicMock()]
         self.server._decoder_pushes = [MagicMock()]
@@ -397,6 +399,9 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             sender_role=RoleType.ENCODER.value,
             sender_instance=0,
             sender_control_endpoint="tcp://enc-ctrl",
+            transfer_phase=TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT,
+            handoff_started_at=0.0,
+            phase_started_at=0.0,
             downstream_wait_since=0.0,
         )
 
