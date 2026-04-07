@@ -78,13 +78,13 @@ def make_zimage_sampling() -> ZImageSamplingParams:
 PRESETS: dict[str, ProfilePreset] = {
     "z-image": ProfilePreset(
         name="z-image",
-        model_path="/home/heyang/models/Z_Image",
+        model_path="/workspace/models/Z_Image",
         model_id="Z-Image",
         expected_task_type="T2I",
         task_name="text-to-image",
         request_kind="image",
         requires_input_image=False,
-        output_dir="/home/heyang/profile_output/z_image",
+        output_dir="/workspace/outputs/z_image",
         default_prompt=(
             "cute anime style girl with massive fluffy fennec ears and a big fluffy "
             "tail blonde messy long hair blue eyes wearing a maid outfit with a long "
@@ -97,26 +97,26 @@ PRESETS: dict[str, ProfilePreset] = {
     ),
     "wan2.2-ti2v-5b": ProfilePreset(
         name="wan2.2-ti2v-5b",
-        model_path="/home/heyang/models/Wan2_2-TI2V-5B-Diffusers",
+        model_path="/workspace/models/Wan2_2_TI2V_5B",
         model_id="Wan2.2-TI2V-5B-Diffusers",
         expected_task_type="TI2V",
         task_name="image-to-video",
         request_kind="video",
         requires_input_image=True,
-        output_dir="/home/heyang/profile_output/wan2_2_ti2v_5b",
+        output_dir="/workspace/outputs/wan2_2_ti2v_5b",
         default_prompt="The girl turn the body and spin around in place.",
         default_input_image=str(REPO_ROOT / "examples" / "assets" / "example_image.png"),
         sampling_factory=Wan2_2_TI2V_5B_SamplingParam,
     ),
     "wan2.1-t2v-1.3b": ProfilePreset(
         name="wan2.1-t2v-1.3b",
-        model_path="/home/heyang/models/Wan2_1_T2V_1_3B",
+        model_path="/workspace/models/Wan2_1_T2V_1_3B",
         model_id="Wan2.1-T2V-1.3B-Diffusers",
         expected_task_type="T2V",
         task_name="text-to-video",
         request_kind="video",
         requires_input_image=False,
-        output_dir="/home/heyang/profile_output/wan2_1_t2v_1_3b",
+        output_dir="/workspace/outputs/wan2_1_t2v_1_3b",
         default_prompt=(
             "A small corgi walks happily through a sunlit garden, gentle camera "
             "movement, soft cinematic lighting."
@@ -146,7 +146,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-id", type=str, default=None)
     parser.add_argument("--input-image", type=str, default=None)
     parser.add_argument("--prompt", type=str, default=None)
-    parser.add_argument("--parallel-degrees", type=str, default="1,2,4")
+    parser.add_argument("--parallel-degrees", type=str, default="1,2,4,8")
     parser.add_argument("--num-requests", type=int, default=20)
     parser.add_argument("--online-rps", type=float, default=1.0)
     parser.add_argument("--probe-runs", type=int, default=3)

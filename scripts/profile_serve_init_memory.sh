@@ -722,8 +722,8 @@ echo "Run root: ${RUN_ROOT}"
 
 for TP in "${TP_SIZE_LIST[@]}"; do
   TP_DIR="${RUN_ROOT}/tp${TP}"
-  SERVER_LOG="${TP_DIR}/server.log"
-  PROFILE_JSON="${TP_DIR}/serve_init_profile.json"
+  SERVER_LOG="${TP_DIR}/server_${TP}.log"
+  PROFILE_JSON="${TP_DIR}/serve_init_profile_${TP}.json"
   mkdir -p "${TP_DIR}"
 
   SERVER_ARGS=(
