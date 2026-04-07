@@ -9,11 +9,11 @@ MODEL_PATH="${MODEL_PATH:-/workspace/models/Hunyuan_PromptEnhancer_7B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 CTX_LEN="${CTX_LEN:-32768}"
-TP_SIZE="${TP_SIZE:-1}"
+TP_SIZE="${TP_SIZE:-4}"
 READY_CHECK_TIMEOUT="${READY_CHECK_TIMEOUT:-600}"
 SERVER_BOOTSTRAP_GRACE_SEC="${SERVER_BOOTSTRAP_GRACE_SEC:-5}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe_7b/init/${RUN_ID}}"
+RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe7b/init/${RUN_ID}}"
 
 # Leave these empty by default so we can observe SGLang's own init-time search
 # unless the caller explicitly overrides them.
@@ -120,6 +120,7 @@ write_profile_json() {
   python - "$log_path" "$json_path" "$MODEL_PATH" "$HOST" "$PORT" "$tp" "$CTX_LEN" "$MEM_FRACTION_STATIC" "$CHUNKED_PREFILL_SIZE" "$CUDA_GRAPH_MAX_BS" "$MAX_PREFILL_TOKENS" "$MAX_TOTAL_TOKENS" "$MAX_RUNNING_REQUESTS" <<'PY'
 import ast
 import json
+import os
 import re
 import sys
 from datetime import datetime
@@ -168,11 +169,152 @@ def parse_int(pattern, text):
     return int(match.group(1))
 
 
+def mib_to_gb(value):
+    if value is None:
+        return None
+    return round(value / 1024.0, 3)
+
+
+def size_to_gb(value, unit):
+    if value is None:
+        return None
+    if unit.upper() == "GB":
+        return round(value, 3)
+    if unit.upper() == "MB":
+        return round(value / 1024.0, 3)
+    return None
+
+
 def last_line_containing(lines, needle):
     for line in reversed(lines):
         if needle in line:
             return line
     return ""
+
+
+def collect_extra_memory_overheads(lines):
+    parsed_items = []
+
+    for idx, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        lowered = line.lower()
+
+        if "routing experts device buffer allocated." in lowered:
+            size_mb = parse_float(r"size: ([0-9.]+) MB", line)
+            parsed_items.append(
+                {
+                    "name": "routing_experts_device_buffer",
+                    "memory_kind": "device",
+                    "line_number": idx,
+                    "size_mb": size_mb,
+                    "size_gb": mib_to_gb(size_mb),
+                    "log_line": line,
+                }
+            )
+            continue
+
+        if "routing experts host buffer allocated." in lowered:
+            size_gb = parse_float(r"size: ([0-9.]+) GB", line)
+            parsed_items.append(
+                {
+                    "name": "routing_experts_host_buffer",
+                    "memory_kind": "host",
+                    "line_number": idx,
+                    "size_gb": size_gb,
+                    "log_line": line,
+                }
+            )
+            continue
+
+        if "mamba cache is allocated." in lowered:
+            entry = {
+                "name": "mamba_cache",
+                "memory_kind": "device",
+                "line_number": idx,
+                "num_tokens": parse_int(r"#tokens: (\d+)", line),
+                "conv_state_gb": parse_float(r"conv_state size: ([0-9.]+)GB", line),
+                "ssm_state_gb": parse_float(r"ssm_state size: ([0-9.]+)GB", line),
+                "intermediate_ssm_state_cache_gb": parse_float(
+                    r"intermediate_ssm_state_cache size: ([0-9.]+)GB", line
+                ),
+                "intermediate_conv_window_cache_gb": parse_float(
+                    r"intermediate_conv_window_cache size: ([0-9.]+)GB", line
+                ),
+                "log_line": line,
+            }
+            components = [
+                entry["conv_state_gb"],
+                entry["ssm_state_gb"],
+                entry["intermediate_ssm_state_cache_gb"],
+                entry["intermediate_conv_window_cache_gb"],
+            ]
+            components = [value for value in components if value is not None]
+            if components:
+                entry["total_gb"] = round(sum(components), 3)
+            parsed_items.append(entry)
+            continue
+
+        # Generic catch-all for other size-bearing init-time overhead lines that
+        # may come from communication/workspace/buffer subsystems. We keep the
+        # original line so downstream analysis can interpret new backends.
+        if "size:" in lowered and any(
+            token in lowered for token in ("buffer", "workspace", "cache")
+        ):
+            size_match = re.search(r"size: ([0-9.]+) (GB|MB)", line)
+            if size_match:
+                size_value = float(size_match.group(1))
+                size_unit = size_match.group(2)
+                memory_kind = "host" if "host" in lowered else "device"
+                parsed_items.append(
+                    {
+                        "name": "generic_extra_overhead",
+                        "memory_kind": memory_kind,
+                        "line_number": idx,
+                        "size_value": size_value,
+                        "size_unit": size_unit,
+                        "size_gb": size_to_gb(size_value, size_unit),
+                        "log_line": line,
+                    }
+                )
+
+    def _sum_items(kind):
+        total = 0.0
+        found = False
+        for item in parsed_items:
+            if item.get("memory_kind") != kind:
+                continue
+            size_gb = item.get("size_gb")
+            if size_gb is None:
+                size_gb = item.get("total_gb")
+            if size_gb is None:
+                continue
+            total += size_gb
+            found = True
+        return round(total, 3) if found else None
+
+    configured_hints = {
+        "flashinfer_workspace_env_bytes": int(
+            os.environ.get("SGLANG_FLASHINFER_WORKSPACE_SIZE", str(384 * 1024 * 1024))
+        ),
+        "flashinfer_workspace_env_gb": round(
+            int(
+                os.environ.get(
+                    "SGLANG_FLASHINFER_WORKSPACE_SIZE", str(384 * 1024 * 1024)
+                )
+            )
+            / (1024**3),
+            3,
+        ),
+        "trtllm_mha_default_workspace_gb": round((512 * 1024 * 1024) / (1024**3), 3),
+        "trtllm_mla_default_workspace_gb": round((150 * 1024 * 1024) / (1024**3), 3),
+    }
+
+    return {
+        "parsed_items": parsed_items,
+        "device_total_gb": _sum_items("device"),
+        "host_total_gb": _sum_items("host"),
+        "configured_hints": configured_hints,
+    }
 
 
 def compute_reserved_mem_heuristic_gb(resolved):
@@ -268,6 +410,13 @@ for key in [
     "disable_piecewise_cuda_graph",
     "enable_dp_attention",
     "speculative_algorithm",
+    "attention_backend",
+    "enable_flashinfer_allreduce_fusion",
+    "enable_aiter_allreduce_fusion",
+    "enable_symm_mem",
+    "enable_mscclpp",
+    "enable_torch_symm_mem",
+    "disable_custom_all_reduce",
 ]:
     server_args[key] = parse_server_arg(server_args_line, key)
 
@@ -321,8 +470,19 @@ resolved = {
         else None
     ),
     "disable_piecewise_cuda_graph": server_args.get("disable_piecewise_cuda_graph"),
+    "attention_backend": server_args.get("attention_backend"),
     "enable_dp_attention": bool(server_args.get("enable_dp_attention")),
     "speculative_algorithm": server_args.get("speculative_algorithm"),
+    "enable_flashinfer_allreduce_fusion": server_args.get(
+        "enable_flashinfer_allreduce_fusion"
+    ),
+    "enable_aiter_allreduce_fusion": server_args.get(
+        "enable_aiter_allreduce_fusion"
+    ),
+    "enable_symm_mem": server_args.get("enable_symm_mem"),
+    "enable_mscclpp": server_args.get("enable_mscclpp"),
+    "enable_torch_symm_mem": server_args.get("enable_torch_symm_mem"),
+    "disable_custom_all_reduce": server_args.get("disable_custom_all_reduce"),
 }
 
 requested = {
@@ -357,10 +517,11 @@ memory = {
     "piecewise_cuda_graph_end_avail_mem_gb": piecewise_cuda_graph_end_avail_mem_gb,
     "token_pool_search_watermark": resolved.get("mem_fraction_static"),
     "reserved_mem_heuristic_gb": compute_reserved_mem_heuristic_gb(resolved),
+    "extra_overheads": collect_extra_memory_overheads(lines),
 }
 
 payload = {
-    "schema_version": 1,
+    "schema_version": 2,
     "status": "ready",
     "timestamp": datetime.now().astimezone().isoformat(),
     "requested": requested,
