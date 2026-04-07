@@ -88,6 +88,7 @@ class SendCompletion:
     staged: StagedTransfer | None
     success: bool
     error_msg: str | None = None
+    retryable: bool = True
 
 
 @dataclass
@@ -813,6 +814,7 @@ class DiffusionTransferManager:
                         staged=staged,
                         success=False,
                         error_msg="missing staged payload",
+                        retryable=False,
                     )
                 )
                 return
@@ -831,6 +833,7 @@ class DiffusionTransferManager:
                         staged=staged,
                         success=False,
                         error_msg="send executor not initialized",
+                        retryable=False,
                     )
                 )
                 return
@@ -926,6 +929,7 @@ class DiffusionTransferManager:
                 staged=staged,
                 success=success,
                 error_msg=error_msg,
+                retryable=error_msg != "missing staged payload",
             )
         )
 
@@ -958,6 +962,7 @@ class DiffusionTransferManager:
                     retry_peer.last_error = completion.error_msg
                 can_retry = (
                     retry_peer is not None
+                    and completion.retryable
                     and retry_peer.send_attempts <= retry_peer.max_send_retries
                 )
                 if can_retry:

@@ -11,18 +11,31 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
 )
 
 
+def _make_tensor_buffer(testcase: unittest.TestCase, **kwargs) -> TransferTensorBuffer:
+    buf = TransferTensorBuffer(**kwargs)
+    testcase.addCleanup(buf.cleanup)
+    return buf
+
+
+def _make_meta_buffer(testcase: unittest.TestCase, **kwargs) -> TransferMetaBuffer:
+    buf = TransferMetaBuffer(**kwargs)
+    testcase.addCleanup(buf.cleanup)
+    return buf
+
+
 class TestTransferTensorBuffer(unittest.TestCase):
     """Test tensor buffer allocation and memory operations."""
 
     def test_basic_alloc_free(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=1 << 20, role_name="test")
         handle = buf.allocate(size=4096, request_id="req-1")
         self.assertIsNotNone(handle)
         self.assertEqual(handle.request_id, "req-1")
         self.assertTrue(buf.free(handle))
 
     def test_alloc_failure(self):
-        buf = TransferTensorBuffer(
+        buf = _make_tensor_buffer(
+            self,
             pool_size=1 << 20, min_block_size=1 << 20, role_name="test"
         )
         # Pool has only 1 slot
@@ -35,16 +48,17 @@ class TestTransferTensorBuffer(unittest.TestCase):
         self.assertIsNotNone(h3)
 
     def test_pool_uses_shared_memory(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=1 << 20, role_name="test")
         self.assertTrue(buf.uses_shared_memory)
         self.assertIsNotNone(buf.shared_memory_name)
 
     def test_pool_data_ptr(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=1 << 20, role_name="test")
         self.assertGreater(buf.pool_data_ptr, 0)
 
     def test_free_slots_count(self):
-        buf = TransferTensorBuffer(
+        buf = _make_tensor_buffer(
+            self,
             pool_size=4 << 20, min_block_size=1 << 20, role_name="test"
         )
         self.assertEqual(buf.free_slots_count(1 << 20), 4)
@@ -54,7 +68,7 @@ class TestTransferTensorBuffer(unittest.TestCase):
         self.assertEqual(buf.free_slots_count(1 << 20), 4)
 
     def test_stats(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="encoder")
+        buf = _make_tensor_buffer(self, pool_size=1 << 20, role_name="encoder")
         stats = buf.get_stats()
         self.assertEqual(stats["role"], "encoder")
         self.assertGreater(stats["pool_size"], 0)
@@ -65,7 +79,7 @@ class TestTransferTensorBufferIO(unittest.TestCase):
 
     def test_write_read_cpu_tensor(self):
         """Write a CPU tensor to slot, read it back."""
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=1 << 20, role_name="test")
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         src = torch.randn(4, 8, dtype=torch.float32)
@@ -77,7 +91,7 @@ class TestTransferTensorBufferIO(unittest.TestCase):
         buf.free(handle)
 
     def test_write_read_bfloat16(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=1 << 20, role_name="test")
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         src = torch.randn(2, 16, dtype=torch.bfloat16)
@@ -90,7 +104,7 @@ class TestTransferTensorBufferIO(unittest.TestCase):
         buf.free(handle)
 
     def test_write_multiple_at_offsets(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=1 << 20, role_name="test")
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         t1 = torch.randn(8, dtype=torch.float32)  # 32 bytes
@@ -107,7 +121,8 @@ class TestTransferTensorBufferIO(unittest.TestCase):
         buf.free(handle)
 
     def test_write_exceeds_slot_raises(self):
-        buf = TransferTensorBuffer(
+        buf = _make_tensor_buffer(
+            self,
             pool_size=1 << 20, min_block_size=1024, role_name="test"
         )
         handle = buf.allocate(size=1024, request_id="req-1")
@@ -122,7 +137,7 @@ class TestTransferTensorBufferBatchIO(unittest.TestCase):
     """Test batch write/read with manifest."""
 
     def test_write_read_manifest(self):
-        buf = TransferTensorBuffer(pool_size=4 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=4 << 20, role_name="test")
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         tensors = {
@@ -145,7 +160,7 @@ class TestTransferTensorBufferBatchIO(unittest.TestCase):
         buf.free(handle)
 
     def test_write_read_with_list_tensors(self):
-        buf = TransferTensorBuffer(pool_size=4 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=4 << 20, role_name="test")
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         tensors = {
@@ -165,7 +180,7 @@ class TestTransferTensorBufferBatchIO(unittest.TestCase):
         buf.free(handle)
 
     def test_write_skips_none(self):
-        buf = TransferTensorBuffer(pool_size=4 << 20, role_name="test")
+        buf = _make_tensor_buffer(self, pool_size=4 << 20, role_name="test")
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         tensors = {
@@ -181,7 +196,7 @@ class TestTransferTensorBufferBatchIO(unittest.TestCase):
         """Simulate encoder→denoiser transfer for Wan2.1-like model."""
         # ~60MB total: prompt_embeds + latents
         pool_size = 256 << 20  # 256 MiB
-        buf = TransferTensorBuffer(pool_size=pool_size, role_name="encoder")
+        buf = _make_tensor_buffer(self, pool_size=pool_size, role_name="encoder")
         handle = buf.allocate(size=64 << 20, request_id="wan-001")
         self.assertIsNotNone(handle)
 
@@ -209,7 +224,9 @@ class TestTransferTensorBufferGPU(unittest.TestCase):
     """Test GPU-backed TransferTensorBuffer (GPUDirect RDMA path)."""
 
     def test_gpu_pool_allocation(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test", device="cuda:0")
+        buf = _make_tensor_buffer(
+            self, pool_size=1 << 20, role_name="test", device="cuda:0"
+        )
         self.assertEqual(buf.device, "cuda:0")
         self.assertTrue(buf._pool.is_cuda)
         handle = buf.allocate(size=4096, request_id="req-1")
@@ -218,7 +235,9 @@ class TestTransferTensorBufferGPU(unittest.TestCase):
 
     def test_gpu_write_read_roundtrip(self):
         """Write a GPU tensor to GPU pool, read it back — no D2H/H2D."""
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test", device="cuda:0")
+        buf = _make_tensor_buffer(
+            self, pool_size=1 << 20, role_name="test", device="cuda:0"
+        )
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         src = torch.randn(4, 8, dtype=torch.float32, device="cuda:0")
@@ -233,7 +252,9 @@ class TestTransferTensorBufferGPU(unittest.TestCase):
         buf.free(handle)
 
     def test_gpu_write_read_bfloat16(self):
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test", device="cuda:0")
+        buf = _make_tensor_buffer(
+            self, pool_size=1 << 20, role_name="test", device="cuda:0"
+        )
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         src = torch.randn(2, 16, dtype=torch.bfloat16, device="cuda:0")
@@ -246,7 +267,9 @@ class TestTransferTensorBufferGPU(unittest.TestCase):
         buf.free(handle)
 
     def test_gpu_batch_write_read_manifest(self):
-        buf = TransferTensorBuffer(pool_size=4 << 20, role_name="test", device="cuda:0")
+        buf = _make_tensor_buffer(
+            self, pool_size=4 << 20, role_name="test", device="cuda:0"
+        )
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         tensors = {
@@ -267,7 +290,9 @@ class TestTransferTensorBufferGPU(unittest.TestCase):
 
     def test_gpu_pool_read_to_cpu(self):
         """Read from GPU pool to CPU (cross-device)."""
-        buf = TransferTensorBuffer(pool_size=1 << 20, role_name="test", device="cuda:0")
+        buf = _make_tensor_buffer(
+            self, pool_size=1 << 20, role_name="test", device="cuda:0"
+        )
         handle = buf.allocate(size=1 << 20, request_id="req-1")
 
         src = torch.randn(4, 8, dtype=torch.float32, device="cuda:0")
@@ -296,7 +321,7 @@ class TestTransferEngineGPUDirect(unittest.TestCase):
 
 class TestTransferMetaBuffer(unittest.TestCase):
     def test_roundtrip_scalar_and_manifest_metadata(self):
-        buf = TransferMetaBuffer(slot_count=2, slot_size=4096, role_name="meta")
+        buf = _make_meta_buffer(self, slot_count=2, slot_size=4096, role_name="meta")
         handle = buf.allocate("req-1")
         manifest = {
             "latents": [
@@ -319,7 +344,7 @@ class TestTransferMetaBuffer(unittest.TestCase):
         self.assertEqual(loaded_scalars["timesteps"], [999.0, 950.0, 900.0])
 
     def test_slot_count_and_shared_memory_descriptor(self):
-        buf = TransferMetaBuffer(slot_count=3, slot_size=1024, role_name="meta")
+        buf = _make_meta_buffer(self, slot_count=3, slot_size=1024, role_name="meta")
         self.assertEqual(buf.slot_count, 3)
         self.assertEqual(buf.pool_size, buf.slot_count * buf.slot_size)
         self.assertIsNotNone(buf.shared_memory_name)

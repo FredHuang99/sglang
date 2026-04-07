@@ -9,6 +9,7 @@ import torch
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
+from sglang.multimodal_gen.runtime import server_args as server_args_module
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -45,6 +46,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
     MOVADecodingStage,
     MOVADenoisingStage,
 )
+from sglang.multimodal_gen.runtime.server_args import set_global_server_args
 
 
 class TestPipelineSpecificExtraModules(unittest.TestCase):
@@ -179,7 +181,18 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
         self.assertEqual(extras, {"video_vae", "audio_vae"})
 
 
-class TestStageAffinityAndValidation(unittest.TestCase):
+class _GlobalStageArgsMixin:
+    def setUp(self):
+        super().setUp()
+        self._prev_global_server_args = server_args_module._global_server_args
+        set_global_server_args(SimpleNamespace(comfyui_mode=False))
+
+    def tearDown(self):
+        set_global_server_args(self._prev_global_server_args)
+        super().tearDown()
+
+
+class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
     def _make_hunyuan_pipeline(
         self, role: RoleType, *, paint_enable: bool
     ) -> Hunyuan3D2Pipeline:
@@ -255,7 +268,7 @@ class TestStageAffinityAndValidation(unittest.TestCase):
         self.assertFalse(hasattr(stage, "model_dtype"))
 
 
-class TestHunyuan3DShapeStageRuntimeDtype(unittest.TestCase):
+class TestHunyuan3DShapeStageRuntimeDtype(_GlobalStageArgsMixin, unittest.TestCase):
     def test_conditioner_parameter_dtype_wins_over_sample_dtype(self):
         conditioner = torch.nn.Linear(4, 4, bias=False).to(dtype=torch.float32)
         stage = Hunyuan3DShapeBeforeDenoisingStage(

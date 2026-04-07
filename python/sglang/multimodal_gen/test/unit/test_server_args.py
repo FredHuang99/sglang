@@ -12,12 +12,17 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
+def _from_dict_without_model_resolution(
+    kwargs, pipeline_config: PipelineConfig | None = None
+):
+    pipeline_config = pipeline_config or QwenImagePipelineConfig()
+    with patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config):
+        return ServerArgs.from_dict(kwargs)
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
-        with patch.object(
-            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-        ):
-            return ServerArgs.from_dict(kwargs)
+        return _from_dict_without_model_resolution(kwargs)
 
     def test_tilde_model_path_is_expanded(self):
         args = self._from_dict_without_model_resolution(
@@ -76,7 +81,7 @@ class TestPerRoleParallelism(unittest.TestCase):
     """Test per-role parallelism args and get_role_parallelism helper."""
 
     def test_defaults_are_none(self):
-        args = ServerArgs.from_dict({"model_path": "/fake"})
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         for role in [RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER]:
@@ -87,7 +92,7 @@ class TestPerRoleParallelism(unittest.TestCase):
             self.assertIsNone(par["ring_degree"])
 
     def test_encoder_overrides(self):
-        args = ServerArgs.from_dict(
+        args = _from_dict_without_model_resolution(
             {
                 "model_path": "/fake",
                 "encoder_tp": 2,
@@ -102,7 +107,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertIsNone(par["ring_degree"])
 
     def test_denoiser_overrides(self):
-        args = ServerArgs.from_dict(
+        args = _from_dict_without_model_resolution(
             {
                 "model_path": "/fake",
                 "denoiser_tp": 1,
@@ -120,7 +125,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(par["ring_degree"], 2)
 
     def test_decoder_overrides(self):
-        args = ServerArgs.from_dict(
+        args = _from_dict_without_model_resolution(
             {
                 "model_path": "/fake",
                 "decoder_sp": 2,
@@ -135,7 +140,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertIsNone(par["ring_degree"])
 
     def test_decoder_tp_is_alias_of_decoder_sp(self):
-        args = ServerArgs.from_dict(
+        args = _from_dict_without_model_resolution(
             {
                 "model_path": "/fake",
                 "decoder_tp": 2,
@@ -150,7 +155,7 @@ class TestPerRoleParallelism(unittest.TestCase):
 
     def test_conflicting_decoder_tp_and_decoder_sp_raise(self):
         with self.assertRaisesRegex(ValueError, "decoder_tp is deprecated"):
-            ServerArgs.from_dict(
+            _from_dict_without_model_resolution(
                 {
                     "model_path": "/fake",
                     "decoder_tp": 2,
@@ -159,7 +164,7 @@ class TestPerRoleParallelism(unittest.TestCase):
             )
 
     def test_monolithic_returns_all_none(self):
-        args = ServerArgs.from_dict(
+        args = _from_dict_without_model_resolution(
             {
                 "model_path": "/fake",
                 "encoder_tp": 2,
@@ -173,7 +178,7 @@ class TestPerRoleParallelism(unittest.TestCase):
 
     def test_mixed_roles_independent(self):
         """Per-role args don't interfere with each other."""
-        args = ServerArgs.from_dict(
+        args = _from_dict_without_model_resolution(
             {
                 "model_path": "/fake",
                 "encoder_tp": 1,
@@ -240,7 +245,7 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
     def test_disagg_defaults_match_reviewed_values(self):
-        args = ServerArgs.from_dict({"model_path": "/fake"})
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
         self.assertEqual(args.disagg_max_slots_per_instance, 8)
         self.assertEqual(args.disagg_downstream_wait_timeout, 600)
         self.assertEqual(args.disagg_timeout, 1200)

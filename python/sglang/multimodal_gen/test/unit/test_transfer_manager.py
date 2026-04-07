@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
 
 
 def _make_manager(
+    testcase: unittest.TestCase | None = None,
     pool_size: int = 16 * 1024 * 1024,
     min_block: int = 1024 * 1024,
     session_id: str | None = None,
@@ -51,12 +52,15 @@ def _make_manager(
         slot_size=64 * 1024,
         role_name="test",
     )
-    return DiffusionTransferManager(
+    manager = DiffusionTransferManager(
         engine=engine,
         buffer=buffer,
         meta_buffer=meta_buffer,
         host_id="host-a",
     )
+    if testcase is not None:
+        testcase.addCleanup(manager.cleanup)
+    return manager
 
 
 class TestStaging(unittest.TestCase):
@@ -67,13 +71,13 @@ class TestStaging(unittest.TestCase):
         MockTransferEngine.reset()
 
     def test_stage_single_tensor(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         staged = mgr.stage_tensors("r1", {"data": torch.randn(4, 8)})
         self.assertIsInstance(staged, StagedTransfer)
         self.assertIn("data", staged.manifest)
 
     def test_stage_with_scalar_fields(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         staged = mgr.stage_tensors(
             "r1",
             {"t": torch.randn(4)},
@@ -82,7 +86,7 @@ class TestStaging(unittest.TestCase):
         self.assertEqual(staged.scalar_fields["guidance_scale"], 7.5)
 
     def test_free_staged_is_idempotent(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         mgr.stage_tensors("r1", {"t": torch.randn(4, 8)})
         mgr.free_staged("r1")
         mgr.free_staged("r1")
@@ -97,14 +101,14 @@ class TestReceive(unittest.TestCase):
         MockTransferEngine.reset()
 
     def test_allocate_receive_slot(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         pending = mgr.allocate_receive_slot("r1", 1024 * 1024, 4096)
         self.assertIsInstance(pending, PendingReceive)
         self.assertIsNotNone(mgr.get_receive_slot_addr("r1"))
         self.assertIsNotNone(mgr.get_receive_meta_addr("r1"))
 
     def test_free_receive_slot_is_idempotent(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         mgr.allocate_receive_slot("r1", 1024 * 1024, 4096)
         mgr.free_receive_slot("r1")
         mgr.free_receive_slot("r1")
@@ -119,8 +123,8 @@ class TestTransfer(unittest.TestCase):
         MockTransferEngine.reset()
 
     def test_full_transfer_cycle(self):
-        sender = _make_manager(session_id="sender-1")
-        receiver = _make_manager(session_id="receiver-1")
+        sender = _make_manager(self, session_id="sender-1")
+        receiver = _make_manager(self, session_id="receiver-1")
         original = torch.randn(2, 4, 8, 8)
         staged = sender.stage_tensors(
             "r1",
@@ -150,7 +154,7 @@ class TestTransfer(unittest.TestCase):
         self.assertEqual(scalar_fields["guidance_scale"], 7.5)
 
     def test_duplicate_peer_info_is_ignored_after_queueing(self):
-        sender = _make_manager(session_id="sender-dup")
+        sender = _make_manager(self, session_id="sender-dup")
         sender.stage_tensors("dup-1", {"latents": torch.randn(1, 4, 8, 8)})
         sender._send_queues = [queue.Queue()]
         sender._register_peer_send(
@@ -176,8 +180,8 @@ class TestTransfer(unittest.TestCase):
         self.assertEqual(sender._pending_peer_sends["dup-1"].dest_addr, 123)
 
     def test_send_executor_completes_and_dedupes_terminal_state(self):
-        sender = _make_manager(session_id="sender-exec")
-        receiver = _make_manager(session_id="receiver-exec")
+        sender = _make_manager(self, session_id="sender-exec")
+        receiver = _make_manager(self, session_id="receiver-exec")
         callback = unittest.mock.MagicMock()
         sender._on_send_completion = callback
         sender._send_executors = [ThreadPoolExecutor(max_workers=2)]
@@ -224,7 +228,7 @@ class TestTransfer(unittest.TestCase):
         self.assertNotIn("r1", sender._pending_peer_sends)
 
     def test_send_failure_retries_before_terminal_success(self):
-        sender = _make_manager(session_id="sender-retry")
+        sender = _make_manager(self, session_id="sender-retry")
         callback = unittest.mock.MagicMock()
         sender._on_send_completion = callback
         sender._send_executors = [ThreadPoolExecutor(max_workers=1)]
@@ -267,7 +271,7 @@ class TestTransfer(unittest.TestCase):
         self.assertEqual(sender._terminal_send_states["retry-1"], "success")
 
     def test_send_failure_exhausts_retries_before_terminal_failure(self):
-        sender = _make_manager(session_id="sender-retry-fail")
+        sender = _make_manager(self, session_id="sender-retry-fail")
         callback = unittest.mock.MagicMock()
         sender._on_send_completion = callback
         sender._send_executors = [ThreadPoolExecutor(max_workers=1)]
@@ -300,8 +304,8 @@ class TestTransfer(unittest.TestCase):
         self.assertIsNone(sender.get_staged_info("retry-fail-1"))
 
     def test_same_host_local_copy_path_moves_data_and_meta(self):
-        sender = _make_manager(session_id="sender-local")
-        receiver = _make_manager(session_id="receiver-local")
+        sender = _make_manager(self, session_id="sender-local")
+        receiver = _make_manager(self, session_id="receiver-local")
         staged = sender.stage_tensors(
             "local-1",
             {"latents": torch.randn(1, 4, 8, 8)},
@@ -336,8 +340,8 @@ class TestTransfer(unittest.TestCase):
         self.assertEqual(scalars["request_id"], "local-1")
 
     def test_same_host_local_copy_fails_if_meta_copy_fails(self):
-        sender = _make_manager(session_id="sender-local-fail")
-        receiver = _make_manager(session_id="receiver-local-fail")
+        sender = _make_manager(self, session_id="sender-local-fail")
+        receiver = _make_manager(self, session_id="receiver-local-fail")
         staged = sender.stage_tensors(
             "local-fail-1",
             {"latents": torch.randn(1, 4, 8, 8)},
@@ -381,7 +385,7 @@ class TestTransfer(unittest.TestCase):
         self.assertIn("local shared-memory copy failed", error_msg)
 
     def test_missing_staged_payload_reports_failure(self):
-        mgr = _make_manager(session_id="sender-missing")
+        mgr = _make_manager(self, session_id="sender-missing")
         callback = unittest.mock.MagicMock()
         mgr._on_send_completion = callback
         mgr._send_executors = [ThreadPoolExecutor(max_workers=1)]
@@ -406,7 +410,7 @@ class TestTransfer(unittest.TestCase):
         mgr._send_executors = []
 
     def test_abort_request_frees_staged_and_dynamic_receive_and_tombstones(self):
-        mgr = _make_manager(session_id="sender-abort")
+        mgr = _make_manager(self, session_id="sender-abort")
         staged = mgr.stage_tensors(
             "abort-1",
             {"latents": torch.randn(1, 4, 8, 8)},
@@ -506,7 +510,7 @@ class TestSendRuntimeConfig(unittest.TestCase):
         MockTransferEngine.reset()
 
     def test_default_runtime_config_uses_single_queue_and_fallback_workers(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         with unittest.mock.patch.dict(os.environ, {}, clear=True):
             queue_count, total_workers, worker_counts = mgr._resolve_send_runtime_config(3)
         self.assertEqual(queue_count, 1)
@@ -514,7 +518,7 @@ class TestSendRuntimeConfig(unittest.TestCase):
         self.assertEqual(worker_counts, [3])
 
     def test_queue_only_override_promotes_total_workers(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         with unittest.mock.patch.dict(
             os.environ,
             {"SGLANG_DIFFUSION_DISAGG_SEND_QUEUE_SIZE": "4"},
@@ -526,7 +530,7 @@ class TestSendRuntimeConfig(unittest.TestCase):
         self.assertEqual(worker_counts, [1, 1, 1, 1])
 
     def test_explicit_thread_pool_override_is_evenly_distributed(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         with unittest.mock.patch.dict(
             os.environ,
             {
@@ -541,7 +545,7 @@ class TestSendRuntimeConfig(unittest.TestCase):
         self.assertEqual(worker_counts, [3, 3, 2])
 
     def test_invalid_thread_pool_smaller_than_queue_count_fails(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         with unittest.mock.patch.dict(
             os.environ,
             {
@@ -554,7 +558,7 @@ class TestSendRuntimeConfig(unittest.TestCase):
                 mgr._resolve_send_runtime_config(1)
 
     def test_same_downstream_identity_maps_to_same_queue(self):
-        mgr = _make_manager()
+        mgr = _make_manager(self)
         mgr._send_queues = [queue.Queue() for _ in range(4)]
         first = PendingPeerSend(
             request_id="r1",

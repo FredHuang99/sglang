@@ -7,6 +7,12 @@ import threading
 
 logger = logging.getLogger(__name__)
 
+_POLICY_KWARGS = {
+    "round_robin": frozenset(),
+    "max_free_slots": frozenset({"max_slots_per_instance"}),
+}
+_KNOWN_POLICY_KWARGS = frozenset().union(*_POLICY_KWARGS.values())
+
 
 class DispatchPolicy(abc.ABC):
     def __init__(self, num_instances: int):
@@ -205,4 +211,14 @@ def create_dispatch_policy(name: str, num_instances: int, **kwargs) -> DispatchP
         raise ValueError(
             f"Unknown dispatch policy '{name}'. Available: {list(policies.keys())}"
         )
-    return cls(num_instances=num_instances, **kwargs)
+    unexpected_kwargs = sorted(set(kwargs) - _KNOWN_POLICY_KWARGS)
+    if unexpected_kwargs:
+        unexpected_args = ", ".join(unexpected_kwargs)
+        raise TypeError(
+            f"Unsupported dispatch policy kwargs for '{name}': {unexpected_args}"
+        )
+
+    filtered_kwargs = {
+        key: value for key, value in kwargs.items() if key in _POLICY_KWARGS[name]
+    }
+    return cls(num_instances=num_instances, **filtered_kwargs)

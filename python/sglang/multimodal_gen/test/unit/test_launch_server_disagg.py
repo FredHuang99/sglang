@@ -27,7 +27,7 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
             return_value="outputs/uploads/warmup_image.jpg",
         ), patch(
             "sglang.multimodal_gen.runtime.launch_server.save_image_to_path",
-            return_value="ignored",
+            new=MagicMock(return_value="ignored"),
         ):
             warmup_reqs = _build_disagg_calibration_reqs(server_args)
 

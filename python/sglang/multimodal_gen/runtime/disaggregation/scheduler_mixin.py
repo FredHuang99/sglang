@@ -27,8 +27,6 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferMetaBuffer,
     TransferTensorBuffer,
-    estimate_transfer_bytes,
-    estimate_transfer_manifest,
     estimate_transfer_meta_bytes,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (

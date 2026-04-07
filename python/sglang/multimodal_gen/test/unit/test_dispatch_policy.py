@@ -58,8 +58,15 @@ class TestMaxFreeSlotsFirst(unittest.TestCase):
     def test_all_at_capacity(self):
         policy = MaxFreeSlotsFirst(num_instances=2, max_slots_per_instance=1)
         # Both at capacity — should still pick one
-        result = policy.select(active_counts=[1, 1])
+        with self.assertLogs(
+            "sglang.multimodal_gen.runtime.disaggregation.dispatch_policy",
+            level="WARNING",
+        ) as captured:
+            result = policy.select(active_counts=[1, 1])
         self.assertIn(result, [0, 1])
+        self.assertTrue(
+            any("All 2 instances are at capacity" in line for line in captured.output)
+        )
 
     def test_tie_breaking(self):
         policy = MaxFreeSlotsFirst(num_instances=3, max_slots_per_instance=4)
@@ -135,6 +142,12 @@ class TestCreateDispatchPolicy(unittest.TestCase):
 
     def test_round_robin(self):
         policy = create_dispatch_policy("round_robin", num_instances=2)
+        self.assertIsInstance(policy, RoundRobin)
+
+    def test_round_robin_ignores_max_slots_per_instance(self):
+        policy = create_dispatch_policy(
+            "round_robin", num_instances=2, max_slots_per_instance=3
+        )
         self.assertIsInstance(policy, RoundRobin)
 
     def test_max_free_slots(self):
