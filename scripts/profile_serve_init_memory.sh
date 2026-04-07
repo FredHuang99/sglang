@@ -5,15 +5,15 @@ set -euo pipefail
 # becomes ready, then stop the server and export one JSON file per run that
 # records the init-time values SGLang computed/logged.
 
-MODEL_PATH="${MODEL_PATH:-/workspace/models/Hunyuan_PromptEnhancer_7B}"
+MODEL_PATH="${MODEL_PATH:-/workspace/models/Hunyuan_PromptEnhancer_32B}"
 HOST="${HOST:-127.0.0.1}"
 PORT="${PORT:-30000}"
 CTX_LEN="${CTX_LEN:-32768}"
-TP_SIZE="${TP_SIZE:-1 2 4}"
+TP_SIZE="${TP_SIZE:-2 4}"
 READY_CHECK_TIMEOUT="${READY_CHECK_TIMEOUT:-600}"
 SERVER_BOOTSTRAP_GRACE_SEC="${SERVER_BOOTSTRAP_GRACE_SEC:-5}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
-RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe7b/init/${RUN_ID}}"
+RUN_ROOT="${RUN_ROOT:-/workspace/outputs/pe32b/init/${RUN_ID}}"
 
 # Leave these empty by default so we can observe SGLang's own init-time search
 # unless the caller explicitly overrides them.
@@ -420,8 +420,13 @@ def collect_extra_memory_overheads(lines):
         # Generic catch-all for other size-bearing init-time overhead lines that
         # may come from communication/workspace/buffer subsystems. We keep the
         # original line so downstream analysis can interpret new backends.
-        if "size:" in lowered and any(
+        if (
+            "size:" in lowered
+            and "kv cache is allocated." not in lowered
+            and "mamba cache is allocated." not in lowered
+            and any(
             token in lowered for token in ("buffer", "workspace", "cache")
+            )
         ):
             size_match = re.search(r"size: ([0-9.]+) (GB|MB)", line)
             if size_match:
