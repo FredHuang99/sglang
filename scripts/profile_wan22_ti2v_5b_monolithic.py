@@ -2100,8 +2100,15 @@ def main() -> None:
             parallel_degree,
             len(run_configs),
         )
-        for run_config in run_configs:
-            logger.info("Profiling gpu=%s config=%s", parallel_degree, run_config.name)
+        total_configs = len(run_configs)
+        for config_idx, run_config in enumerate(run_configs, start=1):
+            logger.info(
+                "Profiling gpu=%s config=%s (%s/%s)",
+                parallel_degree,
+                run_config.name,
+                config_idx,
+                total_configs,
+            )
             run_dir = degree_tmp_root / run_config.name
             try:
                 summary["runs"].append(
@@ -2123,6 +2130,16 @@ def main() -> None:
                         "reason": str(exc),
                     }
                 )
+                logger.warning(
+                    "Skipping gpu=%s config=%s (%s/%s) after %s failure and continuing to next config: %s",
+                    parallel_degree,
+                    run_config.name,
+                    config_idx,
+                    total_configs,
+                    exc.phase,
+                    exc,
+                )
+                continue
             except Exception as exc:
                 summary["skipped_configs"].append(
                     {
@@ -2131,6 +2148,14 @@ def main() -> None:
                         "reason": str(exc),
                     }
                 )
+                logger.exception(
+                    "Skipping gpu=%s config=%s (%s/%s) after unexpected failure and continuing to next config",
+                    parallel_degree,
+                    run_config.name,
+                    config_idx,
+                    total_configs,
+                )
+                continue
             finally:
                 refresh_human_summary(summary)
                 save_json(summary_path, summary)
