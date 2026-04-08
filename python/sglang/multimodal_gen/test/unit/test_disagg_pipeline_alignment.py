@@ -183,7 +183,12 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
 
 class _GlobalStageArgsMixin:
     def _install_stage_server_args(self, **kwargs):
-        server_args = SimpleNamespace(comfyui_mode=False, **kwargs)
+        server_args = SimpleNamespace(
+            comfyui_mode=False,
+            enable_torch_compile=False,
+            enable_cfg_parallel=False,
+            **kwargs,
+        )
         set_global_server_args(server_args)
         return server_args
 
