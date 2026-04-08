@@ -187,6 +187,7 @@ class _GlobalStageArgsMixin:
             comfyui_mode=False,
             enable_torch_compile=False,
             enable_cfg_parallel=False,
+            attention_backend=None,
             **kwargs,
         )
         set_global_server_args(server_args)
