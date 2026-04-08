@@ -148,6 +148,11 @@ def parse_args() -> argparse.Namespace:
         help="Pass --trust-remote-code to the server.",
     )
     parser.add_argument(
+        "--enable-text-encoder-offload",
+        action="store_true",
+        help="Enable --text-encoder-cpu-offload while keeping other offload options disabled.",
+    )
+    parser.add_argument(
         "--keep-artifacts",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1177,6 +1182,7 @@ def build_server_command(
     master_port: int,
     output_dir: Path,
     trust_remote_code: bool,
+    enable_text_encoder_offload: bool,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -1211,7 +1217,7 @@ def build_server_command(
         "--dit-layerwise-offload",
         "false",
         "--text-encoder-cpu-offload",
-        "false",
+        "true" if enable_text_encoder_offload else "false",
         "--image-encoder-cpu-offload",
         "false",
         "--vae-cpu-offload",
@@ -1244,6 +1250,7 @@ def launch_server(
     host: str,
     timeout_s: int,
     trust_remote_code: bool,
+    enable_text_encoder_offload: bool,
 ) -> tuple[subprocess.Popen, str, Path, Path, dict[str, Any]]:
     port = find_free_port(host)
     scheduler_port = find_free_port(host)
@@ -1283,6 +1290,7 @@ def launch_server(
         master_port=master_port,
         output_dir=run_dir,
         trust_remote_code=trust_remote_code,
+        enable_text_encoder_offload=enable_text_encoder_offload,
     )
     logger.info(
         "Launching %s [runtime_backend=%s]",
@@ -1624,7 +1632,15 @@ def build_base_summary(
             "warmup_stage_profiling_enabled": False,
             "warmup_resolutions": [f"{sampling.width}x{sampling.height}"],
             "warmup_steps": 1,
-            "offload_policy": "All offload disabled explicitly: dit_cpu_offload=false, dit_layerwise_offload=false, text_encoder_cpu_offload=false, image_encoder_cpu_offload=false, vae_cpu_offload=false, pin_cpu_memory=false.",
+            "offload_policy": (
+                "Explicit offload policy: "
+                "dit_cpu_offload=false, "
+                "dit_layerwise_offload=false, "
+                f"text_encoder_cpu_offload={'true' if args.enable_text_encoder_offload else 'false'}, "
+                "image_encoder_cpu_offload=false, "
+                "vae_cpu_offload=false, "
+                "pin_cpu_memory=false."
+            ),
             "probe_execution_mode": (
                 "Strictly one-by-one. The script starts one probe request, waits "
                 "for it to finish, then starts the next probe request."
@@ -1846,6 +1862,7 @@ def run_single_config(
                 host=args.host,
                 timeout_s=args.wait_timeout,
                 trust_remote_code=args.trust_remote_code,
+                enable_text_encoder_offload=args.enable_text_encoder_offload,
             )
         except Exception as exc:
             raise RunConfigError("launch", str(exc)) from exc

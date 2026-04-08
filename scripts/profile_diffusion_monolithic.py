@@ -159,6 +159,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-timeout", type=int, default=1800)
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument(
+        "--enable-text-encoder-offload",
+        action="store_true",
+        help="Enable --text-encoder-cpu-offload in the underlying monolithic profiler.",
+    )
+    parser.add_argument(
         "--keep-artifacts",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -485,6 +490,7 @@ def main() -> None:
             request_dir = degree_tmp_root / "requests"
             request_dir.mkdir(parents=True, exist_ok=True)
             try:
+                legacy_args = argparse.Namespace(**vars(args))
                 summary["runs"].append(
                     legacy.run_single_config(
                         model_path=args.model_path,
@@ -492,7 +498,7 @@ def main() -> None:
                         prompt=args.prompt,
                         sampling=sampling,
                         run_config=run_config,
-                        args=args,
+                        args=legacy_args,
                         run_dir=run_dir,
                     )
                 )
