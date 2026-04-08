@@ -182,10 +182,15 @@ class TestPipelineSpecificExtraModules(unittest.TestCase):
 
 
 class _GlobalStageArgsMixin:
+    def _install_stage_server_args(self, **kwargs):
+        server_args = SimpleNamespace(comfyui_mode=False, **kwargs)
+        set_global_server_args(server_args)
+        return server_args
+
     def setUp(self):
         super().setUp()
         self._prev_global_server_args = server_args_module._global_server_args
-        set_global_server_args(SimpleNamespace(comfyui_mode=False))
+        self._install_stage_server_args()
 
     def tearDown(self):
         set_global_server_args(self._prev_global_server_args)
@@ -197,7 +202,7 @@ class TestStageAffinityAndValidation(_GlobalStageArgsMixin, unittest.TestCase):
         self, role: RoleType, *, paint_enable: bool
     ) -> Hunyuan3D2Pipeline:
         pipeline = object.__new__(Hunyuan3D2Pipeline)
-        pipeline.server_args = SimpleNamespace(
+        pipeline.server_args = self._install_stage_server_args(
             pipeline_config=Hunyuan3D2PipelineConfig(paint_enable=paint_enable)
         )
         pipeline._disagg_role = role
