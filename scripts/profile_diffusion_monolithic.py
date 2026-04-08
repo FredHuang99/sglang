@@ -378,7 +378,16 @@ def build_base_summary(
             "warmup_stage_profiling_enabled": False,
             "warmup_resolutions": [f"{sampling.width}x{sampling.height}"],
             "warmup_steps": 1,
-            "offload_policy": "All offload disabled explicitly: dit_cpu_offload=false, dit_layerwise_offload=false, text_encoder_cpu_offload=false, image_encoder_cpu_offload=false, vae_cpu_offload=false, pin_cpu_memory=false.",
+            "offload_policy": (
+                "Explicit offload policy: "
+                "dit_cpu_offload=false, "
+                "dit_layerwise_offload=false, "
+                "text_encoder_cpu_offload=requested true only for runs with tp_size==1; "
+                f"current request flag={'true' if args.enable_text_encoder_offload else 'false'}, "
+                "image_encoder_cpu_offload=false, "
+                "vae_cpu_offload=false, "
+                "pin_cpu_memory=false."
+            ),
             "probe_execution_mode": (
                 "Strictly one-by-one. The script starts one probe request, waits "
                 "for it to finish, then starts the next probe request."

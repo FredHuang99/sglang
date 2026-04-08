@@ -1170,6 +1170,15 @@ def build_resolved_parallelism(init_profile: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def should_enable_text_encoder_offload_for_run(
+    run_config: RunConfig, requested_enable: bool
+) -> bool:
+    if not requested_enable:
+        return False
+    tp_size = run_config.tp_size or 1
+    return tp_size == 1
+
+
 def build_server_command(
     *,
     model_path: str,
@@ -1184,6 +1193,9 @@ def build_server_command(
     trust_remote_code: bool,
     enable_text_encoder_offload: bool,
 ) -> list[str]:
+    effective_text_encoder_offload = should_enable_text_encoder_offload_for_run(
+        run_config, enable_text_encoder_offload
+    )
     command = [
         sys.executable,
         "-m",
@@ -1217,7 +1229,7 @@ def build_server_command(
         "--dit-layerwise-offload",
         "false",
         "--text-encoder-cpu-offload",
-        "true" if enable_text_encoder_offload else "false",
+        "true" if effective_text_encoder_offload else "false",
         "--image-encoder-cpu-offload",
         "false",
         "--vae-cpu-offload",
@@ -1636,7 +1648,8 @@ def build_base_summary(
                 "Explicit offload policy: "
                 "dit_cpu_offload=false, "
                 "dit_layerwise_offload=false, "
-                f"text_encoder_cpu_offload={'true' if args.enable_text_encoder_offload else 'false'}, "
+                "text_encoder_cpu_offload=requested true only for runs with tp_size==1; "
+                f"current request flag={'true' if args.enable_text_encoder_offload else 'false'}, "
                 "image_encoder_cpu_offload=false, "
                 "vae_cpu_offload=false, "
                 "pin_cpu_memory=false."
@@ -2053,6 +2066,13 @@ def run_single_config(
             "runtime_backend_reason": DEFAULT_RUNTIME_BACKEND_REASON,
             "requested_parallelism": asdict(run_config),
             "resolved_parallelism": build_resolved_parallelism(init_profile),
+            "effective_offload": {
+                "text_encoder_cpu_offload_requested": args.enable_text_encoder_offload,
+                "text_encoder_cpu_offload_applied": should_enable_text_encoder_offload_for_run(
+                    run_config, args.enable_text_encoder_offload
+                ),
+                "policy": "text_encoder_cpu_offload is only applied when requested and tp_size==1.",
+            },
             "effective_pipeline": {
                 "pipeline_class": init_profile.get("pipeline_class"),
                 "pipeline_name": init_profile.get("pipeline_name"),
