@@ -86,6 +86,43 @@ class _SchedulerHarness:
         return scheduler
 
 
+class TestTransferEngineGpuSelection(unittest.TestCase):
+    def test_rank0_transfer_engine_uses_physical_gpu_id(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler.worker.local_rank = 4
+        scheduler.server_args.pool_control_advertised_endpoint = None
+        scheduler.server_args.pool_control_endpoint = None
+        scheduler.server_args.resolved_role_device = lambda: "cuda"
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-1"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-1"
+        fake_manager.pool_data_ptr = 123
+        fake_manager.pool_size = 4096
+        fake_manager.meta_pool_ptr = 456
+        fake_manager.meta_pool_size = 1024
+        fake_manager.data_shm_name = None
+        fake_manager.meta_shm_name = None
+        fake_manager.host_id = "host-a"
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ) as create_engine, patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager()
+
+        create_engine.assert_called_once_with(
+            hostname="127.0.0.1",
+            gpu_id=4,
+            ib_device=None,
+        )
+        scheduler._pool_result_push.send_multipart.assert_called_once()
+
+
 class _TrackedStreamContext:
     def __init__(self, state, stream):
         self._state = state

@@ -7,10 +7,120 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImagePipelineConfig,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.launch_server import (
     _build_disagg_calibration_reqs,
     _run_disagg_startup_calibration,
+    _spawn_disagg_worker_group,
+    launch_disagg_role,
+    launch_pool_disagg_server,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+def _make_server_args(**overrides):
+    kwargs = {
+        "model_path": "/fake",
+        "pipeline_config": QwenImagePipelineConfig(),
+        "host": "127.0.0.1",
+        "scheduler_port": 30020,
+        "warmup": False,
+        "log_level": "debug",
+    }
+    kwargs.update(overrides)
+    return ServerArgs(**kwargs)
+
+
+def _make_fake_role_args(**kwargs):
+    return SimpleNamespace(
+        **kwargs,
+        resolved_role_device=lambda device=kwargs["disagg_role_device"]: device,
+    )
+
+
+class _FakeReadyReader:
+    def __init__(self, events, rank, payload=None, error=None):
+        self.events = events
+        self.rank = rank
+        self.payload = payload or {"status": "ready"}
+        self.error = error
+        self.closed = False
+
+    def recv(self):
+        self.events.append(("recv", self.rank))
+        if self.error is not None:
+            raise self.error
+        return self.payload
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.events.append(("close_reader", self.rank))
+
+
+class _FakeReadyWriter:
+    def __init__(self, events, rank):
+        self.events = events
+        self.rank = rank
+        self.closed = False
+
+    def close(self):
+        if not self.closed:
+            self.closed = True
+            self.events.append(("close_writer", self.rank))
+
+
+class _FakeProcess:
+    def __init__(self, events, rank, worker_id, name):
+        self.events = events
+        self.rank = rank
+        self.worker_id = worker_id
+        self.name = name
+        self.exitcode = None
+        self._alive = False
+
+    def start(self):
+        self._alive = True
+        self.events.append(("start", self.rank, self.worker_id, self.name))
+
+    def terminate(self):
+        self._alive = False
+        self.exitcode = -15
+        self.events.append(("terminate", self.rank))
+
+    def join(self, timeout=None):
+        self._alive = False
+        self.events.append(("join", self.rank, timeout))
+
+    def is_alive(self):
+        return self._alive
+
+
+class _FakeSpawnContext:
+    def __init__(self, events, reader_specs=None):
+        self.events = events
+        self.reader_specs = reader_specs or {}
+        self.pipe_rank = 0
+
+    def Pipe(self, duplex=False):
+        rank = self.pipe_rank
+        self.pipe_rank += 1
+        spec = self.reader_specs.get(rank, {})
+        return (
+            _FakeReadyReader(
+                self.events,
+                rank,
+                payload=spec.get("payload"),
+                error=spec.get("error"),
+            ),
+            _FakeReadyWriter(self.events, rank),
+        )
+
+    def Process(self, target, args, name, daemon):
+        return _FakeProcess(self.events, args[1], args[0], name)
 
 
 class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
@@ -92,6 +202,101 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
             "sglang.multimodal_gen.runtime.launch_server.time.sleep"
         ), self.assertRaisesRegex(RuntimeError, "Disagg startup calibration failed"):
             _run_disagg_startup_calibration("tcp://127.0.0.1:9999", server_args)
+
+
+class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
+    def _assert_starts_and_closes_before_recv(self, events, expected_ranks):
+        first_recv_idx = next(i for i, event in enumerate(events) if event[0] == "recv")
+        start_ranks = [event[1] for event in events if event[0] == "start"]
+        close_ranks = [event[1] for event in events if event[0] == "close_writer"]
+
+        self.assertEqual(start_ranks, expected_ranks)
+        self.assertEqual(close_ranks[: len(expected_ranks)], expected_ranks)
+
+        start_indices = [
+            idx for idx, event in enumerate(events) if event[0] == "start"
+        ]
+        close_indices = [
+            idx for idx, event in enumerate(events) if event[0] == "close_writer"
+        ]
+        for idx in start_indices + close_indices[: len(expected_ranks)]:
+            self.assertLess(idx, first_recv_idx)
+
+    def test_pool_launch_starts_all_ranks_before_waiting_for_ready(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(events)
+        server_args = _make_server_args(disagg_role_device="cuda")
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.mp.get_context",
+            return_value=pool_ctx,
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server.ServerArgs.from_kwargs",
+            side_effect=lambda **kwargs: _make_fake_role_args(**kwargs),
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server.DiffusionServer"
+        ) as diffusion_server_cls, patch(
+            "sglang.multimodal_gen.runtime.launch_server.is_port_available",
+            return_value=True,
+        ):
+            diffusion_server_cls.return_value = MagicMock(start=MagicMock())
+            launch_pool_disagg_server(
+                server_args,
+                encoder_gpus=[[4, 5, 6, 7]],
+                denoiser_gpus=[],
+                decoder_gpus=[],
+                launch_http_server=False,
+            )
+
+        self._assert_starts_and_closes_before_recv(events, [0, 1, 2, 3])
+
+    def test_standalone_role_launch_starts_all_ranks_before_waiting_for_ready(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(events)
+        server_args = _make_server_args(
+            disagg_role=RoleType.ENCODER,
+            disagg_server_addr="tcp://127.0.0.1:30020",
+            scheduler_port=31020,
+            num_gpus=4,
+            base_gpu_id=4,
+            disagg_role_device="cuda",
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.mp.get_context",
+            return_value=pool_ctx,
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server.ServerArgs.from_kwargs",
+            side_effect=lambda **kwargs: _make_fake_role_args(**kwargs),
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server.is_port_available",
+            return_value=True,
+        ):
+            launch_disagg_role(server_args)
+
+        self._assert_starts_and_closes_before_recv(events, [0, 1, 2, 3])
+
+    def test_worker_group_cleanup_terminates_started_processes_on_ready_failure(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(events, reader_specs={1: {"error": EOFError()}})
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Pool encoder\\[0\\] rank 1 exited before reporting ready",
+        ):
+            _spawn_disagg_worker_group(
+                pool_ctx=pool_ctx,
+                worker_ids=[4, 5, 6, 7],
+                role_args=_make_fake_role_args(
+                    disagg_role_device="cuda",
+                    num_gpus=4,
+                ),
+                process_name_builder=lambda rank_idx: f"enc-r{rank_idx}",
+                group_label="Pool encoder[0]",
+            )
+
+        terminate_ranks = [event[1] for event in events if event[0] == "terminate"]
+        self.assertEqual(terminate_ranks, [0, 1, 2, 3])
 
 
 if __name__ == "__main__":

@@ -621,7 +621,7 @@ class SchedulerDisaggMixin:
         ib_device = getattr(sa, "disagg_ib_device", None)
         engine = create_transfer_engine(
             hostname=hostname,
-            gpu_id=self.gpu_id,
+            gpu_id=self.worker.local_rank,
             ib_device=ib_device,
         )
 

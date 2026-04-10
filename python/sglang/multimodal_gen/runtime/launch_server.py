@@ -158,6 +158,94 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
+def _terminate_processes(processes: list[mp.Process], timeout_s: float = 5.0) -> None:
+    """Best-effort cleanup for spawned worker processes."""
+    for process in processes:
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+    deadline = time.time() + timeout_s
+    for process in processes:
+        remaining = max(0.0, deadline - time.time())
+        try:
+            process.join(timeout=remaining)
+        except Exception:
+            pass
+
+
+def _spawn_disagg_worker_group(
+    pool_ctx: mp.context.BaseContext,
+    worker_ids: list[int],
+    role_args: ServerArgs,
+    process_name_builder,
+    group_label: str,
+) -> list[mp.Process]:
+    """Spawn all ranks for a disagg role instance before waiting for readiness."""
+    processes: list[mp.Process] = []
+    ready_readers: list[tuple[int, mp.connection.Connection]] = []
+    ready_writers: list[mp.connection.Connection] = []
+
+    try:
+        for rank_idx, worker_id in enumerate(worker_ids):
+            reader, writer = pool_ctx.Pipe(duplex=False)
+            ready_readers.append((rank_idx, reader))
+            ready_writers.append(writer)
+
+            process = pool_ctx.Process(
+                target=_run_disagg_role_process,
+                args=(worker_id, rank_idx, rank_idx, role_args, writer, [], []),
+                name=process_name_builder(rank_idx),
+                daemon=True,
+            )
+            process.start()
+            processes.append(process)
+
+        logger.info(
+            "%s: started ranks=%s on worker_ids=%s; waiting for readiness",
+            group_label,
+            list(range(len(worker_ids))),
+            worker_ids,
+        )
+
+        for writer in ready_writers:
+            writer.close()
+
+        for rank_idx, reader in ready_readers:
+            try:
+                data = reader.recv()
+            except EOFError as exc:
+                exitcode = processes[rank_idx].exitcode if rank_idx < len(processes) else None
+                raise RuntimeError(
+                    f"{group_label} rank {rank_idx} exited before reporting ready "
+                    f"(exitcode={exitcode})."
+                ) from exc
+            finally:
+                reader.close()
+
+            if data.get("status") != "ready":
+                raise RuntimeError(
+                    f"{group_label} rank {rank_idx} failed to initialize: {data}"
+                )
+
+        return processes
+    except Exception:
+        _terminate_processes(processes)
+        raise
+    finally:
+        for writer in ready_writers:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        for _, reader in ready_readers:
+            try:
+                reader.close()
+            except Exception:
+                pass
+
+
 def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     """
     Args:
@@ -413,121 +501,108 @@ def launch_pool_disagg_server(
         ),
     ]
 
-    for role_type, gpu_lists, work_eps, control_eps, result_ep in role_configs:
-        for inst_idx, gpu_ids in enumerate(gpu_lists):
-            is_cpu_instance = role_type == RoleType.ENCODER and len(gpu_ids) == 0
-            if len(gpu_ids) == 0 and not is_cpu_instance:
-                raise ValueError(
-                    f"Empty GPU list is only supported for encoder CPU instances, got {role_type.value}[{inst_idx}]"
-                )
-
-            num_role_workers = 1 if is_cpu_instance else len(gpu_ids)
-            role_device = "cpu" if is_cpu_instance else server_args.disagg_role_device
-
-            # Per-role parallelism: use explicit overrides if set, else None (auto-derive)
-            role_par = server_args.get_role_parallelism(role_type)
-
-            role_overrides = {
-                "disagg_role": role_type,
-                "disagg_mode": True,
-                "disagg_instance_id": inst_idx,
-                "disagg_role_device": role_device,
-                "pool_work_endpoint": work_eps[inst_idx],
-                "pool_control_endpoint": control_eps[inst_idx],
-                "pool_control_advertised_endpoint": control_eps[inst_idx],
-                "pool_result_endpoint": result_ep,
-                "num_gpus": num_role_workers,
-                "warmup": role_type == RoleType.ENCODER,
-                "scheduler_port": find_port(port_cursor),
-                "master_port": find_port(port_cursor + 100),
-                # Per-role parallelism (None = auto-derive from num_gpus)
-                "tp_size": role_par["tp_size"],
-                "sp_degree": role_par["sp_degree"],
-                "ulysses_degree": role_par["ulysses_degree"],
-                "ring_degree": role_par["ring_degree"],
-            }
-            port_cursor = role_overrides["master_port"] + 100
-
-            base_dict = {
-                f.name: getattr(server_args, f.name)
-                for f in dataclasses.fields(server_args)
-            }
-            base_dict.update(role_overrides)
-            base_dict.pop("pipeline_config", None)
-            role_args = ServerArgs.from_kwargs(**base_dict)
-
-            pool_ctx = mp.get_context("spawn")
-
-            worker_ids = [0] if is_cpu_instance else gpu_ids
-
-            for rank_idx in range(num_role_workers):
-                reader, writer = pool_ctx.Pipe(duplex=False)
-                worker_id = worker_ids[rank_idx]
-
-                process = pool_ctx.Process(
-                    target=_run_disagg_role_process,
-                    args=(worker_id, rank_idx, rank_idx, role_args, writer, [], []),
-                    name=f"sglang-pool-{role_type.value}-{inst_idx}-r{rank_idx}",
-                    daemon=True,
-                )
-                process.start()
-                all_processes.append(process)
-
-                try:
-                    data = reader.recv()
-                except EOFError:
-                    logger.error(
-                        "Pool %s[%d] rank %d is dead.",
-                        role_type.value,
-                        inst_idx,
-                        rank_idx,
+    try:
+        for role_type, gpu_lists, work_eps, control_eps, result_ep in role_configs:
+            for inst_idx, gpu_ids in enumerate(gpu_lists):
+                is_cpu_instance = role_type == RoleType.ENCODER and len(gpu_ids) == 0
+                if len(gpu_ids) == 0 and not is_cpu_instance:
+                    raise ValueError(
+                        f"Empty GPU list is only supported for encoder CPU instances, got {role_type.value}[{inst_idx}]"
                     )
-                    raise
-                if data.get("status") != "ready":
-                    raise RuntimeError(
-                        f"Pool {role_type.value}[{inst_idx}] rank {rank_idx} "
-                        "failed to initialize."
-                    )
-                reader.close()
 
-            logger.info(
-                "Pool %s[%d] ready on %s %s (work=%s, control=%s)",
-                role_type.value.upper(),
-                inst_idx,
-                "CPU worker(s)" if is_cpu_instance else "GPU(s)",
-                worker_ids,
-                work_eps[inst_idx],
-                control_eps[inst_idx],
-            )
+                num_role_workers = 1 if is_cpu_instance else len(gpu_ids)
+                role_device = "cpu" if is_cpu_instance else server_args.disagg_role_device
+
+                # Per-role parallelism: use explicit overrides if set, else None (auto-derive)
+                role_par = server_args.get_role_parallelism(role_type)
+
+                role_overrides = {
+                    "disagg_role": role_type,
+                    "disagg_mode": True,
+                    "disagg_instance_id": inst_idx,
+                    "disagg_role_device": role_device,
+                    "pool_work_endpoint": work_eps[inst_idx],
+                    "pool_control_endpoint": control_eps[inst_idx],
+                    "pool_control_advertised_endpoint": control_eps[inst_idx],
+                    "pool_result_endpoint": result_ep,
+                    "num_gpus": num_role_workers,
+                    "warmup": role_type == RoleType.ENCODER,
+                    "scheduler_port": find_port(port_cursor),
+                    "master_port": find_port(port_cursor + 100),
+                    # Per-role parallelism (None = auto-derive from num_gpus)
+                    "tp_size": role_par["tp_size"],
+                    "sp_degree": role_par["sp_degree"],
+                    "ulysses_degree": role_par["ulysses_degree"],
+                    "ring_degree": role_par["ring_degree"],
+                }
+                port_cursor = role_overrides["master_port"] + 100
+
+                base_dict = {
+                    f.name: getattr(server_args, f.name)
+                    for f in dataclasses.fields(server_args)
+                }
+                base_dict.update(role_overrides)
+                base_dict.pop("pipeline_config", None)
+                role_args = ServerArgs.from_kwargs(**base_dict)
+
+                pool_ctx = mp.get_context("spawn")
+                worker_ids = [0] if is_cpu_instance else gpu_ids
+                processes = _spawn_disagg_worker_group(
+                    pool_ctx=pool_ctx,
+                    worker_ids=worker_ids,
+                    role_args=role_args,
+                    process_name_builder=lambda rank_idx, role_type=role_type, inst_idx=inst_idx: (
+                        f"sglang-pool-{role_type.value}-{inst_idx}-r{rank_idx}"
+                    ),
+                    group_label=f"Pool {role_type.value}[{inst_idx}]",
+                )
+                all_processes.extend(processes)
+
+                logger.info(
+                    "Pool %s[%d] ready on %s %s (work=%s, control=%s)",
+                    role_type.value.upper(),
+                    inst_idx,
+                    "CPU worker(s)" if is_cpu_instance else "GPU(s)",
+                    worker_ids,
+                    work_eps[inst_idx],
+                    control_eps[inst_idx],
+                )
+    except Exception:
+        _terminate_processes(all_processes)
+        raise
 
     logger.info("All pool role instances ready")
 
     # Start DiffusionServer
     frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
 
-    diffusion_server = DiffusionServer(
-        frontend_endpoint=frontend_endpoint,
-        encoder_work_endpoints=encoder_work_endpoints,
-        denoiser_work_endpoints=denoiser_work_endpoints,
-        decoder_work_endpoints=decoder_work_endpoints,
-        encoder_result_endpoint=encoder_result_ep,
-        denoiser_result_endpoint=denoiser_result_ep,
-        decoder_result_endpoint=decoder_result_ep,
-        dispatch_policy_name=server_args.disagg_dispatch_policy,
-        timeout_s=float(server_args.disagg_timeout),
-        downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
-        max_slots_per_instance=server_args.disagg_max_slots_per_instance,
-    )
-    diffusion_server.start()
-    if server_args.warmup:
-        _run_disagg_startup_calibration(frontend_endpoint, server_args)
-
-    if launch_http_server:
-        logger.info(
-            "Starting FastAPI server (connected to DiffusionServer at port %d).",
-            server_args.scheduler_port,
+    try:
+        diffusion_server = DiffusionServer(
+            frontend_endpoint=frontend_endpoint,
+            encoder_work_endpoints=encoder_work_endpoints,
+            denoiser_work_endpoints=denoiser_work_endpoints,
+            decoder_work_endpoints=decoder_work_endpoints,
+            encoder_result_endpoint=encoder_result_ep,
+            denoiser_result_endpoint=denoiser_result_ep,
+            decoder_result_endpoint=decoder_result_ep,
+            dispatch_policy_name=server_args.disagg_dispatch_policy,
+            timeout_s=float(server_args.disagg_timeout),
+            downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
+            max_slots_per_instance=server_args.disagg_max_slots_per_instance,
         )
-        launch_http_server_only(server_args)
+        diffusion_server.start()
+        if server_args.warmup:
+            _run_disagg_startup_calibration(frontend_endpoint, server_args)
+
+        if launch_http_server:
+            logger.info(
+                "Starting FastAPI server (connected to DiffusionServer at port %d).",
+                server_args.scheduler_port,
+            )
+            launch_http_server_only(server_args)
+    except Exception:
+        _terminate_processes(all_processes)
+        raise
 
     return all_processes
 
@@ -734,39 +809,27 @@ def launch_disagg_role(server_args: ServerArgs):
     role_args = ServerArgs.from_kwargs(**base_dict)
 
     # Spawn GPU worker processes
-    is_cpu_role = role_type == RoleType.ENCODER and role_args.resolved_role_device() == "cpu"
-    num_workers = 1 if is_cpu_role else max(server_args.num_gpus, 1)
+    is_cpu_role = (
+        role_type == RoleType.ENCODER and role_args.resolved_role_device() == "cpu"
+    )
+    num_workers = 1 if is_cpu_role else max(role_args.num_gpus, 1)
     base_gpu_id = server_args.base_gpu_id
     pool_ctx = mp.get_context("spawn")
-    processes = []
 
-    for rank_idx in range(num_workers):
-        reader, writer = pool_ctx.Pipe(duplex=False)
-        worker_id = rank_idx if is_cpu_role else base_gpu_id + rank_idx
-
-        process = pool_ctx.Process(
-            target=_run_disagg_role_process,
-            args=(worker_id, rank_idx, rank_idx, role_args, writer, [], []),
-            name=f"sglang-{role_type.value}-r{rank_idx}",
-            daemon=True,
-        )
-        process.start()
-        processes.append(process)
-
-        try:
-            data = reader.recv()
-        except EOFError:
-            logger.error(
-                "Role %s rank %d is dead.",
-                role_type.value,
-                rank_idx,
-            )
-            raise
-        if data.get("status") != "ready":
-            raise RuntimeError(
-                f"Role {role_type.value} rank {rank_idx} failed to initialize."
-            )
-        reader.close()
+    worker_ids = (
+        [0]
+        if is_cpu_role
+        else [base_gpu_id + rank_idx for rank_idx in range(num_workers)]
+    )
+    processes = _spawn_disagg_worker_group(
+        pool_ctx=pool_ctx,
+        worker_ids=worker_ids,
+        role_args=role_args,
+        process_name_builder=lambda rank_idx, role_type=role_type: (
+            f"sglang-{role_type.value}-r{rank_idx}"
+        ),
+        group_label=f"Role {role_type.value}",
+    )
 
     logger.info(
         "Role %s ready (%d worker(s), work=%s, control=%s, device=%s)",
