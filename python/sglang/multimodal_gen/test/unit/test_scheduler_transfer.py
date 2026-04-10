@@ -78,6 +78,9 @@ class _SchedulerHarness:
             disagg_instance_id=1,
             pool_control_advertised_endpoint="tcp://receiver-ctrl",
             pool_control_endpoint="tcp://receiver-ctrl",
+            pool_work_endpoint=None,
+            disagg_p2p_hostname="127.0.0.1",
+            disagg_ib_device=None,
             sp_degree=1,
             tp_size=1,
             enable_cfg_parallel=False,
@@ -110,6 +113,12 @@ class TestTransferEngineGpuSelection(unittest.TestCase):
             "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
             return_value=fake_engine,
         ) as create_engine, patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+            return_value=MagicMock(),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer",
+            return_value=MagicMock(),
+        ), patch(
             "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
             return_value=fake_manager,
         ):
