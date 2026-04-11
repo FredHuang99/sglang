@@ -81,6 +81,7 @@ class _SchedulerHarness:
             pool_work_endpoint=None,
             disagg_p2p_hostname="127.0.0.1",
             disagg_ib_device=None,
+            disagg_transfer_backend="auto",
             sp_degree=1,
             tp_size=1,
             enable_cfg_parallel=False,
@@ -128,8 +129,53 @@ class TestTransferEngineGpuSelection(unittest.TestCase):
             hostname="127.0.0.1",
             gpu_id=4,
             ib_device=None,
+            backend="mock",
+            force_mock=True,
         )
         scheduler._pool_result_push.send_multipart.assert_called_once()
+
+    def test_explicit_mooncake_backend_is_forwarded_without_force_mock(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler.server_args.disagg_transfer_backend = "mooncake"
+        scheduler.server_args.disagg_p2p_hostname = "10.0.0.5"
+        scheduler.server_args.disagg_ib_device = "mlx5_0"
+        scheduler.server_args.pool_control_advertised_endpoint = None
+        scheduler.server_args.pool_control_endpoint = None
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-2"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-2"
+        fake_manager.pool_data_ptr = 123
+        fake_manager.pool_size = 4096
+        fake_manager.meta_pool_ptr = 456
+        fake_manager.meta_pool_size = 1024
+        fake_manager.data_shm_name = None
+        fake_manager.meta_shm_name = None
+        fake_manager.host_id = "host-b"
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ) as create_engine, patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+            return_value=MagicMock(),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer",
+            return_value=MagicMock(),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager()
+
+        create_engine.assert_called_once_with(
+            hostname="10.0.0.5",
+            gpu_id=0,
+            ib_device="mlx5_0",
+            backend="mooncake",
+            force_mock=False,
+        )
 
 
 class _TrackedStreamContext:

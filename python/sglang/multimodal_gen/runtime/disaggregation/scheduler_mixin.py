@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
     create_transfer_engine,
+    resolve_transfer_backend,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.manager import (
     DiffusionTransferManager,
@@ -619,10 +620,40 @@ class SchedulerDisaggMixin:
         # Create transfer engine
         hostname = getattr(sa, "disagg_p2p_hostname", "127.0.0.1")
         ib_device = getattr(sa, "disagg_ib_device", None)
-        engine = create_transfer_engine(
+        configured_backend = getattr(sa, "disagg_transfer_backend", "auto")
+        resolved_backend = resolve_transfer_backend(
+            configured_backend,
             hostname=hostname,
-            gpu_id=self.worker.local_rank,
             ib_device=ib_device,
+        )
+        logger.info(
+            "Transfer %s: initializing backend=%s (configured=%s, host=%s, gpu_id=%s, ib_device=%s)",
+            self._disagg_role.value.upper(),
+            resolved_backend,
+            configured_backend,
+            hostname,
+            self.worker.local_rank,
+            ib_device,
+        )
+        try:
+            engine = create_transfer_engine(
+                hostname=hostname,
+                gpu_id=self.worker.local_rank,
+                ib_device=ib_device,
+                backend=resolved_backend,
+                force_mock=resolved_backend == "mock",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize transfer engine for "
+                f"{self._disagg_role.value} on gpu_id={self.worker.local_rank} "
+                f"(backend={resolved_backend}, host={hostname}, ib_device={ib_device})"
+            ) from exc
+        logger.info(
+            "Transfer %s: backend=%s initialized (session=%s)",
+            self._disagg_role.value.upper(),
+            resolved_backend,
+            engine.session_id,
         )
 
         buffer = TransferTensorBuffer(

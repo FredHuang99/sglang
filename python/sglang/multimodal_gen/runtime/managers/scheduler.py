@@ -1,22 +1,15 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import asyncio
-import os
 import pickle
 from collections import deque
 from typing import Any, List
 
 import zmq
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
-)
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
-    save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
@@ -38,14 +31,14 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     set_global_server_args,
 )
+from sglang.multimodal_gen.runtime.warmup_utils import (
+    build_server_warmup_reqs as build_warmup_reqs,
+)
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 
 logger = init_logger(__name__)
-
-MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
-
 
 class Scheduler(SchedulerDisaggMixin):
     """
@@ -225,47 +218,9 @@ class Scheduler(SchedulerDisaggMixin):
         if self.warmed_up or not self.server_args.warmup:
             return []
 
-        resolutions = self.server_args.warmup_resolutions or [None]
-        self._warmup_total = len(resolutions)
+        warmup_reqs = build_warmup_reqs(self.server_args)
+        self._warmup_total = len(warmup_reqs)
         self._warmup_processed = 0
-        task_type = self.server_args.pipeline_config.task_type
-        warmup_reqs: list[Req] = []
-
-        for resolution in resolutions:
-            width = height = None
-            if resolution is not None:
-                width, height = _parse_size(resolution)
-
-            req_kwargs = {
-                "data_type": task_type.data_type(),
-                "prompt": "",
-            }
-            if width is not None:
-                req_kwargs["width"] = width
-            if height is not None:
-                req_kwargs["height"] = height
-
-            if task_type in (
-                ModelTaskType.I2I,
-                ModelTaskType.TI2I,
-                ModelTaskType.I2V,
-                ModelTaskType.TI2V,
-            ):
-                uploads_dir = os.path.join("outputs", "uploads")
-                os.makedirs(uploads_dir, exist_ok=True)
-                input_path = asyncio.run(
-                    save_image_to_path(
-                        MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                        os.path.join(uploads_dir, "warmup_image.jpg"),
-                    )
-                )
-                req_kwargs["negative_prompt"] = ""
-                req_kwargs["image_path"] = [input_path]
-
-            req = Req(**req_kwargs)
-            req.set_as_warmup(self.server_args.warmup_steps)
-            warmup_reqs.append(req)
-
         return warmup_reqs
 
     def prepare_server_warmup_reqs(self):

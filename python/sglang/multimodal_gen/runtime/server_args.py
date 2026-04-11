@@ -224,6 +224,7 @@ class ServerArgs:
     disagg_max_slots_per_instance: int = 8
     disagg_transfer_redundancy: float = 1.25
     disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
+    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
     disagg_transfer_pool_size: int = (
         256 * 1024 * 1024
     )  # P2P transfer buffer size (bytes)
@@ -844,6 +845,14 @@ class ServerArgs:
             default=ServerArgs.disagg_role_device,
             choices=["auto", "cpu", "cuda"],
             help="Per-role device override. 'cpu' is currently intended for same-machine encoder roles.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-backend",
+            type=str,
+            default=ServerArgs.disagg_transfer_backend,
+            choices=["auto", "mock", "mooncake"],
+            help="Transfer backend for multimodal diffusion disaggregation. "
+            "'auto' uses mock for loopback/local debugging and mooncake for RDMA-oriented deployments.",
         )
         parser.add_argument(
             "--disagg-transfer-pool-size",

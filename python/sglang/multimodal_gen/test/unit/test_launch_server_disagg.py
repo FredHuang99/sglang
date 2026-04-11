@@ -6,8 +6,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    Wan2_2_TI2V_5B_Config,
+)
+from sglang.multimodal_gen.configs.sample.wan import (
+    Wan2_2_TI2V_5B_SamplingParam,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
+    QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -125,18 +131,19 @@ class _FakeSpawnContext:
 
 class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
     def test_build_calibration_reqs_for_image_task(self):
-        server_args = SimpleNamespace(
+        server_args = _make_server_args(
             warmup=True,
             warmup_resolutions=["640x480"],
-            pipeline_config=SimpleNamespace(task_type=ModelTaskType.I2I),
             warmup_steps=3,
+            model_id="Qwen/Qwen-Image-Edit",
+            pipeline_config=QwenImageEditPipelineConfig(),
         )
 
         with patch(
-            "sglang.multimodal_gen.runtime.launch_server.asyncio.run",
+            "sglang.multimodal_gen.runtime.warmup_utils.asyncio.run",
             return_value="outputs/uploads/warmup_image.jpg",
         ), patch(
-            "sglang.multimodal_gen.runtime.launch_server.save_image_to_path",
+            "sglang.multimodal_gen.runtime.warmup_utils.save_image_to_path",
             new=MagicMock(return_value="ignored"),
         ):
             warmup_reqs = _build_disagg_calibration_reqs(server_args)
@@ -149,6 +156,31 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
         self.assertEqual(req.image_path, ["outputs/uploads/warmup_image.jpg"])
         self.assertEqual(req.negative_prompt, "")
         self.assertEqual(req.num_inference_steps, 3)
+
+    def test_build_calibration_reqs_use_model_specific_sampling_params(self):
+        server_args = _make_server_args(
+            warmup=True,
+            warmup_steps=2,
+            model_id="Wan2.2-TI2V-5B-Diffusers",
+            pipeline_config=Wan2_2_TI2V_5B_Config(),
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.warmup_utils.asyncio.run",
+            return_value="outputs/uploads/warmup_image.jpg",
+        ), patch(
+            "sglang.multimodal_gen.runtime.warmup_utils.save_image_to_path",
+            new=MagicMock(return_value="ignored"),
+        ):
+            warmup_reqs = _build_disagg_calibration_reqs(server_args)
+
+        self.assertEqual(len(warmup_reqs), 1)
+        req = warmup_reqs[0]
+        self.assertIsInstance(req.sampling_params, Wan2_2_TI2V_5B_SamplingParam)
+        self.assertEqual(req.prompt, "warmup")
+        self.assertEqual(req.image_path, ["outputs/uploads/warmup_image.jpg"])
+        self.assertTrue(req.is_warmup)
+        self.assertEqual(req.num_inference_steps, 2)
 
     def test_run_startup_calibration_sends_all_requests(self):
         server_args = SimpleNamespace(

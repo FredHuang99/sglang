@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 import dataclasses
-import asyncio
 import multiprocessing as mp
 import os
 import pickle
@@ -14,16 +13,11 @@ import psutil
 import uvicorn
 import zmq
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.diffusion_server import (
     DiffusionServer,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
-from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
-    _parse_size,
-    save_image_to_path,
-)
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
@@ -33,55 +27,11 @@ from sglang.multimodal_gen.runtime.server_args import (
 )
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
-
-MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+from sglang.multimodal_gen.runtime.warmup_utils import build_server_warmup_reqs
 
 
 def _build_disagg_calibration_reqs(server_args: ServerArgs) -> list[Req]:
-    if not server_args.warmup:
-        return []
-
-    resolutions = server_args.warmup_resolutions or [None]
-    task_type = server_args.pipeline_config.task_type
-    warmup_reqs: list[Req] = []
-
-    for resolution in resolutions:
-        width = height = None
-        if resolution is not None:
-            width, height = _parse_size(resolution)
-
-        req_kwargs = {
-            "data_type": task_type.data_type(),
-            "prompt": "",
-        }
-        if width is not None:
-            req_kwargs["width"] = width
-        if height is not None:
-            req_kwargs["height"] = height
-
-        if task_type in (
-            ModelTaskType.I2I,
-            ModelTaskType.TI2I,
-            ModelTaskType.I2V,
-            ModelTaskType.TI2V,
-            ModelTaskType.I2M,
-        ):
-            uploads_dir = os.path.join("outputs", "uploads")
-            os.makedirs(uploads_dir, exist_ok=True)
-            input_path = asyncio.run(
-                save_image_to_path(
-                    MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-                    os.path.join(uploads_dir, "warmup_image.jpg"),
-                )
-            )
-            req_kwargs["negative_prompt"] = ""
-            req_kwargs["image_path"] = [input_path]
-
-        req = Req(**req_kwargs)
-        req.set_as_warmup(server_args.warmup_steps)
-        warmup_reqs.append(req)
-
-    return warmup_reqs
+    return build_server_warmup_reqs(server_args)
 
 
 def _run_disagg_startup_calibration(

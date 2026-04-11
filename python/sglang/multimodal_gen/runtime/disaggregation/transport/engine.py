@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Transfer engine abstraction for tensor transfer between role instances."""
 
+import ipaddress
 import logging
 import threading
 from abc import ABC, abstractmethod
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +24,41 @@ def _check_mooncake() -> bool:
         except ImportError:
             _MOONCAKE_AVAILABLE = False
     return _MOONCAKE_AVAILABLE
+
+
+def is_mooncake_available() -> bool:
+    return _check_mooncake()
+
+
+def _is_loopback_hostname(hostname: str) -> bool:
+    normalized = (hostname or "").strip().lower()
+    if normalized in {"", "127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"}:
+        return True
+
+    if normalized.startswith("[") and normalized.endswith("]"):
+        normalized = normalized[1:-1]
+
+    try:
+        return ipaddress.ip_address(normalized).is_loopback
+    except ValueError:
+        return False
+
+
+def resolve_transfer_backend(
+    configured_backend: Literal["auto", "mock", "mooncake"] = "auto",
+    *,
+    hostname: str = "127.0.0.1",
+    ib_device: str | None = None,
+) -> Literal["mock", "mooncake"]:
+    if configured_backend == "mock":
+        return "mock"
+    if configured_backend == "mooncake":
+        return "mooncake"
+    if ib_device:
+        return "mooncake"
+    if _is_loopback_hostname(hostname):
+        return "mock"
+    return "mooncake" if _check_mooncake() else "mock"
 
 
 class BaseTransferEngine(ABC):
@@ -176,15 +213,27 @@ def create_transfer_engine(
     hostname: str = "127.0.0.1",
     gpu_id: int = 0,
     ib_device: str | None = None,
+    backend: Literal["auto", "mock", "mooncake"] = "auto",
     force_mock: bool = False,
 ) -> BaseTransferEngine:
     """Factory: returns MooncakeDiffusionEngine if available, else MockTransferEngine."""
-    if not force_mock and _check_mooncake():
+    resolved_backend = "mock" if force_mock else resolve_transfer_backend(
+        backend,
+        hostname=hostname,
+        ib_device=ib_device,
+    )
+    if resolved_backend == "mooncake":
+        if not _check_mooncake():
+            raise RuntimeError(
+                "Mooncake transfer backend was requested but mooncake-transfer-engine "
+                "is not available in this environment."
+            )
         return MooncakeDiffusionEngine(
             hostname=hostname, gpu_id=gpu_id, ib_device=ib_device
         )
     logger.info(
-        "Using MockTransferEngine (mooncake not available or force_mock=%s)",
+        "Using MockTransferEngine (backend=%s, force_mock=%s)",
+        resolved_backend,
         force_mock,
     )
     return MockTransferEngine()

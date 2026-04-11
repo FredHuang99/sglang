@@ -3,11 +3,13 @@
 
 import ctypes
 import unittest
+from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
     BaseTransferEngine,
     MockTransferEngine,
     create_transfer_engine,
+    resolve_transfer_backend,
 )
 
 
@@ -116,6 +118,39 @@ class TestCreateTransferEngine(unittest.TestCase):
     def test_returns_base_interface(self):
         engine = create_transfer_engine(force_mock=True)
         self.assertIsInstance(engine, BaseTransferEngine)
+
+    def test_auto_backend_uses_mock_for_loopback(self):
+        self.assertEqual(
+            resolve_transfer_backend("auto", hostname="127.0.0.1"),
+            "mock",
+        )
+        self.assertEqual(
+            resolve_transfer_backend("auto", hostname="localhost"),
+            "mock",
+        )
+
+    def test_auto_backend_prefers_mooncake_for_rdma_or_non_loopback(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.transport.engine._check_mooncake",
+            return_value=True,
+        ):
+            self.assertEqual(
+                resolve_transfer_backend("auto", hostname="10.0.0.5"),
+                "mooncake",
+            )
+            self.assertEqual(
+                resolve_transfer_backend(
+                    "auto", hostname="127.0.0.1", ib_device="mlx5_0"
+                ),
+                "mooncake",
+            )
+
+    def test_explicit_mooncake_backend_requires_availability(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.transport.engine._check_mooncake",
+            return_value=False,
+        ), self.assertRaisesRegex(RuntimeError, "Mooncake transfer backend"):
+            create_transfer_engine(backend="mooncake")
 
 
 if __name__ == "__main__":

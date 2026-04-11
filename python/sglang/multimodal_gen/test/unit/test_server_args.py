@@ -264,5 +264,24 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
         self.assertEqual(args.disagg_downstream_wait_timeout, 45)
 
 
+class TestDisaggTransferBackendArgs(unittest.TestCase):
+    def test_transfer_backend_defaults_to_auto(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.disagg_transfer_backend, "auto")
+
+    def test_transfer_backend_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-transfer-backend",
+            "mock",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_transfer_backend, "mock")
+
+
 if __name__ == "__main__":
     unittest.main()

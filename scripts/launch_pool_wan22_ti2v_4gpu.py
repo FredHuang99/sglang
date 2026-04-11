@@ -36,6 +36,8 @@ DiffusionServer.
 Important debugging choice:
 - Offload is disabled here on purpose so that the roles visibly occupy GPU
   memory after startup and while serving requests.
+- The transfer backend is forced to `mock` so local single-machine bring-up
+  does not depend on whether Mooncake is installed in the environment.
 
 How to run:
 
@@ -143,6 +145,7 @@ def build_server_args() -> ServerArgs:
         decoder_sp=4,
         # Make sure roles run on GPU and keep modules on GPU.
         disagg_role_device="cuda",
+        disagg_transfer_backend="mock",
         text_encoder_cpu_offload=False,
         image_encoder_cpu_offload=False,
         vae_cpu_offload=False,
