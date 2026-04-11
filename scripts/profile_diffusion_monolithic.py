@@ -151,6 +151,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--online-rps", type=float, default=1.0)
     parser.add_argument("--probe-runs", type=int, default=3)
     parser.add_argument(
+        "--probe-warmup-runs",
+        type=int,
+        default=1,
+        help=(
+            "Number of full warmup probe requests to run before measured probe "
+            "requests. Warmup probe runs are excluded from statistics."
+        ),
+    )
+    parser.add_argument(
         "--run-serving-phases",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -370,6 +379,7 @@ def build_base_summary(
             "dataset_mode": "Repeated fixed request objects built directly in-script.",
             "num_requests": args.num_requests,
             "probe_runs": args.probe_runs,
+            "probe_warmup_runs": args.probe_warmup_runs,
             "online_rps": args.online_rps,
             "run_serving_phases": args.run_serving_phases,
             "runtime_backend": legacy.DEFAULT_RUNTIME_BACKEND,
@@ -389,8 +399,9 @@ def build_base_summary(
                 "pin_cpu_memory=false."
             ),
             "probe_execution_mode": (
-                "Strictly one-by-one. The script starts one probe request, waits "
-                "for it to finish, then starts the next probe request."
+                "Strictly one-by-one. The script first runs the configured probe "
+                "warmup request(s) and excludes them from statistics, then runs "
+                "the measured probe request(s) one at a time."
             ),
         },
         "parallel_degree": parallel_degree,

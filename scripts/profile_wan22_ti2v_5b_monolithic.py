@@ -125,6 +125,15 @@ def parse_args() -> argparse.Namespace:
         help="Number of probe requests to average for stage timing.",
     )
     parser.add_argument(
+        "--probe-warmup-runs",
+        type=int,
+        default=1,
+        help=(
+            "Number of full probe-style warmup requests to run before measured "
+            "probe requests. Warmup probe runs are excluded from timing/statistics."
+        ),
+    )
+    parser.add_argument(
         "--run-serving-phases",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1355,11 +1364,57 @@ async def run_probe_phase(
     requests_list: list[RequestFuncInput],
     probe_runs: int,
     phase_name: str,
+    perf_log_path: Path | None = None,
+    warmup_runs: int = 1,
 ) -> tuple[list[Any], float]:
     probe_request = replace(requests_list[0])
     outputs: list[Any] = []
     total_duration = 0.0
-    logger.info("[%s] probe requests will run strictly one-by-one", phase_name)
+    warmup_runs = max(int(warmup_runs), 0)
+    logger.info(
+        "[%s] probe requests will run strictly one-by-one: %s warmup run(s) + %s measured run(s)",
+        phase_name,
+        warmup_runs,
+        probe_runs,
+    )
+    for warmup_index in range(1, warmup_runs + 1):
+        logger.info(
+            "[%s] starting warmup probe request %s/%s (excluded from statistics)",
+            phase_name,
+            warmup_index,
+            warmup_runs,
+        )
+        warmup_outputs, warmup_duration = await execute_requests(
+            [replace(probe_request)],
+            request_rate=float("inf"),
+            max_concurrency=1,
+            phase_name=f"{phase_name}:warmup{warmup_index}",
+        )
+        warmup_success_count = sum(
+            1 for output in warmup_outputs if getattr(output, "success", False)
+        )
+        if warmup_success_count != len(warmup_outputs):
+            errors = [
+                getattr(output, "error", "")
+                for output in warmup_outputs
+                if not getattr(output, "success", False)
+            ]
+            raise RunConfigError(
+                "probe_warmup",
+                f"probe warmup expected {len(warmup_outputs)} successful request(s), "
+                f"got {warmup_success_count}. Errors: {errors}",
+            )
+        logger.info(
+            "[%s] finished warmup probe request %s/%s in %.2fs (excluded from statistics)",
+            phase_name,
+            warmup_index,
+            warmup_runs,
+            warmup_duration,
+        )
+
+    if warmup_runs > 0 and perf_log_path is not None:
+        clear_perf_log(perf_log_path, f"{phase_name}:measured")
+
     for probe_index in range(1, probe_runs + 1):
         logger.info("[%s] starting probe request %s/%s", phase_name, probe_index, probe_runs)
         probe_outputs, probe_duration = await execute_requests(
@@ -1462,7 +1517,7 @@ def build_metric_definitions() -> dict[str, Any]:
         "request_level": {
             "probe_execution_mode": {
                 "source": "scripts/profile_wan22_ti2v_5b_monolithic.py::run_probe_phase()",
-                "meaning": "Probe requests are executed strictly one-by-one. The script launches one probe request, waits for it to finish, and only then starts the next probe run.",
+                "meaning": "Probe requests are executed strictly one-by-one. Any configured probe warmup runs are executed first and excluded from statistics; only the following measured probe runs are aggregated.",
             },
             "throughput_qps": {
                 "source": "python/sglang/multimodal_gen/benchmarks/bench_serving.py::calculate_metrics()['throughput_qps']",
@@ -1636,6 +1691,7 @@ def build_base_summary(
             "dataset_mode": "VBench single-image directory repeated to num_requests",
             "num_requests": args.num_requests,
             "probe_runs": args.probe_runs,
+            "probe_warmup_runs": args.probe_warmup_runs,
             "online_rps": args.online_rps,
             "run_serving_phases": args.run_serving_phases,
             "runtime_backend": DEFAULT_RUNTIME_BACKEND,
@@ -1655,8 +1711,9 @@ def build_base_summary(
                 "pin_cpu_memory=false."
             ),
             "probe_execution_mode": (
-                "Strictly one-by-one. The script starts one probe request, waits "
-                "for it to finish, then starts the next probe request."
+                "Strictly one-by-one. The script first runs the configured probe "
+                "warmup request(s) and excludes them from statistics, then runs "
+                "the measured probe request(s) one at a time."
             ),
         },
         "parallel_degree": parallel_degree,
@@ -1830,6 +1887,9 @@ def refresh_human_summary(summary: dict[str, Any]) -> None:
             "prompt": summary.get("request_setup", {}).get("prompt"),
             "input_image": summary.get("request_setup", {}).get("input_image"),
             "probe_runs": summary.get("request_setup", {}).get("probe_runs"),
+            "probe_warmup_runs": summary.get("request_setup", {}).get(
+                "probe_warmup_runs"
+            ),
             "run_serving_phases": summary.get("request_setup", {}).get(
                 "run_serving_phases"
             ),
@@ -1899,8 +1959,9 @@ def run_single_config(
             num_prompts=args.num_requests,
         )
         logger.info(
-            "[%s] request set ready: probe_runs=%s measured_requests=%s",
+            "[%s] request set ready: probe_warmup_runs=%s probe_runs=%s measured_requests=%s",
             run_config.name,
+            args.probe_warmup_runs,
             args.probe_runs,
             len(requests_list),
         )
@@ -1908,8 +1969,9 @@ def run_single_config(
 
         try:
             logger.info(
-                "[%s] starting probe phase: %s run(s), profiling enabled",
+                "[%s] starting probe phase: %s warmup run(s) + %s measured run(s); only measured runs are profiled/statistically aggregated",
                 run_config.name,
+                args.probe_warmup_runs,
                 args.probe_runs,
             )
             clear_perf_log(perf_log_path, f"{run_config.name}:probe")
@@ -1918,6 +1980,8 @@ def run_single_config(
                     requests_list,
                     probe_runs=args.probe_runs,
                     phase_name=f"{run_config.name}:probe",
+                    perf_log_path=perf_log_path,
+                    warmup_runs=args.probe_warmup_runs,
                 )
             )
             ensure_probe_successful(probe_outputs, args.probe_runs)
