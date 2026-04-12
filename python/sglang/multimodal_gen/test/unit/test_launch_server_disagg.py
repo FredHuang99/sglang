@@ -135,7 +135,7 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
             warmup=True,
             warmup_resolutions=["640x480"],
             warmup_steps=3,
-            model_id="Qwen/Qwen-Image-Edit",
+            model_id="Qwen-Image-Edit",
             pipeline_config=QwenImageEditPipelineConfig(),
         )
 

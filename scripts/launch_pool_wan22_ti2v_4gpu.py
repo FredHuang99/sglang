@@ -153,7 +153,7 @@ def build_server_args() -> ServerArgs:
         dit_cpu_offload=False,
         # Helpful for debugging and simpler scheduling.
         disagg_dispatch_policy="round_robin",
-        disagg_max_slots_per_instance=1,
+        disagg_max_slots_per_instance=8,
         disagg_timeout=3600,
         disagg_downstream_wait_timeout=1800,
         warmup=True,
