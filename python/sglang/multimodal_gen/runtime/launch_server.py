@@ -526,6 +526,7 @@ def launch_pool_disagg_server(
     # Start DiffusionServer
     frontend_endpoint = f"tcp://{host}:{server_args.scheduler_port}"
 
+    diffusion_server = None
     try:
         diffusion_server = DiffusionServer(
             frontend_endpoint=frontend_endpoint,
@@ -551,6 +552,11 @@ def launch_pool_disagg_server(
             )
             launch_http_server_only(server_args)
     except Exception:
+        if diffusion_server is not None:
+            try:
+                diffusion_server.stop()
+            except Exception:
+                logger.exception("Failed to stop DiffusionServer during cleanup")
         _terminate_processes(all_processes)
         raise
 
@@ -672,15 +678,22 @@ def launch_disagg_server(server_args: ServerArgs):
         downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
         max_slots_per_instance=server_args.disagg_max_slots_per_instance,
     )
-    diffusion_server.start()
-    if server_args.warmup:
-        _run_disagg_startup_calibration(frontend_endpoint, server_args)
+    try:
+        diffusion_server.start()
+        if server_args.warmup:
+            _run_disagg_startup_calibration(frontend_endpoint, server_args)
 
-    logger.info(
-        "Starting HTTP server (connected to DiffusionServer at port %d).",
-        base_port,
-    )
-    launch_http_server_only(server_args)
+        logger.info(
+            "Starting HTTP server (connected to DiffusionServer at port %d).",
+            base_port,
+        )
+        launch_http_server_only(server_args)
+    except Exception:
+        try:
+            diffusion_server.stop()
+        except Exception:
+            logger.exception("Failed to stop DiffusionServer during cleanup")
+        raise
 
 
 def launch_disagg_role(server_args: ServerArgs):

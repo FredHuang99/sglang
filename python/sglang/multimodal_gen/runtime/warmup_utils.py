@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
@@ -29,11 +30,29 @@ MINIMUM_PICTURE_BASE64_FOR_WARMUP = (
 def _warmup_image_path() -> str:
     uploads_dir = os.path.join("outputs", "uploads")
     os.makedirs(uploads_dir, exist_ok=True)
-    return asyncio.run(
-        save_image_to_path(
-            MINIMUM_PICTURE_BASE64_FOR_WARMUP,
-            os.path.join(uploads_dir, "warmup_image.jpg"),
+    try:
+        generated_path = asyncio.run(
+            save_image_to_path(
+                MINIMUM_PICTURE_BASE64_FOR_WARMUP,
+                os.path.join(uploads_dir, "warmup_image.jpg"),
+            )
         )
+        if generated_path:
+            return generated_path
+    except Exception:
+        pass
+
+    repo_root = Path(__file__).resolve().parents[4]
+    candidate_paths = [
+        Path.cwd() / "examples" / "assets" / "example_image.png",
+        Path.cwd().parent / "examples" / "assets" / "example_image.png",
+        repo_root / "examples" / "assets" / "example_image.png",
+    ]
+    for candidate in candidate_paths:
+        if candidate.is_file():
+            return str(candidate.resolve())
+    raise RuntimeError(
+        "Failed to create a warmup image and could not find examples/assets/example_image.png"
     )
 
 
@@ -69,7 +88,6 @@ def build_server_warmup_reqs(server_args: "ServerArgs") -> list[Req]:
         if height is not None:
             sampling_kwargs["height"] = height
         if input_path is not None:
-            sampling_kwargs["negative_prompt"] = ""
             sampling_kwargs["image_path"] = [input_path]
 
         sampling_params = SamplingParams.from_user_sampling_params_args(

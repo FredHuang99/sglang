@@ -12,6 +12,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
 from sglang.multimodal_gen.configs.sample.wan import (
     Wan2_2_TI2V_5B_SamplingParam,
 )
+from sglang.multimodal_gen.configs.sample.qwenimage import (
+    QwenImageEditPlusSamplingParams,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImagePipelineConfig,
@@ -154,7 +157,11 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
         self.assertEqual(req.width, 640)
         self.assertEqual(req.height, 480)
         self.assertEqual(req.image_path, ["outputs/uploads/warmup_image.jpg"])
-        self.assertEqual(req.negative_prompt, "")
+        self.assertIsInstance(req.sampling_params, QwenImageEditPlusSamplingParams)
+        self.assertEqual(
+            req.negative_prompt, QwenImageEditPlusSamplingParams().negative_prompt
+        )
+        self.assertNotEqual(req.negative_prompt, "")
         self.assertEqual(req.num_inference_steps, 3)
 
     def test_build_calibration_reqs_use_model_specific_sampling_params(self):
@@ -179,6 +186,10 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
         self.assertIsInstance(req.sampling_params, Wan2_2_TI2V_5B_SamplingParam)
         self.assertEqual(req.prompt, "warmup")
         self.assertEqual(req.image_path, ["outputs/uploads/warmup_image.jpg"])
+        self.assertEqual(
+            req.negative_prompt, Wan2_2_TI2V_5B_SamplingParam().negative_prompt
+        )
+        self.assertNotEqual(req.negative_prompt, "")
         self.assertTrue(req.is_warmup)
         self.assertEqual(req.num_inference_steps, 2)
 
