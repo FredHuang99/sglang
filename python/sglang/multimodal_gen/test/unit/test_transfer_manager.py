@@ -3,11 +3,13 @@
 
 import os
 import queue
+import socket
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
+import zmq
 
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferMetaBuffer,
@@ -61,6 +63,13 @@ def _make_manager(
     if testcase is not None:
         testcase.addCleanup(manager.cleanup)
     return manager
+
+
+def _reserve_tcp_endpoint() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"tcp://127.0.0.1:{port}"
 
 
 class TestStaging(unittest.TestCase):
@@ -419,6 +428,58 @@ class TestTransfer(unittest.TestCase):
         self.assertIsNone(mgr.get_staged_info("abort-1"))
         self.assertIsNone(mgr.get_receive_slot_addr("abort-1"))
         self.assertEqual(mgr._terminal_send_states["abort-1"], "aborted")
+
+
+class TestCleanup(unittest.TestCase):
+    def setUp(self):
+        MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
+
+    def test_cleanup_waits_for_receive_thread_before_closing_control_socket(self):
+        mgr = _make_manager(session_id="cleanup-order")
+        events = []
+        fake_thread = unittest.mock.Mock()
+        fake_thread.join.side_effect = lambda timeout=None: events.append("join")
+        fake_thread.is_alive.return_value = False
+        fake_socket = unittest.mock.Mock()
+        fake_socket.close.side_effect = lambda linger=0: events.append("close")
+        mgr._running = True
+        mgr._receive_thread = fake_thread
+        mgr._control_pull = fake_socket
+
+        mgr.cleanup()
+
+        self.assertEqual(events[:2], ["join", "close"])
+        fake_socket.close.assert_called_once_with(linger=0)
+
+    def test_cleanup_stops_background_receive_loop_before_socket_close(self):
+        mgr = _make_manager(session_id="cleanup-background")
+        context = zmq.Context(io_threads=1)
+        cleaned_up = False
+
+        try:
+            mgr.start_background_loops(
+                context,
+                _reserve_tcp_endpoint(),
+                start_send_loop=False,
+            )
+            receive_thread = mgr._receive_thread
+            self.assertIsNotNone(receive_thread)
+
+            deadline = time.time() + 1.0
+            while time.time() < deadline and not receive_thread.is_alive():
+                time.sleep(0.01)
+            self.assertTrue(receive_thread.is_alive())
+
+            mgr.cleanup()
+            cleaned_up = True
+
+            self.assertFalse(receive_thread.is_alive())
+            self.assertIsNone(mgr._control_pull)
+        finally:
+            if not cleaned_up:
+                mgr.cleanup()
+            context.destroy(linger=0)
 
 
 class TestTransferProtocol(unittest.TestCase):

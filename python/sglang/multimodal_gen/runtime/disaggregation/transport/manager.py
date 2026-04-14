@@ -1060,12 +1060,24 @@ class DiffusionTransferManager:
         self._running = False
         for send_queue in self._send_queues:
             send_queue.put(None)
+        receive_thread = self._receive_thread
+        if (
+            receive_thread is not None
+            and threading.current_thread() is not receive_thread
+        ):
+            # Let the recv loop observe _running=False via RCVTIMEO before
+            # closing the socket from another thread. Closing first can trip
+            # libzmq assertions during warmup-triggered transfer reconfigure.
+            receive_thread.join(timeout=5)
+            if receive_thread.is_alive():
+                logger.warning(
+                    "DiffusionTransferManager cleanup timed out waiting for "
+                    "receive thread to exit; forcing socket close"
+                )
         if self._control_pull is not None:
-            self._control_pull.close()
+            self._control_pull.close(linger=0)
             self._control_pull = None
-        if self._receive_thread is not None:
-            self._receive_thread.join(timeout=5)
-            self._receive_thread = None
+        self._receive_thread = None
         for thread in self._send_threads:
             thread.join(timeout=5)
         self._send_threads = []
@@ -1078,7 +1090,7 @@ class DiffusionTransferManager:
         self._send_worker_counts = []
         self._drain_send_completions()
         for sock in self._control_push_sockets.values():
-            sock.close()
+            sock.close(linger=0)
         self._control_push_sockets.clear()
         for attachment in self._shared_memory_attachments.values():
             try:
