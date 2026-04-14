@@ -524,13 +524,9 @@ class DiffusionServer:
         while self._denoiser_tta:
             entry = self._denoiser_tta[0]
             p2p = entry.transfer_state
-            idx = self._dispatcher.select_denoiser_with_capacity(
-                self._denoiser_free_slots,
-                excluded_instances=(
-                    self._excluded_instances_for_request(p2p, RoleType.DENOISER)
-                    if p2p is not None
-                    else None
-                ),
+            idx = self._select_downstream_instance_with_capacity(
+                RoleType.DENOISER,
+                p2p,
             )
             if idx is None:
                 break
@@ -545,13 +541,9 @@ class DiffusionServer:
         while self._decoder_tta:
             entry = self._decoder_tta[0]
             p2p = entry.transfer_state
-            idx = self._dispatcher.select_decoder_with_capacity(
-                self._decoder_free_slots,
-                excluded_instances=(
-                    self._excluded_instances_for_request(p2p, RoleType.DECODER)
-                    if p2p is not None
-                    else None
-                ),
+            idx = self._select_downstream_instance_with_capacity(
+                RoleType.DECODER,
+                p2p,
             )
             if idx is None:
                 break
@@ -799,6 +791,29 @@ class DiffusionServer:
             if self._current_capacity_epoch(role, instance_id) == reject_epoch:
                 excluded.add(instance_id)
         return excluded
+
+    def _select_downstream_instance_with_capacity(
+        self,
+        role: RoleType,
+        p2p: _TransferRequestState | None = None,
+        *,
+        extra_excluded: set[int] | None = None,
+    ) -> int | None:
+        excluded = set()
+        if p2p is not None:
+            excluded |= self._excluded_instances_for_request(p2p, role)
+        if extra_excluded:
+            excluded |= set(extra_excluded)
+        excluded_instances = excluded or None
+        if role == RoleType.DENOISER:
+            return self._dispatcher.select_denoiser_with_capacity(
+                self._denoiser_free_slots, excluded_instances=excluded_instances
+            )
+        if role == RoleType.DECODER:
+            return self._dispatcher.select_decoder_with_capacity(
+                self._decoder_free_slots, excluded_instances=excluded_instances
+            )
+        return None
 
     def _enqueue_role_wait(
         self, queue_obj: deque[_RoleTTAEntry], request_id: str, p2p: _TransferRequestState
@@ -1056,13 +1071,32 @@ class DiffusionServer:
         self._clear_receiver_dispatch(p2p)
 
         if msg.get("retryable", True):
-            self._requeue_downstream_transfer(
-                request_id,
+            retry_candidate = self._select_downstream_instance_with_capacity(
+                role_enum,
                 p2p,
-                role_enum=role_enum,
-                rejected_instance=receiver_instance,
+                extra_excluded={receiver_instance},
             )
-            return
+            if retry_candidate is not None:
+                self._requeue_downstream_transfer(
+                    request_id,
+                    p2p,
+                    role_enum=role_enum,
+                    rejected_instance=receiver_instance,
+                )
+                return
+            logger.error(
+                "DiffusionServer: %s alloc reject from %s[%d] has no alternative "
+                "instance; failing request immediately",
+                request_id,
+                role_enum.value,
+                receiver_instance,
+            )
+            reason = (
+                f"{msg.get('reason', 'fatal downstream allocation failure')}; "
+                f"no alternative {role_enum.value} instance available"
+            )
+        else:
+            reason = msg.get("reason", "fatal downstream allocation failure")
 
         self._set_transfer_phase(p2p, TransferPhase.ABORTING)
         self._send_abort(
@@ -1070,14 +1104,14 @@ class DiffusionServer:
             p2p,
             to_sender=True,
             to_receiver=False,
-            reason=msg.get("reason", "fatal downstream allocation failure"),
+            reason=reason,
             source="alloc_failed",
         )
         self._release_sender_slot_if_needed(p2p, record, update_epoch=False)
         self._complete_terminal(
             request_id,
             RequestState.FAILED,
-            f"Fatal downstream allocation failure: {msg.get('reason', 'unknown error')}",
+            f"Fatal downstream allocation failure: {reason}",
         )
         self._transfer_state.pop(request_id, None)
 

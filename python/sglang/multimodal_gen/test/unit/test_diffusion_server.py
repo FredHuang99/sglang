@@ -287,6 +287,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self._submit_running_request("r-retry", RequestState.DENOISING_WAITING)
         self.server._tracker.update_instances("r-retry", denoiser_instance=0)
         self.server._denoiser_free_slots[0] = 0
+        self.server._dispatcher.select_denoiser_with_capacity = MagicMock(return_value=1)
         p2p = _TransferRequestState(
             sender_role=RoleType.ENCODER.value,
             receiver_role=RoleType.DENOISER.value,
@@ -316,6 +317,42 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             self.server._tracker.get("r-retry").state,
             RequestState.DENOISING_WAITING,
         )
+
+    def test_retryable_alloc_reject_without_alternative_fails_fast(self):
+        self._submit_running_request("r-no-alt", RequestState.DENOISING_WAITING)
+        self.server._pending["r-no-alt"] = b"client"
+        self.server._frontend = MagicMock()
+        self.server._send_abort = MagicMock()
+        self.server._encoder_free_slots[0] = 0
+        self.server._tracker.update_instances("r-no-alt", denoiser_instance=0)
+        self.server._transfer_state["r-no-alt"] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            receiver_role=RoleType.DENOISER.value,
+            sender_instance=0,
+            receiver_instance=0,
+            sender_control_endpoint="tcp://enc-ctrl",
+            downstream_wait_since=1.0,
+        )
+
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferAllocRejectMsg(
+                    request_id="r-no-alt",
+                    receiver_role=RoleType.DENOISER.value,
+                    receiver_instance=0,
+                    retryable=True,
+                    reason="busy",
+                )
+            ),
+            RoleType.DENOISER,
+        )
+
+        self.server._send_abort.assert_called_once()
+        self.server._frontend.send_multipart.assert_called_once()
+        self.assertEqual(self.server._encoder_free_slots[0], 1)
+        self.assertEqual(len(self.server._denoiser_tta), 0)
+        self.assertNotIn("r-no-alt", self.server._transfer_state)
+        self.assertIsNone(self.server._tracker.get("r-no-alt"))
 
     def test_alloc_accepted_stops_downstream_wait_timer(self):
         self._submit_running_request("r-accept", RequestState.DENOISING_WAITING)

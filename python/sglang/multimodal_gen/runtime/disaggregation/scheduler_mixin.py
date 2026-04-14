@@ -677,9 +677,19 @@ class SchedulerDisaggMixin:
             host_id=socket.gethostname(),
         )
 
-        # Pre-allocate receive slots for receivers (denoiser/decoder)
+        # Pre-allocate receive slots for inbound roles only after calibration has
+        # measured the transfer footprint. Startup warmup should begin with an
+        # empty pool so the first end-to-end request can allocate dynamically.
         preallocated_slot_info = []
-        if self._role_has_inbound_transfer():
+        should_preallocate_receive_slots = (
+            self._role_has_inbound_transfer() and measured_transfer_bytes is not None
+        )
+        if self._role_has_inbound_transfer() and not should_preallocate_receive_slots:
+            logger.info(
+                "Transfer %s: deferring receive-slot preallocation until warmup calibration",
+                self._disagg_role.value.upper(),
+            )
+        if should_preallocate_receive_slots:
             capacity = max_slots
             slot_size = max(1, int(math.ceil(pool_size / capacity)))
             for i in range(capacity):

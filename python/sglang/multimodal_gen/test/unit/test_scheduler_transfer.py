@@ -178,6 +178,101 @@ class TestTransferEngineGpuSelection(unittest.TestCase):
         )
 
 
+class TestTransferManagerPreallocation(unittest.TestCase):
+    def test_inbound_startup_register_defers_preallocation_until_calibration(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler.server_args.disagg_max_slots_per_instance = 4
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-startup"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-startup"
+        fake_manager.pool_data_ptr = 123
+        fake_manager.pool_size = 4096
+        fake_manager.meta_pool_ptr = 456
+        fake_manager.meta_pool_size = 1024
+        fake_manager.data_shm_name = "data-shm"
+        fake_manager.meta_shm_name = "meta-shm"
+        fake_manager.host_id = "host-a"
+        fake_buffer = MagicMock()
+        fake_meta_buffer = MagicMock()
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+            return_value=fake_buffer,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer",
+            return_value=fake_meta_buffer,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager()
+
+        fake_buffer.allocate.assert_not_called()
+        fake_meta_buffer.allocate.assert_not_called()
+        sent_frames = scheduler._pool_result_push.send_multipart.call_args[0][0]
+        register_msg = decode_transfer_msg(sent_frames)
+        self.assertEqual(register_msg["preallocated_slots"], [])
+        self.assertEqual(scheduler._preallocated_slots, {})
+
+    def test_inbound_calibrated_rebuild_preallocates_receive_slots(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler.server_args.disagg_max_slots_per_instance = 3
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-calibrated"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-calibrated"
+        fake_manager.pool_data_ptr = 1024
+        fake_manager.pool_size = 16384
+        fake_manager.meta_pool_ptr = 2048
+        fake_manager.meta_pool_size = 4096
+        fake_manager.data_shm_name = "data-shm"
+        fake_manager.meta_shm_name = "meta-shm"
+        fake_manager.host_id = "host-b"
+        fake_buffer = MagicMock()
+        fake_buffer.allocate.side_effect = [
+            SimpleNamespace(offset=0, size=8192),
+            SimpleNamespace(offset=8192, size=8192),
+            SimpleNamespace(offset=16384, size=8192),
+        ]
+        fake_meta_buffer = MagicMock()
+        fake_meta_buffer.allocate.side_effect = [
+            SimpleNamespace(offset=0, size=1024),
+            SimpleNamespace(offset=1024, size=1024),
+            SimpleNamespace(offset=2048, size=1024),
+        ]
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+            return_value=fake_buffer,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer",
+            return_value=fake_meta_buffer,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager(
+                measured_transfer_bytes=8192,
+                measured_meta_bytes=1024,
+            )
+
+        self.assertEqual(fake_buffer.allocate.call_count, 3)
+        self.assertEqual(fake_meta_buffer.allocate.call_count, 3)
+        self.assertEqual(set(scheduler._preallocated_slots.keys()), {0, 1, 2})
+        sent_frames = scheduler._pool_result_push.send_multipart.call_args[0][0]
+        register_msg = decode_transfer_msg(sent_frames)
+        self.assertEqual(len(register_msg["preallocated_slots"]), 3)
+
+
 class _TrackedStreamContext:
     def __init__(self, state, stream):
         self._state = state
