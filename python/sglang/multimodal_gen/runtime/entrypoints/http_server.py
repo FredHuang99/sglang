@@ -11,6 +11,7 @@ import torch
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import ORJSONResponse
 
+from sglang.launch_task_recorder import mark_http_startup_ready
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.protocol import (
@@ -64,6 +65,7 @@ health_router = APIRouter()
 
 @health_router.get("/health")
 async def health():
+    mark_http_startup_ready(family="sglang-diffusion")
     return {"status": "ok"}
 
 

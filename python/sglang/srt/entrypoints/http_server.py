@@ -59,7 +59,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
-from sglang.launch_task_recorder import start_http_startup_probe
+from sglang.launch_task_recorder import (
+    mark_http_startup_ready,
+    start_http_startup_probe,
+)
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -507,6 +510,7 @@ async def health_generate(request: Request) -> Response:
         not envs.SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION.get()
         and request.url.path == "/health"
     ):
+        mark_http_startup_ready(family="sglang")
         return Response(status_code=200)
 
     sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
@@ -548,6 +552,8 @@ async def health_generate(request: Request) -> Response:
             task.cancel()
             _global_state.tokenizer_manager.rid_to_state.pop(rid, None)
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
+            if request.url.path == "/health":
+                mark_http_startup_ready(family="sglang")
             return Response(status_code=200)
 
     task.cancel()
