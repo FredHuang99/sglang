@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/entrypoints/cli/main.py
 
+from sglang.launch_task_recorder import record_launch_task
 from sglang.multimodal_gen.runtime.entrypoints.cli.cli_types import CLISubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.generate import GenerateSubcommand
 from sglang.multimodal_gen.runtime.entrypoints.cli.serve import ServeSubcommand
@@ -21,18 +22,22 @@ def cmd_init() -> list[CLISubcommand]:
 
 
 def main() -> None:
-    parser = FlexibleArgumentParser(description="sglang-diffusion CLI")
-    parser.add_argument("-v", "--version", action="version", version="0.1.0")
+    with record_launch_task(
+        task="entrypoint_bootstrap",
+        family="sglang-diffusion",
+    ):
+        parser = FlexibleArgumentParser(description="sglang-diffusion CLI")
+        parser.add_argument("-v", "--version", action="version", version="0.1.0")
 
-    subparsers = parser.add_subparsers(required=False, dest="subparser")
+        subparsers = parser.add_subparsers(required=False, dest="subparser")
 
-    cmds = {}
-    for cmd in cmd_init():
-        cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
-        cmds[cmd.name] = cmd
-    args, unknown_args = parser.parse_known_args()
-    if args.subparser in cmds:
-        cmds[args.subparser].validate(args)
+        cmds = {}
+        for cmd in cmd_init():
+            cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
+            cmds[cmd.name] = cmd
+        args, unknown_args = parser.parse_known_args()
+        if args.subparser in cmds:
+            cmds[args.subparser].validate(args)
 
     if hasattr(args, "dispatch_function"):
         args.dispatch_function(args, unknown_args=unknown_args)

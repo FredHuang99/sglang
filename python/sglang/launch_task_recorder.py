@@ -3,7 +3,10 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import threading
 import time
+import urllib.error
+import urllib.request
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
@@ -162,6 +165,77 @@ def record_launch_task_timing(
         status=status,
         extra=extra,
     )
+
+
+def start_http_startup_probe(
+    *,
+    family: str,
+    url: str,
+    task: str = "http_server_startup",
+    rank: int | str | None = None,
+    extra: dict[str, Any] | None = None,
+    poll_interval_s: float = 0.1,
+    timeout_s: float = 300.0,
+):
+    log_path = _log_path()
+    if log_path is None:
+        return lambda: None
+
+    start_ns = time.perf_counter_ns()
+    payload_extra = dict(extra or {})
+    payload_extra.setdefault("url", url)
+    emit_launch_task_event(
+        task=task,
+        phase="begin",
+        family=family,
+        rank=rank,
+        extra=payload_extra,
+    )
+
+    done = threading.Event()
+    cancelled = threading.Event()
+
+    def _finish(status: str, error: str | None = None) -> None:
+        if done.is_set():
+            return
+        done.set()
+        emit_launch_task_event(
+            task=task,
+            phase="end",
+            family=family,
+            rank=rank,
+            elapsed_ms=(time.perf_counter_ns() - start_ns) / 1_000_000.0,
+            status=status,
+            extra=payload_extra,
+            error=error,
+        )
+
+    def _probe() -> None:
+        deadline = time.time() + timeout_s
+        while not cancelled.is_set() and time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=0.5) as response:
+                    status_code = getattr(response, "status", None) or response.getcode()
+                    if 200 <= int(status_code) < 300:
+                        _finish("ok")
+                        return
+            except Exception:
+                pass
+            time.sleep(poll_interval_s)
+
+        if not cancelled.is_set():
+            _finish("timeout", error=f"Timed out waiting for {url}")
+
+    thread = threading.Thread(target=_probe, name=f"launch-probe-{task}", daemon=True)
+    thread.start()
+
+    def _cancel() -> None:
+        if done.is_set():
+            return
+        cancelled.set()
+        _finish("cancelled", error=f"Cancelled before {url} became ready")
+
+    return _cancel
 
 
 def profile_launch_task(

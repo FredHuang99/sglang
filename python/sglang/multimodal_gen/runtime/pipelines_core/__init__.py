@@ -82,7 +82,15 @@ def build_pipeline(
             pipeline_cls = model_info.pipeline_cls
             logger.info(f"Using pipeline from model_index.json: {pipeline_cls.__name__}")
 
-    pipeline = pipeline_cls(model_path, server_args)
+    with record_launch_task(
+        task="build_pipeline_total",
+        family="sglang-diffusion",
+        extra={
+            "model_path": model_path,
+            "pipeline_class": pipeline_cls.__name__,
+        },
+    ):
+        pipeline = pipeline_cls(model_path, server_args)
 
     logger.info("Pipeline instantiated")
 

@@ -455,191 +455,233 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def initialize(self, pre_model_load_memory: float):
-        server_args = self.server_args
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=self.server_args.enable_memory_saver
-        )
-
-        if self.server_args.remote_instance_weight_loader_use_transfer_engine():
-            self.remote_instance_init_transfer_engine()
-
-        if not self.is_draft_worker:
-            set_global_expert_location_metadata(
-                compute_initial_expert_location_metadata(
-                    server_args=server_args,
-                    model_config=self.model_config,
-                    moe_ep_rank=self.moe_ep_rank,
-                )
-            )
-            if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
-                logger.info(
-                    f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
-                )
-
-            set_global_expert_distribution_recorder(
-                ExpertDistributionRecorder.init_new(
-                    server_args,
-                    get_global_expert_location_metadata(),
-                    rank=self.tp_rank,
-                )
-            )
-
-        # Expert parallelism
-        self.eplb_manager = (
-            EPLBManager(self)
-            if self.server_args.enable_eplb and (not self.is_draft_worker)
-            else None
-        )
-        self.expert_location_updater = ExpertLocationUpdater()
-
-        (
-            ElasticEPStateManager.init(self.server_args)
-            if self.server_args.elastic_ep_backend
-            else None
-        )
-        # Load the model
-        self.sampler = create_sampler()
-        self.load_model()
-
-        # Load the expert backup client
-        self.expert_backup_client = (
-            ExpertBackupClient(self.server_args, self)
-            if (
-                self.server_args.enable_elastic_expert_backup
-                and self.server_args.elastic_ep_backend is not None
-            )
-            else None
-        )
-
-        if (
-            self.server_args.remote_instance_weight_loader_use_transfer_engine()
-            and self.remote_instance_transfer_engine is not None
-            and self.remote_instance_transfer_engine_weight_info is None
+        with record_launch_task(
+            task="model_runner_initialize_total",
+            family="sglang",
+            rank=self.tp_rank,
+            extra={"gpu_id": self.gpu_id},
         ):
-            self.remote_instance_transfer_engine_weight_info = register_memory_region(
-                self.model, self.remote_instance_transfer_engine
-            )
+            server_args = self.server_args
 
-        # For MTP models like DeepSeek-V3 or GLM-4.5, the MTP layer(s) are used separately as draft
-        # models for speculative decoding. In those cases, `num_nextn_predict_layers` is used to
-        # determine the number of layers.
-        model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
-        model_num_layers = (
-            self.model_config.num_nextn_predict_layers
-            if self.is_draft_worker and model_has_mtp_layers
-            else max(
-                self.model_config.num_hidden_layers,
-                self.model_config.num_attention_layers,
-            )
-        )
-        if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
-            model_num_layers = 1
-        elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
-            model_num_layers = 1
-        self.start_layer = getattr(self.model, "start_layer", 0)
-        self.end_layer = getattr(self.model, "end_layer", model_num_layers)
-        self.num_effective_layers = self.end_layer - self.start_layer
-
-        # For LoopCoder models, each loop has its own layer_id, so we need to multiply by loop_num
-        loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
-        if loop_num > 1:
-            self.num_effective_layers = self.num_effective_layers * loop_num
-
-        assert (
-            (not model_has_mtp_layers)
-            or (self.spec_algorithm.is_none())
-            or (
-                (not self.spec_algorithm.is_none())
-                and (self.num_effective_layers == model_num_layers)
-            )
-        ), "PP is not compatible with MTP models."
-
-        # Consider PP, so use start_layer and end_layer.
-        full_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "full_attention_layer_ids")
-            and layer_idx in self.model_config.full_attention_layer_ids
-        ]
-        swa_attention_layer_ids = [
-            layer_idx
-            for layer_idx in range(self.start_layer, self.end_layer + 1)
-            if hasattr(self.model_config, "swa_attention_layer_ids")
-            and layer_idx in self.model_config.swa_attention_layer_ids
-        ]
-        # Update back to model_config.
-        self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
-        self.model_config.full_attention_layer_ids = full_attention_layer_ids
-
-        # Apply torchao quantization
-        torchao_applied = getattr(self.model, "torchao_applied", False)
-        # In layered loading, torchao may have been applied
-        if not torchao_applied:
-            apply_torchao_config_to_model(
-                self.model, get_global_server_args().torchao_config
-            )
-
-        # Apply torch TP if the model supports it
-        supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
-        if self.tp_size > 1 and supports_torch_tp:
-            self.apply_torch_tp()
-
-        # Init lora
-        if server_args.enable_lora:
-            self.init_lora_manager()
-
-        # Init Double Sparsity
-        if server_args.enable_double_sparsity:
-            if server_args.ds_heavy_channel_type is None:
-                raise ValueError(
-                    "Please specify the heavy channel type for double sparsity optimization."
+            with record_launch_task(
+                task="model_runner_pre_load_setup",
+                family="sglang",
+                rank=self.tp_rank,
+                extra={"gpu_id": self.gpu_id},
+            ):
+                self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+                    enable=self.server_args.enable_memory_saver
                 )
-            self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
-        # Enable batch invariant mode
-        if server_args.enable_deterministic_inference:
-            from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+                if self.server_args.remote_instance_weight_loader_use_transfer_engine():
+                    self.remote_instance_init_transfer_engine()
 
-            enable_batch_invariant_mode()
+                if not self.is_draft_worker:
+                    set_global_expert_location_metadata(
+                        compute_initial_expert_location_metadata(
+                            server_args=server_args,
+                            model_config=self.model_config,
+                            moe_ep_rank=self.moe_ep_rank,
+                        )
+                    )
+                    if self.tp_rank == 0 and envs.SGLANG_LOG_EXPERT_LOCATION_METADATA.get():
+                        logger.info(
+                            f"Initial expert_location_metadata: {get_global_expert_location_metadata()}"
+                        )
 
-        # Deduce KV cache dtype
-        self.configure_kv_cache_dtype()
+                    set_global_expert_distribution_recorder(
+                        ExpertDistributionRecorder.init_new(
+                            server_args,
+                            get_global_expert_location_metadata(),
+                            rank=self.tp_rank,
+                        )
+                    )
 
-        # Init memory pool and attention backends
-        self.init_memory_pool(pre_model_load_memory)
+                # Expert parallelism
+                self.eplb_manager = (
+                    EPLBManager(self)
+                    if self.server_args.enable_eplb and (not self.is_draft_worker)
+                    else None
+                )
+                self.expert_location_updater = ExpertLocationUpdater()
 
-        # Init ngram embedding token table
-        self.maybe_init_ngram_embedding()
+                (
+                    ElasticEPStateManager.init(self.server_args)
+                    if self.server_args.elastic_ep_backend
+                    else None
+                )
+                self.sampler = create_sampler()
 
-        # Init routed experts capturer
-        self.init_routed_experts_capturer()
+            self.load_model()
 
-        if self.device == "cuda" or self.device == "musa":
-            self.init_cublas()
-            self.init_attention_backend()
-            self.kernel_warmup()
-            self.init_device_graphs()
-        elif self.device in ["npu", "cpu"]:
-            self.init_attention_backend()
-            self.init_device_graphs()
-        else:
-            self.graph_runner = None
-            self.graph_mem_usage = 0
-            self.init_attention_backend()
+            with record_launch_task(
+                task="model_runner_post_load_setup",
+                family="sglang",
+                rank=self.tp_rank,
+                extra={"gpu_id": self.gpu_id},
+            ):
+                self.expert_backup_client = (
+                    ExpertBackupClient(self.server_args, self)
+                    if (
+                        self.server_args.enable_elastic_expert_backup
+                        and self.server_args.elastic_ep_backend is not None
+                    )
+                    else None
+                )
 
-        if server_args.forward_hooks:
-            register_forward_hooks(self.model, server_args.forward_hooks)
+                if (
+                    self.server_args.remote_instance_weight_loader_use_transfer_engine()
+                    and self.remote_instance_transfer_engine is not None
+                    and self.remote_instance_transfer_engine_weight_info is None
+                ):
+                    self.remote_instance_transfer_engine_weight_info = register_memory_region(
+                        self.model, self.remote_instance_transfer_engine
+                    )
 
-        if self.eagle_use_aux_hidden_state:
-            self.model.set_eagle3_layers_to_capture(
-                self.eagle_aux_hidden_state_layer_ids
-            )
+                model_has_mtp_layers = self.model_config.num_nextn_predict_layers is not None
+                model_num_layers = (
+                    self.model_config.num_nextn_predict_layers
+                    if self.is_draft_worker and model_has_mtp_layers
+                    else max(
+                        self.model_config.num_hidden_layers,
+                        self.model_config.num_attention_layers,
+                    )
+                )
+                if self.model_config.hf_config.architectures[0] == "MiMoV2MTP":
+                    model_num_layers = 1
+                elif self.model_config.hf_config.architectures[0] == "Step3p5MTP":
+                    model_num_layers = 1
+                self.start_layer = getattr(self.model, "start_layer", 0)
+                self.end_layer = getattr(self.model, "end_layer", model_num_layers)
+                self.num_effective_layers = self.end_layer - self.start_layer
 
-        # Initialize piecewise CUDA graph
-        self.init_piecewise_cuda_graphs()
+                loop_num = getattr(self.model_config.hf_config, "loop_num", 1)
+                if loop_num > 1:
+                    self.num_effective_layers = self.num_effective_layers * loop_num
 
-        self.prealloc_symmetric_memory_pool()
+                assert (
+                    (not model_has_mtp_layers)
+                    or (self.spec_algorithm.is_none())
+                    or (
+                        (not self.spec_algorithm.is_none())
+                        and (self.num_effective_layers == model_num_layers)
+                    )
+                ), "PP is not compatible with MTP models."
+
+                full_attention_layer_ids = [
+                    layer_idx
+                    for layer_idx in range(self.start_layer, self.end_layer + 1)
+                    if hasattr(self.model_config, "full_attention_layer_ids")
+                    and layer_idx in self.model_config.full_attention_layer_ids
+                ]
+                swa_attention_layer_ids = [
+                    layer_idx
+                    for layer_idx in range(self.start_layer, self.end_layer + 1)
+                    if hasattr(self.model_config, "swa_attention_layer_ids")
+                    and layer_idx in self.model_config.swa_attention_layer_ids
+                ]
+                self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
+                self.model_config.full_attention_layer_ids = full_attention_layer_ids
+
+                torchao_applied = getattr(self.model, "torchao_applied", False)
+                if not torchao_applied:
+                    apply_torchao_config_to_model(
+                        self.model, get_global_server_args().torchao_config
+                    )
+
+                supports_torch_tp = getattr(self.model, "supports_torch_tp", False)
+                if self.tp_size > 1 and supports_torch_tp:
+                    self.apply_torch_tp()
+
+                if server_args.enable_lora:
+                    self.init_lora_manager()
+
+                if server_args.enable_double_sparsity:
+                    if server_args.ds_heavy_channel_type is None:
+                        raise ValueError(
+                            "Please specify the heavy channel type for double sparsity optimization."
+                        )
+                    self.init_double_sparsity_channel_config(
+                        server_args.ds_heavy_channel_type
+                    )
+
+                if server_args.enable_deterministic_inference:
+                    from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
+
+                    enable_batch_invariant_mode()
+
+                with record_launch_task(
+                    task="kv_cache_dtype_config",
+                    family="sglang",
+                    rank=self.tp_rank,
+                    extra={"gpu_id": self.gpu_id},
+                ):
+                    self.configure_kv_cache_dtype()
+
+            self.init_memory_pool(pre_model_load_memory)
+            self.maybe_init_ngram_embedding()
+            self.init_routed_experts_capturer()
+
+            if self.device == "cuda" or self.device == "musa":
+                with record_launch_task(
+                    task="cublas_init",
+                    family="sglang",
+                    rank=self.tp_rank,
+                    extra={"gpu_id": self.gpu_id},
+                ):
+                    self.init_cublas()
+                with record_launch_task(
+                    task="attention_backend_init",
+                    family="sglang",
+                    rank=self.tp_rank,
+                    extra={"gpu_id": self.gpu_id},
+                ):
+                    self.init_attention_backend()
+                with record_launch_task(
+                    task="kernel_warmup",
+                    family="sglang",
+                    rank=self.tp_rank,
+                    extra={"gpu_id": self.gpu_id},
+                ):
+                    self.kernel_warmup()
+                self.init_device_graphs()
+            elif self.device in ["npu", "cpu"]:
+                with record_launch_task(
+                    task="attention_backend_init",
+                    family="sglang",
+                    rank=self.tp_rank,
+                    extra={"gpu_id": self.gpu_id},
+                ):
+                    self.init_attention_backend()
+                self.init_device_graphs()
+            else:
+                self.graph_runner = None
+                self.graph_mem_usage = 0
+                with record_launch_task(
+                    task="attention_backend_init",
+                    family="sglang",
+                    rank=self.tp_rank,
+                    extra={"gpu_id": self.gpu_id},
+                ):
+                    self.init_attention_backend()
+
+            if server_args.forward_hooks:
+                register_forward_hooks(self.model, server_args.forward_hooks)
+
+            if self.eagle_use_aux_hidden_state:
+                self.model.set_eagle3_layers_to_capture(
+                    self.eagle_aux_hidden_state_layer_ids
+                )
+
+            self.init_piecewise_cuda_graphs()
+
+            with record_launch_task(
+                task="symmetric_memory_pool_prealloc",
+                family="sglang",
+                rank=self.tp_rank,
+                extra={"gpu_id": self.gpu_id},
+            ):
+                self.prealloc_symmetric_memory_pool()
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(

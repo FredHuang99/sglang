@@ -59,6 +59,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+from sglang.launch_task_recorder import start_http_startup_probe
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
@@ -2047,6 +2048,15 @@ def _setup_and_run_http_server(
                 f"keyfile={server_args.ssl_keyfile}"
             )
 
+        ready_host = server_args.host or "127.0.0.1"
+        if ready_host in ("0.0.0.0", "::"):
+            ready_host = "127.0.0.1"
+        cancel_http_probe = start_http_startup_probe(
+            family="sglang",
+            url=f"http://{ready_host}:{server_args.port}/health",
+            extra={"host": ready_host, "port": server_args.port},
+        )
+
         # Listen for HTTP requests
         if server_args.tokenizer_worker_num == 1:
             if server_args.enable_ssl_refresh:
@@ -2085,22 +2095,28 @@ def _setup_and_run_http_server(
 
                 import asyncio
 
-                asyncio.run(_run_with_ssl_refresh())
+                try:
+                    asyncio.run(_run_with_ssl_refresh())
+                finally:
+                    cancel_http_probe()
             else:
                 # Default case, one tokenizer process
-                uvicorn.run(
-                    app,
-                    host=server_args.host,
-                    port=server_args.port,
-                    root_path=server_args.fastapi_root_path,
-                    log_level=server_args.log_level_http or server_args.log_level,
-                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                    loop="uvloop",
-                    ssl_keyfile=server_args.ssl_keyfile,
-                    ssl_certfile=server_args.ssl_certfile,
-                    ssl_ca_certs=server_args.ssl_ca_certs,
-                    ssl_keyfile_password=server_args.ssl_keyfile_password,
-                )
+                try:
+                    uvicorn.run(
+                        app,
+                        host=server_args.host,
+                        port=server_args.port,
+                        root_path=server_args.fastapi_root_path,
+                        log_level=server_args.log_level_http or server_args.log_level,
+                        timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                        loop="uvloop",
+                        ssl_keyfile=server_args.ssl_keyfile,
+                        ssl_certfile=server_args.ssl_certfile,
+                        ssl_ca_certs=server_args.ssl_ca_certs,
+                        ssl_keyfile_password=server_args.ssl_keyfile_password,
+                    )
+                finally:
+                    cancel_http_probe()
         else:
             # Multiple tokenizer and http processes
             from uvicorn.config import LOGGING_CONFIG
@@ -2119,20 +2135,23 @@ def _setup_and_run_http_server(
                     "SSL refresh will be disabled."
                 )
 
-            uvicorn.run(
-                "sglang.srt.entrypoints.http_server:app",
-                host=server_args.host,
-                port=server_args.port,
-                root_path=server_args.fastapi_root_path,
-                log_level=server_args.log_level_http or server_args.log_level,
-                timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
-                loop="uvloop",
-                workers=server_args.tokenizer_worker_num,
-                ssl_keyfile=server_args.ssl_keyfile,
-                ssl_certfile=server_args.ssl_certfile,
-                ssl_ca_certs=server_args.ssl_ca_certs,
-                ssl_keyfile_password=server_args.ssl_keyfile_password,
-            )
+            try:
+                uvicorn.run(
+                    "sglang.srt.entrypoints.http_server:app",
+                    host=server_args.host,
+                    port=server_args.port,
+                    root_path=server_args.fastapi_root_path,
+                    log_level=server_args.log_level_http or server_args.log_level,
+                    timeout_keep_alive=envs.SGLANG_TIMEOUT_KEEP_ALIVE.get(),
+                    loop="uvloop",
+                    workers=server_args.tokenizer_worker_num,
+                    ssl_keyfile=server_args.ssl_keyfile,
+                    ssl_certfile=server_args.ssl_certfile,
+                    ssl_ca_certs=server_args.ssl_ca_certs,
+                    ssl_keyfile_password=server_args.ssl_keyfile_password,
+                )
+            finally:
+                cancel_http_probe()
     finally:
         if server_args.tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:

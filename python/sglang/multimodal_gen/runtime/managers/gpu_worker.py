@@ -12,6 +12,7 @@ from typing import List, Union
 import torch
 from setproctitle import setproctitle
 
+from sglang.launch_task_recorder import record_launch_task
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.loader.utils import get_memory_usage_of_component
 from sglang.multimodal_gen.runtime.distributed import (
@@ -99,92 +100,104 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        role_device = self.server_args.resolved_role_device()
-        if role_device == "cpu":
-            os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
-        else:
-            os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cuda"
-            torch.get_device_module().set_device(self.local_rank)
-        # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.master_port)
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
-        os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
-        # initialize the distributed environment
-        maybe_init_distributed_environment_and_model_parallel(
-            tp_size=self.server_args.tp_size,
-            enable_cfg_parallel=self.server_args.enable_cfg_parallel,
-            ulysses_degree=self.server_args.ulysses_degree,
-            ring_degree=self.server_args.ring_degree,
-            sp_size=self.server_args.sp_degree,
-            dp_size=self.server_args.dp_size,
-            distributed_init_method=NetworkAddress(
-                "127.0.0.1", self.master_port
-            ).to_tcp(),
-            dist_timeout=self.server_args.dist_timeout,
-        )
+        with record_launch_task(
+            task="worker_init_total",
+            family="sglang-diffusion",
+            rank=self.rank,
+            extra={"local_rank": self.local_rank},
+        ):
+            with record_launch_task(
+                task="device_bootstrap",
+                family="sglang-diffusion",
+                rank=self.rank,
+                extra={"local_rank": self.local_rank},
+            ):
+                role_device = self.server_args.resolved_role_device()
+                if role_device == "cpu":
+                    os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
+                else:
+                    os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cuda"
+                    torch.get_device_module().set_device(self.local_rank)
+                # Set environment variables for distributed initialization
+                os.environ["MASTER_ADDR"] = "localhost"
+                os.environ["MASTER_PORT"] = str(self.master_port)
+                os.environ["LOCAL_RANK"] = str(self.local_rank)
+                os.environ["RANK"] = str(self.rank)
+                os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+            # initialize the distributed environment
+            maybe_init_distributed_environment_and_model_parallel(
+                tp_size=self.server_args.tp_size,
+                enable_cfg_parallel=self.server_args.enable_cfg_parallel,
+                ulysses_degree=self.server_args.ulysses_degree,
+                ring_degree=self.server_args.ring_degree,
+                sp_size=self.server_args.sp_degree,
+                dp_size=self.server_args.dp_size,
+                distributed_init_method=NetworkAddress(
+                    "127.0.0.1", self.master_port
+                ).to_tcp(),
+                dist_timeout=self.server_args.dist_timeout,
+            )
 
-        # set proc title
-        if model_parallel_is_initialized():
-            suffix = ""
-            if get_tp_world_size() != 1:
-                tp_rank = get_tp_rank()
-                suffix += f"_TP{tp_rank}"
-            if get_ulysses_parallel_world_size() != 1:
-                u_rank = get_ulysses_parallel_rank()
-                suffix += f"_U{u_rank}"
-            if get_ring_parallel_world_size() != 1:
-                r_rank = get_ring_parallel_rank()
-                suffix += f"_R{r_rank}"
-            if get_classifier_free_guidance_world_size() != 1:
-                c_rank = get_classifier_free_guidance_rank()
-                suffix += f"_C{c_rank}"
-            setproctitle(f"sgl_diffusion::scheduler{suffix}")
-        else:
-            setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
+            # set proc title
+            if model_parallel_is_initialized():
+                suffix = ""
+                if get_tp_world_size() != 1:
+                    tp_rank = get_tp_rank()
+                    suffix += f"_TP{tp_rank}"
+                if get_ulysses_parallel_world_size() != 1:
+                    u_rank = get_ulysses_parallel_rank()
+                    suffix += f"_U{u_rank}"
+                if get_ring_parallel_world_size() != 1:
+                    r_rank = get_ring_parallel_rank()
+                    suffix += f"_R{r_rank}"
+                if get_classifier_free_guidance_world_size() != 1:
+                    c_rank = get_classifier_free_guidance_rank()
+                    suffix += f"_C{c_rank}"
+                setproctitle(f"sgl_diffusion::scheduler{suffix}")
+            else:
+                setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
-        before_build_snapshot = None
-        if self._should_dump_init_profile():
-            before_build_snapshot = capture_memory_snapshot()
+            before_build_snapshot = None
+            if self._should_dump_init_profile():
+                before_build_snapshot = capture_memory_snapshot()
 
-        self.pipeline = build_pipeline(self.server_args)
+            self.pipeline = build_pipeline(self.server_args)
 
-        if self._should_dump_init_profile():
-            after_build_snapshot = capture_memory_snapshot()
-            self._init_profile_ctx = {
-                "before_build_pipeline": before_build_snapshot.to_dict()
-                if before_build_snapshot is not None
-                else {},
-                "after_build_pipeline": after_build_snapshot.to_dict(),
-            }
-            torch.get_device_module().reset_peak_memory_stats()
+            if self._should_dump_init_profile():
+                after_build_snapshot = capture_memory_snapshot()
+                self._init_profile_ctx = {
+                    "before_build_pipeline": before_build_snapshot.to_dict()
+                    if before_build_snapshot is not None
+                    else {},
+                    "after_build_pipeline": after_build_snapshot.to_dict(),
+                }
+                torch.get_device_module().reset_peak_memory_stats()
 
-        # apply layerwise offload after lora is applied while building LoRAPipeline
-        # otherwise empty offloaded weights could fail lora converting
-        if self.server_args.dit_layerwise_offload:
-            # enable layerwise offload if possible
-            for module_name in [
-                "transformer",
-                "transformer_2",
-                "video_dit",
-                "video_dit_2",
-                "audio_dit",
-            ]:
-                dit = self.pipeline.get_module(module_name)
-                if dit:
-                    if isinstance(dit, OffloadableDiTMixin):
-                        dit.configure_layerwise_offload(self.server_args)
-                    else:
-                        logger.info(
-                            f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
-                        )
+            # apply layerwise offload after lora is applied while building LoRAPipeline
+            # otherwise empty offloaded weights could fail lora converting
+            if self.server_args.dit_layerwise_offload:
+                # enable layerwise offload if possible
+                for module_name in [
+                    "transformer",
+                    "transformer_2",
+                    "video_dit",
+                    "video_dit_2",
+                    "audio_dit",
+                ]:
+                    dit = self.pipeline.get_module(module_name)
+                    if dit:
+                        if isinstance(dit, OffloadableDiTMixin):
+                            dit.configure_layerwise_offload(self.server_args)
+                        else:
+                            logger.info(
+                                f"Module {type(dit).__name__} does not support layerwise offload. Skipping."
+                            )
 
-        logger.info(
-            "Worker %s: Initialized device=%s, model, and distributed environment.",
-            self.rank,
-            role_device,
-        )
+            logger.info(
+                "Worker %s: Initialized device=%s, model, and distributed environment.",
+                self.rank,
+                role_device,
+            )
 
     def _should_dump_init_profile(self) -> bool:
         return self._init_profile_enabled and self.rank == 0 and (
@@ -736,11 +749,17 @@ def run_scheduler_process(
             local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
-        pipe_writer.send(
-            {
-                "status": "ready",
-            }
-        )
+        with record_launch_task(
+            task="worker_ready_signal",
+            family="sglang-diffusion",
+            rank=rank,
+            extra={"local_rank": local_rank},
+        ):
+            pipe_writer.send(
+                {
+                    "status": "ready",
+                }
+            )
         scheduler.event_loop()
     except _oom_exceptions() as _e:
         logger.warning(OOM_MSG)

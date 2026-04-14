@@ -5,6 +5,7 @@ import os
 import sys
 import warnings
 
+from sglang.launch_task_recorder import record_launch_task
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import suppress_noisy_warnings
@@ -56,7 +57,8 @@ if __name__ == "__main__":
         stacklevel=1,
     )
 
-    server_args = prepare_server_args(sys.argv[1:])
+    with record_launch_task(task="entrypoint_bootstrap", family="sglang"):
+        server_args = prepare_server_args(sys.argv[1:])
 
     try:
         run_server(server_args)

@@ -46,6 +46,7 @@ import torch
 import uvloop
 import zmq
 
+from sglang.launch_task_recorder import record_launch_task
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.EngineBase import EngineBase
 from sglang.srt.managers.data_parallel_controller import (
@@ -613,19 +614,33 @@ class Engine(EngineBase):
             Tuple of (tokenizer_manager, template_manager, port_args, scheduler_init_result).
         """
         # Configure global environment
-        configure_logger(server_args)
-        _set_envs_and_config(server_args)
-        server_args.check_server_args()
+        with record_launch_task(
+            task="engine_subprocess_setup",
+            family="sglang",
+            extra={"node_rank": server_args.node_rank, "tp_size": server_args.tp_size},
+        ):
+            configure_logger(server_args)
+            _set_envs_and_config(server_args)
+            server_args.check_server_args()
 
-        # Allocate ports for inter-process communications
-        if port_args is None:
-            port_args = PortArgs.init_new(server_args)
-        logger.info(f"{server_args=}")
+            # Allocate ports for inter-process communications
+            if port_args is None:
+                port_args = PortArgs.init_new(server_args)
+            logger.info(f"{server_args=}")
 
-        # Launch scheduler processes
-        scheduler_init_result = cls._launch_scheduler_processes(
-            server_args, port_args, run_scheduler_process_func
-        )
+        with record_launch_task(
+            task="parent_worker_spawn",
+            family="sglang",
+            extra={"dp_size": server_args.dp_size, "tp_size": server_args.tp_size},
+        ):
+            with record_launch_task(
+                task="scheduler_spawn",
+                family="sglang",
+                extra={"dp_size": server_args.dp_size, "tp_size": server_args.tp_size},
+            ):
+                scheduler_init_result = cls._launch_scheduler_processes(
+                    server_args, port_args, run_scheduler_process_func
+                )
 
         if (
             server_args.enable_elastic_expert_backup
@@ -636,7 +651,12 @@ class Engine(EngineBase):
         if server_args.node_rank >= 1:
             # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
             # so they can just wait here.
-            scheduler_init_result.wait_for_ready()
+            with record_launch_task(
+                task="parent_wait_workers_ready",
+                family="sglang",
+                extra={"node_rank": server_args.node_rank},
+            ):
+                scheduler_init_result.wait_for_ready()
 
             if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
                 # When using `Engine` as a Python API, we don't want to block here.
@@ -660,27 +680,42 @@ class Engine(EngineBase):
             )
 
         # Launch detokenizer process
-        detoken_proc = mp.Process(
-            target=run_detokenizer_process_func,
-            args=(
-                server_args,
-                port_args,
-            ),
-        )
-        detoken_proc.start()
+        with record_launch_task(
+            task="detokenizer_spawn",
+            family="sglang",
+            extra={"tokenizer_worker_num": server_args.tokenizer_worker_num},
+        ):
+            detoken_proc = mp.Process(
+                target=run_detokenizer_process_func,
+                args=(
+                    server_args,
+                    port_args,
+                ),
+            )
+            detoken_proc.start()
 
         # Init tokenizer manager first, as the bootstrap server is initialized here
-        if server_args.tokenizer_worker_num == 1:
-            tokenizer_manager, template_manager = init_tokenizer_manager_func(
-                server_args, port_args
-            )
-        else:
-            # Launch multi-tokenizer router
-            tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
-            template_manager = None
+        with record_launch_task(
+            task="tokenizer_manager_init",
+            family="sglang",
+            extra={"tokenizer_worker_num": server_args.tokenizer_worker_num},
+        ):
+            if server_args.tokenizer_worker_num == 1:
+                tokenizer_manager, template_manager = init_tokenizer_manager_func(
+                    server_args, port_args
+                )
+            else:
+                # Launch multi-tokenizer router
+                tokenizer_manager = MultiTokenizerRouter(server_args, port_args)
+                template_manager = None
 
         # Wait for the model to finish loading
-        scheduler_init_result.wait_for_ready()
+        with record_launch_task(
+            task="parent_wait_workers_ready",
+            family="sglang",
+            extra={"node_rank": server_args.node_rank},
+        ):
+            scheduler_init_result.wait_for_ready()
 
         # Get back some info from scheduler to tokenizer_manager
         tokenizer_manager.max_req_input_len = scheduler_init_result.scheduler_infos[0][

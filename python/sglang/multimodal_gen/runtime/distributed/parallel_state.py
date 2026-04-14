@@ -46,7 +46,7 @@ import torch.distributed
 from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
-from sglang.launch_task_recorder import profile_launch_task
+from sglang.launch_task_recorder import profile_launch_task, record_launch_task
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -505,23 +505,36 @@ def maybe_init_distributed_environment_and_model_parallel(
         main_process_only=False,
     )
 
-    init_distributed_environment(
-        world_size=world_size,
+    with record_launch_task(
+        task="distributed_and_model_parallel_init_total",
+        family="sglang-diffusion",
         rank=rank,
-        local_rank=local_rank,
-        distributed_init_method=distributed_init_method,
-        device_id=device,
-        backend=current_platform.get_torch_distributed_backend_str(),
-        timeout=dist_timeout,
-    )
-    initialize_model_parallel(
-        data_parallel_size=dp_size,
-        classifier_free_guidance_degree=2 if enable_cfg_parallel else 1,
-        tensor_parallel_degree=tp_size,
-        ulysses_degree=ulysses_degree,
-        ring_degree=ring_degree,
-        sequence_parallel_degree=sp_size,
-    )
+        extra={
+            "world_size": world_size,
+            "tp_size": tp_size,
+            "sp_size": sp_size,
+            "ulysses_degree": ulysses_degree,
+            "ring_degree": ring_degree,
+            "dp_size": dp_size,
+        },
+    ):
+        init_distributed_environment(
+            world_size=world_size,
+            rank=rank,
+            local_rank=local_rank,
+            distributed_init_method=distributed_init_method,
+            device_id=device,
+            backend=current_platform.get_torch_distributed_backend_str(),
+            timeout=dist_timeout,
+        )
+        initialize_model_parallel(
+            data_parallel_size=dp_size,
+            classifier_free_guidance_degree=2 if enable_cfg_parallel else 1,
+            tensor_parallel_degree=tp_size,
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            sequence_parallel_degree=sp_size,
+        )
 
     # Only set CUDA device if we're on a CUDA platform
     if current_platform.is_cuda_alike():

@@ -26,23 +26,51 @@ POLL_INTERVAL_S = 0.2
 
 EXPECTED_TASK_KEYS: dict[str, list[str]] = {
     "sglang": [
+        "entrypoint_bootstrap",
+        "engine_subprocess_setup",
+        "parent_worker_spawn",
+        "scheduler_spawn",
+        "detokenizer_spawn",
+        "tokenizer_manager_init",
+        "parent_wait_workers_ready",
+        "http_server_startup",
+        "model_runner_initialize_total",
+        "model_runner_pre_load_setup",
+        "model_runner_post_load_setup",
         "torch_distributed_init",
         "load_weight",
+        "kv_cache_dtype_config",
         "memory_pool_init",
+        "cublas_init",
+        "attention_backend_init",
+        "kernel_warmup",
         "cuda_graph_capture",
         "piecewise_cuda_graph_capture",
+        "symmetric_memory_pool_prealloc",
         "torch_compile",
     ],
     "sglang-diffusion": [
+        "entrypoint_bootstrap",
+        "parent_worker_spawn",
+        "parent_wait_workers_ready",
+        "http_server_startup",
         "scheduler_bind",
+        "worker_init_total",
+        "device_bootstrap",
         "distributed_init",
+        "distributed_and_model_parallel_init_total",
         "pipeline_select",
+        "build_pipeline_total",
+        "pipeline_config_load",
+        "executor_build",
         "component_load:text_encoder",
         "component_load:tokenizer",
         "component_load:vae",
         "component_load:transformer",
         "component_load:scheduler",
+        "pipeline_initialize",
         "pipeline_stage_create",
+        "worker_ready_signal",
         "cuda_graph_capture",
         "torch_compile",
     ],
@@ -802,6 +830,12 @@ def build_summary(
             "launch_tasks_jsonl": (
                 "Structured begin/end task events emitted by the server runtime when "
                 "SGLANG_LAUNCH_TASK_LOG_PATH is set."
+            ),
+            "envelope_vs_leaf_tasks": (
+                "Some tasks are coarse envelope timers (for example worker_init_total, "
+                "build_pipeline_total, model_runner_initialize_total, parent_wait_workers_ready) "
+                "that intentionally overlap with smaller leaf tasks. Do not sum every task "
+                "to estimate launch_time_ms."
             ),
             "elapsed_ms_sum": (
                 "Sum of all observed end-event durations for the same task key."

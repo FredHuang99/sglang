@@ -95,7 +95,19 @@ class ComposedPipelineBase(ABC):
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
-        self.executor = executor or self.build_executor(server_args=server_args)
+        if executor is not None:
+            self.executor = executor
+        else:
+            with record_launch_task(
+                task="executor_build",
+                family="sglang-diffusion",
+                extra={
+                    "pipeline_name": getattr(
+                        self, "pipeline_name", self.__class__.__name__
+                    )
+                },
+            ):
+                self.executor = self.build_executor(server_args=server_args)
 
         if required_config_modules is not None:
             self._required_config_modules = required_config_modules
@@ -144,7 +156,12 @@ class ComposedPipelineBase(ABC):
 
     def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
-        self.initialize_pipeline(self.server_args)
+        with record_launch_task(
+            task="pipeline_initialize",
+            family="sglang-diffusion",
+            extra={"pipeline_name": getattr(self, "pipeline_name", self.__class__.__name__)},
+        ):
+            self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
         with record_launch_task(
@@ -161,11 +178,16 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
-        model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
-        self.model_path = model_path
-        logger.info("Model path: %s", model_path)
-        config = verify_model_config_and_directory(model_path)
-        return cast(dict[str, Any], config)
+        with record_launch_task(
+            task="pipeline_config_load",
+            family="sglang-diffusion",
+            extra={"model_path": self.model_path},
+        ):
+            model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
+            self.model_path = model_path
+            logger.info("Model path: %s", model_path)
+            config = verify_model_config_and_directory(model_path)
+            return cast(dict[str, Any], config)
 
     @property
     def required_config_modules(self) -> list[str]:
