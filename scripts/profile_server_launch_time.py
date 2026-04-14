@@ -6,29 +6,37 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import logging
+import os
+import re
+import shutil
+import signal
+import site
+import socket
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
 import requests
 
-from sglang.multimodal_gen.configs.sample.wan import (
-    Wan2_2_TI2V_5B_SamplingParam,
-    WanT2V_1_3B_SamplingParams,
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
-from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-logger = init_logger(__name__)
+logger = logging.getLogger(__name__)
 
 SCRIPT_PATH = Path(__file__).resolve()
 LEGACY_SCRIPT_PATH = SCRIPT_PATH.with_name("profile_wan22_ti2v_5b_monolithic.py")
+WAIT_LOG_INTERVAL_S = 15
 
 
-def load_legacy_module():
+@lru_cache(maxsize=1)
+def get_diffusion_legacy():
     spec = importlib.util.spec_from_file_location(
         "_sglang_legacy_monolithic_profile_for_launch_time",
         LEGACY_SCRIPT_PATH,
@@ -41,8 +49,15 @@ def load_legacy_module():
     return module
 
 
-legacy = load_legacy_module()
-RunConfig = legacy.RunConfig
+@dataclass(frozen=True)
+class RunConfig:
+    name: str
+    mode: str
+    num_gpus: int
+    tp_size: int | None
+    sp_degree: int | None
+    ulysses_degree: int | None
+    ring_degree: int | None
 
 
 @dataclass(frozen=True)
@@ -72,7 +87,21 @@ class LLMSetup:
     cuda_graph_max_bs: int | None = None
 
 
-def make_zimage_sampling() -> ZImageSamplingParams:
+def make_wan22_ti2v_sampling() -> Any:
+    from sglang.multimodal_gen.configs.sample.wan import Wan2_2_TI2V_5B_SamplingParam
+
+    return Wan2_2_TI2V_5B_SamplingParam()
+
+
+def make_want2v_13b_sampling() -> Any:
+    from sglang.multimodal_gen.configs.sample.wan import WanT2V_1_3B_SamplingParams
+
+    return WanT2V_1_3B_SamplingParams()
+
+
+def make_zimage_sampling() -> Any:
+    from sglang.multimodal_gen.configs.sample.zimage import ZImageSamplingParams
+
     return ZImageSamplingParams(width=1024, height=1024)
 
 
@@ -126,7 +155,7 @@ PRESETS: dict[str, LaunchPreset] = {
         model_id="Wan2.2-TI2V-5B-Diffusers",
         output_subdir="wan2_2_ti2v_5b/launch",
         expected_task_type="TI2V",
-        sampling_factory=Wan2_2_TI2V_5B_SamplingParam,
+        sampling_factory=make_wan22_ti2v_sampling,
     ),
     "wan2.1-t2v-1.3b": LaunchPreset(
         key="wan2.1-t2v-1.3b",
@@ -135,7 +164,7 @@ PRESETS: dict[str, LaunchPreset] = {
         model_id="Wan2.1-T2V-1.3B-Diffusers",
         output_subdir="wan2_1_t2v_1_3b/launch",
         expected_task_type="T2V",
-        sampling_factory=WanT2V_1_3B_SamplingParams,
+        sampling_factory=make_want2v_13b_sampling,
     ),
     "z-image": LaunchPreset(
         key="z-image",
@@ -239,6 +268,146 @@ def parse_llm_setup_keys(raw: str | None) -> list[str]:
     return deduped
 
 
+def parse_parallel_degrees(args: argparse.Namespace) -> list[int]:
+    cleaned = (
+        args.parallel_degrees.replace("{", "")
+        .replace("}", "")
+        .replace("[", "")
+        .replace("]", "")
+    )
+    tokens = [token for token in re.split(r"[\s,]+", cleaned.strip()) if token]
+    if not tokens:
+        raise ValueError("No valid values were found in --parallel-degrees.")
+
+    degrees: list[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        value = int(token)
+        if value <= 0:
+            raise ValueError(
+                f"parallel degree must be a positive integer, got {value}."
+            )
+        if value not in seen:
+            seen.add(value)
+            degrees.append(value)
+    return degrees
+
+
+def resolve_visible_gpu_count() -> int:
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices:
+        devices = [d.strip() for d in cuda_visible_devices.split(",") if d.strip()]
+        return len(devices)
+    try:
+        import torch
+
+        return int(torch.cuda.device_count())
+    except Exception:
+        return 0
+
+
+def find_free_port(host: str) -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((host, 0))
+        return int(sock.getsockname()[1])
+
+
+def detect_cutlass_python_packages_dir() -> Path | None:
+    candidates: list[Path] = []
+    try:
+        candidates.extend(Path(path) for path in site.getsitepackages())
+    except Exception:
+        pass
+    try:
+        user_site = site.getusersitepackages()
+        if user_site:
+            candidates.append(Path(user_site))
+    except Exception:
+        pass
+
+    seen: set[Path] = set()
+    for base in candidates:
+        if base in seen:
+            continue
+        seen.add(base)
+        python_packages_dir = base / "nvidia_cutlass_dsl" / "python_packages"
+        if (python_packages_dir / "cutlass").exists():
+            return python_packages_dir.resolve()
+    return None
+
+
+def prepend_pythonpath(env: dict[str, str], path: Path) -> None:
+    existing = env.get("PYTHONPATH", "")
+    parts = [part for part in existing.split(os.pathsep) if part]
+    path_str = str(path)
+    if path_str not in parts:
+        parts.insert(0, path_str)
+    env["PYTHONPATH"] = os.pathsep.join(parts)
+
+
+def safe_rmtree(path: Path) -> None:
+    logger.info("Cleaning temporary artifacts: %s", path)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def factor_pairs(n: int) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    for i in range(1, n + 1):
+        if n % i == 0:
+            pairs.append((i, n // i))
+    return pairs
+
+
+def build_run_configs(parallel_degree: int) -> list[RunConfig]:
+    runs: list[RunConfig] = []
+    seen: set[tuple[int, int, int, int]] = set()
+
+    def add_run(run: RunConfig) -> None:
+        key = (
+            run.tp_size or 1,
+            run.sp_degree or 1,
+            run.ulysses_degree or 1,
+            run.ring_degree or 1,
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        runs.append(run)
+
+    divisors_desc = sorted(
+        [d for d in range(1, parallel_degree + 1) if parallel_degree % d == 0],
+        reverse=True,
+    )
+    for tp_size in divisors_desc:
+        sp_degree = parallel_degree // tp_size
+        if sp_degree == 1:
+            add_run(
+                RunConfig(
+                    name=f"e_tp{tp_size}_sp{sp_degree}",
+                    mode="explicit",
+                    num_gpus=parallel_degree,
+                    tp_size=tp_size,
+                    sp_degree=sp_degree,
+                    ulysses_degree=None,
+                    ring_degree=None,
+                )
+            )
+            continue
+        for ulysses_degree, ring_degree in factor_pairs(sp_degree):
+            add_run(
+                RunConfig(
+                    name=f"e_tp{tp_size}_sp{sp_degree}_u{ulysses_degree}_r{ring_degree}",
+                    mode="explicit",
+                    num_gpus=parallel_degree,
+                    tp_size=tp_size,
+                    sp_degree=sp_degree,
+                    ulysses_degree=ulysses_degree,
+                    ring_degree=ring_degree,
+                )
+            )
+    return runs
+
+
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir:
         return Path(args.output_dir).expanduser().resolve()
@@ -258,6 +427,67 @@ def read_log_tail(log_path: Path, lines: int = 120) -> str:
         return ""
     content = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     return "\n".join(content[-lines:])
+
+
+def start_logged_process(
+    *,
+    command: list[str],
+    log_path: Path,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen[str], Any]:
+    log_fh = log_path.open("w", encoding="utf-8")
+    popen_kwargs: dict[str, Any] = {
+        "stdout": log_fh,
+        "stderr": subprocess.STDOUT,
+        "text": True,
+        "env": env,
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except Exception:
+        log_fh.close()
+        raise
+    process._sgl_log_fh = log_fh  # type: ignore[attr-defined]
+    return process, log_fh
+
+
+def stop_server(process: subprocess.Popen[str] | None) -> None:
+    if process is None:
+        return
+
+    try:
+        if process.poll() is None:
+            if os.name == "nt":
+                process.terminate()
+            else:
+                os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=10)
+    except Exception:
+        pass
+
+    try:
+        if process.poll() is None:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+    except Exception:
+        pass
+
+    log_fh = getattr(process, "_sgl_log_fh", None)
+    if log_fh is not None:
+        try:
+            log_fh.flush()
+            log_fh.close()
+        except Exception:
+            pass
 
 
 def build_promptenhancer_command(
@@ -408,7 +638,7 @@ def wait_for_promptenhancer_ready(
                 f"Timed out waiting for {base_url}/v1/models after {timeout_s}s.\n"
                 f"{read_log_tail(server_log_path)}"
             )
-        if elapsed - last_log_at >= legacy.WAIT_LOG_INTERVAL_S:
+        if elapsed - last_log_at >= WAIT_LOG_INTERVAL_S:
             logger.info(
                 "Waiting for prompt-enhancer server readiness... elapsed=%ss ready=False",
                 int(elapsed),
@@ -420,7 +650,7 @@ def wait_for_promptenhancer_ready(
 def cleanup_case_dir(case_dir: Path, keep_artifacts: bool) -> None:
     if keep_artifacts:
         return
-    legacy.safe_rmtree(case_dir)
+    safe_rmtree(case_dir)
 
 
 def ns_to_ms(value_ns: int) -> float:
@@ -475,7 +705,7 @@ def measure_promptenhancer_case(
 ) -> dict[str, Any]:
     server_log_path = case_dir / "server.log"
     case_dir.mkdir(parents=True, exist_ok=True)
-    port = legacy.find_free_port(host)
+    port = find_free_port(host)
     base_url = f"http://{host}:{port}"
     command = build_promptenhancer_command(
         preset=preset,
@@ -485,18 +715,10 @@ def measure_promptenhancer_case(
     )
 
     process: subprocess.Popen[str] | None = None
-    log_fh = None
     start_ns = time.perf_counter_ns()
     try:
         logger.info("Launching %s", " ".join(command))
-        log_fh = server_log_path.open("w", encoding="utf-8")
-        process = subprocess.Popen(
-            command,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        process._sgl_log_fh = log_fh  # type: ignore[attr-defined]
+        process, _ = start_logged_process(command=command, log_path=server_log_path)
         model_card = wait_for_promptenhancer_ready(
             process=process,
             base_url=base_url,
@@ -531,13 +753,7 @@ def measure_promptenhancer_case(
             reason=str(exc),
         )
     finally:
-        legacy.stop_server(process)
-        if process is None and log_fh is not None:
-            try:
-                log_fh.flush()
-                log_fh.close()
-            except Exception:
-                pass
+        stop_server(process)
 
 
 def measure_diffusion_case(
@@ -555,7 +771,8 @@ def measure_diffusion_case(
     sampling = preset.sampling_factory()
     launch_time_ns: int | None = None
     process = None
-    legacy.EXPECTED_TASK_TYPE = preset.expected_task_type
+    diffusion_legacy = get_diffusion_legacy()
+    diffusion_legacy.EXPECTED_TASK_TYPE = preset.expected_task_type
     start_ns = time.perf_counter_ns()
     command_preview = build_diffusion_command_preview(
         preset=preset,
@@ -564,7 +781,7 @@ def measure_diffusion_case(
         host=host,
     )
     try:
-        process, base_url, perf_dir, init_profile_path, model_card = legacy.launch_server(
+        process, base_url, perf_dir, init_profile_path, model_card = diffusion_legacy.launch_server(
             model_path=preset.model_path,
             model_id=preset.model_id,
             run_config=run_config,
@@ -605,7 +822,7 @@ def measure_diffusion_case(
             reason=str(exc),
         )
     finally:
-        legacy.stop_server(process)
+        diffusion_legacy.stop_server(process)
 
 
 def refresh_human_summary(summary: dict[str, Any]) -> None:
@@ -649,7 +866,7 @@ def build_summary(*, args: argparse.Namespace, output_dir: Path, visible_gpu_cou
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "run_root": str(output_dir),
         "visible_gpu_count": visible_gpu_count,
-        "parallel_degrees": legacy.parse_parallel_degrees(args),
+        "parallel_degrees": parse_parallel_degrees(args),
         "selected_models": selected_models,
         "keep_artifacts": args.keep_artifacts,
         "launch_time_semantics": {
@@ -666,8 +883,8 @@ def build_summary(*, args: argparse.Namespace, output_dir: Path, visible_gpu_cou
 def main() -> None:
     args = parse_args()
     model_keys = parse_model_keys(args.models)
-    parallel_degrees = legacy.parse_parallel_degrees(args)
-    visible_gpu_count = legacy.resolve_visible_gpu_count()
+    parallel_degrees = parse_parallel_degrees(args)
+    visible_gpu_count = resolve_visible_gpu_count()
     output_dir = resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "server_launch_time_summary.json"
@@ -721,7 +938,7 @@ def main() -> None:
                 cleanup_case_dir(case_dir, args.keep_artifacts)
                 continue
 
-            run_configs = legacy.build_run_configs(gpu_count)
+            run_configs = build_run_configs(gpu_count)
             logger.info(
                 "preset=%s gpu=%s will measure %s explicit tp*sp=P launch case(s)",
                 model_key,

@@ -18,7 +18,6 @@ import requests
 import profile_server_launch_time as launch_time
 
 logger = launch_time.logger
-legacy = launch_time.legacy
 PRESETS = launch_time.PRESETS
 RunConfig = launch_time.RunConfig
 
@@ -232,9 +231,9 @@ def prepare_case_env(launch_tasks_path: Path, *, diffusion: bool) -> dict[str, s
     env = os.environ.copy()
     env["SGLANG_LAUNCH_TASK_LOG_PATH"] = str(launch_tasks_path.resolve())
     if diffusion:
-        cutlass_python_packages_dir = legacy.detect_cutlass_python_packages_dir()
+        cutlass_python_packages_dir = launch_time.detect_cutlass_python_packages_dir()
         if cutlass_python_packages_dir is not None:
-            legacy.prepend_pythonpath(env, cutlass_python_packages_dir)
+            launch_time.prepend_pythonpath(env, cutlass_python_packages_dir)
             logger.info(
                 "Added CUTLASS Python packages dir to PYTHONPATH: %s",
                 cutlass_python_packages_dir,
@@ -317,7 +316,7 @@ def wait_for_server_endpoints(
                 models_ready_ns=models_ready_ns,
             )
 
-        if now - last_log_time >= legacy.WAIT_LOG_INTERVAL_S:
+        if now - last_log_time >= launch_time.WAIT_LOG_INTERVAL_S:
             elapsed_s = int(timeout_s - max(deadline - now, 0))
             logger.info(
                 "Waiting for readiness... elapsed=%ss health=%s models=%s expected_task_type=%s",
@@ -534,16 +533,7 @@ def start_process(
     server_log_path: Path,
     env: dict[str, str],
 ) -> tuple[subprocess.Popen[str], Any]:
-    log_fh = server_log_path.open("w", encoding="utf-8")
-    process = subprocess.Popen(
-        command,
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-    )
-    process._sgl_log_fh = log_fh  # type: ignore[attr-defined]
-    return process, log_fh
+    return launch_time.start_logged_process(command=command, log_path=server_log_path, env=env)
 
 
 def measure_promptenhancer_case(
@@ -556,7 +546,7 @@ def measure_promptenhancer_case(
     case_dir: Path,
 ) -> dict[str, Any]:
     case_dir.mkdir(parents=True, exist_ok=True)
-    port = legacy.find_free_port(host)
+    port = launch_time.find_free_port(host)
     base_url = f"http://{host}:{port}"
     server_log_path = case_dir / "server.log"
     launch_tasks_path = case_dir / "launch_tasks.jsonl"
@@ -677,7 +667,7 @@ def measure_promptenhancer_case(
             },
         )
     finally:
-        legacy.stop_server(process)
+        launch_time.stop_server(process)
 
 
 def measure_diffusion_case(
@@ -690,9 +680,9 @@ def measure_diffusion_case(
     case_dir: Path,
 ) -> dict[str, Any]:
     case_dir.mkdir(parents=True, exist_ok=True)
-    port = legacy.find_free_port(host)
-    scheduler_port = legacy.find_free_port(host)
-    master_port = legacy.find_free_port(host)
+    port = launch_time.find_free_port(host)
+    scheduler_port = launch_time.find_free_port(host)
+    master_port = launch_time.find_free_port(host)
     base_url = f"http://{host}:{port}"
     server_log_path = case_dir / "server.log"
     launch_tasks_path = case_dir / "launch_tasks.jsonl"
@@ -797,7 +787,7 @@ def measure_diffusion_case(
             },
         )
     finally:
-        legacy.stop_server(process)
+        launch_time.stop_server(process)
 
 
 def refresh_human_summary(summary: dict[str, Any]) -> None:
@@ -847,7 +837,7 @@ def build_summary(
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "run_root": str(output_dir),
         "visible_gpu_count": visible_gpu_count,
-        "parallel_degrees": legacy.parse_parallel_degrees(args),
+        "parallel_degrees": launch_time.parse_parallel_degrees(args),
         "selected_models": selected_models,
         "selected_llm_setups": selected_llm_setups,
         "keep_artifacts": args.keep_artifacts,
@@ -896,8 +886,8 @@ def main() -> None:
     args = parse_args()
     model_keys = launch_time.parse_model_keys(args.models)
     llm_setup_keys = launch_time.parse_llm_setup_keys(args.llm_setups)
-    parallel_degrees = legacy.parse_parallel_degrees(args)
-    visible_gpu_count = legacy.resolve_visible_gpu_count()
+    parallel_degrees = launch_time.parse_parallel_degrees(args)
+    visible_gpu_count = launch_time.resolve_visible_gpu_count()
     output_dir = resolve_output_dir(args)
     output_dir.mkdir(parents=True, exist_ok=True)
     summary_path = output_dir / "server_launch_breakdown_summary.json"
@@ -1008,7 +998,7 @@ def main() -> None:
                 launch_time.cleanup_case_dir(case_dir, args.keep_artifacts)
                 continue
 
-            run_configs = legacy.build_run_configs(gpu_count)
+            run_configs = launch_time.build_run_configs(gpu_count)
             logger.info(
                 "preset=%s gpu=%s will measure %s explicit tp*sp=P launch breakdown case(s)",
                 model_key,
