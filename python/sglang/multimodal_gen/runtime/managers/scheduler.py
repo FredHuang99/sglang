@@ -9,6 +9,7 @@ from typing import Any, List
 
 import zmq
 
+from sglang.launch_task_recorder import record_launch_task
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
@@ -79,9 +80,15 @@ class Scheduler(SchedulerDisaggMixin):
         endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
             # router allocates identify (envelope) for each connection
-            self.receiver, actual_endpoint = get_zmq_socket(
-                self.context, zmq.ROUTER, endpoint, True
-            )
+            with record_launch_task(
+                task="scheduler_bind",
+                family="sglang-diffusion",
+                rank=gpu_id,
+                extra={"endpoint": endpoint},
+            ):
+                self.receiver, actual_endpoint = get_zmq_socket(
+                    self.context, zmq.ROUTER, endpoint, True
+                )
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
             self.receiver = None

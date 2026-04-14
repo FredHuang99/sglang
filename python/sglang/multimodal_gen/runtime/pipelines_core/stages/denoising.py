@@ -19,6 +19,7 @@ import torch.nn as nn
 from einops import rearrange
 from tqdm.auto import tqdm
 
+from sglang.launch_task_recorder import record_launch_task_timing
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -112,8 +113,12 @@ class DenoisingStage(PipelineStage):
         attn_head_size = hidden_size // num_attention_heads
 
         # torch compile
-        for transformer in filter(None, [self.transformer, self.transformer_2]):
-            self._maybe_enable_torch_compile(transformer)
+        for component_name, transformer in (
+            ("transformer", self.transformer),
+            ("transformer_2", self.transformer_2),
+        ):
+            if transformer is not None:
+                self._maybe_enable_torch_compile(transformer, component_name)
 
         self.scheduler = scheduler
         self.vae = vae
@@ -135,7 +140,9 @@ class DenoisingStage(PipelineStage):
         self._cached_num_steps = None
         self._is_warmed_up = False
 
-    def _maybe_enable_torch_compile(self, module: object) -> None:
+    def _maybe_enable_torch_compile(
+        self, module: object, component_name: str | None = None
+    ) -> None:
         """
         Compile a module with torch.compile, and enable inductor overlap tweak if available.
         No-op if torch compile is disabled or the object is not a nn.Module.
@@ -165,7 +172,26 @@ class DenoisingStage(PipelineStage):
             logger.info(f"Compiling transformer with mode: {mode}")
 
         # TODO(triple-mu): support customized fullgraph and dynamic in the future
-        module.compile(**compile_kwargs)
+        compile_start_ns = time.perf_counter_ns()
+        try:
+            module.compile(**compile_kwargs)
+        except Exception as exc:
+            record_launch_task_timing(
+                task="torch_compile",
+                family="sglang-diffusion",
+                component=component_name or module.__class__.__name__,
+                elapsed_ms=(time.perf_counter_ns() - compile_start_ns)
+                / 1_000_000.0,
+                status="error",
+                extra={"error": str(exc)},
+            )
+            raise
+        record_launch_task_timing(
+            task="torch_compile",
+            family="sglang-diffusion",
+            component=component_name or module.__class__.__name__,
+            elapsed_ms=(time.perf_counter_ns() - compile_start_ns) / 1_000_000.0,
+        )
 
     def _maybe_enable_cache_dit(
         self, num_inference_steps: int | tuple[int, int], batch: Req
@@ -556,7 +582,7 @@ class DenoisingStage(PipelineStage):
             )
             # enable cache-dit before torch.compile (delayed mounting)
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-            self._maybe_enable_torch_compile(self.transformer)
+            self._maybe_enable_torch_compile(self.transformer, "transformer")
             if pipeline:
                 pipeline.add_module("transformer", self.transformer)
             server_args.model_loaded["transformer"] = True

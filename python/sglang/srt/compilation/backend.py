@@ -15,6 +15,7 @@ import torch
 import torch.fx as fx
 from torch._dispatch.python import enable_python_dispatcher
 
+from sglang.launch_task_recorder import record_launch_task_timing
 from sglang.srt.compilation.compilation_config import CompilationConfig
 from sglang.srt.compilation.compilation_counter import compilation_counter
 from sglang.srt.compilation.compiler_interface import EagerAdapter, InductorAdaptor
@@ -198,6 +199,16 @@ class CompilerManager:
                     runtime_shape,
                     elapsed,
                 )
+            record_launch_task_timing(
+                task="torch_compile",
+                family="sglang",
+                elapsed_ms=elapsed * 1000.0,
+                extra={
+                    "runtime_shape": runtime_shape,
+                    "graph_index": graph_index,
+                    "num_graphs": num_graphs,
+                },
+            )
 
         return compiled_graph
 

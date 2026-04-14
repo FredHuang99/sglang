@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.launch_task_recorder import profile_launch_task, record_launch_task
 from sglang.jit_kernel.ngram_embedding import update_token_table
 from sglang.srt.configs import (
     BailingHybridConfig,
@@ -806,6 +807,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"You can fix this by setting arguments `--tp` and `--ep` correctly."
                 )
 
+    @profile_launch_task(
+        task="torch_distributed_init",
+        family="sglang",
+        rank=lambda self: self.tp_rank,
+        extra=lambda self: {
+            "gpu_id": self.gpu_id,
+            "tp_size": self.tp_size,
+            "pp_size": self.pp_size,
+            "ep_size": self.moe_ep_size,
+        },
+    )
     def init_torch_distributed(self):
         tic = time.perf_counter()
         logger.info("Init torch distributed begin.")
@@ -988,6 +1000,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 ),
             )
 
+    @profile_launch_task(
+        task="load_weight",
+        family="sglang",
+        rank=lambda self: self.tp_rank,
+        extra=lambda self: {
+            "gpu_id": self.gpu_id,
+            "tp_size": self.tp_size,
+            "model_path": self.server_args.model_path,
+        },
+    )
     def load_model(self):
         tic_total = time.perf_counter()
         before_avail_memory = get_available_gpu_memory(self.device, self.gpu_id)
@@ -2300,33 +2322,42 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.device == "cpu" and not self.server_args.enable_torch_compile:
             return
 
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        graph_backend = defaultdict(
-            lambda: "cuda graph",
-            {
-                "cpu": "cpu graph",
-                "npu": "npu graph",
+        with record_launch_task(
+            task="cuda_graph_capture",
+            family="sglang",
+            rank=self.tp_rank,
+            extra={
+                "device": self.device,
+                "disable_cuda_graph": self.server_args.disable_cuda_graph,
             },
-        )
-        logger.info(
-            f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
-        )
-        graph_runners = defaultdict(
-            lambda: CudaGraphRunner,
-            {
-                "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
-            },
-        )
-        self.graph_runner = graph_runners[self.device](self)
+        ):
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            graph_backend = defaultdict(
+                lambda: "cuda graph",
+                {
+                    "cpu": "cpu graph",
+                    "npu": "npu graph",
+                },
+            )
+            logger.info(
+                f"Capture {graph_backend[self.device]} begin. This can take up to several minutes. avail mem={before_mem:.2f} GB"
+            )
+            graph_runners = defaultdict(
+                lambda: CudaGraphRunner,
+                {
+                    "cpu": CPUGraphRunner,
+                    "npu": NPUGraphRunner,
+                },
+            )
+            self.graph_runner = graph_runners[self.device](self)
 
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        self.graph_mem_usage = before_mem - after_mem
-        logger.info(
-            f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
-        )
+            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            self.graph_mem_usage = before_mem - after_mem
+            logger.info(
+                f"Capture {graph_backend[self.device]} end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+                f"mem usage={self.graph_mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            )
 
     def init_piecewise_cuda_graphs(self):
         """Initialize piecewise CUDA graph runner."""
@@ -2417,20 +2448,29 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             return
 
-        tic = time.perf_counter()
-        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        logger.info(
-            f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
-        )
+        with record_launch_task(
+            task="piecewise_cuda_graph_capture",
+            family="sglang",
+            rank=self.tp_rank,
+            extra={
+                "device": self.device,
+                "disable_piecewise_cuda_graph": self.server_args.disable_piecewise_cuda_graph,
+            },
+        ):
+            tic = time.perf_counter()
+            before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            logger.info(
+                f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
+            )
 
-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
-        after_mem = get_available_gpu_memory(self.device, self.gpu_id)
-        mem_usage = before_mem - after_mem
-        logger.info(
-            f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
-            f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
-        )
+            after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            mem_usage = before_mem - after_mem
+            logger.info(
+                f"Capture piecewise CUDA graph end. Time elapsed: {time.perf_counter() - tic:.2f} s. "
+                f"mem usage={mem_usage:.2f} GB. avail mem={after_mem:.2f} GB."
+            )
 
     def init_threads_binding(self):
         omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")

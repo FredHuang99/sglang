@@ -14,6 +14,7 @@ from diffusers import AutoModel
 from torch import nn
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
+from sglang.launch_task_recorder import profile_launch_task
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -88,6 +89,16 @@ class ComponentLoader(ABC):
     ) -> list[str]:
         return []
 
+    @profile_launch_task(
+        task="component_load",
+        family="sglang-diffusion",
+        component=lambda self, component_model_path, server_args, component_name, transformers_or_diffusers: component_name,
+        extra=lambda self, component_model_path, server_args, component_name, transformers_or_diffusers: {
+            "component_model_path": component_model_path,
+            "loader": self.__class__.__name__,
+            "library": transformers_or_diffusers,
+        },
+    )
     def load(
         self,
         component_model_path: str,

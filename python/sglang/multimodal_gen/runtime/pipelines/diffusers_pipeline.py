@@ -9,6 +9,7 @@ through sglang's infrastructure using vanilla diffusers pipelines.
 import argparse
 import inspect
 import re
+import time
 import warnings
 from io import BytesIO
 from typing import Any
@@ -20,6 +21,7 @@ import torchvision.transforms as T
 from diffusers import DiffusionPipeline
 from PIL import Image
 
+from sglang.launch_task_recorder import record_launch_task_timing
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -634,6 +636,7 @@ class DiffusersPipeline(ComposedPipelineBase):
             if hasattr(pipe, comp):
                 try:
                     component = getattr(pipe, comp)
+                    compile_start_ns = time.perf_counter_ns()
                     # TODO(DefTruth): Add support for 'compile_repeated_blocks' for 'transformer'
                     # modules which can significantly reduce compilation time for large models
                     # with repeated blocks.
@@ -649,7 +652,23 @@ class DiffusersPipeline(ComposedPipelineBase):
                     logger.info(
                         f"Applied torch.compile to {comp} component of the pipeline"
                     )
+                    record_launch_task_timing(
+                        task="torch_compile",
+                        family="sglang-diffusion",
+                        component=comp,
+                        elapsed_ms=(time.perf_counter_ns() - compile_start_ns)
+                        / 1_000_000.0,
+                    )
                 except Exception as e:
+                    record_launch_task_timing(
+                        task="torch_compile",
+                        family="sglang-diffusion",
+                        component=comp,
+                        elapsed_ms=(time.perf_counter_ns() - compile_start_ns)
+                        / 1_000_000.0,
+                        status="error",
+                        extra={"error": str(e)},
+                    )
                     logger.warning(f"Failed to apply torch.compile to {comp}: {e}")
 
         return pipe

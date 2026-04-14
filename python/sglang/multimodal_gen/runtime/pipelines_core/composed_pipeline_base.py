@@ -15,6 +15,7 @@ from typing import Any, Callable, Literal, cast
 import torch
 from tqdm import tqdm
 
+from sglang.launch_task_recorder import record_launch_task
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -146,7 +147,12 @@ class ComposedPipelineBase(ABC):
         self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
-        self.create_pipeline_stages(self.server_args)
+        with record_launch_task(
+            task="pipeline_stage_create",
+            family="sglang-diffusion",
+            extra={"pipeline_name": getattr(self, "pipeline_name", self.__class__.__name__)},
+        ):
+            self.create_pipeline_stages(self.server_args)
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         return self.modules.get(module_name, default_value)

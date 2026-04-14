@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.launch_task_recorder import profile_launch_task
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -783,6 +784,15 @@ class ModelRunnerKVCacheMixin:
             mem_fraction_static=self.server_args.mem_fraction_static,
         )
 
+    @profile_launch_task(
+        task="memory_pool_init",
+        family="sglang",
+        rank=lambda self, pre_model_load_memory: self.tp_rank,
+        extra=lambda self, pre_model_load_memory: {
+            "gpu_id": self.gpu_id,
+            "mem_fraction_static": self.mem_fraction_static,
+        },
+    )
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (

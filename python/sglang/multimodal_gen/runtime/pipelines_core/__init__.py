@@ -9,6 +9,7 @@ This package contains diffusion pipelines for generating videos and images.
 
 from typing import cast
 
+from sglang.launch_task_recorder import record_launch_task
 from sglang.multimodal_gen.registry import get_model_info
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -43,38 +44,44 @@ def build_pipeline(
     """
     model_path = server_args.model_path
 
-    # Check if pipeline class is explicitly specified
-    if server_args.pipeline_class_name:
-        from sglang.multimodal_gen.registry import (
-            _PIPELINE_REGISTRY,
-            _discover_and_register_pipelines,
-        )
-
-        _discover_and_register_pipelines()
-        logger.info(f"Requested pipeline_class_name: {server_args.pipeline_class_name}")
-        logger.info(
-            f"Available pipelines in registry: {list(_PIPELINE_REGISTRY.keys())}"
-        )
-        pipeline_cls = _PIPELINE_REGISTRY.get(server_args.pipeline_class_name)
-        if pipeline_cls is None:
-            raise ValueError(
-                f"Pipeline class '{server_args.pipeline_class_name}' not found in registry. "
-                f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}"
+    with record_launch_task(
+        task="pipeline_select",
+        family="sglang-diffusion",
+        extra={"model_path": model_path, "model_id": server_args.model_id},
+    ):
+        # Check if pipeline class is explicitly specified
+        if server_args.pipeline_class_name:
+            from sglang.multimodal_gen.registry import (
+                _PIPELINE_REGISTRY,
+                _discover_and_register_pipelines,
             )
-        logger.info(
-            f"✓ Using explicitly specified pipeline: {server_args.pipeline_class_name} (class: {pipeline_cls.__name__})"
-        )
-    else:
-        logger.info("No pipeline_class_name specified, using model_index.json")
-        model_info = get_model_info(
-            model_path,
-            backend=server_args.backend,
-            model_id=server_args.model_id,
-        )
-        pipeline_cls = model_info.pipeline_cls
-        logger.info(f"Using pipeline from model_index.json: {pipeline_cls.__name__}")
 
-    # instantiate the pipelines
+            _discover_and_register_pipelines()
+            logger.info(f"Requested pipeline_class_name: {server_args.pipeline_class_name}")
+            logger.info(
+                f"Available pipelines in registry: {list(_PIPELINE_REGISTRY.keys())}"
+            )
+            pipeline_cls = _PIPELINE_REGISTRY.get(server_args.pipeline_class_name)
+            if pipeline_cls is None:
+                raise ValueError(
+                    f"Pipeline class '{server_args.pipeline_class_name}' not found in registry. "
+                    f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}"
+                )
+            logger.info(
+                "Using explicitly specified pipeline: %s (class: %s)",
+                server_args.pipeline_class_name,
+                pipeline_cls.__name__,
+            )
+        else:
+            logger.info("No pipeline_class_name specified, using model_index.json")
+            model_info = get_model_info(
+                model_path,
+                backend=server_args.backend,
+                model_id=server_args.model_id,
+            )
+            pipeline_cls = model_info.pipeline_cls
+            logger.info(f"Using pipeline from model_index.json: {pipeline_cls.__name__}")
+
     pipeline = pipeline_cls(model_path, server_args)
 
     logger.info("Pipeline instantiated")

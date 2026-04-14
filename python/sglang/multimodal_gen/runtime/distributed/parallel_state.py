@@ -46,6 +46,7 @@ import torch.distributed
 from torch.distributed import ProcessGroup
 
 import sglang.multimodal_gen.envs as envs
+from sglang.launch_task_recorder import profile_launch_task
 from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGroup
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -178,6 +179,16 @@ def get_tp_group() -> GroupCoordinator:
     return _TP
 
 
+@profile_launch_task(
+    task="distributed_init",
+    family="sglang-diffusion",
+    rank=lambda world_size=1, rank=0, distributed_init_method="env://", local_rank=0, backend="nccl", device_id=None, timeout=None: rank,
+    extra=lambda world_size=1, rank=0, distributed_init_method="env://", local_rank=0, backend="nccl", device_id=None, timeout=None: {
+        "world_size": world_size,
+        "backend": backend,
+        "local_rank": local_rank,
+    },
+)
 def init_distributed_environment(
     world_size: int = 1,
     rank: int = 0,
