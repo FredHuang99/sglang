@@ -147,6 +147,15 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Keep per-case logs and temporary launch directories.",
     )
+    parser.add_argument(
+        "--llm-setups",
+        type=str,
+        default="default",
+        help=(
+            "Comma-separated LLM setup keys for prompt-enhancer presets. "
+            f"Supported setups: {','.join(launch_time.LLM_SETUPS.keys())}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -491,6 +500,8 @@ def write_case_breakdown(case_dir: Path, record: dict[str, Any]) -> None:
         "model_key": record.get("model_key"),
         "family": record.get("family"),
         "gpu_count": record.get("gpu_count"),
+        "setup_name": record.get("setup_name"),
+        "setup_args": record.get("setup_args"),
         "requested_parallelism": record.get("requested_parallelism"),
         "resolved_parallelism": record.get("resolved_parallelism"),
         "health_ready_ms": record.get("health_ready_ms"),
@@ -539,6 +550,7 @@ def measure_promptenhancer_case(
     *,
     preset: launch_time.LaunchPreset,
     gpu_count: int,
+    llm_setup: launch_time.LLMSetup,
     host: str,
     timeout_s: int,
     case_dir: Path,
@@ -554,6 +566,7 @@ def measure_promptenhancer_case(
         tp_size=gpu_count,
         host=host,
         port=port,
+        llm_setup=llm_setup,
     )
 
     process: subprocess.Popen[str] | None = None
@@ -581,7 +594,7 @@ def measure_promptenhancer_case(
             gpu_count=gpu_count,
             requested_parallelism={"tp_size": gpu_count},
             resolved_parallelism={"tp_size": gpu_count},
-            case_name=f"tp{gpu_count}",
+            case_name=f"tp{gpu_count}__{llm_setup.key}",
             case_dir=case_dir,
             launch_command=command,
             status="completed",
@@ -593,6 +606,12 @@ def measure_promptenhancer_case(
             task_events=task_events,
             task_summary=task_summary,
             extra={
+                "setup_name": llm_setup.key,
+                "setup_args": {
+                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
+                    "max_running_requests": llm_setup.max_running_requests,
+                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
+                },
                 "ready_url_health": f"{base_url}/health",
                 "ready_url_models": f"{base_url}/v1/models",
             },
@@ -605,7 +624,7 @@ def measure_promptenhancer_case(
             gpu_count=gpu_count,
             requested_parallelism={"tp_size": gpu_count},
             resolved_parallelism={"tp_size": gpu_count},
-            case_name=f"tp{gpu_count}",
+            case_name=f"tp{gpu_count}__{llm_setup.key}",
             case_dir=case_dir,
             launch_command=command,
             status="failed",
@@ -617,6 +636,12 @@ def measure_promptenhancer_case(
             task_events=task_events,
             task_summary=task_summary,
             extra={
+                "setup_name": llm_setup.key,
+                "setup_args": {
+                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
+                    "max_running_requests": llm_setup.max_running_requests,
+                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
+                },
                 "ready_url_health": f"{base_url}/health",
                 "ready_url_models": f"{base_url}/v1/models",
             },
@@ -629,7 +654,7 @@ def measure_promptenhancer_case(
             gpu_count=gpu_count,
             requested_parallelism={"tp_size": gpu_count},
             resolved_parallelism={"tp_size": gpu_count},
-            case_name=f"tp{gpu_count}",
+            case_name=f"tp{gpu_count}__{llm_setup.key}",
             case_dir=case_dir,
             launch_command=command,
             status="failed",
@@ -641,6 +666,12 @@ def measure_promptenhancer_case(
             task_events=task_events,
             task_summary=task_summary,
             extra={
+                "setup_name": llm_setup.key,
+                "setup_args": {
+                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
+                    "max_running_requests": llm_setup.max_running_requests,
+                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
+                },
                 "ready_url_health": f"{base_url}/health",
                 "ready_url_models": f"{base_url}/v1/models",
             },
@@ -789,6 +820,7 @@ def refresh_human_summary(summary: dict[str, Any]) -> None:
                 {
                     "case_name": record["case_name"],
                     "gpu_count": record["gpu_count"],
+                    "setup_name": record.get("setup_name"),
                     "health_ready_ms": record["health_ready_ms"],
                     "models_ready_ms": record["models_ready_ms"],
                 }
@@ -810,12 +842,14 @@ def build_summary(
     visible_gpu_count: int,
 ) -> dict[str, Any]:
     selected_models = launch_time.parse_model_keys(args.models)
+    selected_llm_setups = launch_time.parse_llm_setup_keys(args.llm_setups)
     return {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "run_root": str(output_dir),
         "visible_gpu_count": visible_gpu_count,
         "parallel_degrees": legacy.parse_parallel_degrees(args),
         "selected_models": selected_models,
+        "selected_llm_setups": selected_llm_setups,
         "keep_artifacts": args.keep_artifacts,
         "launch_readiness_semantics": {
             "health_ready_ms": (
@@ -861,6 +895,7 @@ def build_summary(
 def main() -> None:
     args = parse_args()
     model_keys = launch_time.parse_model_keys(args.models)
+    llm_setup_keys = launch_time.parse_llm_setup_keys(args.llm_setups)
     parallel_degrees = legacy.parse_parallel_degrees(args)
     visible_gpu_count = legacy.resolve_visible_gpu_count()
     output_dir = resolve_output_dir(args)
@@ -876,6 +911,72 @@ def main() -> None:
         preset = PRESETS[model_key]
         logger.info("Starting launch-breakdown sweep for preset=%s", model_key)
         for gpu_count in parallel_degrees:
+            if preset.family == "sglang":
+                for setup_key in llm_setup_keys:
+                    llm_setup = launch_time.LLM_SETUPS[setup_key]
+                    case_dir = (
+                        output_dir
+                        / preset.output_subdir
+                        / f"tp{gpu_count}"
+                        / llm_setup.key
+                    )
+                    if visible_gpu_count < gpu_count:
+                        record = make_case_record(
+                            preset=preset,
+                            gpu_count=gpu_count,
+                            requested_parallelism={"tp_size": gpu_count},
+                            resolved_parallelism={"tp_size": gpu_count},
+                            case_name=f"tp{gpu_count}__{llm_setup.key}",
+                            case_dir=case_dir,
+                            launch_command=None,
+                            status="skipped",
+                            reason=(
+                                f"Requested gpu_count={gpu_count}, but only {visible_gpu_count} "
+                                f"visible GPU(s) are available."
+                            ),
+                            health_ready_ns=None,
+                            models_ready_ns=None,
+                            model_card=None,
+                            launch_tasks_path=case_dir / "launch_tasks.jsonl",
+                            task_events=[],
+                            task_summary=summarize_launch_tasks([], family="sglang"),
+                            extra={
+                                "setup_name": llm_setup.key,
+                                "setup_args": {
+                                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
+                                    "max_running_requests": llm_setup.max_running_requests,
+                                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
+                                },
+                            },
+                        )
+                        summary["cases"].append(record)
+                        write_case_breakdown(case_dir, record)
+                        refresh_human_summary(summary)
+                        launch_time.save_json(summary_path, summary)
+                        launch_time.cleanup_case_dir(case_dir, args.keep_artifacts)
+                        continue
+
+                    logger.info(
+                        "Measuring preset=%s family=sglang tp=%s setup=%s",
+                        model_key,
+                        gpu_count,
+                        llm_setup.key,
+                    )
+                    record = measure_promptenhancer_case(
+                        preset=preset,
+                        gpu_count=gpu_count,
+                        llm_setup=llm_setup,
+                        host=args.host,
+                        timeout_s=args.wait_timeout,
+                        case_dir=case_dir,
+                    )
+                    summary["cases"].append(record)
+                    write_case_breakdown(case_dir, record)
+                    refresh_human_summary(summary)
+                    launch_time.save_json(summary_path, summary)
+                    launch_time.cleanup_case_dir(case_dir, args.keep_artifacts)
+                continue
+
             if visible_gpu_count < gpu_count:
                 case_dir = output_dir / preset.output_subdir / f"gpu{gpu_count}"
                 record = make_case_record(
@@ -899,27 +1000,6 @@ def main() -> None:
                     task_summary=summarize_launch_tasks(
                         [], family=normalized_family(preset)
                     ),
-                )
-                summary["cases"].append(record)
-                write_case_breakdown(case_dir, record)
-                refresh_human_summary(summary)
-                launch_time.save_json(summary_path, summary)
-                launch_time.cleanup_case_dir(case_dir, args.keep_artifacts)
-                continue
-
-            if preset.family == "sglang":
-                case_dir = output_dir / preset.output_subdir / f"tp{gpu_count}"
-                logger.info(
-                    "Measuring preset=%s family=sglang tp=%s",
-                    model_key,
-                    gpu_count,
-                )
-                record = measure_promptenhancer_case(
-                    preset=preset,
-                    gpu_count=gpu_count,
-                    host=args.host,
-                    timeout_s=args.wait_timeout,
-                    case_dir=case_dir,
                 )
                 summary["cases"].append(record)
                 write_case_breakdown(case_dir, record)

@@ -63,8 +63,35 @@ class LaunchPreset:
     disable_piecewise_cuda_graph: bool = False
 
 
+@dataclass(frozen=True)
+class LLMSetup:
+    key: str
+    description: str
+    chunked_prefill_size: int | None = None
+    max_running_requests: int | None = None
+    cuda_graph_max_bs: int | None = None
+
+
 def make_zimage_sampling() -> ZImageSamplingParams:
     return ZImageSamplingParams(width=1024, height=1024)
+
+
+LLM_SETUPS: dict[str, LLMSetup] = {
+    "default": LLMSetup(
+        key="default",
+        description="Preset default prompt-enhancer launch parameters.",
+    ),
+    "cp512_req1_cg1": LLMSetup(
+        key="cp512_req1_cg1",
+        description=(
+            "Use chunked prefill size 512, max_running_requests 1, "
+            "and cuda_graph_max_bs 1."
+        ),
+        chunked_prefill_size=512,
+        max_running_requests=1,
+        cuda_graph_max_bs=1,
+    ),
+}
 
 
 PRESETS: dict[str, LaunchPreset] = {
@@ -192,6 +219,26 @@ def parse_model_keys(raw: str) -> list[str]:
     return deduped
 
 
+def parse_llm_setup_keys(raw: str | None) -> list[str]:
+    if raw is None:
+        return ["default"]
+    keys = [token.strip() for token in raw.replace(";", ",").split(",") if token.strip()]
+    if not keys:
+        return ["default"]
+    invalid = [key for key in keys if key not in LLM_SETUPS]
+    if invalid:
+        raise ValueError(
+            f"Unsupported llm setup(s): {invalid}. Supported setups: {sorted(LLM_SETUPS)}"
+        )
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key not in seen:
+            seen.add(key)
+            deduped.append(key)
+    return deduped
+
+
 def resolve_output_dir(args: argparse.Namespace) -> Path:
     if args.output_dir:
         return Path(args.output_dir).expanduser().resolve()
@@ -219,7 +266,24 @@ def build_promptenhancer_command(
     tp_size: int,
     host: str,
     port: int,
+    llm_setup: LLMSetup | None = None,
 ) -> list[str]:
+    effective_chunked_prefill_size = (
+        llm_setup.chunked_prefill_size
+        if llm_setup is not None and llm_setup.chunked_prefill_size is not None
+        else preset.chunked_prefill_size
+    )
+    effective_max_running_requests = (
+        llm_setup.max_running_requests
+        if llm_setup is not None and llm_setup.max_running_requests is not None
+        else None
+    )
+    effective_cuda_graph_max_bs = (
+        llm_setup.cuda_graph_max_bs
+        if llm_setup is not None and llm_setup.cuda_graph_max_bs is not None
+        else preset.cuda_graph_max_bs
+    )
+
     command = [
         sys.executable,
         "-m",
@@ -243,10 +307,12 @@ def build_promptenhancer_command(
         command.append("--skip-server-warmup")
     if preset.disable_piecewise_cuda_graph:
         command.append("--disable-piecewise-cuda-graph")
-    if preset.chunked_prefill_size is not None:
-        command.extend(["--chunked-prefill-size", str(preset.chunked_prefill_size)])
-    if preset.cuda_graph_max_bs is not None:
-        command.extend(["--cuda-graph-max-bs", str(preset.cuda_graph_max_bs)])
+    if effective_chunked_prefill_size is not None:
+        command.extend(["--chunked-prefill-size", str(effective_chunked_prefill_size)])
+    if effective_max_running_requests is not None:
+        command.extend(["--max-running-requests", str(effective_max_running_requests)])
+    if effective_cuda_graph_max_bs is not None:
+        command.extend(["--cuda-graph-max-bs", str(effective_cuda_graph_max_bs)])
     return command
 
 
