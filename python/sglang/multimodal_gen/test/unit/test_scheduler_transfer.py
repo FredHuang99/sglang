@@ -69,6 +69,7 @@ class _SchedulerHarness:
         scheduler._warmup_inbound_sizes = {}
         scheduler._aborted_request_ids = {}
         scheduler._running = True
+        scheduler.context = MagicMock()
         scheduler.gpu_id = 0
         scheduler.worker = SimpleNamespace(
             local_rank=0,
