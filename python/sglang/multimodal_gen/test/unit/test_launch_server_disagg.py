@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.sample.wan import (
     Wan2_2_TI2V_5B_SamplingParam,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import (
-    QwenImageEditPlusSamplingParams,
+    QwenImageSamplingParams,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
@@ -159,9 +159,9 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
         self.assertEqual(req.width, 640)
         self.assertEqual(req.height, 480)
         self.assertEqual(req.image_path, ["outputs/uploads/warmup_image.jpg"])
-        self.assertIsInstance(req.sampling_params, QwenImageEditPlusSamplingParams)
+        self.assertIsInstance(req.sampling_params, QwenImageSamplingParams)
         self.assertEqual(
-            req.negative_prompt, QwenImageEditPlusSamplingParams().negative_prompt
+            req.negative_prompt, QwenImageSamplingParams().negative_prompt
         )
         self.assertNotEqual(req.negative_prompt, "")
         self.assertEqual(req.num_inference_steps, 3)
