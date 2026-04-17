@@ -902,28 +902,6 @@ class DiffusionServer:
             source_host_id=p2p.sender_host_id,
         )
 
-        free_slots = peer_info.get("free_preallocated_slots", [])
-        chosen_idx = None
-        for idx, slot_info in enumerate(free_slots):
-            if slot_info.get("size", 0) < p2p.data_size:
-                continue
-            if slot_info.get("meta_size", 0) < p2p.meta_size:
-                continue
-            chosen_idx = idx
-            break
-
-        if chosen_idx is not None:
-            slot_info = free_slots.pop(chosen_idx)
-            p2p.receiver_session_id = peer_info.get("session_id", "")
-            p2p.receiver_pool_ptr = peer_info.get("pool_ptr", 0)
-            p2p.receiver_slot_offset = slot_info["offset"]
-            p2p.receiver_slot_size = slot_info.get("size", p2p.data_size)
-            p2p.receiver_meta_pool_ptr = peer_info.get("meta_pool_ptr", 0)
-            p2p.receiver_meta_slot_offset = slot_info.get("meta_offset", 0)
-            p2p.receiver_meta_slot_size = slot_info.get("meta_size", p2p.meta_size)
-            p2p.prealloc_slot_id = slot_info.get("slot_id")
-            alloc_msg.preallocated_slot = dict(slot_info)
-
         self._role_pushes(receiver_role)[receiver_idx].send_multipart(
             encode_transfer_msg(alloc_msg)
         )
@@ -1027,8 +1005,7 @@ class DiffusionServer:
             "data_shm_name": msg.get("data_shm_name"),
             "meta_shm_name": msg.get("meta_shm_name"),
         }
-        prealloc = msg.get("preallocated_slots", [])
-        info["free_preallocated_slots"] = list(prealloc) if prealloc else []
+        info["free_preallocated_slots"] = []
 
         if role == RoleType.ENCODER:
             idx = info["instance_id"]
@@ -1047,7 +1024,7 @@ class DiffusionServer:
             idx,
             info["session_id"],
             info["control_endpoint"],
-            len(prealloc),
+            len(info["free_preallocated_slots"]),
         )
 
     def _handle_alloc_reject(self, msg: dict) -> None:
@@ -1138,31 +1115,9 @@ class DiffusionServer:
     def _recycle_prealloc_slot(
         self, p2p: _TransferRequestState, role: RoleType
     ) -> None:
-        if (
-            p2p is None
-            or p2p.prealloc_slot_id is None
-            or p2p.receiver_prealloc_recycled
-        ):
+        del role
+        if p2p is None:
             return
-        receiver_idx = p2p.receiver_instance
-        if role == RoleType.DENOISER:
-            peer_info = self._denoiser_peers.get(receiver_idx, {})
-        elif role == RoleType.DECODER:
-            peer_info = self._decoder_peers.get(receiver_idx, {})
-        else:
-            return
-        free_list = peer_info.get("free_preallocated_slots", [])
-        free_list.append(
-            {
-                "offset": p2p.receiver_slot_offset,
-                "size": p2p.receiver_slot_size or p2p.data_size,
-                "slot_id": p2p.prealloc_slot_id,
-                "addr": p2p.receiver_pool_ptr + p2p.receiver_slot_offset,
-                "meta_offset": p2p.receiver_meta_slot_offset,
-                "meta_size": p2p.receiver_meta_slot_size or p2p.meta_size,
-                "meta_addr": p2p.receiver_meta_pool_ptr + p2p.receiver_meta_slot_offset,
-            }
-        )
         p2p.receiver_prealloc_recycled = True
         p2p.prealloc_slot_id = None
 

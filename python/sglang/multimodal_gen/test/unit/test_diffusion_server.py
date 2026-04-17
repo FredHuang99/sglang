@@ -76,7 +76,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             record.decoder_instance = 0
         record.state = state
 
-    def test_transfer_register_tracks_host_meta_and_prealloc(self):
+    def test_transfer_register_tracks_host_meta_and_ignores_prealloc(self):
         reg_msg = TransferRegisterMsg(
             role="denoiser",
             instance_id=0,
@@ -109,10 +109,9 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.assertEqual(peer["host_id"], "host-a")
         self.assertTrue(peer["supports_local_copy"])
         self.assertEqual(peer["meta_pool_ptr"], 0x8F000000)
-        self.assertEqual(peer["free_preallocated_slots"][0]["slot_id"], 4)
-        self.assertEqual(peer["free_preallocated_slots"][0]["meta_size"], 2048)
+        self.assertEqual(peer["free_preallocated_slots"], [])
 
-    def test_transfer_staged_dispatches_alloc_with_meta_and_host(self):
+    def test_transfer_staged_dispatches_dynamic_alloc_with_meta_and_host(self):
         self.server._handle_transfer_result(
             encode_transfer_msg(
                 TransferRegisterMsg(
@@ -177,7 +176,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.assertEqual(alloc_msg["source_control_endpoint"], "tcp://enc-ctrl")
         self.assertEqual(alloc_msg["source_host_id"], "host-a")
         self.assertEqual(alloc_msg["meta_size"], 2048)
-        self.assertEqual(alloc_msg["preallocated_slot"]["slot_id"], 1)
+        self.assertIsNone(alloc_msg.get("preallocated_slot"))
         self.assertEqual(
             self.server._tracker.get("r1").state,
             RequestState.DENOISING_WAITING,
@@ -401,7 +400,6 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             receiver_meta_slot_offset=64,
             receiver_meta_slot_size=2048,
             meta_size=2048,
-            prealloc_slot_id=7,
             transfer_phase=TransferPhase.WAITING_ALLOC_RESULT,
             handoff_started_at=0.0,
             phase_started_at=0.0,
@@ -479,7 +477,6 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             receiver_meta_slot_offset=64,
             receiver_meta_slot_size=2048,
             meta_size=2048,
-            prealloc_slot_id=7,
         )
 
         done_msg = {
@@ -498,11 +495,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.server._handle_transfer_done(done_msg, RoleType.DENOISER)
 
         self.assertEqual(self.server._denoiser_free_slots[0], 0)
-        self.assertEqual(len(self.server._denoiser_peers[0]["free_preallocated_slots"]), 1)
-        self.assertEqual(
-            self.server._denoiser_peers[0]["free_preallocated_slots"][0]["meta_size"],
-            2048,
-        )
+        self.assertEqual(self.server._denoiser_peers[0]["free_preallocated_slots"], [])
         self.assertEqual(len(self.server._decoder_tta), 1)
         self.assertEqual(
             self.server._tracker.get("r-done").state,

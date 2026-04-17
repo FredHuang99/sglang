@@ -219,7 +219,7 @@ class TestTransferManagerPreallocation(unittest.TestCase):
         self.assertEqual(register_msg["preallocated_slots"], [])
         self.assertEqual(scheduler._preallocated_slots, {})
 
-    def test_inbound_calibrated_rebuild_preallocates_receive_slots(self):
+    def test_inbound_calibrated_rebuild_keeps_receive_slots_dynamic(self):
         scheduler = _SchedulerHarness.make(RoleType.DENOISER)
         scheduler.server_args.disagg_max_slots_per_instance = 3
 
@@ -265,12 +265,12 @@ class TestTransferManagerPreallocation(unittest.TestCase):
                 measured_meta_bytes=1024,
             )
 
-        self.assertEqual(fake_buffer.allocate.call_count, 3)
-        self.assertEqual(fake_meta_buffer.allocate.call_count, 3)
-        self.assertEqual(set(scheduler._preallocated_slots.keys()), {0, 1, 2})
+        fake_buffer.allocate.assert_not_called()
+        fake_meta_buffer.allocate.assert_not_called()
+        self.assertEqual(scheduler._preallocated_slots, {})
         sent_frames = scheduler._pool_result_push.send_multipart.call_args[0][0]
         register_msg = decode_transfer_msg(sent_frames)
-        self.assertEqual(len(register_msg["preallocated_slots"]), 3)
+        self.assertEqual(register_msg["preallocated_slots"], [])
 
 
 class _TrackedStreamContext:
