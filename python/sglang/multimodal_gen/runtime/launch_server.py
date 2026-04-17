@@ -69,6 +69,53 @@ def _run_disagg_startup_calibration(
         context.destroy(linger=0)
 
 
+def _wait_for_disagg_role_registration(
+    diffusion_server: DiffusionServer,
+    *,
+    expected_encoders: int,
+    expected_denoisers: int,
+    expected_decoders: int,
+    timeout_s: float,
+    poll_interval_s: float = 0.1,
+) -> None:
+    logger.info(
+        "Waiting for standalone role registration before startup calibration: "
+        "encoder=%d, denoiser=%d, decoder=%d",
+        expected_encoders,
+        expected_denoisers,
+        expected_decoders,
+    )
+    deadline = time.monotonic() + timeout_s
+
+    while True:
+        stats = diffusion_server.get_stats()
+        actual_encoders = int(stats.get("encoder_peers", 0))
+        actual_denoisers = int(stats.get("denoiser_peers", 0))
+        actual_decoders = int(stats.get("decoder_peers", 0))
+
+        if (
+            actual_encoders == expected_encoders
+            and actual_denoisers == expected_denoisers
+            and actual_decoders == expected_decoders
+        ):
+            logger.info(
+                "All standalone role instances registered; starting startup calibration"
+            )
+            return
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "Timed out waiting for standalone role registration before startup "
+                "calibration "
+                f"(encoder {actual_encoders}/{expected_encoders}, "
+                f"denoiser {actual_denoisers}/{expected_denoisers}, "
+                f"decoder {actual_decoders}/{expected_decoders})"
+            )
+
+        time.sleep(min(poll_interval_s, remaining))
+
+
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
     """Kill the process and all its child processes."""
     # Remove sigchld handler to avoid spammy logs.
@@ -681,6 +728,13 @@ def launch_disagg_server(server_args: ServerArgs):
     try:
         diffusion_server.start()
         if server_args.warmup:
+            _wait_for_disagg_role_registration(
+                diffusion_server,
+                expected_encoders=len(encoder_work_endpoints),
+                expected_denoisers=len(denoiser_work_endpoints),
+                expected_decoders=len(decoder_work_endpoints),
+                timeout_s=float(server_args.disagg_timeout),
+            )
             _run_disagg_startup_calibration(frontend_endpoint, server_args)
 
         logger.info(

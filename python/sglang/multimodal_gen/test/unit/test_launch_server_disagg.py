@@ -24,6 +24,8 @@ from sglang.multimodal_gen.runtime.launch_server import (
     _build_disagg_calibration_reqs,
     _run_disagg_startup_calibration,
     _spawn_disagg_worker_group,
+    _wait_for_disagg_role_registration,
+    launch_disagg_server,
     launch_disagg_role,
     launch_pool_disagg_server,
 )
@@ -245,6 +247,94 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
             "sglang.multimodal_gen.runtime.launch_server.time.sleep"
         ), self.assertRaisesRegex(RuntimeError, "Disagg startup calibration failed"):
             _run_disagg_startup_calibration("tcp://127.0.0.1:9999", server_args)
+
+    def test_wait_for_role_registration_returns_after_all_peers_register(self):
+        diffusion_server = MagicMock()
+        diffusion_server.get_stats.side_effect = [
+            {"encoder_peers": 1, "denoiser_peers": 0, "decoder_peers": 0},
+            {"encoder_peers": 1, "denoiser_peers": 1, "decoder_peers": 1},
+        ]
+
+        with patch("sglang.multimodal_gen.runtime.launch_server.time.sleep"):
+            _wait_for_disagg_role_registration(
+                diffusion_server,
+                expected_encoders=1,
+                expected_denoisers=1,
+                expected_decoders=1,
+                timeout_s=1.0,
+            )
+
+        self.assertEqual(diffusion_server.get_stats.call_count, 2)
+
+    def test_wait_for_role_registration_times_out_with_peer_counts(self):
+        diffusion_server = MagicMock()
+        diffusion_server.get_stats.return_value = {
+            "encoder_peers": 1,
+            "denoiser_peers": 0,
+            "decoder_peers": 0,
+        }
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.time.monotonic",
+            side_effect=[0.0, 0.0, 0.2, 0.2],
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server.time.sleep"
+        ), self.assertRaisesRegex(
+            RuntimeError,
+            "encoder 1/1, denoiser 0/1, decoder 0/1",
+        ):
+            _wait_for_disagg_role_registration(
+                diffusion_server,
+                expected_encoders=1,
+                expected_denoisers=1,
+                expected_decoders=1,
+                timeout_s=0.1,
+            )
+
+    def test_launch_disagg_server_waits_for_role_registration_before_warmup(self):
+        server_args = _make_server_args(
+            disagg_role=RoleType.SERVER,
+            warmup=True,
+            disagg_timeout=12,
+            encoder_urls="tcp://127.0.0.1:33020",
+            denoiser_urls="tcp://127.0.0.1:33021",
+            decoder_urls="tcp://127.0.0.1:33022",
+        )
+        fake_server = MagicMock()
+        events = []
+
+        def record_wait(*args, **kwargs):
+            del args, kwargs
+            events.append("wait")
+
+        def record_warmup(*args, **kwargs):
+            del args, kwargs
+            events.append("warmup")
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.DiffusionServer",
+            return_value=fake_server,
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server._wait_for_disagg_role_registration",
+            side_effect=record_wait,
+        ) as wait_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server._run_disagg_startup_calibration",
+            side_effect=record_warmup,
+        ) as warmup_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server.launch_http_server_only"
+        ):
+            launch_disagg_server(server_args)
+
+        fake_server.start.assert_called_once_with()
+        wait_mock.assert_called_once_with(
+            fake_server,
+            expected_encoders=1,
+            expected_denoisers=1,
+            expected_decoders=1,
+            timeout_s=12.0,
+        )
+        warmup_mock.assert_called_once()
+        self.assertEqual(events, ["wait", "warmup"])
 
 
 class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
