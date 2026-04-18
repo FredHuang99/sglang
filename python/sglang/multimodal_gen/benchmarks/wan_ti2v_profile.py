@@ -227,6 +227,41 @@ def apply_request_overrides(
     return payload
 
 
+def _clamp_cfg_scale(value: Any, *, fallback: float = 1.0) -> float:
+    if isinstance(value, bool):
+        return fallback
+    if isinstance(value, (int, float)):
+        return float(value) if float(value) <= 1.0 else fallback
+    return fallback
+
+
+def disable_cfg_for_request(
+    payload: dict[str, Any],
+    *,
+    endpoint_kind: Literal["video", "image"],
+) -> dict[str, Any]:
+    disabled_payload = dict(payload)
+    disabled_payload["guidance_scale"] = _clamp_cfg_scale(
+        disabled_payload.get("guidance_scale")
+    )
+    disabled_payload["negative_prompt"] = None
+
+    if endpoint_kind == "video" and "guidance_scale_2" in disabled_payload:
+        disabled_payload["guidance_scale_2"] = _clamp_cfg_scale(
+            disabled_payload.get("guidance_scale_2")
+        )
+
+    if "true_cfg_scale" in disabled_payload:
+        disabled_payload["true_cfg_scale"] = _clamp_cfg_scale(
+            disabled_payload.get("true_cfg_scale")
+        )
+
+    if "cfg_normalization" in disabled_payload:
+        disabled_payload["cfg_normalization"] = 0.0
+
+    return disabled_payload
+
+
 def build_submission_schedule(
     *,
     num_requests: int,
@@ -613,6 +648,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-inference-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--guidance-scale", type=float, default=None)
+    parser.add_argument("--disable-cfg", action="store_true")
     return parser
 
 
@@ -651,6 +687,11 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         guidance_scale=args.guidance_scale,
     )
+    if args.disable_cfg:
+        payload = disable_cfg_for_request(
+            payload,
+            endpoint_kind=request_spec.endpoint_kind,
+        )
 
     rows = asyncio.run(
         run_benchmark_async(
@@ -682,6 +723,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"output_dir={output_dir}")
     print(f"profile_preset={resolved_preset}")
     print(f"endpoint_kind={request_spec.endpoint_kind}")
+    print(f"disable_cfg={args.disable_cfg}")
     for line in summary_lines:
         print(line)
     return 0

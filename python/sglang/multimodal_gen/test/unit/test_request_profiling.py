@@ -10,6 +10,7 @@ from sglang.multimodal_gen.benchmarks.wan_ti2v_profile import (
     build_submission_schedule,
     build_default_request_spec,
     detect_profile_preset,
+    disable_cfg_for_request,
     summarize_profile_run,
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
@@ -96,6 +97,36 @@ class TestWanTi2vBenchmarkHelpers(unittest.TestCase):
         self.assertNotIn("input_reference", payload)
         self.assertNotIn("fps", payload)
         self.assertNotIn("num_frames", payload)
+
+    def test_disable_cfg_for_video_request_clamps_guidance_and_clears_negative_prompt(self):
+        payload = disable_cfg_for_request(
+            {
+                "model": "Wan2.2-TI2V-5B-Diffusers",
+                "guidance_scale": 5.0,
+                "guidance_scale_2": 3.5,
+                "negative_prompt": "bad anatomy",
+                "cfg_normalization": 1.0,
+            },
+            endpoint_kind="video",
+        )
+        self.assertEqual(payload["guidance_scale"], 1.0)
+        self.assertEqual(payload["guidance_scale_2"], 1.0)
+        self.assertIsNone(payload["negative_prompt"])
+        self.assertEqual(payload["cfg_normalization"], 0.0)
+
+    def test_disable_cfg_for_image_request_preserves_already_disabled_scales(self):
+        payload = disable_cfg_for_request(
+            {
+                "model": "Tongyi-MAI/Z-Image-Turbo",
+                "guidance_scale": 0.0,
+                "true_cfg_scale": 4.0,
+                "negative_prompt": " ",
+            },
+            endpoint_kind="image",
+        )
+        self.assertEqual(payload["guidance_scale"], 0.0)
+        self.assertEqual(payload["true_cfg_scale"], 1.0)
+        self.assertIsNone(payload["negative_prompt"])
 
     def test_build_submission_schedule(self):
         self.assertEqual(
