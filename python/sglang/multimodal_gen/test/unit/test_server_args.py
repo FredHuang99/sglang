@@ -50,6 +50,17 @@ class TestServerArgsPathExpansion(unittest.TestCase):
             args.component_paths["vae"], os.path.expanduser("~/fake/local/vae")
         )
 
+    def test_profile_output_dir_is_expanded(self):
+        args = self._from_dict_without_model_resolution(
+            {
+                "model_path": "/data/my-model",
+                "profile_output_dir": "~/profile-output",
+            }
+        )
+        self.assertEqual(
+            args.profile_output_dir, os.path.expanduser("~/profile-output")
+        )
+
 
 class TestModelIdResolution(unittest.TestCase):
     def setUp(self):
@@ -220,6 +231,24 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.encoder_tp, 1)
         self.assertEqual(args.decoder_sp, 8)
         self.assertIsNone(args.decoder_tp)
+
+    def test_profile_cli_args_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--profile-enabled",
+            "true",
+            "--profile-output-dir",
+            "/tmp/profile",
+            "--profile-run-id",
+            "run-123",
+        ]
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertTrue(args.profile_enabled)
+        self.assertEqual(args.profile_output_dir, "/tmp/profile")
+        self.assertEqual(args.profile_run_id, "run-123")
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):

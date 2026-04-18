@@ -60,6 +60,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.request_profiling import (
+    RequestCsvProfiler,
+    resolve_profile_dir,
+)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
@@ -542,9 +546,19 @@ class SchedulerDisaggMixin:
         self._pending_transfer_reconfigure = None
         self._transfer_reconfigured = False
         self._warmup_inbound_sizes = {}
+        self._role_profile_writer = None
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
+            if getattr(server_args, "profile_enabled", False) and self.gpu_id == 0:
+                profile_dir = resolve_profile_dir(
+                    server_args.profile_output_dir,
+                    server_args.profile_run_id,
+                    deployment_mode="disaggregation",
+                )
+                self._role_profile_writer = RequestCsvProfiler(
+                    f"{profile_dir}/{self._disagg_role.value}.csv"
+                )
             if self._disagg_uses_cuda():
                 device = torch.device(f"cuda:{local_rank}")
                 self._swap_in_stream = torch.cuda.Stream(device=device)
@@ -552,6 +566,32 @@ class SchedulerDisaggMixin:
                 self._swap_out_stream = torch.cuda.Stream(device=device)
             self._init_disagg_sockets()
             self._init_disagg_transfer_manager()
+
+    def _profile_role_update(self: Scheduler, request_id: str, **fields: Any) -> None:
+        if self._role_profile_writer is None or self.gpu_id != 0:
+            return
+        fields.setdefault("instance_id", getattr(self.server_args, "disagg_instance_id", 0))
+        self._role_profile_writer.update(request_id, **fields)
+
+    def _profile_role_finalize(
+        self: Scheduler,
+        request_id: str,
+        *,
+        status: str,
+        error: str | None = None,
+        **extra_fields: Any,
+    ) -> None:
+        if self._role_profile_writer is None or self.gpu_id != 0:
+            return
+        extra_fields.setdefault(
+            "instance_id", getattr(self.server_args, "disagg_instance_id", 0)
+        )
+        self._role_profile_writer.finalize(
+            request_id,
+            status=status,
+            error=error,
+            extra_fields=extra_fields,
+        )
 
     def _init_disagg_sockets(self: Scheduler):
         """Initialize ZMQ sockets for disaggregated mode (DiffusionServer-mediated).
@@ -870,6 +910,11 @@ class SchedulerDisaggMixin:
         if not self._role_has_outbound_transfer():
             return
         if not success or staged is None:
+            self._profile_role_finalize(
+                request_id,
+                status="failed",
+                error=error_msg or "transfer_sync failed",
+            )
             if self._disagg_role == RoleType.DENOISER:
                 self._warmup_inbound_sizes.pop(request_id, None)
             failed_msg = TransferFailedMsg(
@@ -901,6 +946,11 @@ class SchedulerDisaggMixin:
             )
             return
 
+        staged_tensor_sent_time_s = time.time()
+        self._profile_role_update(
+            request_id,
+            staged_tensor_sent_time_s=staged_tensor_sent_time_s,
+        )
         ready_msg = TransferReadyMsg(
             request_id=request_id,
             prealloc_slot_id=getattr(peer_info, "prealloc_slot_id", None),
@@ -915,6 +965,12 @@ class SchedulerDisaggMixin:
                 "Transfer %s: failed to notify downstream ready for %s",
                 self._disagg_role.value.upper(),
                 request_id,
+            )
+            self._profile_role_finalize(
+                request_id,
+                status="failed",
+                error="failed to notify downstream ready",
+                staged_tensor_sent_time_s=staged_tensor_sent_time_s,
             )
             self._pool_result_push.send_multipart(
                 encode_transfer_msg(
@@ -931,6 +987,11 @@ class SchedulerDisaggMixin:
             encode_transfer_msg(
                 TransferPushedMsg(request_id=request_id, success=True, error=None)
             )
+        )
+        self._profile_role_finalize(
+            request_id,
+            status="completed",
+            staged_tensor_sent_time_s=staged_tensor_sent_time_s,
         )
         if staged.scalar_fields.get("is_warmup"):
             if self._disagg_role == RoleType.ENCODER:
@@ -1105,6 +1166,7 @@ class SchedulerDisaggMixin:
             self._broadcast_to_all_ranks(("compute", item.scalar_fields))
 
         req = self._build_disagg_compute_req(item.scalar_fields, item.tensors)
+        self._profile_role_update(item.request_id, role_start_time_s=time.time())
         if self._disagg_role == RoleType.DENOISER:
             self._disagg_denoiser_compute(req, item.request_id, item.role_name)
         elif self._disagg_role == RoleType.DECODER:
@@ -1718,6 +1780,10 @@ class SchedulerDisaggMixin:
                 )
             )
         )
+        self._profile_role_update(
+            request_id,
+            role_accept_time_s=time.time(),
+        )
 
         logger.debug(
             "Transfer %s: allocated receive slot for %s (data_offset=%d, data_size=%d, meta_offset=%d, meta_size=%d)",
@@ -1735,6 +1801,7 @@ class SchedulerDisaggMixin:
         prealloc_slot_id = msg.get("prealloc_slot_id")
         self._remember_aborted_request(request_id)
         self._release_pending_receive(request_id, prealloc_slot_id)
+        self._profile_role_finalize(request_id, status="failed", error=error)
 
         logger.error(
             "Transfer %s: upstream transfer failed for %s: %s",
@@ -1750,6 +1817,11 @@ class SchedulerDisaggMixin:
         self._remember_aborted_request(request_id)
         if self._transfer_manager is not None:
             self._transfer_manager.abort_request(request_id)
+        self._profile_role_finalize(
+            request_id,
+            status="failed",
+            error=msg.get("reason", "server abort"),
+        )
         logger.warning(
             "Transfer %s: aborted %s (%s)",
             self._disagg_role.value.upper(),
@@ -1841,6 +1913,12 @@ class SchedulerDisaggMixin:
                     stream=self._swap_out_stream,
                 )
         duration_s = time.monotonic() - start_time
+        compute_finish_time_s = time.time()
+        self._profile_role_update(
+            request_id,
+            role_finish_time_s=compute_finish_time_s,
+            compute_duration_ms=duration_s * 1000.0,
+        )
 
         if self._is_request_aborted(request_id):
             self._cleanup_aborted_staged_request(request_id)
@@ -1853,6 +1931,13 @@ class SchedulerDisaggMixin:
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
                 self._disagg_metrics.record_request_failed(request_id)
+            self._profile_role_finalize(
+                request_id,
+                status="failed",
+                error=str(error_msg),
+                role_finish_time_s=compute_finish_time_s,
+                compute_duration_ms=duration_s * 1000.0,
+            )
             return
 
         if staged is None:
@@ -1864,6 +1949,13 @@ class SchedulerDisaggMixin:
             self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
             if self._disagg_metrics:
                 self._disagg_metrics.record_request_failed(request_id)
+            self._profile_role_finalize(
+                request_id,
+                status="failed",
+                error="Failed to stage denoiser output for decoder",
+                role_finish_time_s=compute_finish_time_s,
+                compute_duration_ms=duration_s * 1000.0,
+            )
             return
 
         self._enqueue_outbound_transfer(
@@ -1917,6 +2009,12 @@ class SchedulerDisaggMixin:
             output_batch = self.worker.execute_forward([req])
         self._make_current_stream_wait_for_compute()
         duration_s = time.monotonic() - start_time
+        compute_finish_time_s = time.time()
+        self._profile_role_update(
+            request_id,
+            role_finish_time_s=compute_finish_time_s,
+            compute_duration_ms=duration_s * 1000.0,
+        )
 
         if self._is_request_aborted(request_id):
             return
@@ -1935,14 +2033,25 @@ class SchedulerDisaggMixin:
         if output_batch.error is not None:
             scalar_fields["error"] = output_batch.error
 
+        result_sent_time_s = None
         if self._pool_result_push is not None:
             send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
+            result_sent_time_s = time.time()
 
         if self._disagg_metrics:
             if output_batch.error:
                 self._disagg_metrics.record_request_failed(request_id)
             else:
                 self._disagg_metrics.record_request_complete(request_id)
+
+        self._profile_role_finalize(
+            request_id,
+            status="failed" if output_batch.error else "completed",
+            error=output_batch.error,
+            role_finish_time_s=compute_finish_time_s,
+            compute_duration_ms=duration_s * 1000.0,
+            result_sent_time_s=result_sent_time_s,
+        )
 
         logger.debug("Transfer DECODER: processed %s in %.2f s", request_id, duration_s)
 
@@ -1962,6 +2071,11 @@ class SchedulerDisaggMixin:
 
         req = reqs[0]
         request_id = getattr(req, "request_id", "unknown")
+        self._profile_role_update(
+            request_id,
+            role_accept_time_s=time.time(),
+            role_start_time_s=time.time(),
+        )
 
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
@@ -1970,6 +2084,7 @@ class SchedulerDisaggMixin:
         staged = None
         stage_event = None
         scalar_fields = None
+        compute_start_time = time.monotonic()
         with self._compute_stream_context():
             req_result = self.worker.execute_forward(reqs, return_req=True)
             if isinstance(req_result, Req) and self._pool_result_push is not None:
@@ -1981,6 +2096,13 @@ class SchedulerDisaggMixin:
                         scalar_fields=scalar_fields,
                         stream=self._swap_out_stream,
                     )
+        duration_s = time.monotonic() - compute_start_time
+        compute_finish_time_s = time.time()
+        self._profile_role_update(
+            request_id,
+            role_finish_time_s=compute_finish_time_s,
+            compute_duration_ms=duration_s * 1000.0,
+        )
 
         if self._is_request_aborted(request_id):
             self._cleanup_aborted_staged_request(request_id)
@@ -1997,6 +2119,13 @@ class SchedulerDisaggMixin:
                 )
             if self._disagg_metrics:
                 self._disagg_metrics.record_request_failed(request_id)
+            self._profile_role_finalize(
+                request_id,
+                status="failed",
+                error=str(error_msg),
+                role_finish_time_s=compute_finish_time_s,
+                compute_duration_ms=duration_s * 1000.0,
+            )
             return
 
         if self._pool_result_push is not None:
@@ -2013,6 +2142,13 @@ class SchedulerDisaggMixin:
                     self._pool_result_push,
                     {},
                     {"request_id": request_id, "_disagg_error": "No transfer manager"},
+                )
+                self._profile_role_finalize(
+                    request_id,
+                    status="failed",
+                    error="No transfer manager",
+                    role_finish_time_s=compute_finish_time_s,
+                    compute_duration_ms=duration_s * 1000.0,
                 )
 
         if self._disagg_metrics:

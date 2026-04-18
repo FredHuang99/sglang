@@ -2,6 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 import pickle
+import time
 from collections import deque
 from typing import Any, List
 
@@ -37,6 +38,11 @@ from sglang.multimodal_gen.runtime.warmup_utils import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.request_profiling import (
+    RequestCsvProfiler,
+    flatten_request_metrics,
+    resolve_profile_dir,
+)
 
 logger = init_logger(__name__)
 
@@ -118,6 +124,20 @@ class Scheduler(SchedulerDisaggMixin):
         self._consecutive_error_count = 0
 
         self._init_disagg_state(server_args, local_rank)
+        self._monolithic_profile_writer = None
+        if (
+            self.gpu_id == 0
+            and self._disagg_role == RoleType.MONOLITHIC
+            and getattr(server_args, "profile_enabled", False)
+        ):
+            profile_dir = resolve_profile_dir(
+                server_args.profile_output_dir,
+                server_args.profile_run_id,
+                deployment_mode="monolithic",
+            )
+            self._monolithic_profile_writer = RequestCsvProfiler(
+                f"{profile_dir}/monolithic_server.csv"
+            )
         if self._disagg_role != RoleType.MONOLITHIC:
             self._run_disagg_startup_warmup(self.build_server_warmup_reqs())
             self.warmed_up = True
@@ -211,8 +231,40 @@ class Scheduler(SchedulerDisaggMixin):
 
         # pop the first (earliest)
         item = self.waiting_queue.popleft()
+        req = item[1]
+        if (
+            isinstance(req, Req)
+            and not req.is_warmup
+            and req.metrics is not None
+            and req.metrics.start_time_s is None
+        ):
+            req.metrics.start_time_s = time.time()
 
         return [item]
+
+    def _write_monolithic_profile_row(
+        self,
+        req: Req | Any,
+        output_batch: OutputBatch,
+    ) -> None:
+        if (
+            self._monolithic_profile_writer is None
+            or not isinstance(req, Req)
+            or req.is_warmup
+            or (req.metrics is None and output_batch.metrics is None)
+        ):
+            return
+
+        metrics = output_batch.metrics or req.metrics
+        if metrics.finish_time_s is None:
+            metrics.finish_time_s = time.time()
+
+        row = flatten_request_metrics(metrics)
+        row["status"] = "failed" if output_batch.error else "completed"
+        row["error"] = output_batch.error
+        if output_batch.output_file_paths:
+            row["output_file_paths"] = output_batch.output_file_paths
+        self._monolithic_profile_writer.write_row(row)
 
     def build_server_warmup_reqs(self) -> list[Req]:
         if self.warmed_up or not self.server_args.warmup:
@@ -334,6 +386,15 @@ class Scheduler(SchedulerDisaggMixin):
             try:
                 new_reqs = self.recv_reqs()
                 new_reqs = self.process_received_reqs_with_req_based_warmup(new_reqs)
+                now_s = time.time()
+                for _, req in new_reqs:
+                    if (
+                        isinstance(req, Req)
+                        and not req.is_warmup
+                        and req.metrics is not None
+                        and req.metrics.arrival_time_s is None
+                    ):
+                        req.metrics.arrival_time_s = now_s
                 self.waiting_queue.extend(new_reqs)
                 # Reset error count on success
                 self._consecutive_error_count = 0
@@ -382,6 +443,8 @@ class Scheduler(SchedulerDisaggMixin):
                     exc_info=True,
                 )
                 output_batch = OutputBatch(error=str(e))
+                if isinstance(processed_req, Req) and processed_req.metrics is not None:
+                    output_batch.metrics = processed_req.metrics
 
             # 3. return results
             try:
@@ -408,6 +471,7 @@ class Scheduler(SchedulerDisaggMixin):
                         else:
                             logger.info(f"Warmup req processing failed")
 
+                self._write_monolithic_profile_row(processed_req, output_batch)
                 # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
             except zmq.ZMQError as e:

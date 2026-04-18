@@ -32,6 +32,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     is_transfer_message,
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
+from sglang.multimodal_gen.runtime.utils.request_profiling import (
+    RequestCsvProfiler,
+    resolve_profile_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +118,9 @@ class DiffusionServer:
         downstream_wait_timeout_s: float = 120.0,
         max_slots_per_instance: int = 2,
         p2p_mode: bool = True,
+        profile_enabled: bool = False,
+        profile_output_dir: str | None = None,
+        profile_run_id: str | None = None,
     ):
         self._frontend_endpoint = frontend_endpoint
         self._encoder_work_endpoints = encoder_work_endpoints
@@ -162,6 +169,15 @@ class DiffusionServer:
 
         self._transfer_mode = p2p_mode
         self._transfer_state: dict[str, _TransferRequestState] = {}
+        self._server_profile_writer = None
+        self._profiled_request_ids: set[str] = set()
+        if profile_enabled:
+            profile_dir = resolve_profile_dir(
+                profile_output_dir,
+                profile_run_id,
+                deployment_mode="disaggregation",
+            )
+            self._server_profile_writer = RequestCsvProfiler(f"{profile_dir}/server.csv")
 
         # Per-instance registration: instance_idx -> {session_id, pool_ptr, pool_size}
         self._encoder_peers: dict[int, dict] = {}
@@ -185,6 +201,69 @@ class DiffusionServer:
     @property
     def dispatcher(self) -> PoolDispatcher:
         return self._dispatcher
+
+    def _mark_profile_event(
+        self, request_id: str, event_name: str, timestamp_s: float | None = None
+    ) -> None:
+        if self._server_profile_writer is None:
+            return
+        try:
+            self._tracker.mark_event(request_id, event_name, timestamp_s)
+        except ValueError:
+            pass
+
+    def _finalize_server_profile(
+        self,
+        request_id: str,
+        *,
+        status: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if (
+            self._server_profile_writer is None
+            or request_id in self._profiled_request_ids
+        ):
+            return
+
+        record = self._tracker.get(request_id)
+        if record is None:
+            return
+        if "finish_time_s" not in record.event_timestamps and record.is_terminal():
+            record.event_timestamps["finish_time_s"] = time.time()
+
+        row = {
+            "request_id": request_id,
+            "status": status or record.state.value,
+            "error": error if error is not None else record.error,
+            "request_arrival_time_s": record.submit_time_s,
+            "encoder_tta_enter_time_s": record.state_timestamps.get(
+                RequestState.ENCODER_WAITING.value
+            ),
+            "encoder_tta_leave_time_s": record.state_timestamps.get(
+                RequestState.ENCODER_RUNNING.value
+            ),
+            "denoiser_tta_enter_time_s": record.state_timestamps.get(
+                RequestState.DENOISING_WAITING.value
+            ),
+            "denoiser_tta_leave_time_s": record.state_timestamps.get(
+                RequestState.DENOISING_RUNNING.value
+            ),
+            "decoder_tta_enter_time_s": record.state_timestamps.get(
+                RequestState.DECODER_WAITING.value
+            ),
+            "decoder_tta_leave_time_s": record.state_timestamps.get(
+                RequestState.DECODER_RUNNING.value
+            ),
+            "completion_signal_time_s": record.event_timestamps.get(
+                "completion_signal_time_s"
+            ),
+            "finish_time_s": record.event_timestamps.get("finish_time_s"),
+            "encoder_instance": record.encoder_instance,
+            "denoiser_instance": record.denoiser_instance,
+            "decoder_instance": record.decoder_instance,
+        }
+        self._server_profile_writer.write_row(row)
+        self._profiled_request_ids.add(request_id)
 
     def _close_control_push_sockets(self) -> None:
         for sock in self._control_push_sockets.values():
@@ -426,6 +505,7 @@ class DiffusionServer:
         if request_id is None:
             logger.warning("DiffusionServer: decoder result missing request_id")
             return
+        self._mark_profile_event(request_id, "completion_signal_time_s")
 
         record = self._tracker.get(request_id)
         p2p = self._transfer_state.get(request_id)
@@ -463,9 +543,16 @@ class DiffusionServer:
                 "DiffusionServer: no pending client for decoder result %s",
                 request_id,
             )
+            self._mark_profile_event(request_id, "finish_time_s")
+            self._finalize_server_profile(
+                request_id,
+                status="failed" if output_batch.error else "completed",
+                error=output_batch.error,
+            )
             self._tracker.remove(request_id)
             return
 
+        self._mark_profile_event(request_id, "finish_time_s")
         try:
             self._frontend.send_multipart(
                 [client_identity, b"", pickle.dumps(output_batch)]
@@ -479,6 +566,11 @@ class DiffusionServer:
 
         logger.debug("DiffusionServer: returned result for %s", request_id)
         self._transfer_state.pop(request_id, None)
+        self._finalize_server_profile(
+            request_id,
+            status="failed" if output_batch.error else "completed",
+            error=output_batch.error,
+        )
         self._tracker.remove(request_id)
 
     def _dispatch_to_encoder(
@@ -1146,10 +1238,13 @@ class DiffusionServer:
             OutputBatch,
         )
 
+        self._mark_profile_event(request_id, "completion_signal_time_s")
         with self._lock:
             client_identity = self._pending.pop(request_id, None)
 
         if client_identity is None:
+            self._mark_profile_event(request_id, "finish_time_s")
+            self._finalize_server_profile(request_id, status="completed")
             self._tracker.remove(request_id)
             return
 
@@ -1169,6 +1264,7 @@ class DiffusionServer:
                 error=scalar_fields.get("error"),
             )
 
+            self._mark_profile_event(request_id, "finish_time_s")
             self._frontend.send_multipart(
                 [client_identity, b"", pickle.dumps(output_batch)]
             )
@@ -1178,7 +1274,12 @@ class DiffusionServer:
                 request_id,
                 e,
             )
+            self._mark_profile_event(request_id, "finish_time_s")
 
+        self._finalize_server_profile(
+            request_id,
+            status="completed",
+        )
         self._tracker.remove(request_id)
 
     def _transfer_return_to_client_from_msg(self, request_id: str, msg: dict) -> None:
@@ -1186,16 +1287,24 @@ class DiffusionServer:
             OutputBatch,
         )
 
+        self._mark_profile_event(request_id, "completion_signal_time_s")
         with self._lock:
             client_identity = self._pending.pop(request_id, None)
 
         if client_identity is None:
+            self._mark_profile_event(request_id, "finish_time_s")
+            self._finalize_server_profile(
+                request_id,
+                status="failed" if msg.get("error") else "completed",
+                error=msg.get("error"),
+            )
             self._tracker.remove(request_id)
             return
 
         output_batch = OutputBatch(error=msg.get("error"))
 
         try:
+            self._mark_profile_event(request_id, "finish_time_s")
             self._frontend.send_multipart(
                 [client_identity, b"", pickle.dumps(output_batch)]
             )
@@ -1205,6 +1314,12 @@ class DiffusionServer:
                 request_id,
                 e,
             )
+            self._mark_profile_event(request_id, "finish_time_s")
+        self._finalize_server_profile(
+            request_id,
+            status="failed" if msg.get("error") else "completed",
+            error=msg.get("error"),
+        )
         self._tracker.remove(request_id)
 
     def _complete_terminal(
@@ -1238,11 +1353,18 @@ class DiffusionServer:
             client_identity = self._pending.pop(request_id, None)
 
         if client_identity is None:
+            self._mark_profile_event(request_id, "finish_time_s")
+            self._finalize_server_profile(
+                request_id,
+                status=terminal_state.value,
+                error=error_msg,
+            )
             self._tracker.remove(request_id)
             return
 
         error_batch = OutputBatch(error=error_msg)
         try:
+            self._mark_profile_event(request_id, "finish_time_s")
             self._frontend.send_multipart(
                 [client_identity, b"", pickle.dumps(error_batch)]
             )
@@ -1253,6 +1375,11 @@ class DiffusionServer:
                 e,
             )
 
+        self._finalize_server_profile(
+            request_id,
+            status=terminal_state.value,
+            error=error_msg,
+        )
         self._tracker.remove(request_id)
 
     def _clear_receiver_dispatch(self, p2p: _TransferRequestState) -> None:

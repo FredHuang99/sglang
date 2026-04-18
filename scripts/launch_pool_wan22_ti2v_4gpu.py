@@ -1,194 +1,438 @@
-"""
-Launch a single-machine pooled diffusion deployment for Wan2.2 TI2V 5B.
-
-This script uses the Python API `launch_pool_disagg_server`, which is the
-"real" pool mode in SGLang diffusion disaggregation. In this mode:
-
-1. We do NOT manually start `sglang serve --disagg-role server`.
-2. We do NOT manually start `encoder` / `denoiser` / `decoder` role processes.
-3. The Python launcher spawns:
-   - 1 head HTTP server
-   - 1 encoder instance
-   - 1 denoiser instance
-   - 1 decoder instance
-4. Endpoints for work / control / result are derived automatically from the
-   head scheduler port.
-
-Requested topology in this file:
-
-- encoder count   = 1
-- denoiser count  = 1
-- decoder count   = 1
-- encoder TP      = 4
-- denoiser Ulysses/SP = 4
-- decoder SP      = 4
-- all three roles use GPUs [4, 5, 6, 7]
-
-This means:
-- encoder instance uses GPUs [4, 5, 6, 7] with TP=4
-- denoiser instance uses GPUs [4, 5, 6, 7] with SP/Ulysses=4
-- decoder instance uses GPUs [4, 5, 6, 7] with SP=4
-
-The same GPU group is reused across the three role types. This is supported
-by pool mode because roles run as separate instances coordinated by the head
-DiffusionServer.
-
-Important debugging choice:
-- Offload is disabled here on purpose so that the roles visibly occupy GPU
-  memory after startup and while serving requests.
-- The transfer backend is forced to `mock` so local single-machine bring-up
-  does not depend on whether Mooncake is installed in the environment.
-
-How to run:
-
-    python scripts/launch_pool_wan22_ti2v_4gpu.py
-
-How to send a TI2V request after startup:
-
-1. Multipart upload, safest:
-
-    curl -X POST http://127.0.0.1:30010/v1/videos ^
-      -F "model=Wan2.2-TI2V-5B-Diffusers" ^
-      -F "prompt=Turn the man upside down" ^
-      -F "size=1280x704" ^
-      -F "seconds=4" ^
-      -F "num_inference_steps=30" ^
-      -F "input_reference=@/absolute/path/to/example_image.png"
-
-2. JSON with a server-local image path:
-
-    curl -X POST http://127.0.0.1:30010/v1/videos ^
-      -H "Content-Type: application/json" ^
-      -d "{\"model\":\"Wan2.2-TI2V-5B-Diffusers\",\"prompt\":\"Turn the man upside down\",\"size\":\"1280x704\",\"seconds\":\"4\",\"num_inference_steps\":30,\"input_reference\":\"/absolute/path/on/server/example_image.png\"}"
-
-3. Poll job status:
-
-    curl http://127.0.0.1:30010/v1/videos/<video_id>
-
-4. Download result:
-
-    curl -L -o out.mp4 http://127.0.0.1:30010/v1/videos/<video_id>/content
-
-Port meaning in this script:
-
-- HTTP_PORT = 30010
-  The public HTTP/OpenAI-compatible API. Your curl requests go here.
-
-- HEAD_SCHEDULER_PORT = 30020
-  The head DiffusionServer frontend. Role instances register to this port and
-  head dispatches jobs through it. This is internal ZMQ traffic, not HTTP.
-
-- HEAD_SCHEDULER_PORT + 1 = 30021
-  Internal result endpoint for encoder -> head.
-
-- HEAD_SCHEDULER_PORT + 2 = 30022
-  Internal result endpoint for denoiser -> head.
-
-- HEAD_SCHEDULER_PORT + 3 = 30023
-  Internal result endpoint for decoder -> head.
-
-What you should see in logs:
-
-- head side:
-  `DiffusionServer transfer: registered encoder[0] ...`
-  `DiffusionServer transfer: registered denoiser[0] ...`
-  `DiffusionServer transfer: registered decoder[0] ...`
-
-- role side:
-  `Transfer ENCODER: registered with DS`
-  `Transfer DENOISER: registered with DS`
-  `Transfer DECODER: registered with DS`
-
-If requests are accepted but stay queued, look for missing registration logs.
-"""
+"""Launch pooled or split 4-GPU disaggregated Wan2.2 TI2V deployments."""
 
 from __future__ import annotations
 
-from sglang.multimodal_gen.runtime.launch_server import launch_pool_disagg_server
+import argparse
+import multiprocessing as mp
+from typing import Any
+
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.launch_server import (
+    kill_process_tree,
+    launch_disagg_role,
+    launch_disagg_server,
+    launch_pool_disagg_server,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.disagg_launcher_utils import (
+    resolve_disagg_ib_device,
+)
 
 
-# ----------------------------
-# User-editable deployment cfg
-# ----------------------------
-MODEL_PATH = "/data/Wan2_2_TI2V_5B"
-MODEL_ID = "Wan2.2-TI2V-5B-Diffusers"
-
-HOST = "127.0.0.1"
-HTTP_PORT = 30010
-HEAD_SCHEDULER_PORT = 30020
-
-# One encoder instance, one denoiser instance, one decoder instance.
-# Each instance uses the same 4 GPUs: [4, 5, 6, 7].
-GPU_GROUP = [4, 5, 6, 7]
-
-# Debug-friendly defaults:
-# - Disable offload so GPU memory usage is visible.
-# - Use max_slots_per_instance=1 to simplify early bring-up.
-LOG_LEVEL = "debug"
-
-
-def build_server_args() -> ServerArgs:
-    """Construct ServerArgs for pooled 1/1/1 role deployment."""
-    return ServerArgs.from_kwargs(
-        model_path=MODEL_PATH,
-        model_id=MODEL_ID,
-        host=HOST,
-        port=HTTP_PORT,
-        scheduler_port=HEAD_SCHEDULER_PORT,
-        log_level=LOG_LEVEL,
-        # Requested role parallelism.
-        encoder_tp=4,
-        denoiser_sp=4,
-        denoiser_ulysses=4,
-        denoiser_ring=1,
-        decoder_sp=4,
-        # Make sure roles run on GPU and keep modules on GPU.
-        disagg_role_device="cuda",
-        disagg_transfer_backend="mock",
-        text_encoder_cpu_offload=False,
-        image_encoder_cpu_offload=False,
-        vae_cpu_offload=False,
-        dit_layerwise_offload=False,
-        dit_cpu_offload=False,
-        # Helpful for debugging and simpler scheduling.
-        disagg_dispatch_policy="round_robin",
-        disagg_max_slots_per_instance=8,
-        disagg_timeout=3600,
-        disagg_downstream_wait_timeout=1800,
-        warmup=True,
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", default="/data/Wan2_2_TI2V_5B")
+    parser.add_argument("--model-id", default="Wan2.2-TI2V-5B-Diffusers")
+    parser.add_argument("--deployment-layout", choices=["single_host", "split_two_hosts"], default="single_host")
+    parser.add_argument("--node-role", choices=["all_in_one", "machine_a", "machine_b"], default="all_in_one")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=30010)
+    parser.add_argument("--scheduler-port", type=int, default=30020)
+    parser.add_argument("--machine-a-host", default="10.3.4.3")
+    parser.add_argument("--machine-b-host", default="10.3.4.2")
+    parser.add_argument("--encoder-scheduler-port", type=int, default=None)
+    parser.add_argument("--denoiser-scheduler-port", type=int, default=None)
+    parser.add_argument("--decoder-scheduler-port", type=int, default=None)
+    parser.add_argument("--encoder-device", choices=["cpu", "cuda"], default="cuda")
+    parser.add_argument("--encoder-base-gpu-id", type=int, default=4)
+    parser.add_argument("--encoder-num-gpus", type=int, default=4)
+    parser.add_argument("--denoiser-base-gpu-id", type=int, default=4)
+    parser.add_argument("--denoiser-num-gpus", type=int, default=4)
+    parser.add_argument("--decoder-base-gpu-id", type=int, default=4)
+    parser.add_argument("--decoder-num-gpus", type=int, default=4)
+    parser.add_argument("--encoder-tp", type=int, default=None)
+    parser.add_argument("--denoiser-sp", type=int, default=None)
+    parser.add_argument("--denoiser-ulysses", type=int, default=None)
+    parser.add_argument("--denoiser-ring", type=int, default=1)
+    parser.add_argument("--decoder-sp", type=int, default=None)
+    parser.add_argument("--log-level", type=str, default="info")
+    parser.add_argument("--disagg-role-device", type=str, default="cuda")
+    parser.add_argument("--disagg-transfer-backend", type=str, default=None)
+    parser.add_argument("--encoder-transfer-backend", type=str, default=None)
+    parser.add_argument("--denoiser-transfer-backend", type=str, default=None)
+    parser.add_argument("--decoder-transfer-backend", type=str, default=None)
+    parser.add_argument("--encoder-ib-device", type=str, default="auto")
+    parser.add_argument("--denoiser-ib-device", type=str, default="auto")
+    parser.add_argument("--decoder-ib-device", type=str, default="auto")
+    parser.add_argument("--disagg-dispatch-policy", type=str, default="round_robin")
+    parser.add_argument("--disagg-max-slots-per-instance", type=int, default=8)
+    parser.add_argument("--disagg-timeout", type=int, default=3600)
+    parser.add_argument("--disagg-downstream-wait-timeout", type=int, default=3600)
+    parser.add_argument("--warmup", action="store_true", default=True)
+    parser.add_argument("--disable-warmup", action="store_true")
+    parser.add_argument("--profile-enabled", action="store_true")
+    parser.add_argument("--profile-output-dir", type=str, default="/data/profile")
+    parser.add_argument("--profile-run-id", type=str, default="disagg_wan2_2_ti2v_5b_4gpu")
+    parser.add_argument(
+        "--text-encoder-cpu-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
+    parser.add_argument(
+        "--image-encoder-cpu-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--vae-cpu-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--dit-cpu-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--dit-layerwise-offload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--pin-cpu-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    return parser
 
 
-def main() -> None:
-    server_args = build_server_args()
+def _build_gpu_group(base_gpu_id: int, num_gpus: int) -> list[int]:
+    if num_gpus <= 0:
+        return []
+    return list(range(base_gpu_id, base_gpu_id + num_gpus))
 
-    print("Launching pooled disaggregated diffusion server...")
-    print(f"  model_path       : {MODEL_PATH}")
-    print(f"  model_id         : {MODEL_ID}")
-    print(f"  host/http_port   : {HOST}:{HTTP_PORT}")
-    print(f"  head_sched_port  : {HEAD_SCHEDULER_PORT}")
-    print(f"  encoder_gpus     : {[GPU_GROUP]} (tp=4)")
-    print(f"  denoiser_gpus    : {[GPU_GROUP]} (sp=4, ulysses=4, ring=1)")
-    print(f"  decoder_gpus     : {[GPU_GROUP]} (sp=4)")
-    print("")
-    print("Expected internal head endpoints:")
-    print(f"  frontend         : tcp://{HOST}:{HEAD_SCHEDULER_PORT}")
-    print(f"  encoder_result   : tcp://{HOST}:{HEAD_SCHEDULER_PORT + 1}")
-    print(f"  denoiser_result  : tcp://{HOST}:{HEAD_SCHEDULER_PORT + 2}")
-    print(f"  decoder_result   : tcp://{HOST}:{HEAD_SCHEDULER_PORT + 3}")
-    print("")
-    print("HTTP API:")
-    print(f"  health           : http://{HOST}:{HTTP_PORT}/health")
-    print(f"  create video     : http://{HOST}:{HTTP_PORT}/v1/videos")
-    print("")
-    print("Waiting for role registration logs before sending requests...")
+
+def _resolve_bind_host(args: argparse.Namespace) -> str:
+    if args.deployment_layout == "split_two_hosts" and args.host == "127.0.0.1":
+        return "0.0.0.0"
+    return args.host
+
+
+def _resolve_encoder_tp(args: argparse.Namespace) -> int:
+    if args.encoder_device == "cpu":
+        if args.encoder_tp not in (None, 1):
+            raise ValueError("encoder_tp must be 1 when encoder-device=cpu.")
+        return 1
+    return args.encoder_tp or max(1, args.encoder_num_gpus)
+
+
+def _resolve_denoiser_sp(args: argparse.Namespace) -> int:
+    return args.denoiser_sp or max(1, args.denoiser_num_gpus)
+
+
+def _resolve_denoiser_ulysses(args: argparse.Namespace) -> int:
+    return args.denoiser_ulysses or _resolve_denoiser_sp(args)
+
+
+def _resolve_decoder_sp(args: argparse.Namespace) -> int:
+    return args.decoder_sp or max(1, args.decoder_num_gpus)
+
+
+def _resolve_role_port(explicit_port: int | None, scheduler_port: int, offset: int) -> int:
+    return explicit_port if explicit_port is not None else scheduler_port + offset
+
+
+def _resolve_role_transfer_backend(args: argparse.Namespace, role_name: str) -> str:
+    explicit = getattr(args, f"{role_name}_transfer_backend")
+    if explicit is not None:
+        return explicit
+    if args.disagg_transfer_backend is not None:
+        return args.disagg_transfer_backend
+    if args.deployment_layout == "single_host":
+        return "mock"
+    return "mock" if role_name == "encoder" else "auto"
+
+
+def _resolve_role_ib_device(
+    requested: str | None,
+    *,
+    host: str,
+) -> str | None:
+    return resolve_disagg_ib_device(requested, host=host)
+
+
+def _resolve_pool_transfer_backend(args: argparse.Namespace) -> str:
+    if args.disagg_transfer_backend is not None:
+        return args.disagg_transfer_backend
+    for role_name in ("encoder", "denoiser", "decoder"):
+        explicit = getattr(args, f"{role_name}_transfer_backend")
+        if explicit is not None:
+            return explicit
+    return "mock"
+
+
+def _resolve_pool_ib_device(args: argparse.Namespace, *, host: str) -> str | None:
+    for role_name in ("denoiser", "decoder", "encoder"):
+        explicit = getattr(args, f"{role_name}_ib_device")
+        resolved = _resolve_role_ib_device(explicit, host=host)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _build_common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "model_path": args.model_path,
+        "model_id": args.model_id,
+        "log_level": args.log_level,
+        "encoder_tp": _resolve_encoder_tp(args),
+        "denoiser_sp": _resolve_denoiser_sp(args),
+        "denoiser_ulysses": _resolve_denoiser_ulysses(args),
+        "denoiser_ring": args.denoiser_ring,
+        "decoder_sp": _resolve_decoder_sp(args),
+        "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
+        "image_encoder_cpu_offload": args.image_encoder_cpu_offload,
+        "vae_cpu_offload": args.vae_cpu_offload,
+        "dit_layerwise_offload": args.dit_layerwise_offload,
+        "dit_cpu_offload": args.dit_cpu_offload,
+        "pin_cpu_memory": args.pin_cpu_memory,
+        "disagg_dispatch_policy": args.disagg_dispatch_policy,
+        "disagg_max_slots_per_instance": args.disagg_max_slots_per_instance,
+        "disagg_timeout": args.disagg_timeout,
+        "disagg_downstream_wait_timeout": args.disagg_downstream_wait_timeout,
+        "warmup": args.warmup,
+        "profile_enabled": args.profile_enabled,
+        "profile_output_dir": args.profile_output_dir,
+        "profile_run_id": args.profile_run_id,
+    }
+
+
+def _build_pool_server_args(args: argparse.Namespace) -> ServerArgs:
+    bind_host = _resolve_bind_host(args)
+    kwargs = _build_common_kwargs(args)
+    kwargs.update(
+        {
+            "host": bind_host,
+            "port": args.port,
+            "scheduler_port": args.scheduler_port,
+            "disagg_role_device": args.disagg_role_device,
+            "disagg_transfer_backend": _resolve_pool_transfer_backend(args),
+            "disagg_p2p_hostname": bind_host,
+            "disagg_ib_device": _resolve_pool_ib_device(args, host=bind_host),
+        }
+    )
+    return ServerArgs.from_kwargs(**kwargs)
+
+
+def _build_role_server_args(
+    args: argparse.Namespace,
+    *,
+    role: RoleType,
+    host: str,
+    scheduler_port: int,
+    base_gpu_id: int,
+    num_gpus: int,
+    disagg_role_device: str,
+    disagg_server_addr: str,
+    transfer_backend: str,
+    ib_device: str | None,
+) -> ServerArgs:
+    kwargs = _build_common_kwargs(args)
+    kwargs.update(
+        {
+            "host": host,
+            "scheduler_port": scheduler_port,
+            "num_gpus": num_gpus,
+            "base_gpu_id": base_gpu_id,
+            "disagg_role": role,
+            "disagg_server_addr": disagg_server_addr,
+            "disagg_role_device": disagg_role_device,
+            "disagg_transfer_backend": transfer_backend,
+            "disagg_p2p_hostname": host,
+            "disagg_ib_device": ib_device,
+        }
+    )
+    return ServerArgs.from_kwargs(**kwargs)
+
+
+def _build_head_server_args(args: argparse.Namespace) -> ServerArgs:
+    bind_host = _resolve_bind_host(args)
+    encoder_port = _resolve_role_port(args.encoder_scheduler_port, args.scheduler_port, 100)
+    denoiser_port = _resolve_role_port(args.denoiser_scheduler_port, args.scheduler_port, 200)
+    decoder_port = _resolve_role_port(args.decoder_scheduler_port, args.scheduler_port, 300)
+    kwargs = _build_common_kwargs(args)
+    kwargs.update(
+        {
+            "host": bind_host,
+            "port": args.port,
+            "scheduler_port": args.scheduler_port,
+            "disagg_role": RoleType.SERVER,
+            "encoder_urls": f"tcp://{args.machine_a_host}:{encoder_port}",
+            "denoiser_urls": f"tcp://{args.machine_a_host}:{denoiser_port}",
+            "decoder_urls": f"tcp://{args.machine_b_host}:{decoder_port}",
+        }
+    )
+    return ServerArgs.from_kwargs(**kwargs)
+
+
+def _spawn_role_process(server_args: ServerArgs, name: str) -> mp.Process:
+    ctx = mp.get_context("spawn")
+    process = ctx.Process(
+        target=launch_disagg_role,
+        args=(server_args,),
+        name=name,
+        daemon=False,
+    )
+    process.start()
+    return process
+
+
+def _cleanup_processes(processes: list[mp.Process]) -> None:
+    for process in processes:
+        if process.is_alive():
+            try:
+                kill_process_tree(process.pid)
+            except Exception:
+                process.terminate()
+    for process in processes:
+        try:
+            process.join(timeout=5)
+        except Exception:
+            pass
+
+
+def _launch_single_host(args: argparse.Namespace) -> None:
+    server_args = _build_pool_server_args(args)
+    encoder_gpus = (
+        [[]]
+        if args.encoder_device == "cpu"
+        else [_build_gpu_group(args.encoder_base_gpu_id, args.encoder_num_gpus)]
+    )
+    denoiser_gpus = [_build_gpu_group(args.denoiser_base_gpu_id, args.denoiser_num_gpus)]
+    decoder_gpus = [_build_gpu_group(args.decoder_base_gpu_id, args.decoder_num_gpus)]
+
+    print("Launching pooled disaggregated Wan2.2 TI2V server")
+    print(f"  model_path      : {args.model_path}")
+    print(f"  model_id        : {args.model_id}")
+    print(f"  host/http_port  : {_resolve_bind_host(args)}:{args.port}")
+    print(f"  scheduler_port  : {args.scheduler_port}")
+    print(f"  encoder_device  : {args.encoder_device}")
+    print(f"  encoder_gpus    : {encoder_gpus}")
+    print(f"  denoiser_gpus   : {denoiser_gpus}")
+    print(f"  decoder_gpus    : {decoder_gpus}")
+    print(
+        "  topology        : encoder "
+        f"{'cpu' if args.encoder_device == 'cpu' else f'tp={_resolve_encoder_tp(args)}'}"
+        f" | denoiser sp={_resolve_denoiser_sp(args)} ulysses={_resolve_denoiser_ulysses(args)} ring={args.denoiser_ring}"
+        f" | decoder sp={_resolve_decoder_sp(args)}"
+    )
+    if args.profile_enabled:
+        print(f"  profile_output  : {args.profile_output_dir}")
+        print(f"  profile_run_id  : {args.profile_run_id}")
 
     launch_pool_disagg_server(
         server_args,
-        encoder_gpus=[GPU_GROUP],
-        denoiser_gpus=[GPU_GROUP],
-        decoder_gpus=[GPU_GROUP],
+        encoder_gpus=encoder_gpus,
+        denoiser_gpus=denoiser_gpus,
+        decoder_gpus=decoder_gpus,
+    )
+
+
+def _launch_split_machine_a(args: argparse.Namespace) -> None:
+    encoder_port = _resolve_role_port(args.encoder_scheduler_port, args.scheduler_port, 100)
+    denoiser_port = _resolve_role_port(args.denoiser_scheduler_port, args.scheduler_port, 200)
+    server_addr = f"tcp://{args.machine_a_host}:{args.scheduler_port}"
+
+    encoder_args = _build_role_server_args(
+        args,
+        role=RoleType.ENCODER,
+        host=args.machine_a_host,
+        scheduler_port=encoder_port,
+        base_gpu_id=args.encoder_base_gpu_id,
+        num_gpus=0 if args.encoder_device == "cpu" else args.encoder_num_gpus,
+        disagg_role_device=args.encoder_device,
+        disagg_server_addr=server_addr,
+        transfer_backend=_resolve_role_transfer_backend(args, "encoder"),
+        ib_device=_resolve_role_ib_device(args.encoder_ib_device, host=args.machine_a_host),
+    )
+    denoiser_args = _build_role_server_args(
+        args,
+        role=RoleType.DENOISER,
+        host=args.machine_a_host,
+        scheduler_port=denoiser_port,
+        base_gpu_id=args.denoiser_base_gpu_id,
+        num_gpus=args.denoiser_num_gpus,
+        disagg_role_device=args.disagg_role_device,
+        disagg_server_addr=server_addr,
+        transfer_backend=_resolve_role_transfer_backend(args, "denoiser"),
+        ib_device=_resolve_role_ib_device(args.denoiser_ib_device, host=args.machine_a_host),
+    )
+    head_args = _build_head_server_args(args)
+
+    role_processes = [
+        _spawn_role_process(encoder_args, "wan-disagg-encoder-a"),
+        _spawn_role_process(denoiser_args, "wan-disagg-denoiser-a"),
+    ]
+
+    print("Launching split two-host Wan2.2 TI2V deployment (machine_a)")
+    print(f"  machine_a_host  : {args.machine_a_host}")
+    print(f"  machine_b_host  : {args.machine_b_host}")
+    print(f"  bind_host       : {_resolve_bind_host(args)}")
+    print(f"  http_port       : {args.port}")
+    print(f"  server_addr     : {server_addr}")
+    print(f"  encoder_port    : {encoder_port} ({args.encoder_device})")
+    print(f"  denoiser_port   : {denoiser_port}")
+    print(
+        "  encoder         : "
+        + ("cpu" if args.encoder_device == "cpu" else f"tp={_resolve_encoder_tp(args)}")
+    )
+    print(
+        "  denoiser        : "
+        f"sp={_resolve_denoiser_sp(args)} ulysses={_resolve_denoiser_ulysses(args)} ring={args.denoiser_ring}"
+    )
+    print(f"  decoder_remote  : tcp://{args.machine_b_host}:{_resolve_role_port(args.decoder_scheduler_port, args.scheduler_port, 300)}")
+
+    try:
+        launch_disagg_server(head_args)
+    finally:
+        _cleanup_processes(role_processes)
+
+
+def _launch_split_machine_b(args: argparse.Namespace) -> None:
+    decoder_port = _resolve_role_port(args.decoder_scheduler_port, args.scheduler_port, 300)
+    decoder_args = _build_role_server_args(
+        args,
+        role=RoleType.DECODER,
+        host=args.machine_b_host,
+        scheduler_port=decoder_port,
+        base_gpu_id=args.decoder_base_gpu_id,
+        num_gpus=args.decoder_num_gpus,
+        disagg_role_device=args.disagg_role_device,
+        disagg_server_addr=f"tcp://{args.machine_a_host}:{args.scheduler_port}",
+        transfer_backend=_resolve_role_transfer_backend(args, "decoder"),
+        ib_device=_resolve_role_ib_device(args.decoder_ib_device, host=args.machine_b_host),
+    )
+
+    print("Launching split two-host Wan2.2 TI2V deployment (machine_b)")
+    print(f"  machine_a_host  : {args.machine_a_host}")
+    print(f"  machine_b_host  : {args.machine_b_host}")
+    print(f"  decoder_port    : {decoder_port}")
+    print(f"  decoder         : sp={_resolve_decoder_sp(args)}")
+    print(f"  decoder_gpus    : {_build_gpu_group(args.decoder_base_gpu_id, args.decoder_num_gpus)}")
+
+    launch_disagg_role(decoder_args)
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.disable_warmup:
+        args.warmup = False
+
+    if args.deployment_layout == "single_host":
+        if args.node_role != "all_in_one":
+            raise ValueError("single_host layout only supports --node-role all_in_one.")
+        _launch_single_host(args)
+        return
+
+    if args.node_role == "machine_a":
+        _launch_split_machine_a(args)
+        return
+    if args.node_role == "machine_b":
+        _launch_split_machine_b(args)
+        return
+    raise ValueError(
+        "split_two_hosts layout requires --node-role machine_a or machine_b."
     )
 
 

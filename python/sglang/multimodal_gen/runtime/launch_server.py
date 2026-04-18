@@ -587,6 +587,9 @@ def launch_pool_disagg_server(
             timeout_s=float(server_args.disagg_timeout),
             downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
             max_slots_per_instance=server_args.disagg_max_slots_per_instance,
+            profile_enabled=server_args.profile_enabled,
+            profile_output_dir=server_args.profile_output_dir,
+            profile_run_id=server_args.profile_run_id,
         )
         diffusion_server.start()
         if server_args.warmup:
@@ -724,6 +727,9 @@ def launch_disagg_server(server_args: ServerArgs):
         timeout_s=float(server_args.disagg_timeout),
         downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
         max_slots_per_instance=server_args.disagg_max_slots_per_instance,
+        profile_enabled=server_args.profile_enabled,
+        profile_output_dir=server_args.profile_output_dir,
+        profile_run_id=server_args.profile_run_id,
     )
     try:
         diffusion_server.start()

@@ -40,6 +40,7 @@ class TestRequestTracker(unittest.TestCase):
         self.assertEqual(record.request_id, "r1")
         self.assertEqual(record.state, RequestState.PENDING)
         self.assertFalse(record.is_terminal())
+        self.assertIn(RequestState.PENDING.value, record.state_timestamps)
 
         got = tracker.get("r1")
         self.assertIs(got, record)
@@ -234,6 +235,19 @@ class TestRequestTracker(unittest.TestCase):
         tracker.transition("r1", RequestState.ENCODER_WAITING)
         tracker.transition("r1", RequestState.TIMED_OUT)
         self.assertTrue(tracker.get("r1").is_terminal())
+
+    def test_state_and_event_timestamps_recorded(self):
+        tracker = RequestTracker()
+        tracker.submit("r1")
+        tracker.transition("r1", RequestState.ENCODER_WAITING)
+        tracker.transition("r1", RequestState.ENCODER_RUNNING)
+        tracker.mark_event("r1", "completion_signal_time_s", 123.45)
+
+        record = tracker.get("r1")
+        self.assertIn(RequestState.ENCODER_WAITING.value, record.state_timestamps)
+        self.assertIn(RequestState.ENCODER_RUNNING.value, record.state_timestamps)
+        self.assertEqual(record.event_timestamps["completion_signal_time_s"], 123.45)
+        self.assertGreater(record.last_transition_time_s, 0.0)
 
 
 if __name__ == "__main__":

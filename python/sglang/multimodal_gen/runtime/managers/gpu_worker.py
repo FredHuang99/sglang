@@ -249,6 +249,10 @@ class GPUWorker:
             # For disagg roles, return raw Req to let the caller handle
             # the role-to-role tensor transfer before OutputBatch conversion.
             if return_req and isinstance(result, Req):
+                duration_ms = (time.monotonic() - start_time) * 1000
+                if result.metrics is not None:
+                    result.metrics.total_duration_ms = duration_ms
+                    result.metrics.finish_time_s = time.time()
                 return result
 
             if isinstance(result, Req):
@@ -282,6 +286,7 @@ class GPUWorker:
             duration_ms = (time.monotonic() - start_time) * 1000
             if output_batch.metrics is not None:
                 output_batch.metrics.total_duration_ms = duration_ms
+                output_batch.metrics.finish_time_s = time.time()
 
             # Save output to file and return file path only if requested. Avoid the serialization
             # and deserialization overhead between scheduler_client and gpu_worker.
@@ -329,6 +334,9 @@ class GPUWorker:
             if output_batch is None:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing request {req.request_id}: {e}"
+            if req.metrics is not None:
+                req.metrics.finish_time_s = time.time()
+                output_batch.metrics = req.metrics
         return output_batch
 
     def get_can_stay_resident_components(

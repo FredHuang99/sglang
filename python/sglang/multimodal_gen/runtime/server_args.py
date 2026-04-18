@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.request_profiling import (
+    DEFAULT_PROFILE_OUTPUT_DIR,
+)
 from sglang.multimodal_gen.utils import (
     FlexibleArgumentParser,
     StoreBoolean,
@@ -190,6 +193,9 @@ class ServerArgs:
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
+    profile_enabled: bool = False
+    profile_output_dir: str = DEFAULT_PROFILE_OUTPUT_DIR
+    profile_run_id: str | None = None
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -341,6 +347,8 @@ class ServerArgs:
 
     def _adjust_path(self):
         expand_path_fields(self)
+        if self.profile_output_dir is not None:
+            self.profile_output_dir = os.path.expanduser(self.profile_output_dir)
         self._adjust_save_paths()
 
     def _adjust_parameters(self):
@@ -1116,6 +1124,24 @@ class ServerArgs:
             type=str,
             default=ServerArgs.input_save_path,
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
+        )
+        parser.add_argument(
+            "--profile-enabled",
+            action=StoreBoolean,
+            default=ServerArgs.profile_enabled,
+            help="Enable structured per-request profiling CSV outputs.",
+        )
+        parser.add_argument(
+            "--profile-output-dir",
+            type=str,
+            default=ServerArgs.profile_output_dir,
+            help="Directory for structured profiling outputs.",
+        )
+        parser.add_argument(
+            "--profile-run-id",
+            type=str,
+            default=ServerArgs.profile_run_id,
+            help="Run identifier used to namespace profiling outputs.",
         )
 
         # LoRA

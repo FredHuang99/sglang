@@ -24,6 +24,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     get_is_main_process,
     init_logger,
 )
+from sglang.multimodal_gen.runtime.utils.request_profiling import (
+    aggregate_logical_stage_durations,
+)
 
 logger = init_logger(__name__)
 
@@ -53,6 +56,9 @@ class RequestMetrics:
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+        self.arrival_time_s: float | None = None
+        self.start_time_s: float | None = None
+        self.finish_time_s: float | None = None
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
 
@@ -79,6 +85,10 @@ class RequestMetrics:
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "arrival_time_s": self.arrival_time_s,
+            "start_time_s": self.start_time_s,
+            "finish_time_s": self.finish_time_s,
+            "logical_stage_durations_ms": aggregate_logical_stage_durations(self),
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()

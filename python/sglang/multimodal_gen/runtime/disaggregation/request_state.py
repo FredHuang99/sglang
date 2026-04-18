@@ -69,10 +69,18 @@ class RequestRecord:
     state: RequestState = RequestState.PENDING
     submit_time: float = field(default_factory=time.monotonic)
     last_transition_time: float = field(default_factory=time.monotonic)
+    submit_time_s: float = field(default_factory=time.time)
+    last_transition_time_s: float = field(default_factory=time.time)
+    state_timestamps: dict[str, float] = field(default_factory=dict)
+    event_timestamps: dict[str, float] = field(default_factory=dict)
     encoder_instance: int | None = None
     denoiser_instance: int | None = None
     decoder_instance: int | None = None
     error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.state.value not in self.state_timestamps:
+            self.state_timestamps[self.state.value] = self.submit_time_s
 
     def elapsed_s(self) -> float:
         return time.monotonic() - self.submit_time
@@ -127,7 +135,11 @@ class RequestTracker:
                 )
 
             record.state = new_state
-            record.last_transition_time = time.monotonic()
+            now_mono = time.monotonic()
+            now_s = time.time()
+            record.last_transition_time = now_mono
+            record.last_transition_time_s = now_s
+            record.state_timestamps[new_state.value] = now_s
             if error is not None:
                 record.error = error
             if encoder_instance is not None:
@@ -139,6 +151,18 @@ class RequestTracker:
 
             logger.debug(
                 "Request %s: %s -> %s", request_id, old_state.value, new_state.value
+            )
+            return record
+
+    def mark_event(
+        self, request_id: str, event_name: str, timestamp_s: float | None = None
+    ) -> RequestRecord:
+        with self._lock:
+            record = self._requests.get(request_id)
+            if record is None:
+                raise ValueError(f"Unknown request_id: {request_id}")
+            record.event_timestamps[event_name] = (
+                time.time() if timestamp_s is None else timestamp_s
             )
             return record
 
