@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import sys
 from typing import Any
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -17,6 +18,9 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.disagg_launcher_utils import (
     resolve_disagg_ib_device,
 )
+
+
+ZIMAGE_NUM_ATTENTION_HEADS = 30
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -258,6 +262,65 @@ def _resolve_pool_ib_device(args: argparse.Namespace, *, host: str) -> str | Non
         if resolved is not None:
             return resolved
     return None
+
+
+def _arg_was_provided(argv: list[str], flag_name: str) -> bool:
+    return any(arg == flag_name or arg.startswith(f"{flag_name}=") for arg in argv)
+
+
+def _is_zimage_model(args: argparse.Namespace) -> bool:
+    candidate = " ".join(
+        part for part in (args.model_id, args.model_path) if part
+    ).lower()
+    normalized = candidate.replace("_", "-")
+    return "z-image" in normalized or "zimage" in normalized
+
+
+def _preferred_zimage_ulysses_degree(sp_degree: int) -> int:
+    for candidate in range(sp_degree, 0, -1):
+        if sp_degree % candidate == 0 and ZIMAGE_NUM_ATTENTION_HEADS % candidate == 0:
+            return candidate
+    return 1
+
+
+def _apply_zimage_denoiser_topology_defaults(
+    args: argparse.Namespace, raw_argv: list[str]
+) -> None:
+    denoiser_flags = ("--denoiser-sp", "--denoiser-ulysses", "--denoiser-ring")
+    if any(_arg_was_provided(raw_argv, flag) for flag in denoiser_flags):
+        return
+
+    denoiser_sp = _resolve_denoiser_sp(args)
+    denoiser_ulysses = _preferred_zimage_ulysses_degree(denoiser_sp)
+    args.denoiser_sp = denoiser_sp
+    args.denoiser_ulysses = denoiser_ulysses
+    args.denoiser_ring = denoiser_sp // denoiser_ulysses
+
+
+def _validate_zimage_denoiser_topology(args: argparse.Namespace) -> None:
+    denoiser_sp = _resolve_denoiser_sp(args)
+    denoiser_ulysses = _resolve_denoiser_ulysses(args)
+    denoiser_ring = args.denoiser_ring
+    if denoiser_ulysses <= 0:
+        raise ValueError("--denoiser-ulysses must be positive.")
+    if denoiser_ring <= 0:
+        raise ValueError("--denoiser-ring must be positive.")
+    if denoiser_sp != denoiser_ulysses * denoiser_ring:
+        raise ValueError(
+            "Invalid Z-Image denoiser parallelism: "
+            f"--denoiser-sp ({denoiser_sp}) must equal --denoiser-ulysses * "
+            f"--denoiser-ring ({denoiser_ulysses} * {denoiser_ring} = "
+            f"{denoiser_ulysses * denoiser_ring}). "
+            "For 4 GPUs use --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2."
+        )
+    if ZIMAGE_NUM_ATTENTION_HEADS % denoiser_ulysses != 0:
+        raise ValueError(
+            "Invalid Z-Image denoiser parallelism: "
+            f"Z-Image has {ZIMAGE_NUM_ATTENTION_HEADS} attention heads, so "
+            f"--denoiser-ulysses must divide {ZIMAGE_NUM_ATTENTION_HEADS}. "
+            f"Got --denoiser-ulysses {denoiser_ulysses}. "
+            "For 4 GPUs use --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2."
+        )
 
 
 def _build_common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
@@ -515,9 +578,16 @@ def _launch_split_machine_b(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = build_parser()
+    raw_argv = sys.argv[1:]
     args = parser.parse_args()
     if args.disable_warmup:
         args.warmup = False
+
+    if _is_zimage_model(args) and (
+        args.deployment_layout == "single_host" or args.node_role == "machine_a"
+    ):
+        _apply_zimage_denoiser_topology_defaults(args, raw_argv)
+        _validate_zimage_denoiser_topology(args)
 
     if args.deployment_layout == "single_host":
         if args.node_role != "all_in_one":

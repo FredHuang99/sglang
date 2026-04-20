@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
+
+
+ZIMAGE_NUM_ATTENTION_HEADS = 30
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,14 +107,64 @@ def _resolve_gpu_group(args: argparse.Namespace) -> list[int]:
     return list(range(args.base_gpu_id, args.base_gpu_id + args.num_gpus))
 
 
+def _arg_was_provided(argv: list[str], flag_name: str) -> bool:
+    return any(arg == flag_name or arg.startswith(f"{flag_name}=") for arg in argv)
+
+
+def _is_zimage_model(args: argparse.Namespace) -> bool:
+    candidate = " ".join(
+        part for part in (args.model_id, args.model_path) if part
+    ).lower()
+    normalized = candidate.replace("_", "-")
+    return "z-image" in normalized or "zimage" in normalized
+
+
+def _preferred_zimage_ulysses_degree(sp_degree: int) -> int:
+    for candidate in range(sp_degree, 0, -1):
+        if sp_degree % candidate == 0 and ZIMAGE_NUM_ATTENTION_HEADS % candidate == 0:
+            return candidate
+    return 1
+
+
+def _apply_zimage_topology_defaults(
+    args: argparse.Namespace, raw_argv: list[str]
+) -> None:
+    topology_flags = ("--sp-degree", "--ulysses-degree", "--ring-degree")
+    if any(_arg_was_provided(raw_argv, flag) for flag in topology_flags):
+        return
+
+    # Z-Image has 30 attention heads, so the 4-GPU Wan default
+    # ulysses=4 is invalid. Keep SP at 4 GPUs but split it as ring=2 x ulysses=2.
+    args.ulysses_degree = _preferred_zimage_ulysses_degree(args.sp_degree)
+    args.ring_degree = args.sp_degree // args.ulysses_degree
+
+
+def _validate_zimage_topology(args: argparse.Namespace) -> None:
+    if args.ulysses_degree <= 0:
+        raise ValueError("--ulysses-degree must be positive.")
+    if ZIMAGE_NUM_ATTENTION_HEADS % args.ulysses_degree != 0:
+        raise ValueError(
+            "Invalid Z-Image parallelism: "
+            f"Z-Image has {ZIMAGE_NUM_ATTENTION_HEADS} attention heads, so "
+            f"--ulysses-degree must divide {ZIMAGE_NUM_ATTENTION_HEADS}. "
+            f"Got --ulysses-degree {args.ulysses_degree}. "
+            "For 4 GPUs use --sp-degree 4 --ulysses-degree 2 --ring-degree 2."
+        )
+
+
 def main() -> None:
     parser = build_parser()
+    raw_argv = sys.argv[1:]
     args = parser.parse_args()
     #if args.num_gpus != 4:
     #    raise ValueError("This launcher is fixed to a 4-GPU topology.")
 
     if args.disable_warmup:
         args.warmup = False
+
+    if _is_zimage_model(args):
+        _apply_zimage_topology_defaults(args, raw_argv)
+        _validate_zimage_topology(args)
 
     gpu_group = _resolve_gpu_group(args)
     args.num_gpus = len(gpu_group)
