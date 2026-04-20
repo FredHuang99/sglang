@@ -87,6 +87,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder-ib-device", type=str, default="auto")
     parser.add_argument("--disagg-dispatch-policy", type=str, default="round_robin")
     parser.add_argument("--disagg-max-slots-per-instance", type=int, default=8)
+    parser.add_argument("--disagg-transfer-pool-size", type=int, default=256 * 1024 * 1024)
+    parser.add_argument("--disagg-transfer-redundancy", type=float, default=1.25)
     parser.add_argument("--disagg-timeout", type=int, default=3600)
     parser.add_argument("--disagg-downstream-wait-timeout", type=int, default=3600)
     parser.add_argument("--warmup", action="store_true", default=False)
@@ -341,6 +343,8 @@ def _build_common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "pin_cpu_memory": args.pin_cpu_memory,
         "disagg_dispatch_policy": args.disagg_dispatch_policy,
         "disagg_max_slots_per_instance": args.disagg_max_slots_per_instance,
+        "disagg_transfer_pool_size": args.disagg_transfer_pool_size,
+        "disagg_transfer_redundancy": args.disagg_transfer_redundancy,
         "disagg_timeout": args.disagg_timeout,
         "disagg_downstream_wait_timeout": args.disagg_downstream_wait_timeout,
         "warmup": args.warmup,
@@ -474,6 +478,8 @@ def _launch_single_host(args: argparse.Namespace) -> None:
         print(f"  profile_output  : {args.profile_output_dir}")
         print(f"  profile_run_id  : {args.profile_run_id}")
     print(f"  server_warmup   : {args.warmup}")
+    print(f"  transfer_pool   : {args.disagg_transfer_pool_size}")
+    print(f"  transfer_redund.: {args.disagg_transfer_redundancy}")
     if not args.warmup:
         print("  benchmark warmup: use benchmark --num-warmup-requests")
 
@@ -541,6 +547,8 @@ def _launch_split_machine_a(args: argparse.Namespace) -> None:
     )
     print(f"  decoder_remote  : tcp://{args.machine_b_host}:{_resolve_role_port(args.decoder_scheduler_port, args.scheduler_port, 300)}")
     print(f"  server_warmup   : {args.warmup}")
+    print(f"  transfer_pool   : {args.disagg_transfer_pool_size}")
+    print(f"  transfer_redund.: {args.disagg_transfer_redundancy}")
     if not args.warmup:
         print("  benchmark warmup: use benchmark --num-warmup-requests")
 
@@ -572,6 +580,8 @@ def _launch_split_machine_b(args: argparse.Namespace) -> None:
     print(f"  decoder         : sp={_resolve_decoder_sp(args)}")
     print(f"  decoder_gpus    : {decoder_gpu_ids}")
     print(f"  server_warmup   : {args.warmup}")
+    print(f"  transfer_pool   : {args.disagg_transfer_pool_size}")
+    print(f"  transfer_redund.: {args.disagg_transfer_redundancy}")
 
     launch_disagg_role(decoder_args)
 

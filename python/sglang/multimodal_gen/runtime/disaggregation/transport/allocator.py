@@ -10,6 +10,30 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+def next_power_of_2(n: int) -> int:
+    if n <= 0:
+        return 1
+    n -= 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    return n + 1
+
+
+def round_allocation_size(size: int, min_block_size: int = 1 << 20) -> int:
+    """Return the actual buddy block size needed for a requested allocation."""
+    if size <= 0:
+        raise ValueError(f"Allocation size must be positive, got {size}")
+    if min_block_size <= 0 or (min_block_size & (min_block_size - 1)) != 0:
+        raise ValueError(
+            f"min_block_size must be a power of 2, got {min_block_size}"
+        )
+    return max(next_power_of_2(size), min_block_size)
+
+
 @dataclass
 class Block:
     offset: int  # byte offset from pool start
@@ -28,7 +52,7 @@ class BuddyAllocator:
             )
 
         self._min_block_size = min_block_size
-        self._pool_size = self._next_power_of_2(max(pool_size, min_block_size))
+        self._pool_size = next_power_of_2(max(pool_size, min_block_size))
         self._lock = threading.Lock()
 
         # Free lists indexed by order: order 0 = min_block_size, order 1 = 2*min_block_size, ...
@@ -72,7 +96,7 @@ class BuddyAllocator:
         if size <= 0:
             raise ValueError(f"Allocation size must be positive, got {size}")
 
-        alloc_size = max(self._next_power_of_2(size), self._min_block_size)
+        alloc_size = round_allocation_size(size, self._min_block_size)
         target_order = self._size_to_order(alloc_size)
 
         if target_order > self._max_order:
@@ -114,7 +138,7 @@ class BuddyAllocator:
     def can_allocate(self, size: int) -> bool:
         if size <= 0:
             return False
-        alloc_size = max(self._next_power_of_2(size), self._min_block_size)
+        alloc_size = round_allocation_size(size, self._min_block_size)
         target_order = self._size_to_order(alloc_size)
         if target_order > self._max_order:
             return False
@@ -129,7 +153,7 @@ class BuddyAllocator:
         """Count how many allocations of the given size can fit."""
         if slot_size <= 0:
             return 0
-        alloc_size = max(self._next_power_of_2(slot_size), self._min_block_size)
+        alloc_size = round_allocation_size(slot_size, self._min_block_size)
 
         with self._lock:
             count = 0
@@ -219,13 +243,4 @@ class BuddyAllocator:
 
     @staticmethod
     def _next_power_of_2(n: int) -> int:
-        if n <= 0:
-            return 1
-        n -= 1
-        n |= n >> 1
-        n |= n >> 2
-        n |= n >> 4
-        n |= n >> 8
-        n |= n >> 16
-        n |= n >> 32
-        return n + 1
+        return next_power_of_2(n)

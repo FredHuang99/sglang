@@ -155,10 +155,17 @@ class DiffusionServer:
         self._lock = threading.Lock()
         self._control_push_sockets: dict[str, zmq.Socket] = {}
 
-        # FreeBufferSlots per instance
+        # FreeBufferSlots per instance. Capacity limits may shrink after role
+        # registration if the transfer buffer cannot actually hold the requested
+        # max slots at the calibrated buddy allocation size.
+        self._max_slots_per_instance = max_slots_per_instance
+        self._encoder_capacity_limits = [max_slots_per_instance] * self._num_encoders
+        self._denoiser_capacity_limits = [max_slots_per_instance] * self._num_denoisers
+        self._decoder_capacity_limits = [max_slots_per_instance] * self._num_decoders
         self._encoder_free_slots = [max_slots_per_instance] * self._num_encoders
         self._denoiser_free_slots = [max_slots_per_instance] * self._num_denoisers
         self._decoder_free_slots = [max_slots_per_instance] * self._num_decoders
+        self._encoder_capacity_epochs = [0] * self._num_encoders
         self._denoiser_capacity_epochs = [0] * self._num_denoisers
         self._decoder_capacity_epochs = [0] * self._num_decoders
 
@@ -496,7 +503,7 @@ class DiffusionServer:
 
         record = self._tracker.get(request_id)
         if record is not None and record.encoder_instance is not None:
-            self._encoder_free_slots[record.encoder_instance] += 1
+            self._release_role_slot(RoleType.ENCODER, record.encoder_instance)
 
         self._complete_terminal(request_id, RequestState.FAILED, str(error))
 
@@ -517,8 +524,7 @@ class DiffusionServer:
             self._recycle_prealloc_slot(p2p, RoleType.DECODER)
             self._release_receiver_slot_if_needed(p2p, record)
         elif record and record.decoder_instance is not None:
-            self._decoder_free_slots[record.decoder_instance] += 1
-            self._bump_capacity_epoch(RoleType.DECODER, record.decoder_instance)
+            self._release_role_slot(RoleType.DECODER, record.decoder_instance)
 
         tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
 
@@ -818,7 +824,7 @@ class DiffusionServer:
             record.state in (RequestState.ENCODER_RUNNING, RequestState.ENCODER_DONE)
             and record.encoder_instance is not None
         ):
-            self._encoder_free_slots[record.encoder_instance] += 1
+            self._release_role_slot(RoleType.ENCODER, record.encoder_instance)
         if (
             record.state
             in (
@@ -828,14 +834,12 @@ class DiffusionServer:
             )
             and record.denoiser_instance is not None
         ):
-            self._denoiser_free_slots[record.denoiser_instance] += 1
-            self._bump_capacity_epoch(RoleType.DENOISER, record.denoiser_instance)
+            self._release_role_slot(RoleType.DENOISER, record.denoiser_instance)
         if (
             record.state in (RequestState.DECODER_WAITING, RequestState.DECODER_RUNNING)
             and record.decoder_instance is not None
         ):
-            self._decoder_free_slots[record.decoder_instance] += 1
-            self._bump_capacity_epoch(RoleType.DECODER, record.decoder_instance)
+            self._release_role_slot(RoleType.DECODER, record.decoder_instance)
 
     def _peer_registry(self, role: RoleType) -> dict[int, dict]:
         if role == RoleType.ENCODER:
@@ -855,6 +859,63 @@ class DiffusionServer:
             return self._decoder_pushes
         raise ValueError(f"Unsupported role for push sockets: {role}")
 
+    def _role_slot_arrays(self, role: RoleType) -> tuple[list[int], list[int]]:
+        if role == RoleType.ENCODER:
+            return self._encoder_free_slots, self._encoder_capacity_limits
+        if role == RoleType.DENOISER:
+            return self._denoiser_free_slots, self._denoiser_capacity_limits
+        if role == RoleType.DECODER:
+            return self._decoder_free_slots, self._decoder_capacity_limits
+        raise ValueError(f"Unsupported role for slot arrays: {role}")
+
+    def _release_role_slot(
+        self,
+        role: RoleType,
+        instance_id: int | None,
+        *,
+        update_epoch: bool = True,
+    ) -> None:
+        if instance_id is None or instance_id < 0:
+            return
+        free_slots, capacity_limits = self._role_slot_arrays(role)
+        if instance_id >= len(free_slots):
+            return
+        if self._max_slots_per_instance <= 0:
+            return
+        capacity = capacity_limits[instance_id]
+        if free_slots[instance_id] >= capacity:
+            return
+        free_slots[instance_id] += 1
+        if update_epoch:
+            self._bump_capacity_epoch(role, instance_id)
+
+    def _apply_registered_capacity(
+        self,
+        role: RoleType,
+        instance_id: int,
+        capacity_slots: int | None,
+    ) -> None:
+        if instance_id < 0:
+            return
+        free_slots, capacity_limits = self._role_slot_arrays(role)
+        if instance_id >= len(free_slots):
+            return
+        requested_capacity = (
+            self._max_slots_per_instance if not capacity_slots else int(capacity_slots)
+        )
+        new_capacity = max(
+            1,
+            min(self._max_slots_per_instance, requested_capacity),
+        )
+        old_capacity = capacity_limits[instance_id]
+        active_slots = max(0, old_capacity - free_slots[instance_id])
+        capacity_limits[instance_id] = new_capacity
+        free_slots[instance_id] = max(0, new_capacity - active_slots)
+        # A register/re-register can mean the role rebuilt its transfer pool even
+        # when the visible slot count stays unchanged, so unblock retryable
+        # alloc rejects that were waiting for a capacity epoch change.
+        self._bump_capacity_epoch(role, instance_id)
+
     def _send_control_message(self, endpoint: str, msg) -> None:
         if not endpoint:
             return
@@ -867,12 +928,16 @@ class DiffusionServer:
     def _bump_capacity_epoch(self, role: RoleType, instance_id: int | None) -> None:
         if instance_id is None or instance_id < 0:
             return
-        if role == RoleType.DENOISER and instance_id < len(self._denoiser_capacity_epochs):
+        if role == RoleType.ENCODER and instance_id < len(self._encoder_capacity_epochs):
+            self._encoder_capacity_epochs[instance_id] += 1
+        elif role == RoleType.DENOISER and instance_id < len(self._denoiser_capacity_epochs):
             self._denoiser_capacity_epochs[instance_id] += 1
         elif role == RoleType.DECODER and instance_id < len(self._decoder_capacity_epochs):
             self._decoder_capacity_epochs[instance_id] += 1
 
     def _current_capacity_epoch(self, role: RoleType, instance_id: int) -> int:
+        if role == RoleType.ENCODER and 0 <= instance_id < len(self._encoder_capacity_epochs):
+            return self._encoder_capacity_epochs[instance_id]
         if role == RoleType.DENOISER and 0 <= instance_id < len(self._denoiser_capacity_epochs):
             return self._denoiser_capacity_epochs[instance_id]
         if role == RoleType.DECODER and 0 <= instance_id < len(self._decoder_capacity_epochs):
@@ -1014,16 +1079,20 @@ class DiffusionServer:
             return
 
         if p2p.sender_role == RoleType.ENCODER.value and record.encoder_instance is not None:
-            self._encoder_free_slots[record.encoder_instance] += 1
+            self._release_role_slot(
+                RoleType.ENCODER, record.encoder_instance, update_epoch=update_epoch
+            )
             p2p.sender_slot_released = True
         elif (
             p2p.sender_role == RoleType.DENOISER.value
             and record.denoiser_instance is not None
         ):
-            self._denoiser_free_slots[record.denoiser_instance] += 1
+            self._release_role_slot(
+                RoleType.DENOISER,
+                record.denoiser_instance,
+                update_epoch=update_epoch,
+            )
             p2p.sender_slot_released = True
-            if update_epoch:
-                self._bump_capacity_epoch(RoleType.DENOISER, record.denoiser_instance)
 
     def _release_receiver_slot_if_needed(
         self,
@@ -1039,18 +1108,20 @@ class DiffusionServer:
             p2p.receiver_role == RoleType.DENOISER.value
             and record.denoiser_instance is not None
         ):
-            self._denoiser_free_slots[record.denoiser_instance] += 1
+            self._release_role_slot(
+                RoleType.DENOISER,
+                record.denoiser_instance,
+                update_epoch=update_epoch,
+            )
             p2p.receiver_slot_released = True
-            if update_epoch:
-                self._bump_capacity_epoch(RoleType.DENOISER, record.denoiser_instance)
         elif (
             p2p.receiver_role == RoleType.DECODER.value
             and record.decoder_instance is not None
         ):
-            self._decoder_free_slots[record.decoder_instance] += 1
+            self._release_role_slot(
+                RoleType.DECODER, record.decoder_instance, update_epoch=update_epoch
+            )
             p2p.receiver_slot_released = True
-            if update_epoch:
-                self._bump_capacity_epoch(RoleType.DECODER, record.decoder_instance)
 
     def _handle_transfer_result(self, frames: list, role: RoleType) -> None:
         try:
@@ -1100,6 +1171,8 @@ class DiffusionServer:
             "supports_local_copy": bool(msg.get("supports_local_copy", False)),
             "data_shm_name": msg.get("data_shm_name"),
             "meta_shm_name": msg.get("meta_shm_name"),
+            "capacity_slots": int(msg.get("capacity_slots") or 0),
+            "capacity_slot_size": int(msg.get("capacity_slot_size") or 0),
         }
         info["free_preallocated_slots"] = []
 
@@ -1114,12 +1187,16 @@ class DiffusionServer:
             self._decoder_peers[idx] = info
         else:
             idx = 0
+        self._apply_registered_capacity(role, idx, info["capacity_slots"])
         logger.info(
-            "DiffusionServer transfer: registered %s[%d] session=%s control=%s prealloc=%d",
+            "DiffusionServer transfer: registered %s[%d] session=%s control=%s "
+            "capacity=%d x %d bytes prealloc=%d",
             role,
             idx,
             info["session_id"],
             info["control_endpoint"],
+            info["capacity_slots"],
+            info["capacity_slot_size"],
             len(info["free_preallocated_slots"]),
         )
 
@@ -1144,30 +1221,20 @@ class DiffusionServer:
         self._clear_receiver_dispatch(p2p)
 
         if msg.get("retryable", True):
-            retry_candidate = self._select_downstream_instance_with_capacity(
-                role_enum,
-                p2p,
-                extra_excluded={receiver_instance},
-            )
-            if retry_candidate is not None:
-                self._requeue_downstream_transfer(
-                    request_id,
-                    p2p,
-                    role_enum=role_enum,
-                    rejected_instance=receiver_instance,
-                )
-                return
-            logger.error(
-                "DiffusionServer: %s alloc reject from %s[%d] has no alternative "
-                "instance; failing request immediately",
+            logger.warning(
+                "DiffusionServer: %s retryable alloc reject from %s[%d]; "
+                "requeueing until capacity changes or timeout",
                 request_id,
                 role_enum.value,
                 receiver_instance,
             )
-            reason = (
-                f"{msg.get('reason', 'fatal downstream allocation failure')}; "
-                f"no alternative {role_enum.value} instance available"
+            self._requeue_downstream_transfer(
+                request_id,
+                p2p,
+                role_enum=role_enum,
+                rejected_instance=receiver_instance,
             )
+            return
         else:
             reason = msg.get("reason", "fatal downstream allocation failure")
 
@@ -1651,6 +1718,9 @@ class DiffusionServer:
             "encoder_free_slots": list(self._encoder_free_slots),
             "denoiser_free_slots": list(self._denoiser_free_slots),
             "decoder_free_slots": list(self._decoder_free_slots),
+            "encoder_capacity_limits": list(self._encoder_capacity_limits),
+            "denoiser_capacity_limits": list(self._denoiser_capacity_limits),
+            "decoder_capacity_limits": list(self._decoder_capacity_limits),
             "encoder_tta_depth": len(self._encoder_tta),
             "denoiser_tta_depth": len(self._denoiser_tta),
             "decoder_tta_depth": len(self._decoder_tta),

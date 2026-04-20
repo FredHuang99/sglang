@@ -24,6 +24,9 @@ import zmq
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.disaggregation.transport.allocator import (
+    round_allocation_size,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferMetaBuffer,
     TransferTensorBuffer,
@@ -78,6 +81,18 @@ class _PendingOutboundTransfer:
     stage_event: object | None
     msg_type: str
     staged_for_decoder: bool = False
+
+
+@dataclasses.dataclass
+class _PendingOutboundStaging:
+    request_id: str
+    tensor_fields: dict[str, Any]
+    scalar_fields: dict[str, Any]
+    msg_type: str
+    staged_for_decoder: bool = False
+    first_attempt_time_s: float = dataclasses.field(default_factory=time.monotonic)
+    compute_finish_time_s: float | None = None
+    compute_duration_ms: float | None = None
 
 
 @dataclasses.dataclass
@@ -540,6 +555,7 @@ class SchedulerDisaggMixin:
         self._compute_ready_queue = None
         self._swap_out_queue = None
         self._send_ready_queue = None
+        self._outbound_staging_retry_queue = None
         self._preallocated_slots = {}
         self._aborted_request_ids = {}
         self._aborted_request_ttl_s = max(60.0, self._disagg_timeout_s * 2.0)
@@ -662,17 +678,23 @@ class SchedulerDisaggMixin:
 
         sa = self.server_args
 
-        # Pool size: configurable, default 256 MiB
-        pool_size = getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
+        max_slots = max(1, int(getattr(sa, "disagg_max_slots_per_instance", 1)))
+
+        # Pool size: configurable, default 256 MiB. Warmup auto-sizing must use
+        # the buddy allocator's rounded block size, otherwise 37 MiB measured
+        # payloads are under-counted even though they occupy a 64 MiB slot.
+        configured_pool_size = int(
+            getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
+        )
+        pool_size = configured_pool_size
+        capacity_slot_size = round_allocation_size(64 * 1024 * 1024)
         if measured_transfer_bytes is not None:
             redundancy = float(getattr(sa, "disagg_transfer_redundancy", 1.0))
-            max_slots = max(1, int(getattr(sa, "disagg_max_slots_per_instance", 1)))
-            computed_pool_size = max(
-                measured_transfer_bytes,
-                int(math.ceil(measured_transfer_bytes * max_slots * redundancy)),
+            capacity_slot_size = round_allocation_size(int(measured_transfer_bytes))
+            computed_pool_size = int(
+                math.ceil(capacity_slot_size * max_slots * redundancy)
             )
-            if computed_pool_size > 0:
-                pool_size = computed_pool_size
+            pool_size = max(configured_pool_size, computed_pool_size)
 
         # Create transfer engine
         hostname = getattr(sa, "disagg_p2p_hostname", "127.0.0.1")
@@ -718,7 +740,6 @@ class SchedulerDisaggMixin:
             device="cpu",
             role_name=self._disagg_role.value,
         )
-        max_slots = max(1, int(getattr(sa, "disagg_max_slots_per_instance", 1)))
         meta_slot_size = measured_meta_bytes or (64 * 1024)
         meta_buffer = TransferMetaBuffer(
             slot_count=max_slots,
@@ -733,6 +754,13 @@ class SchedulerDisaggMixin:
             meta_buffer=meta_buffer,
             host_id=socket.gethostname(),
         )
+        try:
+            free_capacity_slots = int(
+                self._transfer_manager.free_slots_count(capacity_slot_size)
+            )
+        except (TypeError, ValueError):
+            free_capacity_slots = max_slots
+        capacity_slots = max(1, min(max_slots, free_capacity_slots))
 
         # Warmup calibration only resizes transfer buffers. Receive slots remain
         # dynamic so runtime allocation semantics continue to match the
@@ -773,14 +801,19 @@ class SchedulerDisaggMixin:
             meta_pool_ptr=self._transfer_manager.meta_pool_ptr,
             meta_pool_size=self._transfer_manager.meta_pool_size,
             meta_shm_name=self._transfer_manager.meta_shm_name,
+            capacity_slots=capacity_slots,
+            capacity_slot_size=capacity_slot_size,
             preallocated_slots=preallocated_slot_info,
         )
         self._pool_result_push.send_multipart(encode_transfer_msg(register_msg))
         logger.info(
-            "Transfer %s: registered with DS (session=%s, pool=%d bytes, prealloc=%d)",
+            "Transfer %s: registered with DS (session=%s, pool=%d bytes, "
+            "capacity=%d x %d bytes, prealloc=%d)",
             self._disagg_role.value.upper(),
             self._transfer_manager.session_id,
-            pool_size,
+            self._transfer_manager.pool_size,
+            capacity_slots,
+            capacity_slot_size,
             len(preallocated_slot_info),
         )
 
@@ -794,6 +827,8 @@ class SchedulerDisaggMixin:
         if self._role_has_outbound_transfer():
             self._swap_out_queue = deque()
             self._send_ready_queue = deque()
+            if self._outbound_staging_retry_queue is None:
+                self._outbound_staging_retry_queue = deque()
 
         if sa.pool_control_endpoint:
             self._transfer_manager.start_background_loops(
@@ -1100,19 +1135,31 @@ class SchedulerDisaggMixin:
     def _drain_transfer_control_socket(self: Scheduler) -> int:
         return self._drain_disagg_work_socket()
 
-    def _process_transfer_control_queue(self: Scheduler) -> bool:
+    def _process_transfer_control_queue(
+        self: Scheduler,
+        *,
+        allow_new_work: bool = True,
+    ) -> bool:
         if self._control_queue is None:
             return False
 
         handled = False
+        deferred_msgs = []
         while True:
             try:
                 msg = self._control_queue.get_nowait()
             except queue.Empty:
                 break
 
-            handled = True
             msg_type = msg.get("msg_type", "")
+            if not allow_new_work and msg_type in (
+                TransferMsgType.ALLOC,
+                TransferMsgType.READY,
+            ):
+                deferred_msgs.append(msg)
+                continue
+
+            handled = True
             if msg_type == TransferMsgType.ALLOC:
                 self._handle_transfer_alloc(msg)
             elif msg_type == TransferMsgType.ABORT:
@@ -1130,6 +1177,9 @@ class SchedulerDisaggMixin:
                     self._disagg_role.value.upper(),
                     msg_type,
                 )
+
+        for msg in deferred_msgs:
+            self._control_queue.put(msg)
 
         return handled
 
@@ -1227,6 +1277,113 @@ class SchedulerDisaggMixin:
                 staged_for_decoder=staged_for_decoder,
             )
         )
+
+    def _has_pending_outbound_staging_retry(self: Scheduler) -> bool:
+        return bool(self._outbound_staging_retry_queue)
+
+    def _enqueue_outbound_staging_retry(
+        self: Scheduler,
+        request_id: str,
+        tensor_fields: dict[str, Any],
+        scalar_fields: dict[str, Any],
+        *,
+        msg_type: str,
+        staged_for_decoder: bool = False,
+        compute_finish_time_s: float | None = None,
+        compute_duration_ms: float | None = None,
+    ) -> None:
+        if self._outbound_staging_retry_queue is None:
+            self._outbound_staging_retry_queue = deque()
+        self._outbound_staging_retry_queue.append(
+            _PendingOutboundStaging(
+                request_id=request_id,
+                tensor_fields=tensor_fields,
+                scalar_fields=scalar_fields,
+                msg_type=msg_type,
+                staged_for_decoder=staged_for_decoder,
+                compute_finish_time_s=compute_finish_time_s,
+                compute_duration_ms=compute_duration_ms,
+            )
+        )
+        logger.warning(
+            "Transfer %s: staging buffer full for %s; queued for retry",
+            self._disagg_role.value.upper(),
+            request_id,
+        )
+
+    def _send_outbound_staging_error(
+        self: Scheduler,
+        item: _PendingOutboundStaging,
+        error: str,
+    ) -> None:
+        if item.msg_type == TransferMsgType.STAGED:
+            send_tensors(
+                self._pool_result_push,
+                {},
+                {"request_id": item.request_id, "_disagg_error": error},
+            )
+        else:
+            done_msg = TransferDoneMsg(request_id=item.request_id, error=error)
+            self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
+
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_failed(item.request_id)
+        self._profile_role_finalize(
+            item.request_id,
+            status="failed",
+            error=error,
+            role_finish_time_s=item.compute_finish_time_s,
+            compute_duration_ms=item.compute_duration_ms,
+        )
+
+    def _process_outbound_staging_retry_once(self: Scheduler) -> bool:
+        if not self._outbound_staging_retry_queue or self._transfer_manager is None:
+            return False
+
+        item = self._outbound_staging_retry_queue.popleft()
+        if self._is_request_aborted(item.request_id):
+            self._cleanup_aborted_staged_request(item.request_id)
+            return True
+
+        timeout_s = float(
+            getattr(
+                self.server_args,
+                "disagg_downstream_wait_timeout",
+                getattr(self, "_disagg_timeout_s", 600.0),
+            )
+        )
+        if time.monotonic() - item.first_attempt_time_s > timeout_s:
+            error = f"Transfer staging timed out after {timeout_s}s"
+            self._warmup_inbound_sizes.pop(item.request_id, None)
+            self._transfer_manager.abort_request(item.request_id)
+            self._send_outbound_staging_error(item, error)
+            return True
+
+        staged, stage_event = self._transfer_manager.stage_tensors_async(
+            request_id=item.request_id,
+            tensor_fields=item.tensor_fields,
+            scalar_fields=item.scalar_fields,
+            stream=self._swap_out_stream,
+        )
+        if staged is None:
+            self._outbound_staging_retry_queue.appendleft(item)
+            return False
+
+        self._enqueue_outbound_transfer(
+            item.request_id,
+            staged,
+            stage_event,
+            msg_type=item.msg_type,
+            staged_for_decoder=item.staged_for_decoder,
+        )
+        if self._disagg_metrics:
+            self._disagg_metrics.record_request_complete(item.request_id)
+        logger.debug(
+            "Transfer %s: staging retry succeeded for %s",
+            self._disagg_role.value.upper(),
+            item.request_id,
+        )
+        return True
 
     def _process_swap_out_queue_once(self: Scheduler) -> bool:
         if not self._swap_out_queue or self._send_ready_queue is None:
@@ -1365,15 +1522,22 @@ class SchedulerDisaggMixin:
         while self._running:
             try:
                 handled_work = False
-                handled_work |= self._drain_disagg_work_socket() > 0
-                handled_work |= self._process_transfer_control_queue()
-                handled_work |= self._process_prefetch_queue_once()
-                handled_work |= self._process_swapping_queue_once()
-                computed = self._process_compute_ready_queue_once(is_multi_rank)
-                handled_work |= computed
+                computed = False
+                staging_backpressure = self._has_pending_outbound_staging_retry()
+                handled_work |= self._process_transfer_control_queue(
+                    allow_new_work=not staging_backpressure
+                )
+                handled_work |= self._process_outbound_staging_retry_once()
                 handled_work |= self._process_swap_out_queue_once()
                 handled_work |= self._process_send_ready_queue_once()
                 handled_work |= self._maybe_apply_pending_transfer_reconfigure()
+                if not self._has_pending_outbound_staging_retry():
+                    handled_work |= self._drain_disagg_work_socket() > 0
+                    handled_work |= self._process_transfer_control_queue()
+                    handled_work |= self._process_prefetch_queue_once()
+                    handled_work |= self._process_swapping_queue_once()
+                    computed = self._process_compute_ready_queue_once(is_multi_rank)
+                    handled_work |= computed
 
                 if is_multi_rank and not computed:
                     self._broadcast_to_all_ranks(("skip",))
@@ -1453,16 +1617,17 @@ class SchedulerDisaggMixin:
         while self._running:
             try:
                 handled_work = False
-                frames = self._try_recv_work_noblock()
-                if frames is not None:
-                    handled_work = True
-                    if is_multi_rank:
-                        self._broadcast_to_all_ranks(("encoder_work", frames))
-                    self._disagg_encoder_step(send_tensors, frames=frames)
-
+                handled_work |= self._process_outbound_staging_retry_once()
                 handled_work |= self._process_swap_out_queue_once()
                 handled_work |= self._process_send_ready_queue_once()
                 handled_work |= self._maybe_apply_pending_transfer_reconfigure()
+                if not self._has_pending_outbound_staging_retry():
+                    frames = self._try_recv_work_noblock()
+                    if frames is not None:
+                        handled_work = True
+                        if is_multi_rank:
+                            self._broadcast_to_all_ranks(("encoder_work", frames))
+                        self._disagg_encoder_step(send_tensors, frames=frames)
 
                 if not handled_work:
                     time.sleep(0.001)
@@ -1919,6 +2084,8 @@ class SchedulerDisaggMixin:
         start_time = time.monotonic()
         staged = None
         stage_event = None
+        tensor_fields = {}
+        scalar_fields = {}
         with self._compute_stream_context():
             result = self.worker.execute_forward([req], return_req=True)
             if isinstance(result, Req):
@@ -1958,19 +2125,13 @@ class SchedulerDisaggMixin:
             return
 
         if staged is None:
-            self._warmup_inbound_sizes.pop(request_id, None)
-            done_msg = TransferDoneMsg(
-                request_id=request_id,
-                error="Failed to stage denoiser output for decoder",
-            )
-            self._pool_result_push.send_multipart(encode_transfer_msg(done_msg))
-            if self._disagg_metrics:
-                self._disagg_metrics.record_request_failed(request_id)
-            self._profile_role_finalize(
+            self._enqueue_outbound_staging_retry(
                 request_id,
-                status="failed",
-                error="Failed to stage denoiser output for decoder",
-                role_finish_time_s=compute_finish_time_s,
+                tensor_fields,
+                scalar_fields,
+                msg_type=TransferMsgType.DONE,
+                staged_for_decoder=True,
+                compute_finish_time_s=compute_finish_time_s,
                 compute_duration_ms=duration_s * 1000.0,
             )
             return
@@ -2100,7 +2261,8 @@ class SchedulerDisaggMixin:
         # Run encoder stages
         staged = None
         stage_event = None
-        scalar_fields = None
+        tensor_fields = {}
+        scalar_fields = {}
         compute_start_time = time.monotonic()
         with self._compute_stream_context():
             req_result = self.worker.execute_forward(reqs, return_req=True)
@@ -2145,13 +2307,18 @@ class SchedulerDisaggMixin:
             )
             return
 
+        stage_enqueued = False
         if self._pool_result_push is not None:
             if self._transfer_manager is not None:
                 # Transfer mode: stage tensors to TransferBuffer, send transfer_staged
-                self._finalize_disagg_encoder_stage(
+                stage_enqueued = self._finalize_disagg_encoder_stage(
                     request_id,
                     staged,
                     stage_event,
+                    tensor_fields,
+                    scalar_fields,
+                    compute_finish_time_s=compute_finish_time_s,
+                    compute_duration_ms=duration_s * 1000.0,
                 )
             else:
                 # Fallback: send error (transfer manager not initialized)
@@ -2168,29 +2335,37 @@ class SchedulerDisaggMixin:
                     compute_duration_ms=duration_s * 1000.0,
                 )
 
-        if self._disagg_metrics:
+        if stage_enqueued and self._disagg_metrics:
             self._disagg_metrics.record_request_complete(request_id)
 
         logger.debug("Pool ENCODER: processed %s", request_id)
 
     def _finalize_disagg_encoder_stage(
-        self: Scheduler, request_id: str, staged, stage_event
-    ) -> None:
+        self: Scheduler,
+        request_id: str,
+        staged,
+        stage_event,
+        tensor_fields: dict[str, Any],
+        scalar_fields: dict[str, Any],
+        *,
+        compute_finish_time_s: float | None = None,
+        compute_duration_ms: float | None = None,
+    ) -> bool:
         if self._is_request_aborted(request_id):
             if self._transfer_manager is not None:
                 self._transfer_manager.abort_request(request_id)
-            return
+            return False
 
         if staged is None:
-            # Staging failed 閳?send error via relay as fallback
-            send_tensors(
-                self._pool_result_push,
-                {},
-                {"request_id": request_id, "_disagg_error": "Transfer staging failed"},
+            self._enqueue_outbound_staging_retry(
+                request_id,
+                tensor_fields,
+                scalar_fields,
+                msg_type=TransferMsgType.STAGED,
+                compute_finish_time_s=compute_finish_time_s,
+                compute_duration_ms=compute_duration_ms,
             )
-            if self._disagg_metrics:
-                self._disagg_metrics.record_request_failed(request_id)
-            return
+            return False
 
         self._enqueue_outbound_transfer(
             request_id,
@@ -2198,6 +2373,7 @@ class SchedulerDisaggMixin:
             stage_event,
             msg_type=TransferMsgType.STAGED,
         )
+        return True
 
     def _disagg_encoder_transfer_stage(
         self: Scheduler, request_id: str, tensor_fields: dict, scalar_fields: dict
@@ -2214,4 +2390,10 @@ class SchedulerDisaggMixin:
                 scalar_fields=scalar_fields,
                 stream=self._swap_out_stream,
             )
-        self._finalize_disagg_encoder_stage(request_id, staged, stage_event)
+        self._finalize_disagg_encoder_stage(
+            request_id,
+            staged,
+            stage_event,
+            tensor_fields,
+            scalar_fields,
+        )

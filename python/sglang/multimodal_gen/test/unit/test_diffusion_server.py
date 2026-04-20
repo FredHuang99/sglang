@@ -111,6 +111,42 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.assertEqual(peer["meta_pool_ptr"], 0x8F000000)
         self.assertEqual(peer["free_preallocated_slots"], [])
 
+    def test_transfer_register_updates_effective_capacity(self):
+        server = DiffusionServer(
+            frontend_endpoint="tcp://127.0.0.1:19920",
+            encoder_work_endpoints=["tcp://127.0.0.1:19921"],
+            denoiser_work_endpoints=["tcp://127.0.0.1:19922"],
+            decoder_work_endpoints=["tcp://127.0.0.1:19923"],
+            encoder_result_endpoint="tcp://127.0.0.1:19924",
+            denoiser_result_endpoint="tcp://127.0.0.1:19925",
+            decoder_result_endpoint="tcp://127.0.0.1:19926",
+            max_slots_per_instance=32,
+        )
+        self.addCleanup(server.stop)
+        server._denoiser_free_slots[0] = 31
+
+        server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferRegisterMsg(
+                    role="denoiser",
+                    instance_id=0,
+                    session_id="den-capacity",
+                    pool_size=256 * 1024 * 1024,
+                    capacity_slots=4,
+                    capacity_slot_size=64 * 1024 * 1024,
+                )
+            ),
+            RoleType.DENOISER,
+        )
+
+        self.assertEqual(server._denoiser_capacity_limits[0], 4)
+        self.assertEqual(server._denoiser_free_slots[0], 3)
+        self.assertEqual(server._denoiser_peers[0]["capacity_slots"], 4)
+        self.assertEqual(
+            server._denoiser_peers[0]["capacity_slot_size"],
+            64 * 1024 * 1024,
+        )
+
     def test_transfer_staged_dispatches_dynamic_alloc_with_meta_and_host(self):
         self.server._handle_transfer_result(
             encode_transfer_msg(
@@ -317,7 +353,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             RequestState.DENOISING_WAITING,
         )
 
-    def test_retryable_alloc_reject_without_alternative_fails_fast(self):
+    def test_retryable_alloc_reject_without_alternative_requeues(self):
         self._submit_running_request("r-no-alt", RequestState.DENOISING_WAITING)
         self.server._pending["r-no-alt"] = b"client"
         self.server._frontend = MagicMock()
@@ -346,12 +382,15 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             RoleType.DENOISER,
         )
 
-        self.server._send_abort.assert_called_once()
-        self.server._frontend.send_multipart.assert_called_once()
-        self.assertEqual(self.server._encoder_free_slots[0], 1)
-        self.assertEqual(len(self.server._denoiser_tta), 0)
-        self.assertNotIn("r-no-alt", self.server._transfer_state)
-        self.assertIsNone(self.server._tracker.get("r-no-alt"))
+        self.server._send_abort.assert_not_called()
+        self.server._frontend.send_multipart.assert_not_called()
+        self.assertEqual(self.server._encoder_free_slots[0], 0)
+        self.assertEqual(len(self.server._denoiser_tta), 1)
+        self.assertIn("r-no-alt", self.server._transfer_state)
+        self.assertIsNotNone(self.server._tracker.get("r-no-alt"))
+        p2p = self.server._transfer_state["r-no-alt"]
+        self.assertEqual(p2p.transfer_phase, TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT)
+        self.assertIn(0, p2p.rejected_instances)
 
     def test_alloc_accepted_stops_downstream_wait_timer(self):
         self._submit_running_request("r-accept", RequestState.DENOISING_WAITING)

@@ -6,6 +6,7 @@ import unittest
 
 from sglang.multimodal_gen.runtime.disaggregation.transport.allocator import (
     BuddyAllocator,
+    round_allocation_size,
 )
 
 
@@ -211,6 +212,12 @@ class TestBuddyAllocatorThreadSafety(unittest.TestCase):
 
 class TestBuddyAllocatorRealisticSizes(unittest.TestCase):
     """Test with realistic diffusion tensor sizes."""
+
+    def test_round_allocation_size_matches_buddy_slot(self):
+        self.assertEqual(
+            round_allocation_size(37_356_032, min_block_size=1 << 20),
+            64 << 20,
+        )
 
     def test_encoder_denoiser_slots(self):
         """Encoder→Denoiser: ~60MB per request. Pool for 4 concurrent requests."""

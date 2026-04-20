@@ -169,6 +169,8 @@ class TransferRegisterMsg:
     meta_pool_ptr: int = 0
     meta_pool_size: int = 0
     meta_shm_name: str | None = None
+    capacity_slots: int = 0
+    capacity_slot_size: int = 0
     # Pre-allocated receive slots:
     # [{"slot_id": int, "offset": int, "size": int, "addr": int,
     #   "meta_offset": int, "meta_size": int, "meta_addr": int}]

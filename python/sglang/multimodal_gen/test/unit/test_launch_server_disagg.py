@@ -336,6 +336,54 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
         warmup_mock.assert_called_once()
         self.assertEqual(events, ["wait", "warmup"])
 
+    def test_launch_pool_disagg_server_waits_for_registration_before_warmup(self):
+        server_args = _make_server_args(
+            disagg_role_device="cuda",
+            warmup=True,
+            disagg_timeout=12,
+        )
+        fake_server = MagicMock()
+        events = []
+
+        def record_wait(*args, **kwargs):
+            del args, kwargs
+            events.append("wait")
+
+        def record_warmup(*args, **kwargs):
+            del args, kwargs
+            events.append("warmup")
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.DiffusionServer",
+            return_value=fake_server,
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server._wait_for_disagg_role_registration",
+            side_effect=record_wait,
+        ) as wait_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server._run_disagg_startup_calibration",
+            side_effect=record_warmup,
+        ) as warmup_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server.launch_http_server_only"
+        ):
+            launch_pool_disagg_server(
+                server_args,
+                encoder_gpus=[],
+                denoiser_gpus=[],
+                decoder_gpus=[],
+                launch_http_server=False,
+            )
+
+        fake_server.start.assert_called_once_with()
+        wait_mock.assert_called_once_with(
+            fake_server,
+            expected_encoders=0,
+            expected_denoisers=0,
+            expected_decoders=0,
+            timeout_s=12.0,
+        )
+        warmup_mock.assert_called_once()
+        self.assertEqual(events, ["wait", "warmup"])
+
 
 class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
     def _assert_starts_and_closes_before_recv(self, events, expected_ranks):

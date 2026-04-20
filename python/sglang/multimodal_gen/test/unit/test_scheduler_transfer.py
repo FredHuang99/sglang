@@ -61,6 +61,7 @@ class _SchedulerHarness:
         scheduler._compute_ready_queue = queue.Queue()
         scheduler._swap_out_queue = deque()
         scheduler._send_ready_queue = deque()
+        scheduler._outbound_staging_retry_queue = deque()
         scheduler._swap_in_stream = None
         scheduler._compute_stream = None
         scheduler._swap_out_stream = None
@@ -68,6 +69,7 @@ class _SchedulerHarness:
         scheduler._transfer_reconfigured = False
         scheduler._warmup_inbound_sizes = {}
         scheduler._aborted_request_ids = {}
+        scheduler._disagg_timeout_s = 600.0
         scheduler._running = True
         scheduler.context = MagicMock()
         scheduler.gpu_id = 0
@@ -570,6 +572,62 @@ class TestSchedulerTransferStreams(unittest.TestCase):
             stream=scheduler._swap_out_stream,
         )
 
+    def test_sender_staging_failure_retries_without_client_error(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler._transfer_manager = MagicMock()
+        staged = SimpleNamespace(
+            transfer_size=1,
+            meta_size=1,
+            scalar_fields={},
+            slot=None,
+            meta_slot=None,
+        )
+        scheduler._transfer_manager.stage_tensors_async.return_value = (staged, None)
+
+        enqueued = scheduler._finalize_disagg_encoder_stage(
+            "stage-retry",
+            None,
+            None,
+            {"latents": torch.randn(1, 4, 4, 4)},
+            {"request_id": "stage-retry"},
+        )
+
+        self.assertFalse(enqueued)
+        self.assertEqual(len(scheduler._outbound_staging_retry_queue), 1)
+        scheduler._pool_result_push.send_multipart.assert_not_called()
+
+        self.assertTrue(scheduler._process_outbound_staging_retry_once())
+
+        scheduler._transfer_manager.stage_tensors_async.assert_called_once_with(
+            request_id="stage-retry",
+            tensor_fields=unittest.mock.ANY,
+            scalar_fields={"request_id": "stage-retry"},
+            stream=scheduler._swap_out_stream,
+        )
+        self.assertEqual(len(scheduler._outbound_staging_retry_queue), 0)
+        self.assertEqual(len(scheduler._swap_out_queue), 1)
+        self.assertEqual(scheduler._swap_out_queue[0].request_id, "stage-retry")
+
+    def test_staging_backpressure_defers_new_alloc_control(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler._handle_transfer_alloc = MagicMock()
+        scheduler._handle_transfer_abort = MagicMock()
+        scheduler._control_queue.put(
+            {"msg_type": TransferMsgType.ALLOC, "request_id": "new-work"}
+        )
+        scheduler._control_queue.put(
+            {"msg_type": TransferMsgType.ABORT, "request_id": "abort-me"}
+        )
+
+        self.assertTrue(
+            scheduler._process_transfer_control_queue(allow_new_work=False)
+        )
+
+        scheduler._handle_transfer_alloc.assert_not_called()
+        scheduler._handle_transfer_abort.assert_called_once()
+        deferred = scheduler._control_queue.get_nowait()
+        self.assertEqual(deferred["request_id"], "new-work")
+
     def test_encoder_forward_runs_on_compute_stream(self):
         scheduler = _SchedulerHarness.make(RoleType.ENCODER)
         scheduler.server_args.resolved_role_device = lambda: "cuda"
@@ -729,6 +787,53 @@ class TestSchedulerTransferStreams(unittest.TestCase):
 
 
 class TestSchedulerWarmupCalibration(unittest.TestCase):
+    def test_calibrated_pool_size_uses_rounded_buddy_slot(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler.server_args.disagg_max_slots_per_instance = 32
+        scheduler.server_args.disagg_transfer_redundancy = 1.25
+        scheduler.server_args.disagg_transfer_pool_size = 256 * 1024 * 1024
+        expected_slot_size = 64 * 1024 * 1024
+        expected_pool_size = int(expected_slot_size * 32 * 1.25)
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-sized"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-sized"
+        fake_manager.pool_data_ptr = 123
+        fake_manager.pool_size = expected_pool_size
+        fake_manager.meta_pool_ptr = 456
+        fake_manager.meta_pool_size = 1024
+        fake_manager.data_shm_name = None
+        fake_manager.meta_shm_name = None
+        fake_manager.host_id = "host-sized"
+        fake_manager.free_slots_count.return_value = 32
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+        ) as buffer_cls, patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer"
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager(
+                measured_transfer_bytes=37_356_032,
+                measured_meta_bytes=1024,
+            )
+
+        buffer_cls.assert_called_once_with(
+            pool_size=expected_pool_size,
+            device="cpu",
+            role_name=RoleType.ENCODER.value,
+        )
+        sent_frames = scheduler._pool_result_push.send_multipart.call_args[0][0]
+        register_msg = decode_transfer_msg(sent_frames)
+        self.assertEqual(register_msg["capacity_slot_size"], expected_slot_size)
+        self.assertEqual(register_msg["capacity_slots"], 32)
+
     def test_schedule_transfer_reconfigure_keeps_max_sizes(self):
         scheduler = _SchedulerHarness.make(RoleType.ENCODER)
         scheduler._transfer_manager = MagicMock()

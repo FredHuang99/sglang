@@ -594,6 +594,13 @@ def launch_pool_disagg_server(
         )
         diffusion_server.start()
         if server_args.warmup:
+            _wait_for_disagg_role_registration(
+                diffusion_server,
+                expected_encoders=len(encoder_gpus),
+                expected_denoisers=len(denoiser_gpus),
+                expected_decoders=len(decoder_gpus),
+                timeout_s=float(server_args.disagg_timeout),
+            )
             _run_disagg_startup_calibration(frontend_endpoint, server_args)
 
         if launch_http_server:
