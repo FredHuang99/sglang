@@ -102,23 +102,23 @@ class TestWanTi2vBenchmarkHelpers(unittest.TestCase):
         )
         self.assertEqual(detect_profile_preset("auto"), "wan2_2_ti2v_5b")
 
-    def test_build_default_request_spec_for_zimage_turbo(self):
+    def test_build_default_request_spec_for_zimage(self):
         request_spec = build_default_request_spec("z_image")
         self.assertEqual(request_spec.endpoint_kind, "image")
-        self.assertEqual(request_spec.payload["model"], "Tongyi-MAI/Z-Image-Turbo")
-        self.assertEqual(request_spec.payload["num_inference_steps"], 9)
-        self.assertEqual(request_spec.payload["guidance_scale"], 0.0)
+        self.assertEqual(request_spec.payload["model"], "Z-Image")
+        self.assertEqual(request_spec.payload["num_inference_steps"], 50)
+        self.assertEqual(request_spec.payload["guidance_scale"], 5.0)
         self.assertEqual(request_spec.payload["response_format"], "url")
         self.assertNotIn("size", request_spec.payload)
 
-    def test_build_default_request_spec_for_zimage_non_turbo(self):
+    def test_build_default_request_spec_for_zimage_turbo_override(self):
         request_spec = build_default_request_spec(
             "z_image",
-            model_override="Tongyi-MAI/Z-Image",
+            model_override="Z-Image-Turbo",
         )
         self.assertEqual(request_spec.endpoint_kind, "image")
-        self.assertEqual(request_spec.payload["num_inference_steps"], 50)
-        self.assertEqual(request_spec.payload["guidance_scale"], 5.0)
+        self.assertEqual(request_spec.payload["num_inference_steps"], 9)
+        self.assertEqual(request_spec.payload["guidance_scale"], 0.0)
 
     def test_apply_request_overrides_ignores_video_only_fields_for_image(self):
         payload = apply_request_overrides(

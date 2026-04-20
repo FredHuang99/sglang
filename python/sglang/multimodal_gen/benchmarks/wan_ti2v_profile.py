@@ -159,7 +159,7 @@ def build_default_request_spec(
 ) -> RequestSpec:
     if profile_preset == "wan2_1_t2v_1_3b":
         sample = WanT2V_1_3B_SamplingParams()
-        model = model_override or "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        model = model_override or "Wan2.1-T2V-1.3B-Diffusers"
         return RequestSpec(
             endpoint_kind="video",
             payload=_default_video_payload(
@@ -170,7 +170,7 @@ def build_default_request_spec(
         )
 
     if profile_preset == "z_image":
-        model = model_override or "Tongyi-MAI/Z-Image-Turbo"
+        model = model_override or "Z-Image"
         return RequestSpec(endpoint_kind="image", payload=_default_zimage_payload(model))
 
     sample = Wan2_2_TI2V_5B_SamplingParam()
