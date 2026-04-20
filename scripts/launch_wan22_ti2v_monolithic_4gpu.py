@@ -15,7 +15,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler-port", type=int, default=30020)
     parser.add_argument("--num-gpus", type=int, default=4)
     parser.add_argument("--base-gpu-id", type=int, default=4)
-    parser.add_argument("--tp-size", type=int, default=4)
+    parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--sp-degree", type=int, default=4)
     parser.add_argument("--ulysses-degree", type=int, default=4)
     parser.add_argument("--ring-degree", type=int, default=1)
