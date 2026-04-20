@@ -191,6 +191,7 @@ async def create_video(
     output_compression: Optional[int] = Form(None),
     extra_body: Optional[str] = Form(None),
 ):
+    request_arrival_time_s = time.time()
     content_type = request.headers.get("content-type", "").lower()
     request_id = generate_request_id()
 
@@ -338,6 +339,8 @@ async def create_video(
         server_args=server_args,
         sampling_params=sampling_params,
     )
+    if batch.metrics is not None:
+        batch.metrics.arrival_time_s = request_arrival_time_s
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs

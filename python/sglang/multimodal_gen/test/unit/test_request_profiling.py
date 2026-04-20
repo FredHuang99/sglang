@@ -8,17 +8,22 @@ import unittest
 from sglang.multimodal_gen.benchmarks.wan_ti2v_profile import (
     apply_request_overrides,
     build_parser,
-    build_submission_schedule,
     build_default_request_spec,
+    build_submission_schedule,
     build_warmup_requests,
     detect_profile_preset,
     disable_cfg_for_request,
     summarize_profile_run,
 )
+from sglang.multimodal_gen.runtime.disaggregation.request_state import (
+    RequestState,
+    RequestTracker,
+)
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.runtime.utils.request_profiling import (
     CsvProfileWriter,
     aggregate_logical_stage_durations,
+    flatten_request_metrics,
     resolve_profile_dir,
 )
 
@@ -51,7 +56,36 @@ class TestRequestProfilingUtils(unittest.TestCase):
         logical = aggregate_logical_stage_durations(metrics)
         self.assertEqual(logical["denoiser"], 50.0)
         self.assertEqual(logical["decoder"], 10.0)
-        self.assertEqual(logical["encoder"], 40.0)
+        self.assertEqual(logical["encoder"], 20.0)
+
+    def test_flatten_request_metrics_exposes_queue_and_unattributed_time(self):
+        metrics = RequestMetrics(request_id="req-queue")
+        metrics.arrival_time_s = 10.0
+        metrics.start_time_s = 12.5
+        metrics.finish_time_s = 15.0
+        metrics.total_duration_ms = 120.0
+        metrics.stages = {
+            "InputValidationStage": 5.0,
+            "DenoisingStage": 80.0,
+            "DecodingStage": 20.0,
+        }
+
+        row = flatten_request_metrics(metrics)
+
+        self.assertEqual(row["queue_duration_ms"], 2500.0)
+        self.assertEqual(row["e2e_duration_ms"], 5000.0)
+        self.assertEqual(row["logical_encoder_duration_ms"], 5.0)
+        self.assertEqual(row["logical_denoiser_duration_ms"], 80.0)
+        self.assertEqual(row["logical_decoder_duration_ms"], 20.0)
+        self.assertEqual(row["unattributed_duration_ms"], 15.0)
+
+    def test_request_tracker_can_preserve_external_arrival_time(self):
+        tracker = RequestTracker()
+        record = tracker.submit("req-disagg", submit_time_s=123.5)
+
+        self.assertEqual(record.submit_time_s, 123.5)
+        self.assertEqual(record.last_transition_time_s, 123.5)
+        self.assertEqual(record.state_timestamps[RequestState.PENDING.value], 123.5)
 
 
 class TestWanTi2vBenchmarkHelpers(unittest.TestCase):

@@ -454,8 +454,12 @@ class DiffusionServer:
         if request_id is None:
             request_id = f"ds-{time.monotonic()}"
 
+        metrics = getattr(req, "metrics", None)
+        request_arrival_time_s = (
+            getattr(metrics, "arrival_time_s", None) if metrics is not None else None
+        )
         try:
-            self._tracker.submit(request_id)
+            self._tracker.submit(request_id, submit_time_s=request_arrival_time_s)
         except ValueError:
             logger.warning("DiffusionServer: duplicate request_id %s", request_id)
             return

@@ -570,8 +570,25 @@ class SchedulerDisaggMixin:
     def _profile_role_update(self: Scheduler, request_id: str, **fields: Any) -> None:
         if self._role_profile_writer is None or self.gpu_id != 0:
             return
-        fields.setdefault("instance_id", getattr(self.server_args, "disagg_instance_id", 0))
-        self._role_profile_writer.update(request_id, **fields)
+        fields.setdefault(
+            "instance_id", getattr(self.server_args, "disagg_instance_id", 0)
+        )
+        record = self._role_profile_writer.update(request_id, **fields)
+        accept_time_s = record.get("role_accept_time_s")
+        start_time_s = record.get("role_start_time_s")
+        if (
+            accept_time_s is not None
+            and start_time_s is not None
+            and "role_queue_duration_ms" not in record
+            and float(start_time_s) >= float(accept_time_s)
+        ):
+            self._role_profile_writer.update(
+                request_id,
+                role_queue_duration_ms=(
+                    float(start_time_s) - float(accept_time_s)
+                )
+                * 1000.0,
+            )
 
     def _profile_role_finalize(
         self: Scheduler,

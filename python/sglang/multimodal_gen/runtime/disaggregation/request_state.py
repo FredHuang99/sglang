@@ -96,11 +96,17 @@ class RequestTracker:
         self._lock = threading.Lock()
         self._requests: dict[str, RequestRecord] = {}
 
-    def submit(self, request_id: str) -> RequestRecord:
+    def submit(
+        self, request_id: str, *, submit_time_s: float | None = None
+    ) -> RequestRecord:
         with self._lock:
             if request_id in self._requests:
                 raise ValueError(f"Duplicate request_id: {request_id}")
-            record = RequestRecord(request_id=request_id)
+            record_kwargs = {}
+            if submit_time_s is not None:
+                record_kwargs["submit_time_s"] = float(submit_time_s)
+                record_kwargs["last_transition_time_s"] = float(submit_time_s)
+            record = RequestRecord(request_id=request_id, **record_kwargs)
             self._requests[request_id] = record
             return record
 

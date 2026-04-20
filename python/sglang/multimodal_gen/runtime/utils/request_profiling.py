@@ -205,17 +205,38 @@ def flatten_request_metrics(metrics) -> dict[str, Any]:
     if metrics is None:
         return {}
 
+    arrival_time_s = getattr(metrics, "arrival_time_s", None)
+    start_time_s = getattr(metrics, "start_time_s", None)
+    finish_time_s = getattr(metrics, "finish_time_s", None)
+    total_duration_ms = getattr(metrics, "total_duration_ms", None)
     row: dict[str, Any] = {
         "request_id": getattr(metrics, "request_id", ""),
-        "arrival_time_s": getattr(metrics, "arrival_time_s", None),
-        "start_time_s": getattr(metrics, "start_time_s", None),
-        "finish_time_s": getattr(metrics, "finish_time_s", None),
-        "total_duration_ms": getattr(metrics, "total_duration_ms", None),
+        "arrival_time_s": arrival_time_s,
+        "start_time_s": start_time_s,
+        "finish_time_s": finish_time_s,
+        "total_duration_ms": total_duration_ms,
     }
+    if (
+        arrival_time_s is not None
+        and start_time_s is not None
+        and start_time_s >= arrival_time_s
+    ):
+        row["queue_duration_ms"] = (start_time_s - arrival_time_s) * 1000.0
+    if (
+        arrival_time_s is not None
+        and finish_time_s is not None
+        and finish_time_s >= arrival_time_s
+    ):
+        row["e2e_duration_ms"] = (finish_time_s - arrival_time_s) * 1000.0
 
     logical = aggregate_logical_stage_durations(metrics)
     for stage_name, duration_ms in logical.items():
         row[f"logical_{stage_name}_duration_ms"] = duration_ms
+    total_stage_duration_ms = sum(logical.values())
+    if total_duration_ms is not None:
+        row["unattributed_duration_ms"] = max(
+            0.0, float(total_duration_ms) - total_stage_duration_ms
+        )
 
     for stage_name, duration_ms in getattr(metrics, "stages", {}).items():
         row[f"raw_stage_{stage_name}_duration_ms"] = duration_ms
@@ -229,11 +250,10 @@ def flatten_request_metrics(metrics) -> dict[str, Any]:
 def aggregate_logical_stage_durations(metrics) -> dict[str, float]:
     stages = dict(getattr(metrics, "stages", {}) or {})
     steps = list(getattr(metrics, "steps", []) or [])
-    total_duration_ms = float(getattr(metrics, "total_duration_ms", 0.0) or 0.0)
 
     decoder_ms = 0.0
     denoiser_ms = 0.0
-    encoder_known_ms = 0.0
+    encoder_ms = 0.0
 
     for stage_name, duration_ms in stages.items():
         stage_key = stage_name.lower()
@@ -243,17 +263,10 @@ def aggregate_logical_stage_durations(metrics) -> dict[str, float]:
         elif "denois" in stage_key:
             denoiser_ms += duration_ms
         else:
-            encoder_known_ms += duration_ms
+            encoder_ms += duration_ms
 
     if denoiser_ms <= 0.0 and steps:
         denoiser_ms = sum(float(step_ms) for step_ms in steps)
-
-    if total_duration_ms > 0.0:
-        encoder_ms = max(0.0, total_duration_ms - denoiser_ms - decoder_ms)
-        if encoder_known_ms > 0.0:
-            encoder_ms = max(encoder_ms, encoder_known_ms)
-    else:
-        encoder_ms = encoder_known_ms
 
     return {
         "encoder": encoder_ms,

@@ -110,6 +110,7 @@ def _build_image_response_kwargs(
 async def generations(
     request: ImageGenerationsRequest,
 ):
+    request_arrival_time_s = time.time()
     request_id = generate_request_id()
     server_args = get_global_server_args()
     ext = choose_output_image_ext(request.output_format, request.background)
@@ -141,6 +142,8 @@ async def generations(
             server_args=server_args,
             sampling_params=sampling,
         )
+        if batch.metrics is not None:
+            batch.metrics.arrival_time_s = request_arrival_time_s
         # Add diffusers_kwargs if provided
         if request.diffusers_kwargs:
             batch.extra["diffusers_kwargs"] = request.diffusers_kwargs
@@ -215,6 +218,7 @@ async def edits(
     upscaling_scale: Optional[int] = Form(4),
     num_frames: int = Form(1),
 ):
+    request_arrival_time_s = time.time()
     request_id = generate_request_id()
     server_args = get_global_server_args()
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
@@ -276,6 +280,8 @@ async def edits(
             server_args=server_args,
             sampling_params=sampling,
         )
+        if batch.metrics is not None:
+            batch.metrics.arrival_time_s = request_arrival_time_s
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch
         )
