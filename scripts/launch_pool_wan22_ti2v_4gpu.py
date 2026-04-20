@@ -36,10 +36,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--encoder-device", choices=["cpu", "cuda"], default="cuda")
     parser.add_argument("--encoder-base-gpu-id", type=int, default=4)
     parser.add_argument("--encoder-num-gpus", type=int, default=4)
+    parser.add_argument(
+        "--encoder-gpu-ids",
+        nargs="+",
+        default=None,
+        help=(
+            "Physical encoder GPU IDs, e.g. --encoder-gpu-ids 0 1 6 7 "
+            "or --encoder-gpu-ids 0,1,6,7. Overrides encoder base/num."
+        ),
+    )
     parser.add_argument("--denoiser-base-gpu-id", type=int, default=4)
     parser.add_argument("--denoiser-num-gpus", type=int, default=4)
+    parser.add_argument(
+        "--denoiser-gpu-ids",
+        nargs="+",
+        default=None,
+        help=(
+            "Physical denoiser GPU IDs, e.g. --denoiser-gpu-ids 0 1 6 7 "
+            "or --denoiser-gpu-ids 0,1,6,7. Overrides denoiser base/num."
+        ),
+    )
     parser.add_argument("--decoder-base-gpu-id", type=int, default=4)
     parser.add_argument("--decoder-num-gpus", type=int, default=4)
+    parser.add_argument(
+        "--decoder-gpu-ids",
+        nargs="+",
+        default=None,
+        help=(
+            "Physical decoder GPU IDs, e.g. --decoder-gpu-ids 0 1 6 7 "
+            "or --decoder-gpu-ids 0,1,6,7. Overrides decoder base/num."
+        ),
+    )
     parser.add_argument("--encoder-tp", type=int, default=None)
     parser.add_argument("--denoiser-sp", type=int, default=None)
     parser.add_argument("--denoiser-ulysses", type=int, default=None)
@@ -96,10 +123,72 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_gpu_ids(values: list[str] | str | None, *, flag_name: str) -> list[int] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part for part in str(value).replace(",", " ").split() if part)
+    if not tokens:
+        raise ValueError(f"{flag_name} requires at least one GPU id.")
+
+    gpu_ids: list[int] = []
+    for token in tokens:
+        try:
+            gpu_id = int(token)
+        except ValueError as exc:
+            raise ValueError(f"{flag_name} contains a non-integer GPU id: {token}") from exc
+        if gpu_id < 0:
+            raise ValueError(f"{flag_name} GPU ids must be non-negative: {gpu_id}")
+        gpu_ids.append(gpu_id)
+
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError(f"{flag_name} contains duplicate GPU ids: {gpu_ids}")
+    return gpu_ids
+
+
 def _build_gpu_group(base_gpu_id: int, num_gpus: int) -> list[int]:
     if num_gpus <= 0:
         return []
     return list(range(base_gpu_id, base_gpu_id + num_gpus))
+
+
+def _resolve_role_gpu_ids(args: argparse.Namespace, role_name: str) -> list[int]:
+    explicit_gpu_ids = _parse_gpu_ids(
+        getattr(args, f"{role_name}_gpu_ids", None),
+        flag_name=f"--{role_name}-gpu-ids",
+    )
+    if explicit_gpu_ids is not None:
+        return explicit_gpu_ids
+    return _build_gpu_group(
+        getattr(args, f"{role_name}_base_gpu_id", 0),
+        getattr(args, f"{role_name}_num_gpus", 0),
+    )
+
+
+def _resolve_encoder_gpu_ids(args: argparse.Namespace) -> list[int]:
+    explicit_gpu_ids = _parse_gpu_ids(
+        getattr(args, "encoder_gpu_ids", None), flag_name="--encoder-gpu-ids"
+    )
+    if args.encoder_device == "cpu":
+        if explicit_gpu_ids is not None:
+            raise ValueError("--encoder-gpu-ids cannot be used with encoder-device=cpu.")
+        return []
+    if explicit_gpu_ids is not None:
+        return explicit_gpu_ids
+    return _build_gpu_group(
+        getattr(args, "encoder_base_gpu_id", 0),
+        getattr(args, "encoder_num_gpus", 0),
+    )
+
+
+def _resolve_role_gpu_count(args: argparse.Namespace, role_name: str) -> int:
+    if role_name == "encoder":
+        return len(_resolve_encoder_gpu_ids(args))
+    return len(_resolve_role_gpu_ids(args, role_name))
 
 
 def _resolve_bind_host(args: argparse.Namespace) -> str:
@@ -112,12 +201,13 @@ def _resolve_encoder_tp(args: argparse.Namespace) -> int:
     if args.encoder_device == "cpu":
         if args.encoder_tp not in (None, 1):
             raise ValueError("encoder_tp must be 1 when encoder-device=cpu.")
+        _resolve_encoder_gpu_ids(args)
         return 1
-    return args.encoder_tp or max(1, args.encoder_num_gpus)
+    return args.encoder_tp or max(1, _resolve_role_gpu_count(args, "encoder"))
 
 
 def _resolve_denoiser_sp(args: argparse.Namespace) -> int:
-    return args.denoiser_sp or max(1, args.denoiser_num_gpus)
+    return args.denoiser_sp or max(1, _resolve_role_gpu_count(args, "denoiser"))
 
 
 def _resolve_denoiser_ulysses(args: argparse.Namespace) -> int:
@@ -125,7 +215,7 @@ def _resolve_denoiser_ulysses(args: argparse.Namespace) -> int:
 
 
 def _resolve_decoder_sp(args: argparse.Namespace) -> int:
-    return args.decoder_sp or max(1, args.decoder_num_gpus)
+    return args.decoder_sp or max(1, _resolve_role_gpu_count(args, "decoder"))
 
 
 def _resolve_role_port(explicit_port: int | None, scheduler_port: int, offset: int) -> int:
@@ -220,20 +310,21 @@ def _build_role_server_args(
     role: RoleType,
     host: str,
     scheduler_port: int,
-    base_gpu_id: int,
-    num_gpus: int,
+    gpu_ids: list[int],
     disagg_role_device: str,
     disagg_server_addr: str,
     transfer_backend: str,
     ib_device: str | None,
 ) -> ServerArgs:
+    is_cpu_role = role == RoleType.ENCODER and disagg_role_device == "cpu"
     kwargs = _build_common_kwargs(args)
     kwargs.update(
         {
             "host": host,
             "scheduler_port": scheduler_port,
-            "num_gpus": num_gpus,
-            "base_gpu_id": base_gpu_id,
+            "num_gpus": 0 if is_cpu_role else len(gpu_ids),
+            "base_gpu_id": gpu_ids[0] if gpu_ids else 0,
+            "gpu_ids": None if is_cpu_role else gpu_ids,
             "disagg_role": role,
             "disagg_server_addr": disagg_server_addr,
             "disagg_role_device": disagg_role_device,
@@ -296,10 +387,10 @@ def _launch_single_host(args: argparse.Namespace) -> None:
     encoder_gpus = (
         [[]]
         if args.encoder_device == "cpu"
-        else [_build_gpu_group(args.encoder_base_gpu_id, args.encoder_num_gpus)]
+        else [_resolve_encoder_gpu_ids(args)]
     )
-    denoiser_gpus = [_build_gpu_group(args.denoiser_base_gpu_id, args.denoiser_num_gpus)]
-    decoder_gpus = [_build_gpu_group(args.decoder_base_gpu_id, args.decoder_num_gpus)]
+    denoiser_gpus = [_resolve_role_gpu_ids(args, "denoiser")]
+    decoder_gpus = [_resolve_role_gpu_ids(args, "decoder")]
 
     print("Launching pooled disaggregated Wan2.2 TI2V server")
     print(f"  model_path      : {args.model_path}")
@@ -335,14 +426,15 @@ def _launch_split_machine_a(args: argparse.Namespace) -> None:
     encoder_port = _resolve_role_port(args.encoder_scheduler_port, args.scheduler_port, 100)
     denoiser_port = _resolve_role_port(args.denoiser_scheduler_port, args.scheduler_port, 200)
     server_addr = f"tcp://{args.machine_a_host}:{args.scheduler_port}"
+    encoder_gpu_ids = _resolve_encoder_gpu_ids(args)
+    denoiser_gpu_ids = _resolve_role_gpu_ids(args, "denoiser")
 
     encoder_args = _build_role_server_args(
         args,
         role=RoleType.ENCODER,
         host=args.machine_a_host,
         scheduler_port=encoder_port,
-        base_gpu_id=args.encoder_base_gpu_id,
-        num_gpus=0 if args.encoder_device == "cpu" else args.encoder_num_gpus,
+        gpu_ids=encoder_gpu_ids,
         disagg_role_device=args.encoder_device,
         disagg_server_addr=server_addr,
         transfer_backend=_resolve_role_transfer_backend(args, "encoder"),
@@ -353,8 +445,7 @@ def _launch_split_machine_a(args: argparse.Namespace) -> None:
         role=RoleType.DENOISER,
         host=args.machine_a_host,
         scheduler_port=denoiser_port,
-        base_gpu_id=args.denoiser_base_gpu_id,
-        num_gpus=args.denoiser_num_gpus,
+        gpu_ids=denoiser_gpu_ids,
         disagg_role_device=args.disagg_role_device,
         disagg_server_addr=server_addr,
         transfer_backend=_resolve_role_transfer_backend(args, "denoiser"),
@@ -375,6 +466,8 @@ def _launch_split_machine_a(args: argparse.Namespace) -> None:
     print(f"  server_addr     : {server_addr}")
     print(f"  encoder_port    : {encoder_port} ({args.encoder_device})")
     print(f"  denoiser_port   : {denoiser_port}")
+    print(f"  encoder_gpus    : {encoder_gpu_ids if encoder_gpu_ids else 'cpu'}")
+    print(f"  denoiser_gpus   : {denoiser_gpu_ids}")
     print(
         "  encoder         : "
         + ("cpu" if args.encoder_device == "cpu" else f"tp={_resolve_encoder_tp(args)}")
@@ -396,13 +489,13 @@ def _launch_split_machine_a(args: argparse.Namespace) -> None:
 
 def _launch_split_machine_b(args: argparse.Namespace) -> None:
     decoder_port = _resolve_role_port(args.decoder_scheduler_port, args.scheduler_port, 300)
+    decoder_gpu_ids = _resolve_role_gpu_ids(args, "decoder")
     decoder_args = _build_role_server_args(
         args,
         role=RoleType.DECODER,
         host=args.machine_b_host,
         scheduler_port=decoder_port,
-        base_gpu_id=args.decoder_base_gpu_id,
-        num_gpus=args.decoder_num_gpus,
+        gpu_ids=decoder_gpu_ids,
         disagg_role_device=args.disagg_role_device,
         disagg_server_addr=f"tcp://{args.machine_a_host}:{args.scheduler_port}",
         transfer_backend=_resolve_role_transfer_backend(args, "decoder"),
@@ -414,7 +507,7 @@ def _launch_split_machine_b(args: argparse.Namespace) -> None:
     print(f"  machine_b_host  : {args.machine_b_host}")
     print(f"  decoder_port    : {decoder_port}")
     print(f"  decoder         : sp={_resolve_decoder_sp(args)}")
-    print(f"  decoder_gpus    : {_build_gpu_group(args.decoder_base_gpu_id, args.decoder_num_gpus)}")
+    print(f"  decoder_gpus    : {decoder_gpu_ids}")
     print(f"  server_warmup   : {args.warmup}")
 
     launch_disagg_role(decoder_args)

@@ -15,6 +15,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scheduler-port", type=int, default=30020)
     parser.add_argument("--num-gpus", type=int, default=4)
     parser.add_argument("--base-gpu-id", type=int, default=4)
+    parser.add_argument(
+        "--gpu-ids",
+        nargs="+",
+        default=None,
+        help=(
+            "Physical GPU IDs to expose, e.g. --gpu-ids 0 1 6 7 or "
+            "--gpu-ids 0,1,6,7. Overrides --base-gpu-id/--num-gpus."
+        ),
+    )
     parser.add_argument("--tp-size", type=int, default=1)
     parser.add_argument("--sp-degree", type=int, default=4)
     parser.add_argument("--ulysses-degree", type=int, default=4)
@@ -58,6 +67,42 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _parse_gpu_ids(values: list[str] | str | None, *, flag_name: str) -> list[int] | None:
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part for part in str(value).replace(",", " ").split() if part)
+    if not tokens:
+        raise ValueError(f"{flag_name} requires at least one GPU id.")
+
+    gpu_ids: list[int] = []
+    for token in tokens:
+        try:
+            gpu_id = int(token)
+        except ValueError as exc:
+            raise ValueError(f"{flag_name} contains a non-integer GPU id: {token}") from exc
+        if gpu_id < 0:
+            raise ValueError(f"{flag_name} GPU ids must be non-negative: {gpu_id}")
+        gpu_ids.append(gpu_id)
+
+    if len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError(f"{flag_name} contains duplicate GPU ids: {gpu_ids}")
+    return gpu_ids
+
+
+def _resolve_gpu_group(args: argparse.Namespace) -> list[int]:
+    explicit_gpu_ids = _parse_gpu_ids(args.gpu_ids, flag_name="--gpu-ids")
+    if explicit_gpu_ids is not None:
+        return explicit_gpu_ids
+    if args.num_gpus <= 0:
+        raise ValueError("--num-gpus must be positive.")
+    return list(range(args.base_gpu_id, args.base_gpu_id + args.num_gpus))
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -66,6 +111,9 @@ def main() -> None:
 
     if args.disable_warmup:
         args.warmup = False
+
+    gpu_group = _resolve_gpu_group(args)
+    args.num_gpus = len(gpu_group)
 
     dit_parallel_size = args.tp_size * args.sp_degree
     if args.num_gpus < dit_parallel_size:
@@ -76,7 +124,6 @@ def main() -> None:
             "--tp-size 4 --sp-degree 1 for 4-GPU TP."
         )
 
-    gpu_group = list(range(args.base_gpu_id, args.base_gpu_id + args.num_gpus))
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpu_group)
 
     from sglang.multimodal_gen.runtime.launch_server import launch_server
@@ -111,7 +158,8 @@ def main() -> None:
     print(f"  model_id        : {args.model_id}")
     print(f"  host/http_port  : {args.host}:{args.port}")
     print(f"  scheduler_port  : {args.scheduler_port}")
-    print(f"  visible_gpus    : {gpu_group}")
+    print(f"  physical_gpus   : {gpu_group}")
+    print(f"  logical_ranks   : {list(range(args.num_gpus))}")
     print(
         "  topology        : "
         f"monolithic tp={args.tp_size} sp={args.sp_degree} "

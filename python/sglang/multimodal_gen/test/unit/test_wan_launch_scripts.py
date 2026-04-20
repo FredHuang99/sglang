@@ -30,6 +30,28 @@ class TestWanLaunchScripts(unittest.TestCase):
         self.assertFalse(mono_args.warmup)
         self.assertFalse(disagg_args.warmup)
 
+    def test_monolithic_gpu_ids_override_base_gpu_range(self):
+        args = self.monolithic_module.build_parser().parse_args(
+            ["--gpu-ids", "0", "1", "6", "7"]
+        )
+        self.assertEqual(self.monolithic_module._resolve_gpu_group(args), [0, 1, 6, 7])
+
+    def test_gpu_ids_accept_comma_separated_values(self):
+        args = self.disagg_module.build_parser().parse_args(
+            ["--denoiser-gpu-ids", "0,1,6,7"]
+        )
+        self.assertEqual(
+            self.disagg_module._resolve_role_gpu_ids(args, "denoiser"),
+            [0, 1, 6, 7],
+        )
+
+    def test_cpu_encoder_rejects_explicit_gpu_ids(self):
+        args = self.disagg_module.build_parser().parse_args(
+            ["--encoder-device", "cpu", "--encoder-gpu-ids", "0", "1", "6", "7"]
+        )
+        with self.assertRaisesRegex(ValueError, "encoder-gpu-ids"):
+            self.disagg_module._resolve_encoder_gpu_ids(args)
+
     def test_cpu_encoder_forces_tp_one(self):
         args = argparse.Namespace(
             encoder_device="cpu",

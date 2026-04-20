@@ -409,6 +409,34 @@ class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
 
         self._assert_starts_and_closes_before_recv(events, [0, 1, 2, 3])
 
+    def test_standalone_role_launch_uses_explicit_gpu_ids(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(events)
+        server_args = _make_server_args(
+            disagg_role=RoleType.DENOISER,
+            disagg_server_addr="tcp://127.0.0.1:30020",
+            scheduler_port=31020,
+            num_gpus=4,
+            base_gpu_id=4,
+            gpu_ids=[0, 1, 6, 7],
+            disagg_role_device="cuda",
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.mp.get_context",
+            return_value=pool_ctx,
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server.ServerArgs.from_kwargs",
+            side_effect=lambda **kwargs: _make_fake_role_args(**kwargs),
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server.is_port_available",
+            return_value=True,
+        ):
+            launch_disagg_role(server_args)
+
+        worker_ids = [event[2] for event in events if event[0] == "start"]
+        self.assertEqual(worker_ids, [0, 1, 6, 7])
+
     def test_worker_group_cleanup_terminates_started_processes_on_ready_failure(self):
         events = []
         pool_ctx = _FakeSpawnContext(events, reader_specs={1: {"error": EOFError()}})

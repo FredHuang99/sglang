@@ -54,6 +54,35 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 
+def _normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
+    if gpu_ids is None:
+        return None
+    if isinstance(gpu_ids, str):
+        values = [gpu_ids]
+    else:
+        values = list(gpu_ids)
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part for part in str(value).replace(",", " ").split() if part)
+    if not tokens:
+        return []
+
+    parsed: list[int] = []
+    for token in tokens:
+        try:
+            gpu_id = int(token)
+        except ValueError as exc:
+            raise ValueError(f"--gpu-ids contains a non-integer GPU id: {token}") from exc
+        if gpu_id < 0:
+            raise ValueError(f"--gpu-ids GPU ids must be non-negative: {gpu_id}")
+        parsed.append(gpu_id)
+
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"--gpu-ids contains duplicate GPU ids: {parsed}")
+    return parsed
+
+
 class Backend(str, Enum):
     """
     Enumeration for different model backends.
@@ -110,6 +139,7 @@ class ServerArgs:
     # Parallelism
     num_gpus: int = 1
     base_gpu_id: int = 0
+    gpu_ids: list[int] | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -641,6 +671,7 @@ class ServerArgs:
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
             self.disagg_role = RoleType.from_string(self.disagg_role)
+        self.gpu_ids = _normalize_gpu_ids(self.gpu_ids)
 
         # 1. adjust parameters
         self._adjust_parameters()
@@ -727,6 +758,16 @@ class ServerArgs:
             default=ServerArgs.base_gpu_id,
             help="The starting GPU ID for this instance. Used with --disagg-role "
             "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
+        )
+        parser.add_argument(
+            "--gpu-ids",
+            nargs="+",
+            default=None,
+            help=(
+                "Physical GPU IDs for this instance, e.g. --gpu-ids 0 1 6 7 "
+                "or --gpu-ids 0,1,6,7. Overrides --base-gpu-id for "
+                "standalone disagg roles."
+            ),
         )
         parser.add_argument(
             "--tp-size",

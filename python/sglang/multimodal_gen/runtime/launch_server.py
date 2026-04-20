@@ -518,6 +518,7 @@ def launch_pool_disagg_server(
                     "disagg_mode": True,
                     "disagg_instance_id": inst_idx,
                     "disagg_role_device": role_device,
+                    "gpu_ids": None if is_cpu_instance else gpu_ids,
                     "pool_work_endpoint": work_eps[inst_idx],
                     "pool_control_endpoint": control_eps[inst_idx],
                     "pool_control_advertised_endpoint": control_eps[inst_idx],
@@ -823,6 +824,8 @@ def launch_disagg_role(server_args: ServerArgs):
         "ulysses_degree": role_par["ulysses_degree"],
         "ring_degree": role_par["ring_degree"],
     }
+    if server_args.gpu_ids is not None:
+        role_overrides["num_gpus"] = len(server_args.gpu_ids)
 
     base_dict = {
         f.name: getattr(server_args, f.name) for f in dataclasses.fields(server_args)
@@ -835,15 +838,23 @@ def launch_disagg_role(server_args: ServerArgs):
     is_cpu_role = (
         role_type == RoleType.ENCODER and role_args.resolved_role_device() == "cpu"
     )
-    num_workers = 1 if is_cpu_role else max(role_args.num_gpus, 1)
-    base_gpu_id = server_args.base_gpu_id
     pool_ctx = mp.get_context("spawn")
 
-    worker_ids = (
-        [0]
-        if is_cpu_role
-        else [base_gpu_id + rank_idx for rank_idx in range(num_workers)]
-    )
+    explicit_gpu_ids = role_args.gpu_ids
+    if is_cpu_role:
+        if explicit_gpu_ids:
+            raise ValueError("--gpu-ids cannot be used when encoder role runs on CPU.")
+        worker_ids = [0]
+    elif explicit_gpu_ids is not None:
+        if not explicit_gpu_ids:
+            raise ValueError("--gpu-ids cannot be empty for CUDA disagg roles.")
+        worker_ids = explicit_gpu_ids
+    else:
+        worker_ids = [
+            server_args.base_gpu_id + rank_idx
+            for rank_idx in range(max(role_args.num_gpus, 1))
+        ]
+    num_workers = len(worker_ids)
     processes = _spawn_disagg_worker_group(
         pool_ctx=pool_ctx,
         worker_ids=worker_ids,
@@ -855,9 +866,10 @@ def launch_disagg_role(server_args: ServerArgs):
     )
 
     logger.info(
-        "Role %s ready (%d worker(s), work=%s, control=%s, device=%s)",
+        "Role %s ready (%d worker(s), worker_ids=%s, work=%s, control=%s, device=%s)",
         role_type.value.upper(),
         num_workers,
+        worker_ids,
         work_endpoint,
         control_endpoint,
         role_args.resolved_role_device(),
