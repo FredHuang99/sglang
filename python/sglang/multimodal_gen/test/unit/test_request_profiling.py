@@ -7,8 +7,10 @@ import unittest
 
 from sglang.multimodal_gen.benchmarks.wan_ti2v_profile import (
     apply_request_overrides,
+    build_parser,
     build_submission_schedule,
     build_default_request_spec,
+    build_warmup_requests,
     detect_profile_preset,
     disable_cfg_for_request,
     summarize_profile_run,
@@ -147,6 +149,28 @@ class TestWanTi2vBenchmarkHelpers(unittest.TestCase):
             ),
             [10.0, 12.0, 14.0],
         )
+
+    def test_build_warmup_requests_reuses_payload_without_client_schedule(self):
+        payload = {"model": "Wan2.2-TI2V-5B-Diffusers", "size": "1280x704"}
+        requests = build_warmup_requests(
+            payload=payload,
+            num_warmup_requests=3,
+            start_time_s=12.5,
+        )
+        self.assertEqual([request.index for request in requests], [-1, -2, -3])
+        self.assertEqual(
+            [request.scheduled_submit_time_s for request in requests],
+            [12.5, 12.5, 12.5],
+        )
+        self.assertEqual(requests[0].payload, payload)
+        self.assertIsNot(requests[0].payload, payload)
+
+    def test_parser_defaults_to_three_warmup_requests(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["--deployment-mode", "monolithic", "--traffic-mode", "burst"]
+        )
+        self.assertEqual(args.num_warmup_requests, 3)
 
     def test_monolithic_summary_finds_runtime_csv_in_sibling_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:

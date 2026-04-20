@@ -304,6 +304,25 @@ def build_benchmark_requests(
     ]
 
 
+def build_warmup_requests(
+    *,
+    payload: dict[str, Any],
+    num_warmup_requests: int,
+    start_time_s: float | None = None,
+) -> list[BenchmarkRequest]:
+    if num_warmup_requests <= 0:
+        return []
+    start = time.time() if start_time_s is None else start_time_s
+    return [
+        BenchmarkRequest(
+            index=-(index + 1),
+            scheduled_submit_time_s=start,
+            payload=dict(payload),
+        )
+        for index in range(num_warmup_requests)
+    ]
+
+
 async def _submit_and_poll_video_request(
     *,
     session,
@@ -435,6 +454,49 @@ async def run_benchmark_async(
                 for request in benchmark_requests
             ]
         return await asyncio.gather(*tasks)
+
+
+async def run_warmup_async(
+    *,
+    base_url: str,
+    endpoint_kind: Literal["video", "image"],
+    payload: dict[str, Any],
+    num_warmup_requests: int,
+    poll_interval_s: float,
+) -> list[dict[str, Any]]:
+    if num_warmup_requests <= 0:
+        return []
+
+    import aiohttp
+
+    rows: list[dict[str, Any]] = []
+    connector = aiohttp.TCPConnector(limit=1)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        warmup_requests = build_warmup_requests(
+            payload=payload,
+            num_warmup_requests=num_warmup_requests,
+        )
+        for index, request in enumerate(warmup_requests):
+            if endpoint_kind == "image":
+                row = await _submit_image_request(
+                    session=session,
+                    base_url=base_url,
+                    request=request,
+                )
+            else:
+                row = await _submit_and_poll_video_request(
+                    session=session,
+                    base_url=base_url,
+                    request=request,
+                    poll_interval_s=poll_interval_s,
+                )
+            if row.get("status") != "completed":
+                error = row.get("error") or row.get("status")
+                raise RuntimeError(
+                    f"Warmup request {index + 1}/{num_warmup_requests} failed: {error}"
+                )
+            rows.append(row)
+    return rows
 
 
 def read_csv_rows(file_path: str) -> list[dict[str, str]]:
@@ -634,6 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=30010)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--num-requests", type=int, default=24)
+    parser.add_argument("--num-warmup-requests", type=int, default=3)
     parser.add_argument("--requests-per-minute", type=float, default=24.0)
     parser.add_argument("--poll-interval-s", type=float, default=2.0)
     parser.add_argument("--request-config", default=None)
@@ -693,6 +756,16 @@ def main(argv: list[str] | None = None) -> int:
             endpoint_kind=request_spec.endpoint_kind,
         )
 
+    warmup_rows = asyncio.run(
+        run_warmup_async(
+            base_url=base_url,
+            endpoint_kind=request_spec.endpoint_kind,
+            payload=payload,
+            num_warmup_requests=args.num_warmup_requests,
+            poll_interval_s=args.poll_interval_s,
+        )
+    )
+
     rows = asyncio.run(
         run_benchmark_async(
             base_url=base_url,
@@ -724,6 +797,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"profile_preset={resolved_preset}")
     print(f"endpoint_kind={request_spec.endpoint_kind}")
     print(f"disable_cfg={args.disable_cfg}")
+    print(f"num_warmup_requests={len(warmup_rows)}")
     for line in summary_lines:
         print(line)
     return 0

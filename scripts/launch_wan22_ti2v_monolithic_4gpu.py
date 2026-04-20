@@ -20,7 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ulysses-degree", type=int, default=4)
     parser.add_argument("--ring-degree", type=int, default=1)
     parser.add_argument("--log-level", type=str, default="info")
-    parser.add_argument("--warmup", action="store_true", default=True)
+    parser.add_argument("--warmup", action="store_true", default=False)
     parser.add_argument("--disable-warmup", action="store_true")
     parser.add_argument("--profile-enabled", action="store_true")
     parser.add_argument("--profile-output-dir", type=str, default="/data/profile")
@@ -67,6 +67,15 @@ def main() -> None:
     if args.disable_warmup:
         args.warmup = False
 
+    dit_parallel_size = args.tp_size * args.sp_degree
+    if args.num_gpus < dit_parallel_size:
+        raise ValueError(
+            "Invalid monolithic parallelism: "
+            f"num_gpus={args.num_gpus} but tp_size*sp_degree={dit_parallel_size}. "
+            "Use --tp-size 1 --sp-degree 4 for 4-GPU SP, or "
+            "--tp-size 4 --sp-degree 1 for 4-GPU TP."
+        )
+
     gpu_group = list(range(args.base_gpu_id, args.base_gpu_id + args.num_gpus))
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(gpu) for gpu in gpu_group)
 
@@ -103,7 +112,14 @@ def main() -> None:
     print(f"  host/http_port  : {args.host}:{args.port}")
     print(f"  scheduler_port  : {args.scheduler_port}")
     print(f"  visible_gpus    : {gpu_group}")
-    print("  topology        : monolithic sp=4 ulysses=4 ring=1")
+    print(
+        "  topology        : "
+        f"monolithic tp={args.tp_size} sp={args.sp_degree} "
+        f"ulysses={args.ulysses_degree} ring={args.ring_degree}"
+    )
+    print(f"  server_warmup   : {args.warmup}")
+    if not args.warmup:
+        print("  benchmark warmup: use benchmark --num-warmup-requests")
     print(f"  text_offload    : {args.text_encoder_cpu_offload}")
     print(f"  image_offload   : {args.image_encoder_cpu_offload}")
     print(f"  vae_offload     : {args.vae_cpu_offload}")

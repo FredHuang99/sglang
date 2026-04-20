@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disagg-max-slots-per-instance", type=int, default=8)
     parser.add_argument("--disagg-timeout", type=int, default=3600)
     parser.add_argument("--disagg-downstream-wait-timeout", type=int, default=3600)
-    parser.add_argument("--warmup", action="store_true", default=True)
+    parser.add_argument("--warmup", action="store_true", default=False)
     parser.add_argument("--disable-warmup", action="store_true")
     parser.add_argument("--profile-enabled", action="store_true")
     parser.add_argument("--profile-output-dir", type=str, default="/data/profile")
@@ -319,6 +319,9 @@ def _launch_single_host(args: argparse.Namespace) -> None:
     if args.profile_enabled:
         print(f"  profile_output  : {args.profile_output_dir}")
         print(f"  profile_run_id  : {args.profile_run_id}")
+    print(f"  server_warmup   : {args.warmup}")
+    if not args.warmup:
+        print("  benchmark warmup: use benchmark --num-warmup-requests")
 
     launch_pool_disagg_server(
         server_args,
@@ -381,6 +384,9 @@ def _launch_split_machine_a(args: argparse.Namespace) -> None:
         f"sp={_resolve_denoiser_sp(args)} ulysses={_resolve_denoiser_ulysses(args)} ring={args.denoiser_ring}"
     )
     print(f"  decoder_remote  : tcp://{args.machine_b_host}:{_resolve_role_port(args.decoder_scheduler_port, args.scheduler_port, 300)}")
+    print(f"  server_warmup   : {args.warmup}")
+    if not args.warmup:
+        print("  benchmark warmup: use benchmark --num-warmup-requests")
 
     try:
         launch_disagg_server(head_args)
@@ -409,6 +415,7 @@ def _launch_split_machine_b(args: argparse.Namespace) -> None:
     print(f"  decoder_port    : {decoder_port}")
     print(f"  decoder         : sp={_resolve_decoder_sp(args)}")
     print(f"  decoder_gpus    : {_build_gpu_group(args.decoder_base_gpu_id, args.decoder_num_gpus)}")
+    print(f"  server_warmup   : {args.warmup}")
 
     launch_disagg_role(decoder_args)
 

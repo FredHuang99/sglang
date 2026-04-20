@@ -19,7 +19,16 @@ def _load_script_module(script_name: str):
 class TestWanLaunchScripts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls.monolithic_module = _load_script_module(
+            "launch_wan22_ti2v_monolithic_4gpu.py"
+        )
         cls.disagg_module = _load_script_module("launch_pool_wan22_ti2v_4gpu.py")
+
+    def test_launchers_disable_server_warmup_by_default(self):
+        mono_args = self.monolithic_module.build_parser().parse_args([])
+        disagg_args = self.disagg_module.build_parser().parse_args([])
+        self.assertFalse(mono_args.warmup)
+        self.assertFalse(disagg_args.warmup)
 
     def test_cpu_encoder_forces_tp_one(self):
         args = argparse.Namespace(
