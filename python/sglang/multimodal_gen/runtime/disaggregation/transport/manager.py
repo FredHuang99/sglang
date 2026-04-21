@@ -616,6 +616,10 @@ class DiffusionTransferManager:
             self._pending_receives[request_id] = pending
         return pending
 
+    def get_pending_receive(self, request_id: str) -> PendingReceive | None:
+        with self._lock:
+            return self._pending_receives.get(request_id)
+
     def free_receive_slot(self, request_id: str) -> None:
         with self._lock:
             pending = self._pending_receives.pop(request_id, None)

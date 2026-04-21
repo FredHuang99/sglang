@@ -605,11 +605,14 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             "host_id": "host-a",
             "free_preallocated_slots": [],
         }
+        self.server._encoder_free_slots[0] = 0
         self.server._denoiser_free_slots[0] = 0
         self.server._transfer_state["r-done"] = _TransferRequestState(
             sender_role=RoleType.ENCODER.value,
             receiver_role=RoleType.DENOISER.value,
+            sender_instance=0,
             receiver_instance=0,
+            sender_slot_released=False,
             receiver_pool_ptr=0x3000,
             receiver_slot_offset=256,
             receiver_slot_size=4096,
@@ -633,7 +636,19 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
 
         self.server._handle_transfer_done(done_msg, RoleType.DENOISER)
         self.server._handle_transfer_done(done_msg, RoleType.DENOISER)
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferPushedMsg(
+                    request_id="r-done",
+                    success=True,
+                    receiver_role=RoleType.DENOISER.value,
+                    receiver_instance=0,
+                )
+            ),
+            RoleType.ENCODER,
+        )
 
+        self.assertEqual(self.server._encoder_free_slots[0], 1)
         self.assertEqual(self.server._denoiser_free_slots[0], 0)
         self.assertEqual(self.server._denoiser_peers[0]["free_preallocated_slots"], [])
         self.assertEqual(len(self.server._decoder_tta), 1)

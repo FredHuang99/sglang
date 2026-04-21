@@ -346,6 +346,42 @@ class TestSchedulerTransferAlloc(unittest.TestCase):
         self.assertEqual(accepted_msg["meta_size"], 2048)
         self.assertIsInstance(accepted_msg["receiver_meta_slot_offset"], int)
 
+    def test_duplicate_alloc_reuses_existing_pending_receive_slot(self):
+        msg = {
+            "msg_type": TransferMsgType.ALLOC,
+            "request_id": "req-alloc-dup",
+            "data_size": 4096,
+            "meta_size": 2048,
+            "source_control_endpoint": "tcp://upstream-ctrl",
+            "source_host_id": "host-a",
+        }
+
+        self.scheduler._handle_transfer_alloc(msg)
+        first_slot_offset = self.tm.get_receive_slot_offset("req-alloc-dup")
+        first_meta_offset = self.tm.get_receive_meta_offset("req-alloc-dup")
+
+        self.tm.send_direct_message.reset_mock()
+        self.scheduler._pool_result_push.send_multipart.reset_mock()
+        self.scheduler._handle_transfer_alloc(msg)
+
+        self.assertEqual(
+            self.tm.get_receive_slot_offset("req-alloc-dup"), first_slot_offset
+        )
+        self.assertEqual(
+            self.tm.get_receive_meta_offset("req-alloc-dup"), first_meta_offset
+        )
+        self.tm.send_direct_message.assert_called_once()
+        _endpoint, peer_msg = self.tm.send_direct_message.call_args[0]
+        self.assertEqual(peer_msg.dest_shm_offset, first_slot_offset)
+        self.assertEqual(peer_msg.meta_dest_shm_offset, first_meta_offset)
+        sent_frames = self.scheduler._pool_result_push.send_multipart.call_args[0][0]
+        accepted_msg = decode_transfer_msg(sent_frames)
+        self.assertEqual(accepted_msg["msg_type"], TransferMsgType.ALLOC_ACCEPTED)
+        self.assertEqual(accepted_msg["receiver_slot_offset"], first_slot_offset)
+        self.assertEqual(
+            accepted_msg["receiver_meta_slot_offset"], first_meta_offset
+        )
+
     def test_alloc_rejects_stale_receiver_session(self):
         msg = {
             "msg_type": TransferMsgType.ALLOC,

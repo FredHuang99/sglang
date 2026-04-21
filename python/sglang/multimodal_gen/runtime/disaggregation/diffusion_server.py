@@ -1638,6 +1638,13 @@ class DiffusionServer:
                 "DiffusionServer transfer: no state for pushed %s", request_id
             )
             return
+        if p2p.decoder_dispatch_enqueued and not p2p.receiver_role:
+            logger.debug(
+                "DiffusionServer transfer: ignoring pushed for %s while decoder "
+                "handoff is waiting for receiver allocation",
+                request_id,
+            )
+            return
 
         source_session_id = msg.get("source_session_id", "")
         dest_session_id = msg.get("dest_session_id", "")
@@ -1653,7 +1660,14 @@ class DiffusionServer:
             )
         )
         if stale:
-            logger.warning(
+            log_stale = (
+                logger.debug
+                if not p2p.receiver_role
+                or p2p.receiver_instance < 0
+                or p2p.decoder_dispatch_enqueued
+                else logger.warning
+            )
+            log_stale(
                 "DiffusionServer transfer: ignoring stale pushed for %s "
                 "(src=%s/%s, dst=%s/%s, role=%s/%s, instance=%s/%s)",
                 request_id,
@@ -1780,6 +1794,9 @@ class DiffusionServer:
                     )
                     self._transfer_state.pop(request_id, None)
                     return
+                if not p2p.transfer_completion_processed:
+                    self._release_sender_slot_if_needed(p2p, record)
+                    p2p.transfer_completion_processed = True
                 self._clear_receiver_dispatch(p2p)
                 p2p.sender_role = RoleType.DENOISER.value
                 p2p.sender_session_id = staged_session_id

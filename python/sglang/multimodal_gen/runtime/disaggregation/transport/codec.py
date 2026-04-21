@@ -186,9 +186,11 @@ def unpack_tensors(
 
     for i, desc in enumerate(descriptors):
         frame = parts[i + 1]
-        buf = frame.buffer if hasattr(frame, "buffer") else bytes(frame)
+        raw_buf = frame.buffer if hasattr(frame, "buffer") else bytes(frame)
+        # torch.frombuffer warns on read-only buffers; make a writable view first,
+        # then clone so the tensor lifetime is decoupled from the ZMQ frame.
+        buf = bytearray(raw_buf)
         dtype = str_to_dtype(desc.dtype)
-        # clone() to own the memory (decouple from ZMQ buffer lifetime)
         tensor = torch.frombuffer(buf, dtype=dtype).reshape(desc.shape).clone()
         if device != "cpu" and device != torch.device("cpu"):
             tensor = tensor.to(device)

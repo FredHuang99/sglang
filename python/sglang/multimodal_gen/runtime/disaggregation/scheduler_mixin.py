@@ -1985,8 +1985,8 @@ class SchedulerDisaggMixin:
         request_id = msg["request_id"]
         if self._is_request_aborted(request_id):
             return
-        data_size = msg.get("data_size", 0)
-        meta_size = msg.get("meta_size", 0)
+        data_size = int(msg.get("data_size", 0) or 0)
+        meta_size = int(msg.get("meta_size", 0) or 0)
         source_host_id = msg.get("source_host_id", "")
         preallocated_slot = msg.get("preallocated_slot")
         current_session_id = (
@@ -2001,8 +2001,14 @@ class SchedulerDisaggMixin:
                 else:
                     self._transfer_manager.free_receive_slot(request_id)
 
-        def reject_alloc(reason: str, *, retryable: bool) -> None:
-            release_pending()
+        def reject_alloc(
+            reason: str,
+            *,
+            retryable: bool,
+            release_pending_slot: bool = True,
+        ) -> None:
+            if release_pending_slot:
+                release_pending()
             self._pool_result_push.send_multipart(
                 encode_transfer_msg(
                     TransferAllocRejectMsg(
@@ -2033,8 +2039,57 @@ class SchedulerDisaggMixin:
             )
             return
 
-        pending = None
-        if preallocated_slot is not None:
+        pending = self._transfer_manager.get_pending_receive(request_id)
+        using_existing_pending = pending is not None
+        if pending is not None:
+            slot_id = (
+                preallocated_slot.get("slot_id")
+                if preallocated_slot is not None
+                else None
+            )
+            if preallocated_slot is not None and pending.slot_id != slot_id:
+                logger.warning(
+                    "Transfer %s: duplicate alloc for %s references a different "
+                    "preallocated slot (%s != %s)",
+                    self._disagg_role.value.upper(),
+                    request_id,
+                    pending.slot_id,
+                    slot_id,
+                )
+                reject_alloc(
+                    "duplicate alloc preallocated slot mismatch",
+                    retryable=True,
+                    release_pending_slot=False,
+                )
+                return
+            if pending.slot is None:
+                if data_size > 0:
+                    reject_alloc(
+                        "duplicate alloc data slot missing",
+                        retryable=True,
+                        release_pending_slot=False,
+                    )
+                    return
+            elif pending.slot.size < data_size:
+                reject_alloc(
+                    "duplicate alloc data slot too small",
+                    retryable=True,
+                    release_pending_slot=False,
+                )
+                return
+            if pending.meta_slot is None or pending.meta_slot.size < meta_size:
+                reject_alloc(
+                    "duplicate alloc meta slot too small",
+                    retryable=True,
+                    release_pending_slot=False,
+                )
+                return
+            logger.debug(
+                "Transfer %s: reusing existing receive slot for duplicate alloc %s",
+                self._disagg_role.value.upper(),
+                request_id,
+            )
+        elif preallocated_slot is not None:
             slot_id = preallocated_slot.get("slot_id")
             prealloc_info = self._preallocated_slots.get(slot_id)
             if prealloc_info is None:
@@ -2101,9 +2156,22 @@ class SchedulerDisaggMixin:
                 self._disagg_role.value.upper(),
                 request_id,
             )
-            reject_alloc("missing source control endpoint", retryable=False)
+            reject_alloc(
+                "missing source control endpoint",
+                retryable=False,
+                release_pending_slot=not using_existing_pending,
+            )
             return
 
+        prealloc_slot_id = (
+            pending.slot_id
+            if pending.slot_id is not None
+            else (
+                preallocated_slot.get("slot_id")
+                if preallocated_slot is not None
+                else None
+            )
+        )
         same_host = source_host_id == self._transfer_manager.host_id
         peer_msg = TransferPeerInfoMsg(
             request_id=request_id,
@@ -2132,7 +2200,7 @@ class SchedulerDisaggMixin:
             dest_shm_offset=pending.slot.offset if pending.slot is not None else 0,
             meta_dest_shm_name=self._transfer_manager.meta_shm_name if same_host else None,
             meta_dest_shm_offset=pending.meta_slot.offset,
-            prealloc_slot_id=preallocated_slot.get("slot_id") if preallocated_slot is not None else None,
+            prealloc_slot_id=prealloc_slot_id,
         )
         try:
             self._transfer_manager.send_direct_message(
@@ -2145,7 +2213,11 @@ class SchedulerDisaggMixin:
                 self._disagg_role.value.upper(),
                 request_id,
             )
-            reject_alloc("failed to send peer info to upstream", retryable=False)
+            reject_alloc(
+                "failed to send peer info to upstream",
+                retryable=False,
+                release_pending_slot=not using_existing_pending,
+            )
             return
 
         self._pool_result_push.send_multipart(
@@ -2163,11 +2235,7 @@ class SchedulerDisaggMixin:
                     receiver_meta_slot_size=pending.meta_slot.size,
                     data_size=data_size,
                     meta_size=meta_size,
-                    prealloc_slot_id=(
-                        preallocated_slot.get("slot_id")
-                        if preallocated_slot is not None
-                        else None
-                    ),
+                    prealloc_slot_id=prealloc_slot_id,
                 )
             )
         )
