@@ -341,6 +341,32 @@ class TestSchedulerTransferAlloc(unittest.TestCase):
         self.assertEqual(accepted_msg["msg_type"], TransferMsgType.ALLOC_ACCEPTED)
         self.assertEqual(accepted_msg["receiver_role"], RoleType.DENOISER.value)
         self.assertEqual(accepted_msg["request_id"], "req-alloc-1")
+        self.assertEqual(accepted_msg["receiver_session_id"], self.engine.session_id)
+        self.assertEqual(accepted_msg["data_size"], 4096)
+        self.assertEqual(accepted_msg["meta_size"], 2048)
+        self.assertIsInstance(accepted_msg["receiver_meta_slot_offset"], int)
+
+    def test_alloc_rejects_stale_receiver_session(self):
+        msg = {
+            "msg_type": TransferMsgType.ALLOC,
+            "request_id": "req-stale-session",
+            "data_size": 4096,
+            "meta_size": 512,
+            "receiver_session_id": "old-receiver-session",
+            "source_control_endpoint": "tcp://upstream-ctrl",
+            "source_host_id": "host-a",
+        }
+
+        self.scheduler._handle_transfer_alloc(msg)
+
+        self.assertIsNone(self.tm.get_receive_slot_addr("req-stale-session"))
+        self.tm.send_direct_message.assert_not_called()
+        sent_frames = self.scheduler._pool_result_push.send_multipart.call_args[0][0]
+        reply = decode_transfer_msg(sent_frames)
+        self.assertEqual(reply["msg_type"], TransferMsgType.ALLOC_REJECT)
+        self.assertTrue(reply["retryable"])
+        self.assertEqual(reply["reason"], "receiver session changed before allocation")
+        self.assertEqual(reply["receiver_session_id"], self.engine.session_id)
 
     def test_missing_source_control_endpoint_reports_non_retryable_alloc_reject(self):
         msg = {
@@ -503,6 +529,94 @@ class TestSchedulerTransferReady(unittest.TestCase):
         self.scheduler._run_prefetched_compute_item.assert_called_once()
         item = self.scheduler._run_prefetched_compute_item.call_args[0][0]
         self.assertEqual(item.request_id, "ready-direct")
+
+
+class TestSchedulerTransferReadyValidation(unittest.TestCase):
+    def test_prefetch_rejects_stale_ready_before_metadata_read(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler._fail_inbound_transfer = MagicMock()
+
+        class _FakeManager:
+            session_id = "new-session"
+
+            def validate_receive_ready(self, *args, **kwargs):
+                return "receiver session mismatch"
+
+            def load_transfer_async(self, *args, **kwargs):
+                raise AssertionError("metadata should not be read for stale READY")
+
+        scheduler._transfer_manager = _FakeManager()
+        msg = {
+            "msg_type": TransferMsgType.READY,
+            "request_id": "stale-ready",
+            "dest_session_id": "old-session",
+            "prealloc_slot_id": 7,
+        }
+
+        item = scheduler._prefetch_transfer_ready(msg)
+
+        self.assertIsNone(item)
+        scheduler._fail_inbound_transfer.assert_called_once()
+        args = scheduler._fail_inbound_transfer.call_args[0]
+        self.assertEqual(args[0], "stale-ready")
+        self.assertIn("Transfer ready validation failed", args[1])
+        self.assertEqual(args[2], 7)
+
+    def test_prefetch_metadata_magic_failure_is_reported_gracefully(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler._fail_inbound_transfer = MagicMock()
+
+        class _FakeManager:
+            session_id = "receiver-session"
+
+            def validate_receive_ready(self, *args, **kwargs):
+                return None
+
+            def load_transfer_async(self, *args, **kwargs):
+                raise ValueError("Invalid transfer metadata magic")
+
+        scheduler._transfer_manager = _FakeManager()
+        msg = {
+            "msg_type": TransferMsgType.READY,
+            "request_id": "bad-metadata",
+            "dest_session_id": "receiver-session",
+        }
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.time.sleep"
+        ):
+            item = scheduler._prefetch_transfer_ready(msg)
+
+        self.assertIsNone(item)
+        scheduler._fail_inbound_transfer.assert_called_once()
+        self.assertIn(
+            "Invalid transfer metadata",
+            scheduler._fail_inbound_transfer.call_args[0][1],
+        )
+
+    def test_invalid_denoiser_scalar_fields_fail_before_compute(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler._fail_inbound_transfer = MagicMock()
+        scheduler._release_pending_receive = MagicMock()
+        scheduler._build_disagg_compute_req = MagicMock()
+        item = _PendingInboundTransfer(
+            request_id="bad-denoiser",
+            role_name="DENOISER",
+            scalar_fields={"request_id": "bad-denoiser", "num_inference_steps": None},
+            tensors={},
+            load_event=None,
+            prealloc_slot_id=11,
+        )
+
+        scheduler._run_prefetched_compute_item(item, is_multi_rank=False)
+
+        scheduler._fail_inbound_transfer.assert_called_once()
+        self.assertIn(
+            "invalid num_inference_steps",
+            scheduler._fail_inbound_transfer.call_args[0][1],
+        )
+        scheduler._release_pending_receive.assert_not_called()
+        scheduler._build_disagg_compute_req.assert_not_called()
 
 
 class TestSchedulerTransferStreams(unittest.TestCase):
@@ -870,6 +984,24 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
         self.assertTrue(scheduler._transfer_reconfigured)
         self.assertEqual(scheduler._preallocated_slots, {})
 
+    def test_apply_pending_transfer_reconfigure_waits_for_local_queues(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        manager = MagicMock()
+        manager.has_active_transfers.return_value = False
+        scheduler._transfer_manager = manager
+        scheduler._pending_transfer_reconfigure = {
+            "transfer_bytes": 4096,
+            "meta_bytes": 1024,
+        }
+        scheduler._control_queue.put({"msg_type": TransferMsgType.READY})
+        scheduler._init_disagg_transfer_manager = MagicMock()
+
+        rebuilt = scheduler._maybe_apply_pending_transfer_reconfigure()
+
+        self.assertFalse(rebuilt)
+        manager.cleanup.assert_not_called()
+        scheduler._init_disagg_transfer_manager.assert_not_called()
+
     def test_encoder_warmup_send_completion_schedules_reconfigure(self):
         scheduler = _SchedulerHarness.make(RoleType.ENCODER)
         scheduler._transfer_manager = MagicMock()
@@ -928,7 +1060,7 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
         item = _PendingInboundTransfer(
             request_id="warmup-dec",
             role_name="DECODER",
-            scalar_fields={"is_warmup": True},
+            scalar_fields={"request_id": "warmup-dec", "is_warmup": True},
             tensors={"latents": torch.randn(1, 4, 4, 4)},
             load_event=None,
             prealloc_slot_id=9,
@@ -941,6 +1073,28 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
 
 
 class TestSchedulerTensorDistribution(unittest.TestCase):
+    def test_build_disagg_req_routes_sampling_fields_through_sampling_params(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+
+        req = scheduler._build_disagg_req(
+            {
+                "request_id": "req-sampling",
+                "num_inference_steps": 50,
+                "width": 1280,
+                "height": 704,
+                "seed": 123,
+            },
+            {},
+        )
+
+        self.assertEqual(req.request_id, "req-sampling")
+        self.assertEqual(req.sampling_params.request_id, "req-sampling")
+        self.assertEqual(req.num_inference_steps, 50)
+        self.assertEqual(req.sampling_params.num_inference_steps, 50)
+        self.assertEqual(req.width, 1280)
+        self.assertEqual(req.height, 704)
+        self.assertIsNotNone(req.generator)
+
     def test_denoiser_stage_managed_sp_shards_and_marks_req(self):
         scheduler = _SchedulerHarness.make(RoleType.DENOISER)
         scheduler.server_args.sp_degree = 2

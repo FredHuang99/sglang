@@ -166,6 +166,20 @@ def _is_tensor_like(value) -> bool:
     return False
 
 
+def _queue_like_empty(value) -> bool:
+    if value is None:
+        return True
+    if hasattr(value, "empty"):
+        try:
+            return bool(value.empty())
+        except Exception:
+            return False
+    try:
+        return len(value) == 0
+    except TypeError:
+        return False
+
+
 def _to_json_serializable(value):
     if isinstance(value, torch.Tensor):
         return value.tolist()
@@ -874,13 +888,29 @@ class SchedulerDisaggMixin:
         pending["meta_bytes"] = max(int(pending["meta_bytes"]), int(measured_meta_bytes or 0))
         self._pending_transfer_reconfigure = pending
 
+    def _transfer_runtime_idle_for_reconfigure(self: Scheduler) -> bool:
+        if self._transfer_manager is not None and self._transfer_manager.has_active_transfers():
+            return False
+        return all(
+            _queue_like_empty(queue_like)
+            for queue_like in (
+                self._control_queue,
+                self._transferring_queue,
+                self._swapping_queue,
+                self._compute_ready_queue,
+                self._swap_out_queue,
+                self._send_ready_queue,
+                self._outbound_staging_retry_queue,
+            )
+        )
+
     def _maybe_apply_pending_transfer_reconfigure(self: Scheduler) -> bool:
         pending = self._pending_transfer_reconfigure
         if (
             self.gpu_id != 0
             or pending is None
             or self._transfer_manager is None
-            or self._transfer_manager.has_active_transfers()
+            or not self._transfer_runtime_idle_for_reconfigure()
         ):
             return False
 
@@ -961,6 +991,20 @@ class SchedulerDisaggMixin:
     ) -> None:
         if not self._role_has_outbound_transfer():
             return
+        source_session_id = (
+            getattr(self._transfer_manager, "session_id", "")
+            if self._transfer_manager is not None
+            else ""
+        )
+        dest_session_id = getattr(peer_info, "dest_session_id", "")
+        receiver_role = getattr(peer_info, "receiver_role", "")
+        receiver_instance = getattr(peer_info, "receiver_instance", -1)
+        if not isinstance(source_session_id, str):
+            source_session_id = ""
+        if not isinstance(dest_session_id, str):
+            dest_session_id = ""
+        if not isinstance(receiver_role, str):
+            receiver_role = ""
         if not success or staged is None:
             self._profile_role_finalize(
                 request_id,
@@ -972,8 +1016,10 @@ class SchedulerDisaggMixin:
             failed_msg = TransferFailedMsg(
                 request_id=request_id,
                 error=error_msg or "transfer_sync failed",
-                receiver_role=getattr(peer_info, "receiver_role", ""),
-                receiver_instance=getattr(peer_info, "receiver_instance", -1),
+                receiver_role=receiver_role,
+                receiver_instance=receiver_instance,
+                source_session_id=source_session_id,
+                dest_session_id=dest_session_id,
                 prealloc_slot_id=getattr(peer_info, "prealloc_slot_id", None),
             )
             try:
@@ -993,6 +1039,10 @@ class SchedulerDisaggMixin:
                         request_id=request_id,
                         success=False,
                         error=error_msg or "transfer_sync failed",
+                        source_session_id=source_session_id,
+                        dest_session_id=dest_session_id,
+                        receiver_role=receiver_role,
+                        receiver_instance=receiver_instance,
                     )
                 )
             )
@@ -1005,6 +1055,14 @@ class SchedulerDisaggMixin:
         )
         ready_msg = TransferReadyMsg(
             request_id=request_id,
+            source_session_id=source_session_id,
+            dest_session_id=dest_session_id,
+            dest_slot_offset=getattr(peer_info, "dest_shm_offset", 0),
+            dest_meta_slot_offset=getattr(peer_info, "meta_dest_shm_offset", 0),
+            data_size=getattr(peer_info, "transfer_size", 0),
+            meta_size=getattr(peer_info, "meta_transfer_size", 0),
+            receiver_role=receiver_role,
+            receiver_instance=receiver_instance,
             prealloc_slot_id=getattr(peer_info, "prealloc_slot_id", None),
         )
         try:
@@ -1030,6 +1088,10 @@ class SchedulerDisaggMixin:
                         request_id=request_id,
                         success=False,
                         error="failed to notify downstream ready",
+                        source_session_id=source_session_id,
+                        dest_session_id=dest_session_id,
+                        receiver_role=receiver_role,
+                        receiver_instance=receiver_instance,
                     )
                 )
             )
@@ -1037,7 +1099,15 @@ class SchedulerDisaggMixin:
 
         self._pool_result_push.send_multipart(
             encode_transfer_msg(
-                TransferPushedMsg(request_id=request_id, success=True, error=None)
+                TransferPushedMsg(
+                    request_id=request_id,
+                    success=True,
+                    error=None,
+                    source_session_id=source_session_id,
+                    dest_session_id=dest_session_id,
+                    receiver_role=receiver_role,
+                    receiver_instance=receiver_instance,
+                )
             )
         )
         self._profile_role_finalize(
@@ -1058,7 +1128,58 @@ class SchedulerDisaggMixin:
                     max(int(inbound_sizes[1]), int(staged.meta_size)),
                 )
 
-    def _prefetch_transfer_ready(self: Scheduler, msg: dict) -> _PendingInboundTransfer:
+    def _fail_inbound_transfer(
+        self: Scheduler,
+        request_id: str,
+        error: str,
+        prealloc_slot_id: int | None = None,
+    ) -> None:
+        if not request_id:
+            return
+        self._remember_aborted_request(request_id)
+        self._release_pending_receive(request_id, prealloc_slot_id)
+        self._warmup_inbound_sizes.pop(request_id, None)
+        self._profile_role_finalize(request_id, status="failed", error=error)
+        if self._pool_result_push is None:
+            return
+        if self._disagg_role == RoleType.DENOISER:
+            self._pool_result_push.send_multipart(
+                encode_transfer_msg(TransferDoneMsg(request_id=request_id, error=error))
+            )
+        elif self._disagg_role == RoleType.DECODER:
+            send_tensors(
+                self._pool_result_push,
+                {},
+                {"request_id": request_id, "error": error},
+            )
+
+    def _validate_inbound_scalar_fields(
+        self: Scheduler, request_id: str, scalar_fields: dict[str, Any]
+    ) -> str | None:
+        scalar_request_id = scalar_fields.get("request_id")
+        if not scalar_request_id:
+            return "missing request_id in transfer metadata"
+        if scalar_request_id != request_id:
+            return (
+                f"request_id mismatch in transfer metadata: "
+                f"ready={request_id}, metadata={scalar_request_id}"
+            )
+        if self._disagg_role == RoleType.DENOISER:
+            num_steps = scalar_fields.get("num_inference_steps")
+            if (
+                isinstance(num_steps, bool)
+                or not isinstance(num_steps, int)
+                or num_steps <= 0
+            ):
+                return (
+                    "invalid num_inference_steps in transfer metadata: "
+                    f"{num_steps!r}"
+                )
+        return None
+
+    def _prefetch_transfer_ready(
+        self: Scheduler, msg: dict
+    ) -> _PendingInboundTransfer | None:
         """Start receiver-side H2D/load and stash loaded tensors for later distribution."""
         request_id = msg["request_id"]
         role_name = self._disagg_role.value.upper()
@@ -1068,11 +1189,62 @@ class SchedulerDisaggMixin:
 
         prealloc_slot_id = msg.get("prealloc_slot_id")
         local_device = self._disagg_local_device()
-        tensors, scalar_fields, load_event = self._transfer_manager.load_transfer_async(
-            request_id,
-            device=local_device,
-            stream=self._swap_in_stream,
-        )
+        if hasattr(type(self._transfer_manager), "validate_receive_ready"):
+            validation_error = self._transfer_manager.validate_receive_ready(
+                request_id,
+                dest_session_id=msg.get("dest_session_id"),
+                dest_slot_offset=msg.get("dest_slot_offset")
+                if "dest_slot_offset" in msg
+                else None,
+                dest_meta_slot_offset=msg.get("dest_meta_slot_offset")
+                if "dest_meta_slot_offset" in msg
+                else None,
+                data_size=msg.get("data_size") if "data_size" in msg else None,
+                meta_size=msg.get("meta_size") if "meta_size" in msg else None,
+            )
+            if validation_error:
+                error = f"Transfer ready validation failed: {validation_error}"
+                logger.error(
+                    "Transfer %s: %s for %s",
+                    role_name,
+                    error,
+                    request_id,
+                )
+                self._fail_inbound_transfer(request_id, error, prealloc_slot_id)
+                return None
+
+        last_error = None
+        for attempt in range(3):
+            try:
+                tensors, scalar_fields, load_event = (
+                    self._transfer_manager.load_transfer_async(
+                        request_id,
+                        device=local_device,
+                        stream=self._swap_in_stream,
+                    )
+                )
+                break
+            except ValueError as exc:
+                last_error = exc
+                if "Invalid transfer metadata magic" not in str(exc):
+                    raise
+                if attempt < 2:
+                    time.sleep(0.001 * (attempt + 1))
+                    continue
+                error = f"Invalid transfer metadata after READY: {exc}"
+                logger.error(
+                    "Transfer %s: %s for %s",
+                    role_name,
+                    error,
+                    request_id,
+                )
+                self._fail_inbound_transfer(request_id, error, prealloc_slot_id)
+                return None
+        else:
+            error = f"failed to load transfer after READY: {last_error}"
+            self._fail_inbound_transfer(request_id, error, prealloc_slot_id)
+            return None
+
         if scalar_fields.get("is_warmup"):
             transfer_bytes = estimate_transfer_bytes(tensors)
             meta_bytes = estimate_transfer_meta_bytes(
@@ -1196,6 +1368,8 @@ class SchedulerDisaggMixin:
             return True
 
         item = self._prefetch_transfer_ready(msg)
+        if item is None:
+            return True
         self._swapping_queue.put(item)
         return True
 
@@ -1226,6 +1400,16 @@ class SchedulerDisaggMixin:
         is_multi_rank: bool,
     ) -> None:
         if self._is_request_aborted(item.request_id):
+            return
+        scalar_error = self._validate_inbound_scalar_fields(
+            item.request_id, item.scalar_fields
+        )
+        if scalar_error is not None:
+            self._fail_inbound_transfer(
+                item.request_id,
+                scalar_error,
+                item.prealloc_slot_id,
+            )
             return
         self._release_pending_receive(item.request_id, item.prealloc_slot_id)
 
@@ -1805,6 +1989,9 @@ class SchedulerDisaggMixin:
         meta_size = msg.get("meta_size", 0)
         source_host_id = msg.get("source_host_id", "")
         preallocated_slot = msg.get("preallocated_slot")
+        current_session_id = (
+            self._transfer_manager.session_id if self._transfer_manager is not None else ""
+        )
 
         def release_pending() -> None:
             if self._transfer_manager is not None:
@@ -1822,6 +2009,7 @@ class SchedulerDisaggMixin:
                         request_id=request_id,
                         receiver_role=self._disagg_role.value,
                         receiver_instance=getattr(self.server_args, "disagg_instance_id", 0),
+                        receiver_session_id=current_session_id,
                         retryable=retryable,
                         reason=reason,
                         prealloc_slot_id=(
@@ -1832,6 +2020,18 @@ class SchedulerDisaggMixin:
                     )
                 )
             )
+
+        expected_session_id = msg.get("receiver_session_id", "")
+        if (
+            expected_session_id
+            and current_session_id
+            and expected_session_id != current_session_id
+        ):
+            reject_alloc(
+                "receiver session changed before allocation",
+                retryable=True,
+            )
+            return
 
         pending = None
         if preallocated_slot is not None:
@@ -1954,6 +2154,15 @@ class SchedulerDisaggMixin:
                     request_id=request_id,
                     receiver_role=self._disagg_role.value,
                     receiver_instance=getattr(self.server_args, "disagg_instance_id", 0),
+                    receiver_session_id=current_session_id,
+                    receiver_slot_offset=(
+                        pending.slot.offset if pending.slot is not None else 0
+                    ),
+                    receiver_slot_size=pending.slot.size if pending.slot is not None else 0,
+                    receiver_meta_slot_offset=pending.meta_slot.offset,
+                    receiver_meta_slot_size=pending.meta_slot.size,
+                    data_size=data_size,
+                    meta_size=meta_size,
                     prealloc_slot_id=(
                         preallocated_slot.get("slot_id")
                         if preallocated_slot is not None
@@ -1981,6 +2190,24 @@ class SchedulerDisaggMixin:
         request_id = msg["request_id"]
         error = msg.get("error", "transfer failed")
         prealloc_slot_id = msg.get("prealloc_slot_id")
+        dest_session_id = msg.get("dest_session_id", "")
+        current_session_id = (
+            self._transfer_manager.session_id if self._transfer_manager is not None else ""
+        )
+        if (
+            dest_session_id
+            and current_session_id
+            and dest_session_id != current_session_id
+        ):
+            logger.warning(
+                "Transfer %s: ignoring stale FAILED for %s "
+                "(msg session=%s, current=%s)",
+                self._disagg_role.value.upper(),
+                request_id,
+                dest_session_id,
+                current_session_id,
+            )
+            return
         self._remember_aborted_request(request_id)
         self._release_pending_receive(request_id, prealloc_slot_id)
         self._profile_role_finalize(request_id, status="failed", error=error)
@@ -2019,6 +2246,8 @@ class SchedulerDisaggMixin:
             return
 
         item = self._prefetch_transfer_ready(msg)
+        if item is None:
+            return
         self._wait_transfer_event_on_compute_stream(item.load_event)
         self._run_prefetched_compute_item(item, is_multi_rank=False)
 
@@ -2062,7 +2291,8 @@ class SchedulerDisaggMixin:
         for key in extra_keys:
             req.extra[key[len("_extra_") :]] = scalar_fields.pop(key)
         # Overlay scalar fields from the transfer message
-        req.__dict__.update(scalar_fields)
+        for key, value in scalar_fields.items():
+            setattr(req, key, value)
         # Set tensor fields
         for key, value in tensors.items():
             setattr(req, key, value)

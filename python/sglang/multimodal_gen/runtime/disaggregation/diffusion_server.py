@@ -201,6 +201,10 @@ class DiffusionServer:
         if p2p.handoff_started_at is None:
             p2p.handoff_started_at = timestamp
 
+    @staticmethod
+    def _session_matches(observed: str | None, expected: str | None) -> bool:
+        return not observed or not expected or observed == expected
+
     @property
     def tracker(self) -> RequestTracker:
         return self._tracker
@@ -1057,6 +1061,7 @@ class DiffusionServer:
             request_id=request_id,
             data_size=p2p.data_size,
             meta_size=p2p.meta_size,
+            receiver_session_id=p2p.receiver_session_id,
             source_role=p2p.sender_role,
             source_instance=p2p.sender_instance,
             source_control_endpoint=p2p.sender_control_endpoint,
@@ -1212,6 +1217,16 @@ class DiffusionServer:
             receiver_role != p2p.receiver_role
             or receiver_instance != p2p.receiver_instance
         ):
+            return
+        receiver_session_id = msg.get("receiver_session_id", "")
+        if not self._session_matches(receiver_session_id, p2p.receiver_session_id):
+            logger.warning(
+                "DiffusionServer: stale alloc reject for %s "
+                "(msg session=%s, expected=%s)",
+                request_id,
+                receiver_session_id,
+                p2p.receiver_session_id,
+            )
             return
 
         record = self._tracker.get(request_id)
@@ -1509,6 +1524,30 @@ class DiffusionServer:
         ):
             return
 
+        receiver_session_id = msg.get("receiver_session_id", "")
+        if not self._session_matches(receiver_session_id, p2p.receiver_session_id):
+            logger.warning(
+                "DiffusionServer: stale alloc accepted for %s "
+                "(msg session=%s, expected=%s)",
+                request_id,
+                receiver_session_id,
+                p2p.receiver_session_id,
+            )
+            return
+
+        if "receiver_slot_offset" in msg:
+            p2p.receiver_slot_offset = int(msg.get("receiver_slot_offset") or 0)
+        if "receiver_slot_size" in msg:
+            p2p.receiver_slot_size = int(msg.get("receiver_slot_size") or 0)
+        if "receiver_meta_slot_offset" in msg:
+            p2p.receiver_meta_slot_offset = int(
+                msg.get("receiver_meta_slot_offset") or 0
+            )
+        if "receiver_meta_slot_size" in msg:
+            p2p.receiver_meta_slot_size = int(msg.get("receiver_meta_slot_size") or 0)
+        if msg.get("prealloc_slot_id") is not None:
+            p2p.prealloc_slot_id = msg.get("prealloc_slot_id")
+
         p2p.alloc_accepted = True
         p2p.downstream_wait_since = None
         self._set_transfer_phase(p2p, TransferPhase.SENDING)
@@ -1527,10 +1566,43 @@ class DiffusionServer:
             return
         encoder_idx = record.encoder_instance if record.encoder_instance is not None else 0
         encoder_peer = self._encoder_peers.get(encoder_idx, {})
+        staged_session_id = msg.get("session_id", "")
+        expected_session_id = encoder_peer.get("session_id", "")
+        if not self._session_matches(staged_session_id, expected_session_id):
+            logger.warning(
+                "DiffusionServer transfer: stale staged payload for %s "
+                "(msg session=%s, expected=%s)",
+                request_id,
+                staged_session_id,
+                expected_session_id,
+            )
+            if record.encoder_instance is not None:
+                self._release_role_slot(RoleType.ENCODER, record.encoder_instance)
+            control_endpoint = encoder_peer.get("control_endpoint", "")
+            if control_endpoint:
+                try:
+                    self._send_control_message(
+                        control_endpoint,
+                        TransferAbortMsg(
+                            request_id=request_id,
+                            reason="stale encoder transfer session",
+                            source="stale_staged",
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        "DiffusionServer: failed to abort stale staged sender"
+                    )
+            self._complete_terminal(
+                request_id,
+                RequestState.FAILED,
+                "Stale encoder transfer session after transfer buffer reconfigure",
+            )
+            return
 
         p2p = _TransferRequestState(
             sender_role=RoleType.ENCODER.value,
-            sender_session_id=msg.get("session_id", ""),
+            sender_session_id=staged_session_id,
             sender_pool_ptr=msg.get("pool_ptr", 0),
             sender_slot_offset=msg.get("slot_offset", 0),
             sender_meta_pool_ptr=msg.get("meta_pool_ptr", 0),
@@ -1564,6 +1636,35 @@ class DiffusionServer:
         if p2p is None:
             logger.warning(
                 "DiffusionServer transfer: no state for pushed %s", request_id
+            )
+            return
+
+        source_session_id = msg.get("source_session_id", "")
+        dest_session_id = msg.get("dest_session_id", "")
+        receiver_role = msg.get("receiver_role", "")
+        receiver_instance = msg.get("receiver_instance", -1)
+        stale = (
+            not self._session_matches(source_session_id, p2p.sender_session_id)
+            or not self._session_matches(dest_session_id, p2p.receiver_session_id)
+            or (receiver_role and receiver_role != p2p.receiver_role)
+            or (
+                receiver_instance != -1
+                and receiver_instance != p2p.receiver_instance
+            )
+        )
+        if stale:
+            logger.warning(
+                "DiffusionServer transfer: ignoring stale pushed for %s "
+                "(src=%s/%s, dst=%s/%s, role=%s/%s, instance=%s/%s)",
+                request_id,
+                source_session_id,
+                p2p.sender_session_id,
+                dest_session_id,
+                p2p.receiver_session_id,
+                receiver_role,
+                p2p.receiver_role,
+                receiver_instance,
+                p2p.receiver_instance,
             )
             return
 
@@ -1625,6 +1726,8 @@ class DiffusionServer:
                     self._release_receiver_slot_if_needed(p2p, record)
 
             if error:
+                if p2p is not None:
+                    self._release_sender_slot_if_needed(p2p, record)
                 self._complete_terminal(
                     request_id,
                     RequestState.FAILED,
@@ -1643,9 +1746,43 @@ class DiffusionServer:
                     return
                 denoiser_idx = record.denoiser_instance if record else 0
                 denoiser_peer = self._denoiser_peers.get(denoiser_idx, {})
+                staged_session_id = msg.get("session_id", "")
+                expected_session_id = denoiser_peer.get("session_id", "")
+                if not self._session_matches(staged_session_id, expected_session_id):
+                    logger.warning(
+                        "DiffusionServer transfer: stale denoiser staged payload for %s "
+                        "(msg session=%s, expected=%s)",
+                        request_id,
+                        staged_session_id,
+                        expected_session_id,
+                    )
+                    self._release_sender_slot_if_needed(p2p, record)
+                    self._release_receiver_slot_if_needed(p2p, record)
+                    control_endpoint = denoiser_peer.get("control_endpoint", "")
+                    if control_endpoint:
+                        try:
+                            self._send_control_message(
+                                control_endpoint,
+                                TransferAbortMsg(
+                                    request_id=request_id,
+                                    reason="stale denoiser transfer session",
+                                    source="stale_staged",
+                                ),
+                            )
+                        except Exception:
+                            logger.exception(
+                                "DiffusionServer: failed to abort stale denoiser sender"
+                            )
+                    self._complete_terminal(
+                        request_id,
+                        RequestState.FAILED,
+                        "Stale denoiser transfer session after transfer buffer reconfigure",
+                    )
+                    self._transfer_state.pop(request_id, None)
+                    return
                 self._clear_receiver_dispatch(p2p)
                 p2p.sender_role = RoleType.DENOISER.value
-                p2p.sender_session_id = msg.get("session_id", "")
+                p2p.sender_session_id = staged_session_id
                 p2p.sender_pool_ptr = msg.get("pool_ptr", 0)
                 p2p.sender_slot_offset = msg.get("slot_offset", 0)
                 p2p.sender_meta_pool_ptr = msg.get("meta_pool_ptr", 0)
@@ -1685,6 +1822,8 @@ class DiffusionServer:
                 self._release_receiver_slot_if_needed(p2p, record)
 
             if error:
+                if p2p is not None:
+                    self._release_sender_slot_if_needed(p2p, record)
                 self._complete_terminal(
                     request_id,
                     RequestState.FAILED,

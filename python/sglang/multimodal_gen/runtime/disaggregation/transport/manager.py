@@ -654,6 +654,68 @@ class DiffusionTransferManager:
             return None
         return pending.meta_slot.offset
 
+    def validate_receive_ready(
+        self,
+        request_id: str,
+        *,
+        dest_session_id: str | None = None,
+        dest_slot_offset: int | None = None,
+        dest_meta_slot_offset: int | None = None,
+        data_size: int | None = None,
+        meta_size: int | None = None,
+    ) -> str | None:
+        """Validate that a READY message targets the current pending receive slot.
+
+        READY can arrive after a warmup-driven transfer-manager resize. In that
+        case request_id alone is not enough: the new manager may have a fresh,
+        zeroed slot for the same request while an older sender session is still
+        finishing. Return a human-readable error instead of letting callers read
+        unrelated metadata bytes.
+        """
+        if dest_session_id and dest_session_id != self.session_id:
+            return (
+                f"receiver session mismatch: ready={dest_session_id}, "
+                f"current={self.session_id}"
+            )
+
+        with self._lock:
+            pending = self._pending_receives.get(request_id)
+
+        if pending is None:
+            return f"no pending receive slot for {request_id}"
+
+        if pending.slot is None:
+            if data_size is not None and int(data_size) > 0:
+                return f"data slot missing for non-empty transfer: ready={data_size}"
+        else:
+            if dest_slot_offset is not None and int(dest_slot_offset) != int(
+                pending.slot.offset
+            ):
+                return (
+                    f"data slot offset mismatch: ready={dest_slot_offset}, "
+                    f"pending={pending.slot.offset}"
+                )
+            if data_size is not None and int(data_size) > int(pending.slot.size):
+                return (
+                    f"data size exceeds receive slot: ready={data_size}, "
+                    f"slot={pending.slot.size}"
+                )
+
+        if dest_meta_slot_offset is not None and pending.meta_slot is not None:
+            if int(dest_meta_slot_offset) != int(pending.meta_slot.offset):
+                return (
+                    f"metadata slot offset mismatch: ready={dest_meta_slot_offset}, "
+                    f"pending={pending.meta_slot.offset}"
+                )
+        if meta_size is not None and pending.meta_slot is not None:
+            if int(meta_size) > int(pending.meta_slot.size):
+                return (
+                    f"metadata size exceeds receive slot: ready={meta_size}, "
+                    f"slot={pending.meta_slot.size}"
+                )
+
+        return None
+
     def get_staged_info(self, request_id: str) -> StagedTransfer | None:
         with self._lock:
             return self._staged.get(request_id)

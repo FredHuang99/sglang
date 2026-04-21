@@ -54,6 +54,7 @@ class TransferAllocMsg:
     request_id: str = ""
     data_size: int = 0
     meta_size: int = 0
+    receiver_session_id: str = ""
     source_role: str = ""
     source_instance: int = -1
     source_control_endpoint: str = ""
@@ -67,6 +68,10 @@ class TransferPushedMsg:
     request_id: str = ""
     success: bool = True
     error: str | None = None
+    source_session_id: str = ""
+    dest_session_id: str = ""
+    receiver_role: str = ""
+    receiver_instance: int = -1
 
 
 @dataclass
@@ -75,6 +80,13 @@ class TransferAllocAcceptedMsg:
     request_id: str = ""
     receiver_role: str = ""
     receiver_instance: int = -1
+    receiver_session_id: str = ""
+    receiver_slot_offset: int = 0
+    receiver_slot_size: int = 0
+    receiver_meta_slot_offset: int = 0
+    receiver_meta_slot_size: int = 0
+    data_size: int = 0
+    meta_size: int = 0
     prealloc_slot_id: int | None = None
 
 
@@ -84,6 +96,7 @@ class TransferAllocRejectMsg:
     request_id: str = ""
     receiver_role: str = ""
     receiver_instance: int = -1
+    receiver_session_id: str = ""
     retryable: bool = True
     reason: str = ""
     prealloc_slot_id: int | None = None
@@ -114,6 +127,14 @@ class TransferPeerInfoMsg:
 class TransferReadyMsg:
     msg_type: str = TransferMsgType.READY
     request_id: str = ""
+    source_session_id: str = ""
+    dest_session_id: str = ""
+    dest_slot_offset: int = 0
+    dest_meta_slot_offset: int = 0
+    data_size: int = 0
+    meta_size: int = 0
+    receiver_role: str = ""
+    receiver_instance: int = -1
     prealloc_slot_id: int | None = None
 
 
@@ -124,6 +145,8 @@ class TransferFailedMsg:
     error: str = ""
     receiver_role: str = ""
     receiver_instance: int = -1
+    source_session_id: str = ""
+    dest_session_id: str = ""
     prealloc_slot_id: int | None = None
 
 

@@ -100,6 +100,43 @@ class TestStaging(unittest.TestCase):
         self.assertIsNone(mgr.get_staged_info("r1"))
 
 
+class TestReceiveReadyValidation(unittest.TestCase):
+    def setUp(self):
+        MockTransferEngine.reset()
+        self.addCleanup(MockTransferEngine.reset)
+
+    def test_validate_receive_ready_checks_session_offsets_and_sizes(self):
+        mgr = _make_manager(self, session_id="receiver-session")
+        pending = mgr.allocate_receive_slot("req-ready", 4096, 1024)
+        self.assertIsNotNone(pending)
+
+        self.assertIsNone(
+            mgr.validate_receive_ready(
+                "req-ready",
+                dest_session_id="receiver-session",
+                dest_slot_offset=pending.slot.offset,
+                dest_meta_slot_offset=pending.meta_slot.offset,
+                data_size=4096,
+                meta_size=1024,
+            )
+        )
+        self.assertIn(
+            "receiver session mismatch",
+            mgr.validate_receive_ready("req-ready", dest_session_id="old-session"),
+        )
+        self.assertIn(
+            "metadata slot offset mismatch",
+            mgr.validate_receive_ready(
+                "req-ready",
+                dest_meta_slot_offset=pending.meta_slot.offset + 1,
+            ),
+        )
+        self.assertIn(
+            "metadata size exceeds",
+            mgr.validate_receive_ready("req-ready", meta_size=pending.meta_slot.size + 1),
+        )
+
+
 class TestReceive(unittest.TestCase):
     def setUp(self):
         MockTransferEngine.reset()

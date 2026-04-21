@@ -211,6 +211,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.assertEqual(alloc_msg["msg_type"], "transfer_alloc")
         self.assertEqual(alloc_msg["source_control_endpoint"], "tcp://enc-ctrl")
         self.assertEqual(alloc_msg["source_host_id"], "host-a")
+        self.assertEqual(alloc_msg["receiver_session_id"], "den-session-0")
         self.assertEqual(alloc_msg["meta_size"], 2048)
         self.assertIsNone(alloc_msg.get("preallocated_slot"))
         self.assertEqual(
@@ -282,6 +283,43 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.assertEqual(
             self.server._tracker.get("r-pushed").state,
             RequestState.DENOISING_RUNNING,
+        )
+
+    def test_stale_transfer_pushed_is_ignored(self):
+        self._submit_running_request("r-stale-pushed", RequestState.DENOISING_WAITING)
+        self.server._tracker.update_instances("r-stale-pushed", denoiser_instance=0)
+        self.server._encoder_free_slots[0] = 0
+        self.server._transfer_state["r-stale-pushed"] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            receiver_role=RoleType.DENOISER.value,
+            sender_instance=0,
+            receiver_instance=0,
+            sender_session_id="new-sender-session",
+            receiver_session_id="new-receiver-session",
+            sender_slot_released=False,
+            alloc_accepted=True,
+        )
+
+        pushed = encode_transfer_msg(
+            TransferPushedMsg(
+                request_id="r-stale-pushed",
+                success=True,
+                source_session_id="old-sender-session",
+                dest_session_id="new-receiver-session",
+                receiver_role=RoleType.DENOISER.value,
+                receiver_instance=0,
+            )
+        )
+
+        self.server._handle_transfer_result(pushed, RoleType.ENCODER)
+
+        self.assertEqual(self.server._encoder_free_slots[0], 0)
+        self.assertFalse(
+            self.server._transfer_state["r-stale-pushed"].transfer_completion_processed
+        )
+        self.assertEqual(
+            self.server._tracker.get("r-stale-pushed").state,
+            RequestState.DENOISING_WAITING,
         )
 
     def test_fatal_alloc_reject_releases_sender_slot(self):
@@ -399,6 +437,7 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             receiver_role=RoleType.DENOISER.value,
             sender_instance=0,
             receiver_instance=0,
+            receiver_session_id="den-session",
             downstream_wait_since=123.0,
         )
         self.server._transfer_state["r-accept"] = p2p
@@ -409,16 +448,53 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
                     request_id="r-accept",
                     receiver_role=RoleType.DENOISER.value,
                     receiver_instance=0,
+                    receiver_session_id="den-session",
+                    receiver_slot_offset=256,
+                    receiver_slot_size=4096,
+                    receiver_meta_slot_offset=64,
+                    receiver_meta_slot_size=2048,
                 )
             ),
             RoleType.DENOISER,
         )
 
         self.assertTrue(self.server._transfer_state["r-accept"].alloc_accepted)
+        self.assertEqual(self.server._transfer_state["r-accept"].receiver_slot_offset, 256)
+        self.assertEqual(
+            self.server._transfer_state["r-accept"].receiver_meta_slot_offset, 64
+        )
         self.assertIsNone(self.server._transfer_state["r-accept"].downstream_wait_since)
         self.assertEqual(
             self.server._transfer_state["r-accept"].transfer_phase,
             TransferPhase.SENDING,
+        )
+
+    def test_stale_alloc_accepted_is_ignored(self):
+        self._submit_running_request("r-stale-accept", RequestState.DENOISING_WAITING)
+        p2p = _TransferRequestState(
+            receiver_role=RoleType.DENOISER.value,
+            receiver_instance=0,
+            receiver_session_id="new-session",
+            downstream_wait_since=123.0,
+        )
+        self.server._transfer_state["r-stale-accept"] = p2p
+
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferAllocAcceptedMsg(
+                    request_id="r-stale-accept",
+                    receiver_role=RoleType.DENOISER.value,
+                    receiver_instance=0,
+                    receiver_session_id="old-session",
+                )
+            ),
+            RoleType.DENOISER,
+        )
+
+        self.assertFalse(self.server._transfer_state["r-stale-accept"].alloc_accepted)
+        self.assertEqual(
+            self.server._transfer_state["r-stale-accept"].transfer_phase,
+            TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT,
         )
 
     def test_alloc_result_timeout_requeues_request_instead_of_failing(self):
@@ -491,6 +567,31 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.assertFalse(kwargs["to_receiver"])
         self.assertEqual(self.server._encoder_free_slots[0], 1)
         self.assertIsNone(self.server._tracker.get("r-timeout"))
+
+    def test_denoiser_error_releases_sender_and_receiver_slots(self):
+        self._submit_running_request("r-den-error", RequestState.DENOISING_RUNNING)
+        self.server._pending["r-den-error"] = b"client"
+        self.server._frontend = MagicMock()
+        self.server._tracker.update_instances("r-den-error", denoiser_instance=0)
+        self.server._encoder_free_slots[0] = 0
+        self.server._denoiser_free_slots[0] = 0
+        self.server._transfer_state["r-den-error"] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            receiver_role=RoleType.DENOISER.value,
+            sender_instance=0,
+            receiver_instance=0,
+            sender_slot_released=False,
+            receiver_slot_released=False,
+        )
+
+        self.server._handle_transfer_done(
+            {"request_id": "r-den-error", "error": "metadata invalid"},
+            RoleType.DENOISER,
+        )
+
+        self.assertEqual(self.server._encoder_free_slots[0], 1)
+        self.assertEqual(self.server._denoiser_free_slots[0], 1)
+        self.assertIsNone(self.server._tracker.get("r-den-error"))
 
     def test_denoiser_done_keeps_slot_busy_for_decoder_handoff_and_enqueues_once(self):
         self._submit_running_request("r-done", RequestState.DENOISING_RUNNING)
