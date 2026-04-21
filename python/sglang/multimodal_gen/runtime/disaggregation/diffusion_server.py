@@ -205,6 +205,34 @@ class DiffusionServer:
     def _session_matches(observed: str | None, expected: str | None) -> bool:
         return not observed or not expected or observed == expected
 
+    def _format_timeout_context(
+        self,
+        request_id: str,
+        record=None,
+        p2p: _TransferRequestState | None = None,
+    ) -> str:
+        if record is None:
+            record = self._tracker.get(request_id)
+        if p2p is None:
+            p2p = self._transfer_state.get(request_id)
+
+        state = record.state.value if record is not None else "unknown"
+        phase = p2p.transfer_phase.value if p2p is not None else "none"
+        sender = (
+            f"{p2p.sender_role}[{p2p.sender_instance}]"
+            if p2p is not None and p2p.sender_role
+            else "none"
+        )
+        receiver = (
+            f"{p2p.receiver_role}[{p2p.receiver_instance}]"
+            if p2p is not None and p2p.receiver_role
+            else "none"
+        )
+        return (
+            f"state={state}, phase={phase}, sender={sender}, "
+            f"receiver={receiver}"
+        )
+
     @property
     def tracker(self) -> RequestTracker:
         return self._tracker
@@ -709,9 +737,15 @@ class DiffusionServer:
         now = time.monotonic()
         wait_timed_out = []
         alloc_phase_timed_out = []
+        handoff_timeout_phases = {
+            TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT,
+            TransferPhase.WAITING_ALLOC_RESULT,
+            TransferPhase.SENDING,
+        }
         for request_id, p2p in list(self._transfer_state.items()):
             if (
-                p2p.handoff_started_at is not None
+                p2p.transfer_phase in handoff_timeout_phases
+                and p2p.handoff_started_at is not None
                 and (now - p2p.handoff_started_at) > self._downstream_wait_timeout_s
             ):
                 wait_timed_out.append(request_id)
@@ -773,7 +807,8 @@ class DiffusionServer:
                 request_id,
                 RequestState.TIMED_OUT,
                 f"DiffusionServer downstream wait timeout: request {request_id} "
-                f"did not acquire a downstream slot within {self._downstream_wait_timeout_s}s",
+                f"did not complete handoff within {self._downstream_wait_timeout_s}s "
+                f"({self._format_timeout_context(request_id, record, p2p)})",
             )
 
         timed_out = self._tracker.find_timed_out(self._timeout_s)
@@ -808,7 +843,8 @@ class DiffusionServer:
                 request_id,
                 RequestState.TIMED_OUT,
                 f"DiffusionServer timeout: request {request_id} "
-                f"not completed within {self._timeout_s}s",
+                f"not completed within {self._timeout_s}s "
+                f"({self._format_timeout_context(request_id, record, p2p)})",
             )
 
         all_timed_out = set(wait_timed_out) | set(timed_out)
@@ -1420,11 +1456,16 @@ class DiffusionServer:
 
         logger.error("DiffusionServer: %s - %s", request_id, error_msg)
 
+        record = self._tracker.get(request_id)
+        if record is not None:
+            self._free_slot_for_record(record)
+
         try:
             self._tracker.transition(request_id, terminal_state, error=error_msg)
         except ValueError:
             pass
 
+        self._transfer_state.pop(request_id, None)
         self._encoder_tta = deque(
             entry for entry in self._encoder_tta if entry.request_id != request_id
         )
@@ -1733,6 +1774,12 @@ class DiffusionServer:
 
         if role == RoleType.DENOISER:
             record = self._tracker.get(request_id)
+            if record is None and p2p is None:
+                logger.debug(
+                    "DiffusionServer transfer: ignoring stale denoiser done for %s",
+                    request_id,
+                )
+                return
 
             if p2p is not None:
                 self._recycle_prealloc_slot(p2p, RoleType.DENOISER)
@@ -1830,7 +1877,17 @@ class DiffusionServer:
                     pass
                 self._enqueue_role_wait(self._decoder_tta, request_id, p2p)
             else:
-                self._transfer_state.pop(request_id, None)
+                if p2p is not None:
+                    self._release_sender_slot_if_needed(p2p, record)
+                    self._release_receiver_slot_if_needed(p2p, record)
+                elif record is not None:
+                    self._free_slot_for_record(record)
+                self._complete_terminal(
+                    request_id,
+                    RequestState.FAILED,
+                    "Denoiser completed without staged decoder payload",
+                )
+                return
 
         elif role == RoleType.DECODER:
             record = self._tracker.get(request_id)

@@ -1,12 +1,26 @@
 import unittest
+from types import SimpleNamespace
 
+from sglang.multimodal_gen.runtime.disaggregation.diffusion_server import (
+    DiffusionServer,
+    _TransferRequestState,
+)
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     MaxFreeSlotsFirst,
     PoolDispatcher,
 )
+from sglang.multimodal_gen.runtime.disaggregation.request_state import (
+    RequestState,
+    TransferPhase,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
+)
+from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
+    SchedulerDisaggMixin,
+    _is_skip_broadcast,
+    _should_broadcast_encoder_idle_skip,
 )
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     TransferPeerInfoMsg,
@@ -16,6 +30,85 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     is_transfer_message,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+
+class _FakeFrontend:
+    def __init__(self):
+        self.sent = []
+
+    def send_multipart(self, frames):
+        self.sent.append(frames)
+
+
+class _EncoderLoopDummy(SchedulerDisaggMixin):
+    def __init__(self, *, rank0: bool, messages=None):
+        self.server_args = SimpleNamespace(
+            sp_degree=1,
+            tp_size=2,
+            enable_cfg_parallel=False,
+        )
+        self.gpu_id = 0 if rank0 else 1
+        self._disagg_role = RoleType.ENCODER
+        self._running = True
+        self._consecutive_error_count = 0
+        self._max_consecutive_errors = 3
+        self.broadcasts = []
+        self.steps = []
+        self.cleaned = False
+        self._messages = list(messages or [])
+        self._pool_work_pull = object()
+
+    def _process_outbound_staging_retry_once(self):
+        return False
+
+    def _process_swap_out_queue_once(self):
+        return False
+
+    def _process_send_ready_queue_once(self):
+        return False
+
+    def _maybe_apply_pending_transfer_reconfigure(self):
+        return False
+
+    def _has_pending_outbound_staging_retry(self):
+        return False
+
+    def _try_recv_work_noblock(self):
+        return None
+
+    def _broadcast_to_all_ranks(self, data):
+        if self.gpu_id == 0:
+            self.broadcasts.append(data)
+            if _is_skip_broadcast(data):
+                self._running = False
+            return data
+        msg = self._messages.pop(0)
+        self.broadcasts.append(msg)
+        return msg
+
+    def _disagg_encoder_step(self, send_tensors_fn, frames):
+        del send_tensors_fn
+        self.steps.append(frames)
+
+    def _cleanup_disagg(self):
+        self.cleaned = True
+
+
+def _make_diffusion_server(*, timeout_s=600.0, downstream_wait_timeout_s=120.0):
+    server = DiffusionServer(
+        frontend_endpoint="inproc://frontend-test",
+        encoder_work_endpoints=["inproc://encoder-work"],
+        denoiser_work_endpoints=["inproc://denoiser-work"],
+        decoder_work_endpoints=["inproc://decoder-work"],
+        encoder_result_endpoint="inproc://encoder-result",
+        denoiser_result_endpoint="inproc://denoiser-result",
+        decoder_result_endpoint="inproc://decoder-result",
+        timeout_s=timeout_s,
+        downstream_wait_timeout_s=downstream_wait_timeout_s,
+        max_slots_per_instance=1,
+    )
+    server._frontend = _FakeFrontend()
+    return server
 
 
 class TestDisaggControlPlane(unittest.TestCase):
@@ -129,6 +222,97 @@ class TestDisaggControlPlane(unittest.TestCase):
             filtered_with_decoder,
             ["text_encoder", "vae", "scheduler"],
         )
+
+    def test_encoder_idle_skip_helpers(self):
+        self.assertTrue(_is_skip_broadcast(("skip",)))
+        self.assertFalse(_is_skip_broadcast(("encoder_work", [])))
+        self.assertFalse(_should_broadcast_encoder_idle_skip(1.0, 1.005))
+        self.assertTrue(_should_broadcast_encoder_idle_skip(1.0, 1.011))
+
+    def test_encoder_rank0_broadcasts_idle_skip(self):
+        dummy = _EncoderLoopDummy(rank0=True)
+
+        dummy._disagg_encoder_rank0_event_loop()
+
+        self.assertIn(("skip",), dummy.broadcasts)
+        self.assertIsNone(dummy.broadcasts[-1])
+        self.assertTrue(dummy.cleaned)
+
+    def test_encoder_follower_ignores_idle_skip(self):
+        dummy = _EncoderLoopDummy(rank0=False, messages=[("skip",), None])
+
+        dummy._disagg_encoder_non_rank0_event_loop()
+
+        self.assertEqual(dummy.steps, [])
+        self.assertTrue(dummy.cleaned)
+
+    def test_denoiser_done_without_decoder_payload_fails_request(self):
+        server = _make_diffusion_server()
+        request_id = "req-missing-decoder-payload"
+        server._pending[request_id] = b"client"
+        server._tracker.submit(request_id)
+        server._tracker.transition(
+            request_id, RequestState.ENCODER_RUNNING, encoder_instance=0
+        )
+        server._tracker.transition(request_id, RequestState.ENCODER_DONE)
+        server._tracker.transition(request_id, RequestState.DENOISING_WAITING)
+        server._tracker.transition(
+            request_id, RequestState.DENOISING_RUNNING, denoiser_instance=0
+        )
+        server._encoder_free_slots[0] = 0
+        server._denoiser_free_slots[0] = 0
+        server._transfer_state[request_id] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            sender_instance=0,
+            sender_slot_released=True,
+            receiver_role=RoleType.DENOISER.value,
+            receiver_instance=0,
+            transfer_phase=TransferPhase.RUNNING_DOWNSTREAM,
+        )
+
+        server._handle_transfer_done(
+            {"request_id": request_id, "staged_for_decoder": False},
+            RoleType.DENOISER,
+        )
+
+        self.assertIsNone(server._tracker.get(request_id))
+        self.assertNotIn(request_id, server._pending)
+        self.assertNotIn(request_id, server._transfer_state)
+        self.assertEqual(server._denoiser_free_slots[0], 1)
+        self.assertEqual(len(server._frontend.sent), 1)
+
+    def test_global_timeout_cleans_transfer_state_and_returns_error(self):
+        server = _make_diffusion_server(timeout_s=0.1)
+        request_id = "req-global-timeout"
+        server._pending[request_id] = b"client"
+        record = server._tracker.submit(request_id)
+        server._tracker.transition(
+            request_id, RequestState.ENCODER_RUNNING, encoder_instance=0
+        )
+        server._tracker.transition(request_id, RequestState.ENCODER_DONE)
+        server._tracker.transition(request_id, RequestState.DENOISING_WAITING)
+        server._tracker.transition(
+            request_id, RequestState.DENOISING_RUNNING, denoiser_instance=0
+        )
+        record.submit_time -= 1.0
+        server._encoder_free_slots[0] = 0
+        server._denoiser_free_slots[0] = 0
+        server._transfer_state[request_id] = _TransferRequestState(
+            sender_role=RoleType.ENCODER.value,
+            sender_instance=0,
+            sender_slot_released=True,
+            receiver_role=RoleType.DENOISER.value,
+            receiver_instance=0,
+            transfer_phase=TransferPhase.RUNNING_DOWNSTREAM,
+        )
+
+        server._handle_timeouts()
+
+        self.assertIsNone(server._tracker.get(request_id))
+        self.assertNotIn(request_id, server._pending)
+        self.assertNotIn(request_id, server._transfer_state)
+        self.assertEqual(server._denoiser_free_slots[0], 1)
+        self.assertEqual(len(server._frontend.sent), 1)
 
 
 if __name__ == "__main__":

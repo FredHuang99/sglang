@@ -73,6 +73,9 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_ENCODER_IDLE_BROADCAST_INTERVAL_S = 0.01
+_SKIP_BROADCAST_MSG = ("skip",)
+
 
 @dataclasses.dataclass
 class _PendingOutboundTransfer:
@@ -103,6 +106,19 @@ class _PendingInboundTransfer:
     tensors: dict[str, torch.Tensor | list[torch.Tensor]]
     load_event: object | None
     prealloc_slot_id: int | None = None
+
+
+def _is_skip_broadcast(msg: object) -> bool:
+    return msg == _SKIP_BROADCAST_MSG
+
+
+def _should_broadcast_encoder_idle_skip(
+    last_broadcast_s: float,
+    now_s: float,
+    interval_s: float = _ENCODER_IDLE_BROADCAST_INTERVAL_S,
+) -> bool:
+    return now_s - last_broadcast_s >= interval_s
+
 
 # ---------------------------------------------------------------------------
 # Field extraction: split Req into tensors (transfer buffer) and scalars (JSON)
@@ -1724,7 +1740,7 @@ class SchedulerDisaggMixin:
                     handled_work |= computed
 
                 if is_multi_rank and not computed:
-                    self._broadcast_to_all_ranks(("skip",))
+                    self._broadcast_to_all_ranks(_SKIP_BROADCAST_MSG)
 
                 if not handled_work:
                     time.sleep(0.001)
@@ -1768,8 +1784,14 @@ class SchedulerDisaggMixin:
                 if msg is None:
                     break
 
+                if _is_skip_broadcast(msg):
+                    self._consecutive_error_count = 0
+                    continue
+
                 if isinstance(msg, tuple) and len(msg) == 2 and msg[0] == "encoder_work":
                     self._disagg_encoder_step(send_tensors, frames=msg[1])
+
+                self._consecutive_error_count = 0
 
             except Exception as e:
                 self._consecutive_error_count += 1
@@ -1797,6 +1819,7 @@ class SchedulerDisaggMixin:
             or self.server_args.tp_size > 1
             or self.server_args.enable_cfg_parallel
         )
+        last_idle_broadcast_s = 0.0
 
         while self._running:
             try:
@@ -1812,6 +1835,16 @@ class SchedulerDisaggMixin:
                         if is_multi_rank:
                             self._broadcast_to_all_ranks(("encoder_work", frames))
                         self._disagg_encoder_step(send_tensors, frames=frames)
+
+                if not handled_work:
+                    if is_multi_rank:
+                        now_s = time.monotonic()
+                        if _should_broadcast_encoder_idle_skip(
+                            last_idle_broadcast_s, now_s
+                        ):
+                            self._broadcast_to_all_ranks(_SKIP_BROADCAST_MSG)
+                            last_idle_broadcast_s = now_s
+                            handled_work = True
 
                 if not handled_work:
                     time.sleep(0.001)
