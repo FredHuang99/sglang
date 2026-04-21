@@ -38,6 +38,16 @@ PROFILE_PRESET_CHOICES = [
     "z_image",
 ]
 _TERMINAL_STATUSES = {"completed", "failed", "deleted"}
+_CLIENT_ERROR_STATUS = "client_error"
+_POLL_MAX_RETRIES = 5
+_POLL_RETRY_BASE_DELAY_S = 0.5
+_POLL_RETRY_MAX_DELAY_S = 4.0
+_RETRYABLE_POLL_EXCEPTION_NAMES = {
+    "ClientConnectionError",
+    "ClientOSError",
+    "ServerDisconnectedError",
+    "ServerTimeoutError",
+}
 
 
 @dataclass(frozen=True)
@@ -51,6 +61,49 @@ class BenchmarkRequest:
     index: int
     scheduled_submit_time_s: float
     payload: dict[str, Any]
+
+
+def _format_error(exc: BaseException | Any) -> str:
+    if isinstance(exc, BaseException):
+        return f"{exc.__class__.__name__}: {exc}"
+    return str(exc)
+
+
+def _is_retryable_poll_error(exc: BaseException) -> bool:
+    return isinstance(exc, (OSError, TimeoutError)) or (
+        exc.__class__.__name__ in _RETRYABLE_POLL_EXCEPTION_NAMES
+    )
+
+
+def _client_error_row(
+    request: BenchmarkRequest,
+    *,
+    request_id: str | None = None,
+    submit_time_s: float | None = None,
+    http_ack_time_s: float | None = None,
+    error: BaseException | str | None = None,
+) -> dict[str, Any]:
+    terminal_time_s = time.time()
+    return {
+        "client_request_index": request.index,
+        "request_id": request_id or "",
+        "scheduled_submit_time_s": request.scheduled_submit_time_s,
+        "submit_time_s": submit_time_s if submit_time_s is not None else "",
+        "http_ack_time_s": http_ack_time_s if http_ack_time_s is not None else "",
+        "terminal_time_s": terminal_time_s,
+        "status": _CLIENT_ERROR_STATUS,
+        "error": _format_error(error) if error is not None else "",
+        "url": None,
+        "file_path": None,
+    }
+
+
+def _row_from_task_result(
+    request: BenchmarkRequest, result: dict[str, Any] | BaseException
+) -> dict[str, Any]:
+    if isinstance(result, BaseException):
+        return _client_error_row(request, error=result)
+    return result
 
 
 def _parse_json_like(text: str) -> dict[str, Any]:
@@ -336,22 +389,37 @@ async def _submit_and_poll_video_request(
         await asyncio.sleep(sleep_s)
 
     submit_time_s = time.time()
-    async with session.post(f"{base_url}/v1/videos", json=request.payload) as response:
-        response.raise_for_status()
-        created = await response.json()
-    http_ack_time_s = time.time()
-
-    request_id = created.get("id")
-    if not request_id:
-        raise RuntimeError(f"Video creation response missing id: {created}")
-
-    terminal_payload = created
-    while terminal_payload.get("status") not in _TERMINAL_STATUSES:
-        await asyncio.sleep(poll_interval_s)
-        async with session.get(f"{base_url}/v1/videos/{request_id}") as response:
+    request_id = ""
+    http_ack_time_s: float | None = None
+    try:
+        async with session.post(
+            f"{base_url}/v1/videos", json=request.payload
+        ) as response:
             response.raise_for_status()
-            terminal_payload = await response.json()
-    terminal_time_s = time.time()
+            created = await response.json()
+        http_ack_time_s = time.time()
+
+        request_id = created.get("id") or ""
+        if not request_id:
+            raise RuntimeError(f"Video creation response missing id: {created}")
+
+        terminal_payload = created
+        while terminal_payload.get("status") not in _TERMINAL_STATUSES:
+            await asyncio.sleep(poll_interval_s)
+            terminal_payload = await _poll_video_status_with_retry(
+                session=session,
+                url=f"{base_url}/v1/videos/{request_id}",
+                poll_interval_s=poll_interval_s,
+            )
+        terminal_time_s = time.time()
+    except Exception as exc:
+        return _client_error_row(
+            request,
+            request_id=request_id,
+            submit_time_s=submit_time_s,
+            http_ack_time_s=http_ack_time_s,
+            error=exc,
+        )
 
     error_value = terminal_payload.get("error")
     if isinstance(error_value, dict):
@@ -371,6 +439,29 @@ async def _submit_and_poll_video_request(
     }
 
 
+async def _poll_video_status_with_retry(
+    *,
+    session,
+    url: str,
+    poll_interval_s: float,
+) -> dict[str, Any]:
+    max_delay_s = max(
+        0.1,
+        min(_POLL_RETRY_MAX_DELAY_S, poll_interval_s if poll_interval_s > 0 else 0.1),
+    )
+    for attempt in range(_POLL_MAX_RETRIES + 1):
+        try:
+            async with session.get(url) as response:
+                response.raise_for_status()
+                return await response.json()
+        except Exception as exc:
+            if attempt >= _POLL_MAX_RETRIES or not _is_retryable_poll_error(exc):
+                raise
+            delay_s = min(max_delay_s, _POLL_RETRY_BASE_DELAY_S * (2**attempt))
+            await asyncio.sleep(delay_s)
+    raise RuntimeError(f"Polling unexpectedly exhausted retries for {url}")
+
+
 async def _submit_image_request(
     *,
     session,
@@ -383,16 +474,23 @@ async def _submit_image_request(
         await asyncio.sleep(sleep_s)
 
     submit_time_s = time.time()
-    async with session.post(
-        f"{base_url}/v1/images/generations", json=request.payload
-    ) as response:
-        response.raise_for_status()
-        result = await response.json()
-    terminal_time_s = time.time()
+    try:
+        async with session.post(
+            f"{base_url}/v1/images/generations", json=request.payload
+        ) as response:
+            response.raise_for_status()
+            result = await response.json()
+        terminal_time_s = time.time()
 
-    request_id = result.get("id")
-    if not request_id:
-        raise RuntimeError(f"Image generation response missing id: {result}")
+        request_id = result.get("id")
+        if not request_id:
+            raise RuntimeError(f"Image generation response missing id: {result}")
+    except Exception as exc:
+        return _client_error_row(
+            request,
+            submit_time_s=submit_time_s,
+            error=exc,
+        )
 
     data = result.get("data") or []
     first_item = data[0] if data else {}
@@ -428,8 +526,16 @@ async def run_benchmark_async(
         traffic_mode=traffic_mode,
         requests_per_minute=requests_per_minute,
     )
-    connector = aiohttp.TCPConnector(limit=max(1, num_requests))
-    async with aiohttp.ClientSession(connector=connector) as session:
+    connector = aiohttp.TCPConnector(
+        enable_cleanup_closed=True,
+        limit=max(1, num_requests),
+    )
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=30,
+        sock_read=30 if endpoint_kind == "video" else None,
+    )
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         if endpoint_kind == "image":
             tasks = [
                 asyncio.create_task(
@@ -453,7 +559,11 @@ async def run_benchmark_async(
                 )
                 for request in benchmark_requests
             ]
-        return await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        return [
+            _row_from_task_result(request, result)
+            for request, result in zip(benchmark_requests, results)
+        ]
 
 
 async def run_warmup_async(
@@ -470,8 +580,13 @@ async def run_warmup_async(
     import aiohttp
 
     rows: list[dict[str, Any]] = []
-    connector = aiohttp.TCPConnector(limit=1)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    connector = aiohttp.TCPConnector(enable_cleanup_closed=True, limit=1)
+    timeout = aiohttp.ClientTimeout(
+        total=None,
+        sock_connect=30,
+        sock_read=30 if endpoint_kind == "video" else None,
+    )
+    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         warmup_requests = build_warmup_requests(
             payload=payload,
             num_warmup_requests=num_warmup_requests,
@@ -790,6 +905,11 @@ def main(argv: list[str] | None = None) -> int:
         traffic_mode=args.traffic_mode,
         client_rows=rows,
     )
+    client_error_count = sum(
+        1 for row in rows if row.get("status") == _CLIENT_ERROR_STATUS
+    )
+    if client_error_count:
+        summary_lines.append(f"client_error_count={client_error_count}")
     write_summary(output_dir, summary_lines)
 
     print(f"run_id={run_id}")

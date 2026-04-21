@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
 import csv
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from sglang.multimodal_gen.benchmarks.wan_ti2v_profile import (
+    BenchmarkRequest,
     apply_request_overrides,
     build_parser,
     build_default_request_spec,
@@ -13,6 +16,8 @@ from sglang.multimodal_gen.benchmarks.wan_ti2v_profile import (
     build_warmup_requests,
     detect_profile_preset,
     disable_cfg_for_request,
+    _row_from_task_result,
+    _submit_and_poll_video_request,
     summarize_profile_run,
 )
 from sglang.multimodal_gen.runtime.disaggregation.request_state import (
@@ -86,6 +91,49 @@ class TestRequestProfilingUtils(unittest.TestCase):
         self.assertEqual(record.submit_time_s, 123.5)
         self.assertEqual(record.last_transition_time_s, 123.5)
         self.assertEqual(record.state_timestamps[RequestState.PENDING.value], 123.5)
+
+
+class _FakeAsyncResponse:
+    def __init__(self, payload=None, *, status=200, enter_error=None):
+        self._payload = payload or {}
+        self.status = status
+        self._enter_error = enter_error
+
+    async def __aenter__(self):
+        if self._enter_error is not None:
+            raise self._enter_error
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise RuntimeError(f"HTTP {self.status}")
+
+    async def json(self):
+        return self._payload
+
+
+class _FakeVideoSession:
+    def __init__(self, *, post_payload, get_results):
+        self._post_payload = post_payload
+        self._get_results = list(get_results)
+        self.get_count = 0
+
+    def post(self, *_args, **_kwargs):
+        return _FakeAsyncResponse(self._post_payload)
+
+    def get(self, *_args, **_kwargs):
+        self.get_count += 1
+        result = self._get_results.pop(0)
+        if isinstance(result, BaseException):
+            return _FakeAsyncResponse(enter_error=result)
+        return _FakeAsyncResponse(result)
+
+
+async def _no_sleep(_delay):
+    return None
 
 
 class TestWanTi2vBenchmarkHelpers(unittest.TestCase):
@@ -205,6 +253,79 @@ class TestWanTi2vBenchmarkHelpers(unittest.TestCase):
             ["--deployment-mode", "monolithic", "--traffic-mode", "burst"]
         )
         self.assertEqual(args.num_warmup_requests, 3)
+
+    def test_video_poll_retries_transient_connection_reset(self):
+        request = BenchmarkRequest(
+            index=0,
+            scheduled_submit_time_s=0.0,
+            payload={"prompt": "hello"},
+        )
+        session = _FakeVideoSession(
+            post_payload={"id": "video-1", "status": "queued"},
+            get_results=[
+                OSError("connection reset"),
+                {"id": "video-1", "status": "completed", "file_path": "out.mp4"},
+            ],
+        )
+
+        with mock.patch(
+            "sglang.multimodal_gen.benchmarks.wan_ti2v_profile.asyncio.sleep",
+            new=_no_sleep,
+        ):
+            row = asyncio.run(
+                _submit_and_poll_video_request(
+                    session=session,
+                    base_url="http://127.0.0.1:30010",
+                    request=request,
+                    poll_interval_s=0.01,
+                )
+            )
+
+        self.assertEqual(row["status"], "completed")
+        self.assertEqual(row["request_id"], "video-1")
+        self.assertEqual(session.get_count, 2)
+
+    def test_video_poll_exhausted_retry_returns_client_error_row(self):
+        request = BenchmarkRequest(
+            index=1,
+            scheduled_submit_time_s=0.0,
+            payload={"prompt": "hello"},
+        )
+        session = _FakeVideoSession(
+            post_payload={"id": "video-2", "status": "queued"},
+            get_results=[OSError("connection reset")] * 6,
+        )
+
+        with mock.patch(
+            "sglang.multimodal_gen.benchmarks.wan_ti2v_profile.asyncio.sleep",
+            new=_no_sleep,
+        ):
+            row = asyncio.run(
+                _submit_and_poll_video_request(
+                    session=session,
+                    base_url="http://127.0.0.1:30010",
+                    request=request,
+                    poll_interval_s=0.01,
+                )
+            )
+
+        self.assertEqual(row["status"], "client_error")
+        self.assertEqual(row["request_id"], "video-2")
+        self.assertIn("OSError", row["error"])
+        self.assertEqual(session.get_count, 6)
+
+    def test_task_exception_is_converted_to_client_error_row(self):
+        request = BenchmarkRequest(
+            index=2,
+            scheduled_submit_time_s=12.5,
+            payload={"prompt": "hello"},
+        )
+
+        row = _row_from_task_result(request, RuntimeError("boom"))
+
+        self.assertEqual(row["status"], "client_error")
+        self.assertEqual(row["request_id"], "")
+        self.assertIn("RuntimeError: boom", row["error"])
 
     def test_monolithic_summary_finds_runtime_csv_in_sibling_dir(self):
         with tempfile.TemporaryDirectory() as tmpdir:
