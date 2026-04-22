@@ -765,10 +765,17 @@ class SchedulerDisaggMixin:
             engine.session_id,
         )
 
+        role_device = sa.resolved_role_device()
+        transfer_pin_mode = getattr(sa, "disagg_transfer_pin_memory", "auto")
+        transfer_pin_memory = role_device == "cuda" and transfer_pin_mode != "off"
+        transfer_pin_memory_strict = role_device == "cuda" and transfer_pin_mode == "required"
+
         buffer = TransferTensorBuffer(
             pool_size=pool_size,
             device="cpu",
             role_name=self._disagg_role.value,
+            pin_memory=transfer_pin_memory,
+            pin_memory_strict=transfer_pin_memory_strict,
         )
         meta_slot_size = measured_meta_bytes or (64 * 1024)
         meta_buffer = TransferMetaBuffer(
@@ -821,7 +828,7 @@ class SchedulerDisaggMixin:
             ),
             work_endpoint=sa.pool_work_endpoint or "",
             rank0_only=True,
-            role_device=sa.resolved_role_device(),
+            role_device=role_device,
             host_id=self._transfer_manager.host_id,
             supports_local_copy=bool(
                 self._transfer_manager.data_shm_name

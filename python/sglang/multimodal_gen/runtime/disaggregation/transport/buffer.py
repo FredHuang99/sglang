@@ -19,6 +19,10 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.allocator import (
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
     str_to_dtype,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport.pinned_memory import (
+    PinnedHostMemoryRegistration,
+    register_pinned_host_memory,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +60,31 @@ class BufferDescriptor:
 
 
 class _SharedMemoryRegion:
-    def __init__(self, role_name: str, tag: str, size: int):
+    def __init__(
+        self,
+        role_name: str,
+        tag: str,
+        size: int,
+        *,
+        pin_memory: bool = False,
+        pin_memory_strict: bool = False,
+    ):
         self._name = f"sgl_diff_{role_name}_{tag}_{uuid.uuid4().hex}"
         self._shm = shared_memory.SharedMemory(name=self._name, create=True, size=size)
         self._np_array = np.ndarray((size,), dtype=np.uint8, buffer=self._shm.buf)
         self._tensor = torch.from_numpy(self._np_array)
+        self._pin_registration: PinnedHostMemoryRegistration | None = None
+        if pin_memory:
+            try:
+                self._pin_registration = register_pinned_host_memory(
+                    int(self._np_array.ctypes.data),
+                    size,
+                    enabled=True,
+                    strict=pin_memory_strict,
+                )
+            except Exception:
+                self.cleanup()
+                raise
 
     @property
     def tensor(self) -> torch.Tensor:
@@ -70,7 +94,26 @@ class _SharedMemoryRegion:
     def name(self) -> str:
         return self._name
 
+    @property
+    def is_pinned(self) -> bool:
+        return bool(self._pin_registration and self._pin_registration.registered)
+
+    @property
+    def pin_memory_status(self) -> str:
+        if self._pin_registration is None:
+            return "disabled"
+        return self._pin_registration.status
+
+    @property
+    def pin_memory_error(self) -> str | None:
+        if self._pin_registration is None:
+            return None
+        return self._pin_registration.error
+
     def cleanup(self) -> None:
+        if self._pin_registration is not None:
+            self._pin_registration.unregister()
+            self._pin_registration = None
         try:
             self._shm.close()
         except FileNotFoundError:
@@ -96,6 +139,8 @@ class TransferTensorBuffer:
         role_name: str = "unknown",
         device: str = "cpu",
         shared_memory_backing: bool | None = None,
+        pin_memory: bool = False,
+        pin_memory_strict: bool = False,
     ):
         self._role_name = role_name
         self._device = device
@@ -107,7 +152,13 @@ class TransferTensorBuffer:
             if shared_memory_backing is None:
                 shared_memory_backing = True
             if shared_memory_backing:
-                self._shared_region = _SharedMemoryRegion(role_name, "tensor", actual_size)
+                self._shared_region = _SharedMemoryRegion(
+                    role_name,
+                    "tensor",
+                    actual_size,
+                    pin_memory=pin_memory,
+                    pin_memory_strict=pin_memory_strict,
+                )
                 self._pool = self._shared_region.tensor
             else:
                 self._pool = torch.empty(actual_size, dtype=torch.uint8)
@@ -116,7 +167,7 @@ class TransferTensorBuffer:
         self._pool_ptr = self._pool.data_ptr()
 
         pool_location = (
-            f"host-shm({self.shared_memory_name})"
+            f"host-shm{'+pinned' if self.pinned_shared_memory else ''}({self.shared_memory_name})"
             if self._shared_region is not None
             else ("host" if device == "cpu" else f"GPU ({device})")
         )
@@ -147,6 +198,22 @@ class TransferTensorBuffer:
     @property
     def uses_shared_memory(self) -> bool:
         return self._shared_region is not None
+
+    @property
+    def pinned_shared_memory(self) -> bool:
+        return bool(self._shared_region and self._shared_region.is_pinned)
+
+    @property
+    def pin_memory_status(self) -> str:
+        if self._shared_region is None:
+            return "not_shared_memory"
+        return self._shared_region.pin_memory_status
+
+    @property
+    def pin_memory_error(self) -> str | None:
+        if self._shared_region is None:
+            return None
+        return self._shared_region.pin_memory_error
 
     def descriptor(self) -> BufferDescriptor:
         return BufferDescriptor(
@@ -336,6 +403,9 @@ class TransferTensorBuffer:
         alloc_stats["role"] = self._role_name
         alloc_stats["uses_shared_memory"] = self.uses_shared_memory
         alloc_stats["shared_memory_name"] = self.shared_memory_name
+        alloc_stats["pinned_shared_memory"] = self.pinned_shared_memory
+        alloc_stats["pin_memory_status"] = self.pin_memory_status
+        alloc_stats["pin_memory_error"] = self.pin_memory_error
         return alloc_stats
 
 

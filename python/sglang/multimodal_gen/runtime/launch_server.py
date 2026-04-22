@@ -183,6 +183,15 @@ def _spawn_disagg_worker_group(
     processes: list[mp.Process] = []
     ready_readers: list[tuple[int, mp.connection.Connection]] = []
     ready_writers: list[mp.connection.Connection] = []
+    role_device = (
+        role_args.resolved_role_device()
+        if hasattr(role_args, "resolved_role_device")
+        else getattr(role_args, "disagg_role_device", "auto")
+    )
+    if role_device == "auto":
+        role_device = "cpu" if getattr(role_args, "num_gpus", 1) <= 0 else "cuda"
+    platform_override = "cpu" if role_device == "cpu" else "cuda"
+    override_env_key = "SGLANG_DIFFUSION_PLATFORM_OVERRIDE"
 
     try:
         for rank_idx, worker_id in enumerate(worker_ids):
@@ -196,7 +205,15 @@ def _spawn_disagg_worker_group(
                 name=process_name_builder(rank_idx),
                 daemon=True,
             )
-            process.start()
+            old_platform_override = os.environ.get(override_env_key)
+            os.environ[override_env_key] = platform_override
+            try:
+                process.start()
+            finally:
+                if old_platform_override is None:
+                    os.environ.pop(override_env_key, None)
+                else:
+                    os.environ[override_env_key] = old_platform_override
             processes.append(process)
 
         logger.info(

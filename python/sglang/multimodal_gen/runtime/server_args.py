@@ -264,6 +264,7 @@ class ServerArgs:
     disagg_transfer_pool_size: int = (
         256 * 1024 * 1024
     )  # P2P transfer buffer size (bytes)
+    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"  # Hostname for P2P transfer engine
     disagg_ib_device: str | None = None  # InfiniBand device for mooncake RDMA
     disagg_server_addr: str | None = (
@@ -908,6 +909,17 @@ class ServerArgs:
             type=int,
             default=256 * 1024 * 1024,
             help="Size of the P2P transfer buffer pool in bytes (default: 256 MiB).",
+        )
+        parser.add_argument(
+            "--disagg-transfer-pin-memory",
+            type=str,
+            default=ServerArgs.disagg_transfer_pin_memory,
+            choices=["auto", "off", "required"],
+            help=(
+                "CUDA host-register same-host shared-memory transfer buffers. "
+                "'auto' pins CUDA role buffers and falls back on failure; "
+                "'required' fails startup if pinning fails; 'off' disables it."
+            ),
         )
         parser.add_argument(
             "--disagg-p2p-hostname",

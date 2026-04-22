@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for disaggregated launch-time calibration helpers."""
 
+import os
 import pickle
 import unittest
 from types import SimpleNamespace
@@ -95,7 +96,9 @@ class _FakeProcess:
 
     def start(self):
         self._alive = True
+        platform_override = os.environ.get("SGLANG_DIFFUSION_PLATFORM_OVERRIDE")
         self.events.append(("start", self.rank, self.worker_id, self.name))
+        self.events.append(("platform_override", self.rank, platform_override))
 
     def terminate(self):
         self._alive = False
@@ -506,6 +509,71 @@ class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
 
         terminate_ranks = [event[1] for event in events if event[0] == "terminate"]
         self.assertEqual(terminate_ranks, [0, 1, 2, 3])
+
+    def test_worker_group_sets_cpu_platform_override_before_spawn_start(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(events)
+
+        with patch.dict(os.environ, {}, clear=True):
+            _spawn_disagg_worker_group(
+                pool_ctx=pool_ctx,
+                worker_ids=[0],
+                role_args=_make_fake_role_args(
+                    disagg_role_device="cpu",
+                    num_gpus=1,
+                ),
+                process_name_builder=lambda rank_idx: f"enc-r{rank_idx}",
+                group_label="Pool encoder[0]",
+            )
+            self.assertIsNone(os.environ.get("SGLANG_DIFFUSION_PLATFORM_OVERRIDE"))
+
+        override_events = [
+            event for event in events if event[0] == "platform_override"
+        ]
+        self.assertEqual(override_events, [("platform_override", 0, "cpu")])
+
+    def test_worker_group_restores_platform_override_between_roles(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(events)
+
+        with patch.dict(
+            os.environ, {"SGLANG_DIFFUSION_PLATFORM_OVERRIDE": "parent"}, clear=False
+        ):
+            _spawn_disagg_worker_group(
+                pool_ctx=pool_ctx,
+                worker_ids=[0],
+                role_args=_make_fake_role_args(
+                    disagg_role_device="cpu",
+                    num_gpus=1,
+                ),
+                process_name_builder=lambda rank_idx: f"enc-r{rank_idx}",
+                group_label="Pool encoder[0]",
+            )
+            _spawn_disagg_worker_group(
+                pool_ctx=pool_ctx,
+                worker_ids=[1, 2],
+                role_args=_make_fake_role_args(
+                    disagg_role_device="cuda",
+                    num_gpus=2,
+                ),
+                process_name_builder=lambda rank_idx: f"den-r{rank_idx}",
+                group_label="Pool denoiser[0]",
+            )
+            self.assertEqual(
+                os.environ.get("SGLANG_DIFFUSION_PLATFORM_OVERRIDE"), "parent"
+            )
+
+        override_events = [
+            event for event in events if event[0] == "platform_override"
+        ]
+        self.assertEqual(
+            override_events,
+            [
+                ("platform_override", 0, "cpu"),
+                ("platform_override", 0, "cuda"),
+                ("platform_override", 1, "cuda"),
+            ],
+        )
 
 
 if __name__ == "__main__":

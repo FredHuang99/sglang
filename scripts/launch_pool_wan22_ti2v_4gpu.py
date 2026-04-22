@@ -89,6 +89,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disagg-max-slots-per-instance", type=int, default=8)
     parser.add_argument("--disagg-transfer-pool-size", type=int, default=256 * 1024 * 1024)
     parser.add_argument("--disagg-transfer-redundancy", type=float, default=1.25)
+    parser.add_argument(
+        "--disagg-transfer-pin-memory",
+        type=str,
+        default="auto",
+        choices=["auto", "off", "required"],
+        help=(
+            "CUDA host-register same-host shared-memory transfer buffers. "
+            "'auto' pins CUDA role buffers and falls back on failure; "
+            "'required' fails startup if pinning fails; 'off' disables it."
+        ),
+    )
     parser.add_argument("--disagg-timeout", type=int, default=3600)
     parser.add_argument("--disagg-downstream-wait-timeout", type=int, default=3600)
     parser.add_argument("--warmup", action="store_true", default=False)
@@ -345,6 +356,7 @@ def _build_common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "disagg_max_slots_per_instance": args.disagg_max_slots_per_instance,
         "disagg_transfer_pool_size": args.disagg_transfer_pool_size,
         "disagg_transfer_redundancy": args.disagg_transfer_redundancy,
+        "disagg_transfer_pin_memory": args.disagg_transfer_pin_memory,
         "disagg_timeout": args.disagg_timeout,
         "disagg_downstream_wait_timeout": args.disagg_downstream_wait_timeout,
         "warmup": args.warmup,
@@ -480,6 +492,7 @@ def _launch_single_host(args: argparse.Namespace) -> None:
     print(f"  server_warmup   : {args.warmup}")
     print(f"  transfer_pool   : {args.disagg_transfer_pool_size}")
     print(f"  transfer_redund.: {args.disagg_transfer_redundancy}")
+    print(f"  transfer_pin    : {args.disagg_transfer_pin_memory}")
     if not args.warmup:
         print("  benchmark warmup: use benchmark --num-warmup-requests")
 
@@ -549,6 +562,7 @@ def _launch_split_machine_a(args: argparse.Namespace) -> None:
     print(f"  server_warmup   : {args.warmup}")
     print(f"  transfer_pool   : {args.disagg_transfer_pool_size}")
     print(f"  transfer_redund.: {args.disagg_transfer_redundancy}")
+    print(f"  transfer_pin    : {args.disagg_transfer_pin_memory}")
     if not args.warmup:
         print("  benchmark warmup: use benchmark --num-warmup-requests")
 
@@ -582,6 +596,7 @@ def _launch_split_machine_b(args: argparse.Namespace) -> None:
     print(f"  server_warmup   : {args.warmup}")
     print(f"  transfer_pool   : {args.disagg_transfer_pool_size}")
     print(f"  transfer_redund.: {args.disagg_transfer_redundancy}")
+    print(f"  transfer_pin    : {args.disagg_transfer_pin_memory}")
 
     launch_disagg_role(decoder_args)
 

@@ -85,6 +85,7 @@ class _SchedulerHarness:
             disagg_p2p_hostname="127.0.0.1",
             disagg_ib_device=None,
             disagg_transfer_backend="auto",
+            disagg_transfer_pin_memory="auto",
             sp_degree=1,
             tp_size=1,
             enable_cfg_parallel=False,
@@ -136,6 +137,119 @@ class TestTransferEngineGpuSelection(unittest.TestCase):
             force_mock=True,
         )
         scheduler._pool_result_push.send_multipart.assert_called_once()
+
+    def test_cuda_role_enables_transfer_pin_memory_by_default(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler.server_args.pool_control_advertised_endpoint = None
+        scheduler.server_args.pool_control_endpoint = None
+        scheduler.server_args.resolved_role_device = lambda: "cuda"
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-pin"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-pin"
+        fake_manager.pool_data_ptr = 123
+        fake_manager.pool_size = 4096
+        fake_manager.meta_pool_ptr = 456
+        fake_manager.meta_pool_size = 1024
+        fake_manager.data_shm_name = "data-shm"
+        fake_manager.meta_shm_name = "meta-shm"
+        fake_manager.host_id = "host-pin"
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+            return_value=MagicMock(),
+        ) as tensor_buffer_cls, patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer",
+            return_value=MagicMock(),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager()
+
+        kwargs = tensor_buffer_cls.call_args.kwargs
+        self.assertTrue(kwargs["pin_memory"])
+        self.assertFalse(kwargs["pin_memory_strict"])
+
+    def test_required_transfer_pin_memory_enables_strict_mode(self):
+        scheduler = _SchedulerHarness.make(RoleType.DENOISER)
+        scheduler.server_args.pool_control_advertised_endpoint = None
+        scheduler.server_args.pool_control_endpoint = None
+        scheduler.server_args.resolved_role_device = lambda: "cuda"
+        scheduler.server_args.disagg_transfer_pin_memory = "required"
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-pin-required"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-pin-required"
+        fake_manager.pool_data_ptr = 123
+        fake_manager.pool_size = 4096
+        fake_manager.meta_pool_ptr = 456
+        fake_manager.meta_pool_size = 1024
+        fake_manager.data_shm_name = "data-shm"
+        fake_manager.meta_shm_name = "meta-shm"
+        fake_manager.host_id = "host-pin"
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+            return_value=MagicMock(),
+        ) as tensor_buffer_cls, patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer",
+            return_value=MagicMock(),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager()
+
+        kwargs = tensor_buffer_cls.call_args.kwargs
+        self.assertTrue(kwargs["pin_memory"])
+        self.assertTrue(kwargs["pin_memory_strict"])
+
+    def test_cpu_role_does_not_pin_transfer_memory(self):
+        scheduler = _SchedulerHarness.make(RoleType.ENCODER)
+        scheduler.server_args.pool_control_advertised_endpoint = None
+        scheduler.server_args.pool_control_endpoint = None
+        scheduler.server_args.disagg_transfer_pin_memory = "required"
+        scheduler.server_args.resolved_role_device = lambda: "cpu"
+
+        fake_engine = MagicMock()
+        fake_engine.session_id = "session-cpu"
+        fake_manager = MagicMock()
+        fake_manager.session_id = "session-cpu"
+        fake_manager.pool_data_ptr = 123
+        fake_manager.pool_size = 4096
+        fake_manager.meta_pool_ptr = 456
+        fake_manager.meta_pool_size = 1024
+        fake_manager.data_shm_name = "data-shm"
+        fake_manager.meta_shm_name = "meta-shm"
+        fake_manager.host_id = "host-cpu"
+
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.create_transfer_engine",
+            return_value=fake_engine,
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
+            return_value=MagicMock(),
+        ) as tensor_buffer_cls, patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer",
+            return_value=MagicMock(),
+        ), patch(
+            "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
+            return_value=fake_manager,
+        ):
+            scheduler._init_disagg_transfer_manager()
+
+        kwargs = tensor_buffer_cls.call_args.kwargs
+        self.assertFalse(kwargs["pin_memory"])
+        self.assertFalse(kwargs["pin_memory_strict"])
 
     def test_explicit_mooncake_backend_is_forwarded_without_force_mock(self):
         scheduler = _SchedulerHarness.make(RoleType.ENCODER)

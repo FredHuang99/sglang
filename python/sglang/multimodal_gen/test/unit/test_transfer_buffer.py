@@ -2,12 +2,17 @@
 """Unit tests for TransferTensorBuffer."""
 
 import unittest
+from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferMetaBuffer,
     TransferTensorBuffer,
+)
+from sglang.multimodal_gen.runtime.disaggregation.transport.pinned_memory import (
+    PinnedHostMemoryRegistration,
+    register_pinned_host_memory,
 )
 
 
@@ -72,6 +77,77 @@ class TestTransferTensorBuffer(unittest.TestCase):
         stats = buf.get_stats()
         self.assertEqual(stats["role"], "encoder")
         self.assertGreater(stats["pool_size"], 0)
+        self.assertFalse(stats["pinned_shared_memory"])
+        self.assertEqual(stats["pin_memory_status"], "disabled")
+
+    def test_shared_memory_pin_registration_updates_stats(self):
+        registration = MagicMock()
+        registration.registered = True
+        registration.status = "pinned"
+        registration.error = None
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.transport.buffer.register_pinned_host_memory",
+            return_value=registration,
+        ) as register:
+            buf = _make_tensor_buffer(
+                self, pool_size=1 << 20, role_name="test", pin_memory=True
+            )
+
+        register.assert_called_once()
+        self.assertTrue(buf.pinned_shared_memory)
+        stats = buf.get_stats()
+        self.assertTrue(stats["pinned_shared_memory"])
+        self.assertEqual(stats["pin_memory_status"], "pinned")
+
+    def test_shared_memory_pin_fallback_updates_stats(self):
+        registration = PinnedHostMemoryRegistration(
+            ptr=4096,
+            size=1 << 20,
+            aligned_ptr=4096,
+            aligned_size=1 << 20,
+            registered=False,
+            status="failed",
+            error="cudaHostRegister failed",
+        )
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.transport.buffer.register_pinned_host_memory",
+            return_value=registration,
+        ):
+            buf = _make_tensor_buffer(
+                self, pool_size=1 << 20, role_name="test", pin_memory=True
+            )
+
+        stats = buf.get_stats()
+        self.assertFalse(stats["pinned_shared_memory"])
+        self.assertEqual(stats["pin_memory_status"], "failed")
+        self.assertEqual(stats["pin_memory_error"], "cudaHostRegister failed")
+
+    def test_shared_memory_pin_cleanup_unregisters(self):
+        registration = MagicMock()
+        registration.registered = True
+        registration.status = "pinned"
+        registration.error = None
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.transport.buffer.register_pinned_host_memory",
+            return_value=registration,
+        ):
+            buf = TransferTensorBuffer(
+                pool_size=1 << 20,
+                role_name="test",
+                pin_memory=True,
+            )
+        buf.cleanup()
+        registration.unregister.assert_called_once()
+
+    def test_required_pin_raises_when_cuda_unavailable(self):
+        with patch("torch.cuda.is_available", return_value=False):
+            with self.assertRaises(RuntimeError):
+                register_pinned_host_memory(
+                    4096,
+                    1 << 20,
+                    enabled=True,
+                    strict=True,
+                )
 
 
 class TestTransferTensorBufferIO(unittest.TestCase):
