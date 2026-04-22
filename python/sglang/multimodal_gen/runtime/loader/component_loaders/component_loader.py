@@ -25,6 +25,9 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profile_log_utils import (
+    get_profile_log_context,
+)
 
 logger = init_logger(__name__)
 
@@ -82,12 +85,22 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
-        gpu_mem_before_loading = current_platform.get_available_gpu_memory()
+        profile_ctx = get_profile_log_context(server_args)
+        mem_before_loading = current_platform.get_available_gpu_memory()
         logger.info(
-            "Loading %s from %s. avail mem: %.2f GB",
+            "ProfileModuleLoadStart role=%s instance=%s rank=%s physical_rank=%s "
+            "world_size=%s device=%s component=%s path=%s mem_kind=%s "
+            "available_before_gb=%.2f",
+            profile_ctx.role,
+            profile_ctx.instance_id,
+            profile_ctx.rank,
+            profile_ctx.physical_rank,
+            profile_ctx.world_size,
+            profile_ctx.device,
             component_name,
             component_model_path,
-            gpu_mem_before_loading,
+            profile_ctx.mem_kind,
+            mem_before_loading,
         )
         try:
             component = self.load_customized(
@@ -124,16 +137,27 @@ class ComponentLoader(ABC):
         else:
             if isinstance(component, nn.Module):
                 component = component.eval()
-            current_gpu_mem = current_platform.get_available_gpu_memory()
+            current_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
-            consumed = gpu_mem_before_loading - current_gpu_mem
+            consumed = mem_before_loading - current_mem
             logger.info(
-                f"Loaded %s: %s ({source} version). model size: %s GB, consumed GPU mem: %.2f GB, avail GPU mem: %.2f GB",
+                "ProfileModuleLoadDone role=%s instance=%s rank=%s "
+                "physical_rank=%s world_size=%s device=%s component=%s "
+                "class=%s source=%s model_size_gb=%s mem_kind=%s "
+                "consumed_gb=%.2f available_after_gb=%.2f",
+                profile_ctx.role,
+                profile_ctx.instance_id,
+                profile_ctx.rank,
+                profile_ctx.physical_rank,
+                profile_ctx.world_size,
+                profile_ctx.device,
                 component_name,
                 component.__class__.__name__,
+                source,
                 model_size,
+                profile_ctx.mem_kind,
                 consumed,
-                current_gpu_mem,
+                current_mem,
             )
         return component, consumed
 

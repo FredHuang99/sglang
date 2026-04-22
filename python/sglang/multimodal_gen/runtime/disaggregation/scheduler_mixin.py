@@ -63,6 +63,10 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profile_log_utils import (
+    bytes_to_gib,
+    get_profile_log_context,
+)
 from sglang.multimodal_gen.runtime.utils.request_profiling import (
     RequestCsvProfiler,
     resolve_profile_dir,
@@ -798,6 +802,40 @@ class SchedulerDisaggMixin:
         except (TypeError, ValueError):
             free_capacity_slots = max_slots
         capacity_slots = max(1, min(max_slots, free_capacity_slots))
+        profile_ctx = get_profile_log_context(
+            sa,
+            rank=getattr(self.worker, "rank", None),
+            physical_rank=getattr(self.worker, "local_rank", None),
+        )
+        logger.info(
+            "ProfileTransferBuffer role=%s instance=%s rank=%s physical_rank=%s "
+            "world_size=%s device=%s session=%s backend=%s data_pool_gb=%.3f "
+            "meta_pool_gb=%.3f configured_data_pool_gb=%.3f capacity_slots=%d "
+            "capacity_slot_gb=%.3f max_slots=%d pin_mode=%s pin_requested=%s "
+            "pinned=%s pin_status=%s pin_error=%s data_shm_name=%s "
+            "meta_shm_name=%s",
+            profile_ctx.role,
+            profile_ctx.instance_id,
+            profile_ctx.rank,
+            profile_ctx.physical_rank,
+            profile_ctx.world_size,
+            profile_ctx.device,
+            self._transfer_manager.session_id,
+            resolved_backend,
+            bytes_to_gib(self._transfer_manager.pool_size),
+            bytes_to_gib(self._transfer_manager.meta_pool_size),
+            bytes_to_gib(configured_pool_size),
+            capacity_slots,
+            bytes_to_gib(capacity_slot_size),
+            max_slots,
+            transfer_pin_mode,
+            transfer_pin_memory,
+            buffer.pinned_shared_memory,
+            buffer.pin_memory_status,
+            buffer.pin_memory_error or "none",
+            self._transfer_manager.data_shm_name,
+            self._transfer_manager.meta_shm_name,
+        )
 
         # Warmup calibration only resizes transfer buffers. Receive slots remain
         # dynamic so runtime allocation semantics continue to match the

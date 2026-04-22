@@ -44,6 +44,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.profile_log_utils import (
+    get_profile_log_context,
+)
 
 logger = init_logger(__name__)
 
@@ -476,6 +479,30 @@ class ComposedPipelineBase(ABC):
             "Memory usage of loaded modules (GiB): %s. avail mem: %s GB",
             self.memory_usages,
             round(current_platform.get_available_gpu_memory(), 2),
+        )
+        profile_ctx = get_profile_log_context(server_args)
+        total_consumed_gb = sum(
+            usage
+            for usage in self.memory_usages.values()
+            if isinstance(usage, (int, float))
+        )
+        logger.info(
+            "ProfileModuleLoadSummary role=%s instance=%s rank=%s "
+            "physical_rank=%s world_size=%s device=%s mem_kind=%s "
+            "required_modules=%s loaded_modules=%s memory_usages_gb=%s "
+            "total_consumed_gb=%.2f available_after_gb=%.2f",
+            profile_ctx.role,
+            profile_ctx.instance_id,
+            profile_ctx.rank,
+            profile_ctx.physical_rank,
+            profile_ctx.world_size,
+            profile_ctx.device,
+            profile_ctx.mem_kind,
+            list(required_modules),
+            list(loaded_components.keys()),
+            self.memory_usages,
+            total_consumed_gb,
+            current_platform.get_available_gpu_memory(),
         )
 
         return loaded_components
