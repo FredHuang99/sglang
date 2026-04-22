@@ -119,6 +119,9 @@ class GPUWorker:
         )
 
         # set proc title
+        role = getattr(self.server_args, "disagg_role", "scheduler")
+        role_name = getattr(role, "value", role)
+        title_prefix = f"sgl_diffusion::{role_name}_scheduler"
         if model_parallel_is_initialized():
             suffix = ""
             if get_tp_world_size() != 1:
@@ -133,9 +136,9 @@ class GPUWorker:
             if get_classifier_free_guidance_world_size() != 1:
                 c_rank = get_classifier_free_guidance_rank()
                 suffix += f"_C{c_rank}"
-            setproctitle(f"sgl_diffusion::scheduler{suffix}")
+            setproctitle(f"{title_prefix}{suffix}")
         else:
-            setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
+            setproctitle(f"{title_prefix}_{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
 
