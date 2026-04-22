@@ -211,16 +211,20 @@ def init_distributed_environment(
             "distributed environment"
         )
 
-        # For MPS and MUSA, don't pass device_id as it doesn't support device indices
-        extra_args = (
-            {}
-            if (
+        # PyTorch only accepts device_id for indexed accelerator devices. CPU
+        # and other non-CUDA backends (gloo/MPS/MUSA/NPU) must omit it.
+        extra_args = {}
+        if (
+            device_id is not None
+            and current_platform.is_cuda_alike()
+            and not (
                 current_platform.is_mps()
                 or current_platform.is_musa()
                 or current_platform.is_npu()
             )
-            else dict(device_id=device_id)
-        )
+            and getattr(device_id, "index", None) is not None
+        ):
+            extra_args["device_id"] = device_id
 
         if timeout is not None:
 

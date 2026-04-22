@@ -230,7 +230,15 @@ def _spawn_disagg_worker_group(
             try:
                 data = reader.recv()
             except EOFError as exc:
-                exitcode = processes[rank_idx].exitcode if rank_idx < len(processes) else None
+                if rank_idx < len(processes):
+                    process = processes[rank_idx]
+                    try:
+                        process.join(timeout=0.1)
+                    except Exception:
+                        pass
+                    exitcode = process.exitcode
+                else:
+                    exitcode = None
                 raise RuntimeError(
                     f"{group_label} rank {rank_idx} exited before reporting ready "
                     f"(exitcode={exitcode})."

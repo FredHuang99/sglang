@@ -86,12 +86,21 @@ class _FakeReadyWriter:
 
 
 class _FakeProcess:
-    def __init__(self, events, rank, worker_id, name):
+    def __init__(
+        self,
+        events,
+        rank,
+        worker_id,
+        name,
+        *,
+        exitcode_after_join=None,
+    ):
         self.events = events
         self.rank = rank
         self.worker_id = worker_id
         self.name = name
         self.exitcode = None
+        self.exitcode_after_join = exitcode_after_join
         self._alive = False
 
     def start(self):
@@ -107,6 +116,8 @@ class _FakeProcess:
 
     def join(self, timeout=None):
         self._alive = False
+        if self.exitcode_after_join is not None:
+            self.exitcode = self.exitcode_after_join
         self.events.append(("join", self.rank, timeout))
 
     def is_alive(self):
@@ -114,9 +125,10 @@ class _FakeProcess:
 
 
 class _FakeSpawnContext:
-    def __init__(self, events, reader_specs=None):
+    def __init__(self, events, reader_specs=None, process_specs=None):
         self.events = events
         self.reader_specs = reader_specs or {}
+        self.process_specs = process_specs or {}
         self.pipe_rank = 0
 
     def Pipe(self, duplex=False):
@@ -134,7 +146,15 @@ class _FakeSpawnContext:
         )
 
     def Process(self, target, args, name, daemon):
-        return _FakeProcess(self.events, args[1], args[0], name)
+        rank = args[1]
+        spec = self.process_specs.get(rank, {})
+        return _FakeProcess(
+            self.events,
+            rank,
+            args[0],
+            name,
+            exitcode_after_join=spec.get("exitcode_after_join"),
+        )
 
 
 class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
@@ -509,6 +529,32 @@ class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
 
         terminate_ranks = [event[1] for event in events if event[0] == "terminate"]
         self.assertEqual(terminate_ranks, [0, 1, 2, 3])
+
+    def test_worker_group_reports_exitcode_after_eof_ready_failure(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(
+            events,
+            reader_specs={0: {"error": EOFError()}},
+            process_specs={0: {"exitcode_after_join": 7}},
+        )
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "Pool encoder\\[0\\] rank 0 exited before reporting ready "
+            "\\(exitcode=7\\)",
+        ):
+            _spawn_disagg_worker_group(
+                pool_ctx=pool_ctx,
+                worker_ids=[4],
+                role_args=_make_fake_role_args(
+                    disagg_role_device="cuda",
+                    num_gpus=1,
+                ),
+                process_name_builder=lambda rank_idx: f"enc-r{rank_idx}",
+                group_label="Pool encoder[0]",
+            )
+
+        self.assertIn(("join", 0, 0.1), events)
 
     def test_worker_group_sets_cpu_platform_override_before_spawn_start(self):
         events = []
