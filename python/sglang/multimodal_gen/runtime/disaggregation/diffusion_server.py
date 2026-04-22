@@ -85,6 +85,8 @@ class _TransferRequestState:
     downstream_wait_since: float | None = None
     downstream_tta_enqueued: bool = False
     rejected_instances: dict[int, int] = field(default_factory=dict)
+    downstream_retry_attempts: int = 0
+    next_downstream_retry_at: float = 0.0
     send_attempts: int = 0
     max_send_retries: int = 2
     last_send_error: str | None = None
@@ -103,6 +105,10 @@ class DiffusionServer:
 
     Capacity-aware dispatch with FreeBufferSlots per instance and TTA queues.
     """
+
+    _ALLOC_RETRY_BASE_DELAY_S = 0.05
+    _ALLOC_RETRY_MAX_DELAY_S = 1.0
+    _STATS_TRANSFER_DETAIL_LIMIT = 64
 
     def __init__(
         self,
@@ -135,7 +141,6 @@ class DiffusionServer:
         self._num_decoders = len(decoder_work_endpoints)
         self._timeout_s = timeout_s
         self._downstream_wait_timeout_s = downstream_wait_timeout_s
-        self._alloc_result_timeout_s = min(self._downstream_wait_timeout_s, 5.0)
 
         self._tracker = RequestTracker()
         self._dispatcher = PoolDispatcher(
@@ -200,6 +205,14 @@ class DiffusionServer:
         p2p.phase_started_at = timestamp
         if p2p.handoff_started_at is None:
             p2p.handoff_started_at = timestamp
+
+    @classmethod
+    def _alloc_retry_delay_s(cls, attempts: int) -> float:
+        exponent = max(0, min(attempts - 1, 5))
+        return min(
+            cls._ALLOC_RETRY_MAX_DELAY_S,
+            cls._ALLOC_RETRY_BASE_DELAY_S * (2**exponent),
+        )
 
     @staticmethod
     def _session_matches(observed: str | None, expected: str | None) -> bool:
@@ -655,38 +668,44 @@ class DiffusionServer:
             self._dispatch_to_encoder(entry.request_id, entry.payload, idx)
 
     def _drain_denoiser_tta(self) -> None:
-        while self._denoiser_tta:
-            entry = self._denoiser_tta[0]
-            p2p = entry.transfer_state
-            idx = self._select_downstream_instance_with_capacity(
-                RoleType.DENOISER,
-                p2p,
-            )
-            if idx is None:
-                break
-            entry = self._denoiser_tta.popleft()
-            if p2p is not None:
-                p2p.downstream_tta_enqueued = False
-            self._transfer_dispatch_to_denoiser(
-                entry.request_id, entry.transfer_state, idx
-            )
+        self._drain_role_tta(
+            self._denoiser_tta,
+            RoleType.DENOISER,
+            self._transfer_dispatch_to_denoiser,
+        )
 
     def _drain_decoder_tta(self) -> None:
-        while self._decoder_tta:
-            entry = self._decoder_tta[0]
+        self._drain_role_tta(
+            self._decoder_tta,
+            RoleType.DECODER,
+            self._transfer_dispatch_to_decoder,
+        )
+
+    def _drain_role_tta(
+        self,
+        queue_obj: deque[_RoleTTAEntry],
+        role: RoleType,
+        dispatch_fn,
+    ) -> None:
+        scan_count = len(queue_obj)
+        for _ in range(scan_count):
+            entry = queue_obj.popleft()
             p2p = entry.transfer_state
+            now = time.monotonic()
             idx = self._select_downstream_instance_with_capacity(
-                RoleType.DECODER,
+                role,
                 p2p,
+                allow_rejected_retry=(
+                    p2p is None or p2p.next_downstream_retry_at <= now
+                ),
             )
             if idx is None:
-                break
-            entry = self._decoder_tta.popleft()
+                queue_obj.append(entry)
+                continue
+
             if p2p is not None:
                 p2p.downstream_tta_enqueued = False
-            self._transfer_dispatch_to_decoder(
-                entry.request_id, entry.transfer_state, idx
-            )
+            dispatch_fn(entry.request_id, entry.transfer_state, idx)
 
     def _extract_request_id(self, frames: list) -> str | None:
         try:
@@ -736,7 +755,6 @@ class DiffusionServer:
     def _handle_timeouts(self) -> None:
         now = time.monotonic()
         wait_timed_out = []
-        alloc_phase_timed_out = []
         handoff_timeout_phases = {
             TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT,
             TransferPhase.WAITING_ALLOC_RESULT,
@@ -750,32 +768,6 @@ class DiffusionServer:
             ):
                 wait_timed_out.append(request_id)
                 continue
-            if (
-                p2p.transfer_phase == TransferPhase.WAITING_ALLOC_RESULT
-                and p2p.phase_started_at is not None
-                and (now - p2p.phase_started_at) > self._alloc_result_timeout_s
-            ):
-                alloc_phase_timed_out.append(request_id)
-
-        for request_id in alloc_phase_timed_out:
-            p2p = self._transfer_state.get(request_id)
-            if p2p is None or p2p.transfer_phase != TransferPhase.WAITING_ALLOC_RESULT:
-                continue
-            if not p2p.receiver_role or p2p.receiver_instance < 0:
-                continue
-            record = self._tracker.get(request_id)
-            role_enum = RoleType.from_string(p2p.receiver_role)
-            rejected_instance = p2p.receiver_instance
-            self._release_receiver_slot_if_needed(p2p, record, update_epoch=False)
-            self._recycle_prealloc_slot(p2p, role_enum)
-            self._clear_receiver_dispatch(p2p)
-            self._requeue_downstream_transfer(
-                request_id,
-                p2p,
-                role_enum=role_enum,
-                rejected_instance=rejected_instance,
-                now=now,
-            )
 
         for request_id in wait_timed_out:
             record = self._tracker.get(request_id)
@@ -999,29 +991,54 @@ class DiffusionServer:
         p2p: _TransferRequestState | None = None,
         *,
         extra_excluded: set[int] | None = None,
+        allow_rejected_retry: bool = True,
     ) -> int | None:
         excluded = set()
+        rejected_excluded = set()
         if p2p is not None:
-            excluded |= self._excluded_instances_for_request(p2p, role)
+            rejected_excluded = self._excluded_instances_for_request(p2p, role)
+            excluded |= rejected_excluded
         if extra_excluded:
             excluded |= set(extra_excluded)
-        excluded_instances = excluded or None
+
+        free_slots: list[int]
         if role == RoleType.DENOISER:
-            return self._dispatcher.select_denoiser_with_capacity(
-                self._denoiser_free_slots, excluded_instances=excluded_instances
-            )
-        if role == RoleType.DECODER:
-            return self._dispatcher.select_decoder_with_capacity(
-                self._decoder_free_slots, excluded_instances=excluded_instances
-            )
-        return None
+            free_slots = self._denoiser_free_slots
+            selector = self._dispatcher.select_denoiser_with_capacity
+        elif role == RoleType.DECODER:
+            free_slots = self._decoder_free_slots
+            selector = self._dispatcher.select_decoder_with_capacity
+        else:
+            return None
+
+        selected = selector(free_slots, excluded_instances=excluded or None)
+        if selected is not None:
+            return selected
+
+        if not allow_rejected_retry or not rejected_excluded or p2p is None:
+            return None
+
+        permanent_excluded = set(extra_excluded or ())
+        selected = selector(
+            free_slots, excluded_instances=permanent_excluded or None
+        )
+        if selected is not None:
+            p2p.rejected_instances.clear()
+        return selected
 
     def _enqueue_role_wait(
-        self, queue_obj: deque[_RoleTTAEntry], request_id: str, p2p: _TransferRequestState
+        self,
+        queue_obj: deque[_RoleTTAEntry],
+        request_id: str,
+        p2p: _TransferRequestState,
+        *,
+        now: float | None = None,
     ) -> None:
         if p2p.downstream_tta_enqueued:
             return
-        self._set_transfer_phase(p2p, TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT)
+        self._set_transfer_phase(
+            p2p, TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT, now=now
+        )
         queue_obj.append(_RoleTTAEntry(request_id=request_id, transfer_state=p2p))
         p2p.downstream_tta_enqueued = True
 
@@ -1092,6 +1109,7 @@ class DiffusionServer:
         p2p.receiver_slot_released = False
         p2p.receiver_prealloc_recycled = False
         p2p.transfer_completion_processed = False
+        p2p.next_downstream_retry_at = 0.0
 
         alloc_msg = TransferAllocMsg(
             request_id=request_id,
@@ -1274,7 +1292,7 @@ class DiffusionServer:
         if msg.get("retryable", True):
             logger.warning(
                 "DiffusionServer: %s retryable alloc reject from %s[%d]; "
-                "requeueing until capacity changes or timeout",
+                "requeueing with backoff until retry or timeout",
                 request_id,
                 role_enum.value,
                 receiver_instance,
@@ -1538,18 +1556,24 @@ class DiffusionServer:
         rejected_instance: int,
         now: float | None = None,
     ) -> None:
+        timestamp = time.monotonic() if now is None else now
         p2p.rejected_instances[rejected_instance] = self._current_capacity_epoch(
             role_enum, rejected_instance
         )
+        p2p.downstream_retry_attempts += 1
+        p2p.next_downstream_retry_at = timestamp + self._alloc_retry_delay_s(
+            p2p.downstream_retry_attempts
+        )
         if p2p.handoff_started_at is not None:
             p2p.downstream_wait_since = p2p.handoff_started_at
-        self._set_transfer_phase(
-            p2p, TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT, now=now
-        )
         if role_enum == RoleType.DENOISER:
-            self._enqueue_role_wait(self._denoiser_tta, request_id, p2p)
+            self._enqueue_role_wait(
+                self._denoiser_tta, request_id, p2p, now=timestamp
+            )
         else:
-            self._enqueue_role_wait(self._decoder_tta, request_id, p2p)
+            self._enqueue_role_wait(
+                self._decoder_tta, request_id, p2p, now=timestamp
+            )
 
     def _handle_alloc_accepted(self, msg: dict) -> None:
         request_id = msg.get("request_id", "")
@@ -1591,6 +1615,9 @@ class DiffusionServer:
 
         p2p.alloc_accepted = True
         p2p.downstream_wait_since = None
+        p2p.rejected_instances.clear()
+        p2p.downstream_retry_attempts = 0
+        p2p.next_downstream_retry_at = 0.0
         self._set_transfer_phase(p2p, TransferPhase.SENDING)
         if p2p.prealloc_slot_id is not None and msg.get("prealloc_slot_id") is None:
             self._recycle_prealloc_slot(
@@ -1865,6 +1892,8 @@ class DiffusionServer:
                 p2p.downstream_wait_since = time.monotonic()
                 p2p.downstream_tta_enqueued = False
                 p2p.rejected_instances.clear()
+                p2p.downstream_retry_attempts = 0
+                p2p.next_downstream_retry_at = 0.0
                 p2p.send_attempts = 0
                 p2p.last_send_error = None
                 p2p.sender_abort_sent = False
@@ -1918,6 +1947,40 @@ class DiffusionServer:
             self._transfer_state.pop(request_id, None)
 
     def get_stats(self) -> dict:
+        now = time.monotonic()
+        transfer_details = []
+        for request_id, p2p in list(self._transfer_state.items())[
+            : self._STATS_TRANSFER_DETAIL_LIMIT
+        ]:
+            transfer_details.append(
+                {
+                    "request_id": request_id,
+                    "phase": p2p.transfer_phase.value,
+                    "sender": (
+                        f"{p2p.sender_role}[{p2p.sender_instance}]"
+                        if p2p.sender_role
+                        else "none"
+                    ),
+                    "receiver": (
+                        f"{p2p.receiver_role}[{p2p.receiver_instance}]"
+                        if p2p.receiver_role
+                        else "none"
+                    ),
+                    "handoff_age_s": (
+                        None
+                        if p2p.handoff_started_at is None
+                        else max(0.0, now - p2p.handoff_started_at)
+                    ),
+                    "phase_age_s": (
+                        None
+                        if p2p.phase_started_at is None
+                        else max(0.0, now - p2p.phase_started_at)
+                    ),
+                    "retry_in_s": max(0.0, p2p.next_downstream_retry_at - now),
+                    "retry_attempts": p2p.downstream_retry_attempts,
+                }
+            )
+
         with self._lock:
             pending_count = len(self._pending)
         return {
@@ -1938,6 +2001,8 @@ class DiffusionServer:
             "denoiser_tta_depth": len(self._denoiser_tta),
             "decoder_tta_depth": len(self._decoder_tta),
             "transfer_active_transfers": len(self._transfer_state),
+            "transfer_state_detail_limit": self._STATS_TRANSFER_DETAIL_LIMIT,
+            "transfer_state_details": transfer_details,
             "encoder_peers": len(self._encoder_peers),
             "denoiser_peers": len(self._denoiser_peers),
             "decoder_peers": len(self._decoder_peers),

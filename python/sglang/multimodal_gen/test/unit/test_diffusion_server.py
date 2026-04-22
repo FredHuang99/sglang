@@ -390,13 +390,16 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             self.server._tracker.get("r-retry").state,
             RequestState.DENOISING_WAITING,
         )
+        self.assertGreater(p2p.next_downstream_retry_at, 0.0)
+        self.assertEqual(p2p.downstream_retry_attempts, 1)
 
-    def test_retryable_alloc_reject_without_alternative_requeues(self):
+    def test_retryable_alloc_reject_without_alternative_retries_after_backoff(self):
         self._submit_running_request("r-no-alt", RequestState.DENOISING_WAITING)
         self.server._pending["r-no-alt"] = b"client"
         self.server._frontend = MagicMock()
         self.server._send_abort = MagicMock()
         self.server._encoder_free_slots[0] = 0
+        self.server._denoiser_free_slots[0] = 0
         self.server._tracker.update_instances("r-no-alt", denoiser_instance=0)
         self.server._transfer_state["r-no-alt"] = _TransferRequestState(
             sender_role=RoleType.ENCODER.value,
@@ -429,6 +432,100 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         p2p = self.server._transfer_state["r-no-alt"]
         self.assertEqual(p2p.transfer_phase, TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT)
         self.assertIn(0, p2p.rejected_instances)
+        retry_at = p2p.next_downstream_retry_at
+
+        with unittest.mock.patch(
+            "sglang.multimodal_gen.runtime.disaggregation.diffusion_server.time.monotonic",
+            return_value=retry_at - 0.001,
+        ):
+            self.server._drain_denoiser_tta()
+
+        self.server._denoiser_pushes[0].send_multipart.assert_not_called()
+        self.assertEqual(len(self.server._denoiser_tta), 1)
+
+        with unittest.mock.patch(
+            "sglang.multimodal_gen.runtime.disaggregation.diffusion_server.time.monotonic",
+            return_value=retry_at + 0.001,
+        ):
+            self.server._drain_denoiser_tta()
+
+        self.server._denoiser_pushes[0].send_multipart.assert_called_once()
+        self.assertEqual(len(self.server._denoiser_tta), 0)
+        self.assertEqual(p2p.transfer_phase, TransferPhase.WAITING_ALLOC_RESULT)
+        self.assertNotIn(0, p2p.rejected_instances)
+
+    def test_retryable_decoder_alloc_reject_single_instance_retries_after_backoff(self):
+        self._submit_running_request("r-decoder-retry", RequestState.DECODER_WAITING)
+        self.server._tracker.update_instances("r-decoder-retry", decoder_instance=0)
+        self.server._decoder_free_slots[0] = 0
+        self.server._transfer_state["r-decoder-retry"] = _TransferRequestState(
+            sender_role=RoleType.DENOISER.value,
+            receiver_role=RoleType.DECODER.value,
+            sender_instance=0,
+            receiver_instance=0,
+            downstream_wait_since=1.0,
+        )
+
+        self.server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferAllocRejectMsg(
+                    request_id="r-decoder-retry",
+                    receiver_role=RoleType.DECODER.value,
+                    receiver_instance=0,
+                    retryable=True,
+                    reason="busy",
+                )
+            ),
+            RoleType.DECODER,
+        )
+
+        p2p = self.server._transfer_state["r-decoder-retry"]
+        retry_at = p2p.next_downstream_retry_at
+        self.assertEqual(len(self.server._decoder_tta), 1)
+        self.assertIn(0, p2p.rejected_instances)
+
+        with unittest.mock.patch(
+            "sglang.multimodal_gen.runtime.disaggregation.diffusion_server.time.monotonic",
+            return_value=retry_at + 0.001,
+        ):
+            self.server._drain_decoder_tta()
+
+        self.server._decoder_pushes[0].send_multipart.assert_called_once()
+        self.assertEqual(len(self.server._decoder_tta), 0)
+        self.assertEqual(p2p.transfer_phase, TransferPhase.WAITING_ALLOC_RESULT)
+        self.assertNotIn(0, p2p.rejected_instances)
+
+    def test_decoder_tta_backoff_head_does_not_block_ready_entry(self):
+        self._submit_running_request("r-cooling", RequestState.DECODER_WAITING)
+        self._submit_running_request("r-ready", RequestState.DECODER_WAITING)
+        self.server._decoder_free_slots[0] = 1
+        cooling = _TransferRequestState(
+            sender_role=RoleType.DENOISER.value,
+            sender_instance=0,
+            next_downstream_retry_at=100.0,
+        )
+        ready = _TransferRequestState(
+            sender_role=RoleType.DENOISER.value,
+            sender_instance=0,
+        )
+        cooling.rejected_instances[0] = 0
+        self.server._transfer_state["r-cooling"] = cooling
+        self.server._transfer_state["r-ready"] = ready
+        self.server._enqueue_role_wait(self.server._decoder_tta, "r-cooling", cooling)
+        self.server._enqueue_role_wait(self.server._decoder_tta, "r-ready", ready)
+
+        with unittest.mock.patch(
+            "sglang.multimodal_gen.runtime.disaggregation.diffusion_server.time.monotonic",
+            return_value=10.0,
+        ):
+            self.server._drain_decoder_tta()
+
+        self.server._decoder_pushes[0].send_multipart.assert_called_once()
+        sent_frames = self.server._decoder_pushes[0].send_multipart.call_args[0][0]
+        alloc_msg = decode_transfer_msg(sent_frames)
+        self.assertEqual(alloc_msg["request_id"], "r-ready")
+        self.assertEqual(len(self.server._decoder_tta), 1)
+        self.assertEqual(self.server._decoder_tta[0].request_id, "r-cooling")
 
     def test_alloc_accepted_stops_downstream_wait_timer(self):
         self._submit_running_request("r-accept", RequestState.DENOISING_WAITING)
@@ -439,7 +536,10 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             receiver_instance=0,
             receiver_session_id="den-session",
             downstream_wait_since=123.0,
+            downstream_retry_attempts=2,
+            next_downstream_retry_at=999.0,
         )
+        p2p.rejected_instances[0] = 0
         self.server._transfer_state["r-accept"] = p2p
 
         self.server._handle_transfer_result(
@@ -467,6 +567,15 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
         self.assertEqual(
             self.server._transfer_state["r-accept"].transfer_phase,
             TransferPhase.SENDING,
+        )
+        self.assertEqual(self.server._transfer_state["r-accept"].rejected_instances, {})
+        self.assertEqual(
+            self.server._transfer_state["r-accept"].downstream_retry_attempts,
+            0,
+        )
+        self.assertEqual(
+            self.server._transfer_state["r-accept"].next_downstream_retry_at,
+            0.0,
         )
 
     def test_stale_alloc_accepted_is_ignored(self):
@@ -497,12 +606,11 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT,
         )
 
-    def test_alloc_result_timeout_requeues_request_instead_of_failing(self):
+    def test_alloc_result_waits_for_role_ack_until_downstream_timeout(self):
         self._submit_running_request("r-alloc-timeout", RequestState.DENOISING_WAITING)
         self.server._tracker.update_instances("r-alloc-timeout", denoiser_instance=0)
         self.server._denoiser_free_slots[0] = 0
         self.server._downstream_wait_timeout_s = 100.0
-        self.server._alloc_result_timeout_s = 1.0
         self.server._transfer_state["r-alloc-timeout"] = _TransferRequestState(
             sender_role=RoleType.ENCODER.value,
             receiver_role=RoleType.DENOISER.value,
@@ -531,11 +639,19 @@ class TestDiffusionServerTransferProtocol(unittest.TestCase):
             self.server._handle_timeouts()
 
         self.assertIn("r-alloc-timeout", self.server._transfer_state)
-        self.assertEqual(len(self.server._denoiser_tta), 1)
-        self.assertEqual(self.server._denoiser_free_slots[0], 1)
+        self.assertEqual(len(self.server._denoiser_tta), 0)
+        self.assertEqual(self.server._denoiser_free_slots[0], 0)
         self.assertEqual(
             self.server._transfer_state["r-alloc-timeout"].transfer_phase,
-            TransferPhase.WAITING_FOR_DOWNSTREAM_SLOT,
+            TransferPhase.WAITING_ALLOC_RESULT,
+        )
+        self.assertEqual(
+            self.server._transfer_state["r-alloc-timeout"].receiver_role,
+            RoleType.DENOISER.value,
+        )
+        self.assertEqual(
+            self.server._transfer_state["r-alloc-timeout"].receiver_instance,
+            0,
         )
 
     def test_downstream_wait_timeout_aborts_sender_only_and_times_out(self):
