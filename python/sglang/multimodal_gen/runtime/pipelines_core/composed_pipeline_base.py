@@ -489,33 +489,53 @@ class ComposedPipelineBase(ABC):
             name += "_stage"
         return name
 
+    def _should_add_stage_for_role(
+        self,
+        role_affinity: RoleType,
+        stage_name: str,
+    ) -> bool:
+        if self._disagg_role == RoleType.MONOLITHIC:
+            return True
+        if role_affinity == self._disagg_role:
+            return True
+
+        logger.info(
+            "Disagg role=%s: skipping stage %s (affinity=%s)",
+            self._disagg_role.value,
+            stage_name,
+            role_affinity.value,
+        )
+        return False
+
     def add_stage(
         self, stage: PipelineStage, stage_name: str | None = None
     ) -> "ComposedPipelineBase":
 
         assert self.modules is not None, "No modules are registered"
-
-        # Filter stages based on disaggregation role
-        if self._disagg_role != RoleType.MONOLITHIC:
-            if stage.role_affinity != self._disagg_role:
-                if stage_name is None:
-                    stage_name = self._infer_stage_name(stage)
-                logger.info(
-                    "Disagg role=%s: skipping stage %s (affinity=%s)",
-                    self._disagg_role.value,
-                    stage_name,
-                    stage.role_affinity.value,
-                )
-                return self
-
         if stage_name is None:
             stage_name = self._infer_stage_name(stage)
+
+        # Filter stages based on disaggregation role
+        if not self._should_add_stage_for_role(stage.role_affinity, stage_name):
+            return self
+
         if stage_name in self._stage_name_mapping:
             raise ValueError(f"Duplicate stage name detected: {stage_name}")
 
         self._stages.append(stage)
         self._stage_name_mapping[stage_name] = stage
         return self
+
+    def add_stage_factory(
+        self,
+        role_affinity: RoleType,
+        stage_factory: Callable[[], PipelineStage],
+        stage_name: str,
+    ) -> "ComposedPipelineBase":
+        assert self.modules is not None, "No modules are registered"
+        if not self._should_add_stage_for_role(role_affinity, stage_name):
+            return self
+        return self.add_stage(stage_factory(), stage_name)
 
     def add_stages(
         self, stages: list[PipelineStage | tuple[PipelineStage, str]]
@@ -587,35 +607,47 @@ class ComposedPipelineBase(ABC):
         vae_key: str | None = "vae",
     ) -> "ComposedPipelineBase":
 
-        kwargs = {
-            "transformer": self.get_module(transformer_key),
-            "scheduler": self.get_module(scheduler_key),
-        }
+        def create_stage() -> PipelineStage:
+            kwargs = {
+                "transformer": self.get_module(transformer_key),
+                "scheduler": self.get_module(scheduler_key),
+            }
 
-        if transformer_2_key:
-            transformer_2 = self.get_module(transformer_2_key, None)
-            if transformer_2 is not None:
-                kwargs["transformer_2"] = transformer_2
+            if transformer_2_key:
+                transformer_2 = self.get_module(transformer_2_key, None)
+                if transformer_2 is not None:
+                    kwargs["transformer_2"] = transformer_2
 
-        if vae_key:
-            vae = self.get_module(vae_key, None)
-            if vae is not None:
-                kwargs["vae"] = vae
-                kwargs["pipeline"] = self
+            if vae_key:
+                vae = self.get_module(vae_key, None)
+                if vae is not None:
+                    kwargs["vae"] = vae
+                    kwargs["pipeline"] = self
 
-        return self.add_stage(DenoisingStage(**kwargs))
+            return DenoisingStage(**kwargs)
+
+        return self.add_stage_factory(
+            RoleType.DENOISER,
+            create_stage,
+            "denoising_stage",
+        )
 
     def add_standard_decoding_stage(
         self,
         vae_key: str = "vae",
     ) -> "ComposedPipelineBase":
 
-        return self.add_stage(
-            DecodingStage(
+        def create_stage() -> PipelineStage:
+            return DecodingStage(
                 vae=self.get_module(vae_key),
                 pipeline=self,
                 component_name=vae_key,
-            ),
+            )
+
+        return self.add_stage_factory(
+            RoleType.DECODER,
+            create_stage,
+            "decoding_stage",
         )
 
     def add_standard_t2i_stages(
