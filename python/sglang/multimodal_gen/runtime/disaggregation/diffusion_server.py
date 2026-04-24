@@ -546,10 +546,6 @@ class DiffusionServer:
             )
             return
 
-        record = self._tracker.get(request_id)
-        if record is not None and record.encoder_instance is not None:
-            self._release_role_slot(RoleType.ENCODER, record.encoder_instance)
-
         self._complete_terminal(request_id, RequestState.FAILED, str(error))
 
     def _handle_decoder_result_frames(self, frames: list) -> None:
@@ -771,7 +767,7 @@ class DiffusionServer:
 
         for request_id in wait_timed_out:
             record = self._tracker.get(request_id)
-            p2p = self._transfer_state.pop(request_id, None)
+            p2p = self._transfer_state.get(request_id)
             if p2p is None:
                 continue
             self._set_transfer_phase(p2p, TransferPhase.ABORTING, now=now)
@@ -808,7 +804,7 @@ class DiffusionServer:
             if request_id in wait_timed_out:
                 continue
             record = self._tracker.get(request_id)
-            p2p = self._transfer_state.pop(request_id, None)
+            p2p = self._transfer_state.get(request_id)
             if p2p is not None and record is not None:
                 self._set_transfer_phase(p2p, TransferPhase.ABORTING, now=now)
                 self._send_abort(
@@ -828,8 +824,6 @@ class DiffusionServer:
                 )
                 if receiver_role is not None:
                     self._recycle_prealloc_slot(p2p, receiver_role)
-            elif record:
-                self._free_slot_for_record(record)
 
             self._complete_terminal(
                 request_id,
@@ -872,6 +866,15 @@ class DiffusionServer:
             and record.decoder_instance is not None
         ):
             self._release_role_slot(RoleType.DECODER, record.decoder_instance)
+
+    def _release_terminal_slots(self, request_id: str, record) -> None:
+        p2p = self._transfer_state.get(request_id)
+        if p2p is None:
+            self._free_slot_for_record(record)
+            return
+
+        self._release_sender_slot_if_needed(p2p, record)
+        self._release_receiver_slot_if_needed(p2p, record)
 
     def _peer_registry(self, role: RoleType) -> dict[int, dict]:
         if role == RoleType.ENCODER:
@@ -1476,7 +1479,7 @@ class DiffusionServer:
 
         record = self._tracker.get(request_id)
         if record is not None:
-            self._free_slot_for_record(record)
+            self._release_terminal_slots(request_id, record)
 
         try:
             self._tracker.transition(request_id, terminal_state, error=error_msg)
@@ -1644,8 +1647,6 @@ class DiffusionServer:
                 staged_session_id,
                 expected_session_id,
             )
-            if record.encoder_instance is not None:
-                self._release_role_slot(RoleType.ENCODER, record.encoder_instance)
             control_endpoint = encoder_peer.get("control_endpoint", "")
             if control_endpoint:
                 try:
