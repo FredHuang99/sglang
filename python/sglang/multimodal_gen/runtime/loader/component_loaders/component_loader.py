@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib
+import logging
 import os
 import pkgutil
 import traceback
@@ -85,23 +86,36 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
-        profile_ctx = get_profile_log_context(server_args)
-        mem_before_loading = current_platform.get_available_gpu_memory()
-        logger.info(
-            "ProfileModuleLoadStart role=%s instance=%s rank=%s physical_rank=%s "
-            "world_size=%s device=%s component=%s path=%s mem_kind=%s "
-            "available_before_gb=%.2f",
-            profile_ctx.role,
-            profile_ctx.instance_id,
-            profile_ctx.rank,
-            profile_ctx.physical_rank,
-            profile_ctx.world_size,
-            profile_ctx.device,
-            component_name,
-            component_model_path,
-            profile_ctx.mem_kind,
-            mem_before_loading,
+        profile_logs_enabled = getattr(
+            server_args, "profile_enabled", False
+        ) or logger.isEnabledFor(logging.DEBUG)
+        profile_ctx = (
+            get_profile_log_context(server_args) if profile_logs_enabled else None
         )
+        mem_before_loading = current_platform.get_available_gpu_memory()
+        if profile_ctx is not None:
+            logger.info(
+                "ProfileModuleLoadStart role=%s instance=%s rank=%s physical_rank=%s "
+                "world_size=%s device=%s component=%s path=%s mem_kind=%s "
+                "available_before_gb=%.2f",
+                profile_ctx.role,
+                profile_ctx.instance_id,
+                profile_ctx.rank,
+                profile_ctx.physical_rank,
+                profile_ctx.world_size,
+                profile_ctx.device,
+                component_name,
+                component_model_path,
+                profile_ctx.mem_kind,
+                mem_before_loading,
+            )
+        else:
+            logger.info(
+                "Loading %s from %s. avail mem: %.2f GB",
+                component_name,
+                component_model_path,
+                mem_before_loading,
+            )
         try:
             component = self.load_customized(
                 component_model_path, server_args, component_name
@@ -140,25 +154,37 @@ class ComponentLoader(ABC):
             current_mem = current_platform.get_available_gpu_memory()
             model_size = get_memory_usage_of_component(component) or "NA"
             consumed = mem_before_loading - current_mem
-            logger.info(
-                "ProfileModuleLoadDone role=%s instance=%s rank=%s "
-                "physical_rank=%s world_size=%s device=%s component=%s "
-                "class=%s source=%s model_size_gb=%s mem_kind=%s "
-                "consumed_gb=%.2f available_after_gb=%.2f",
-                profile_ctx.role,
-                profile_ctx.instance_id,
-                profile_ctx.rank,
-                profile_ctx.physical_rank,
-                profile_ctx.world_size,
-                profile_ctx.device,
-                component_name,
-                component.__class__.__name__,
-                source,
-                model_size,
-                profile_ctx.mem_kind,
-                consumed,
-                current_mem,
-            )
+            if profile_ctx is not None:
+                logger.info(
+                    "ProfileModuleLoadDone role=%s instance=%s rank=%s "
+                    "physical_rank=%s world_size=%s device=%s component=%s "
+                    "class=%s source=%s model_size_gb=%s mem_kind=%s "
+                    "consumed_gb=%.2f available_after_gb=%.2f",
+                    profile_ctx.role,
+                    profile_ctx.instance_id,
+                    profile_ctx.rank,
+                    profile_ctx.physical_rank,
+                    profile_ctx.world_size,
+                    profile_ctx.device,
+                    component_name,
+                    component.__class__.__name__,
+                    source,
+                    model_size,
+                    profile_ctx.mem_kind,
+                    consumed,
+                    current_mem,
+                )
+            else:
+                logger.info(
+                    "Loaded %s: %s (%s version). model size: %s GB, "
+                    "consumed: %.2f GB, avail mem: %.2f GB",
+                    component_name,
+                    component.__class__.__name__,
+                    source,
+                    model_size,
+                    consumed,
+                    current_mem,
+                )
         return component, consumed
 
     def load_native(

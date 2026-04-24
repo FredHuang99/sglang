@@ -32,6 +32,7 @@ class TransferMsgType:
 
     # Registration
     REGISTER = "transfer_register"
+    # Reserved for a future registration handshake; currently unused.
     REGISTER_ACK = "transfer_register_ack"
 
 

@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.disaggregation.request_state import (
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.runtime.utils.request_profiling import (
     CsvProfileWriter,
+    RequestCsvProfiler,
     aggregate_logical_stage_durations,
     flatten_request_metrics,
     resolve_profile_dir,
@@ -49,6 +50,17 @@ class TestRequestProfilingUtils(unittest.TestCase):
             self.assertIn("decoder_ms", rows[0])
             self.assertEqual(rows[0]["encoder_ms"], "1.0")
             self.assertEqual(rows[1]["decoder_ms"], "2.0")
+
+    def test_request_profiler_finalized_cache_is_bounded(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            file_path = os.path.join(tmpdir, "profile.csv")
+            profiler = RequestCsvProfiler(file_path, finalized_cache_size=2)
+
+            profiler.finalize("r1", status="completed")
+            profiler.finalize("r2", status="completed")
+            profiler.finalize("r3", status="completed")
+
+            self.assertEqual(list(profiler._finalized_request_ids), ["r2", "r3"])
 
     def test_logical_stage_aggregation(self):
         metrics = RequestMetrics(request_id="req-1")

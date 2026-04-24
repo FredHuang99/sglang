@@ -359,6 +359,39 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
         warmup_mock.assert_called_once()
         self.assertEqual(events, ["wait", "warmup"])
 
+    def test_launch_disagg_server_waits_for_registration_without_warmup(self):
+        server_args = _make_server_args(
+            disagg_role=RoleType.SERVER,
+            warmup=False,
+            disagg_timeout=12,
+            encoder_urls="tcp://127.0.0.1:33020",
+            denoiser_urls="tcp://127.0.0.1:33021",
+            decoder_urls="tcp://127.0.0.1:33022",
+        )
+        fake_server = MagicMock()
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.DiffusionServer",
+            return_value=fake_server,
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server._wait_for_disagg_role_registration",
+        ) as wait_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server._run_disagg_startup_calibration",
+        ) as warmup_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server.launch_http_server_only"
+        ):
+            launch_disagg_server(server_args)
+
+        fake_server.start.assert_called_once_with()
+        wait_mock.assert_called_once_with(
+            fake_server,
+            expected_encoders=1,
+            expected_denoisers=1,
+            expected_decoders=1,
+            timeout_s=12.0,
+        )
+        warmup_mock.assert_not_called()
+
     def test_launch_pool_disagg_server_waits_for_registration_before_warmup(self):
         server_args = _make_server_args(
             disagg_role_device="cuda",
@@ -407,6 +440,42 @@ class TestDisaggStartupCalibrationHelpers(unittest.TestCase):
         warmup_mock.assert_called_once()
         self.assertEqual(events, ["wait", "warmup"])
 
+    def test_launch_pool_disagg_server_waits_for_registration_without_warmup(self):
+        server_args = _make_server_args(
+            disagg_role_device="cuda",
+            warmup=False,
+            disagg_timeout=12,
+        )
+        fake_server = MagicMock()
+
+        with patch(
+            "sglang.multimodal_gen.runtime.launch_server.DiffusionServer",
+            return_value=fake_server,
+        ), patch(
+            "sglang.multimodal_gen.runtime.launch_server._wait_for_disagg_role_registration",
+        ) as wait_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server._run_disagg_startup_calibration",
+        ) as warmup_mock, patch(
+            "sglang.multimodal_gen.runtime.launch_server.launch_http_server_only"
+        ):
+            launch_pool_disagg_server(
+                server_args,
+                encoder_gpus=[],
+                denoiser_gpus=[],
+                decoder_gpus=[],
+                launch_http_server=False,
+            )
+
+        fake_server.start.assert_called_once_with()
+        wait_mock.assert_called_once_with(
+            fake_server,
+            expected_encoders=0,
+            expected_denoisers=0,
+            expected_decoders=0,
+            timeout_s=12.0,
+        )
+        warmup_mock.assert_not_called()
+
 
 class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
     def _assert_starts_and_closes_before_recv(self, events, expected_ranks):
@@ -440,6 +509,8 @@ class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
         ), patch(
             "sglang.multimodal_gen.runtime.launch_server.DiffusionServer"
         ) as diffusion_server_cls, patch(
+            "sglang.multimodal_gen.runtime.launch_server._wait_for_disagg_role_registration"
+        ), patch(
             "sglang.multimodal_gen.runtime.launch_server.is_port_available",
             return_value=True,
         ):

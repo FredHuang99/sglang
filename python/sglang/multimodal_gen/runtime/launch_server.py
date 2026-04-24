@@ -618,14 +618,14 @@ def launch_pool_disagg_server(
             profile_run_id=server_args.profile_run_id,
         )
         diffusion_server.start()
+        _wait_for_disagg_role_registration(
+            diffusion_server,
+            expected_encoders=len(encoder_gpus),
+            expected_denoisers=len(denoiser_gpus),
+            expected_decoders=len(decoder_gpus),
+            timeout_s=float(server_args.disagg_timeout),
+        )
         if server_args.warmup:
-            _wait_for_disagg_role_registration(
-                diffusion_server,
-                expected_encoders=len(encoder_gpus),
-                expected_denoisers=len(denoiser_gpus),
-                expected_decoders=len(decoder_gpus),
-                timeout_s=float(server_args.disagg_timeout),
-            )
             _run_disagg_startup_calibration(frontend_endpoint, server_args)
 
         if launch_http_server:
@@ -766,14 +766,14 @@ def launch_disagg_server(server_args: ServerArgs):
     )
     try:
         diffusion_server.start()
+        _wait_for_disagg_role_registration(
+            diffusion_server,
+            expected_encoders=len(encoder_work_endpoints),
+            expected_denoisers=len(denoiser_work_endpoints),
+            expected_decoders=len(decoder_work_endpoints),
+            timeout_s=float(server_args.disagg_timeout),
+        )
         if server_args.warmup:
-            _wait_for_disagg_role_registration(
-                diffusion_server,
-                expected_encoders=len(encoder_work_endpoints),
-                expected_denoisers=len(denoiser_work_endpoints),
-                expected_decoders=len(decoder_work_endpoints),
-                timeout_s=float(server_args.disagg_timeout),
-            )
             _run_disagg_startup_calibration(frontend_endpoint, server_args)
 
         logger.info(

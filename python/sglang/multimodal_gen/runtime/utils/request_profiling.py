@@ -9,6 +9,7 @@ import json
 import math
 import os
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any
 
@@ -132,7 +133,6 @@ class CsvProfileWriter:
         self.file_path = os.path.abspath(os.path.expanduser(file_path))
         self._lock = threading.Lock()
         self._fieldnames: list[str] = []
-        self._rows: list[dict[str, str]] = []
 
     @property
     def fieldnames(self) -> list[str]:
@@ -141,29 +141,55 @@ class CsvProfileWriter:
     def write_row(self, row: dict[str, Any]) -> None:
         with self._lock:
             normalized = {key: _coerce_csv_value(value) for key, value in row.items()}
-            for fieldname in normalized:
-                if fieldname not in self._fieldnames:
-                    self._fieldnames.append(fieldname)
-            self._rows.append(normalized)
-            self._rewrite()
+            new_fields = [
+                fieldname
+                for fieldname in normalized
+                if fieldname not in self._fieldnames
+            ]
+            if new_fields:
+                self._fieldnames.extend(new_fields)
+                self._rewrite_with_existing_rows(normalized)
+                return
 
-    def _rewrite(self) -> None:
+            self._append(normalized)
+
+    def _append(self, row: dict[str, str]) -> None:
         os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        needs_header = not os.path.exists(self.file_path) or os.path.getsize(
+            self.file_path
+        ) == 0
+        with open(self.file_path, "a", newline="", encoding="utf-8") as fp:
+            writer = csv.DictWriter(fp, fieldnames=self._fieldnames)
+            if needs_header:
+                writer.writeheader()
+            writer.writerow({name: row.get(name, "") for name in self._fieldnames})
+
+    def _rewrite_with_existing_rows(self, row: dict[str, str]) -> None:
+        os.makedirs(os.path.dirname(self.file_path), exist_ok=True)
+        existing_rows: list[dict[str, str]] = []
+        if os.path.exists(self.file_path) and os.path.getsize(self.file_path) > 0:
+            with open(self.file_path, "r", newline="", encoding="utf-8") as fp:
+                existing_rows = list(csv.DictReader(fp))
+
         with open(self.file_path, "w", newline="", encoding="utf-8") as fp:
             writer = csv.DictWriter(fp, fieldnames=self._fieldnames)
             writer.writeheader()
-            for row in self._rows:
-                writer.writerow({name: row.get(name, "") for name in self._fieldnames})
+            for existing_row in existing_rows:
+                writer.writerow(
+                    {name: existing_row.get(name, "") for name in self._fieldnames}
+                )
+            writer.writerow({name: row.get(name, "") for name in self._fieldnames})
 
 
 class RequestCsvProfiler:
     """Accumulate per-request fields and flush them to CSV."""
 
-    def __init__(self, file_path: str):
+    def __init__(self, file_path: str, finalized_cache_size: int = 65536):
         self._writer = CsvProfileWriter(file_path)
         self._lock = threading.Lock()
         self._records: dict[str, dict[str, Any]] = {}
-        self._finalized_request_ids: set[str] = set()
+        self._finalized_request_ids: OrderedDict[str, None] = OrderedDict()
+        self._finalized_cache_size = max(0, int(finalized_cache_size))
 
     @property
     def file_path(self) -> str:
@@ -173,9 +199,19 @@ class RequestCsvProfiler:
         with self._lock:
             if request_id in self._finalized_request_ids:
                 return {"request_id": request_id}
-            record = self._records.setdefault("{}".format(request_id), {"request_id": request_id})
+            record = self._records.setdefault(
+                "{}".format(request_id), {"request_id": request_id}
+            )
             record.update(fields)
             return dict(record)
+
+    def _remember_finalized(self, request_id: str) -> None:
+        if self._finalized_cache_size <= 0:
+            return
+        self._finalized_request_ids[request_id] = None
+        self._finalized_request_ids.move_to_end(request_id)
+        while len(self._finalized_request_ids) > self._finalized_cache_size:
+            self._finalized_request_ids.popitem(last=False)
 
     def finalize(
         self,
@@ -188,8 +224,10 @@ class RequestCsvProfiler:
         with self._lock:
             if request_id in self._finalized_request_ids:
                 return
-            record = self._records.pop("{}".format(request_id), {"request_id": request_id})
-            self._finalized_request_ids.add(request_id)
+            record = self._records.pop(
+                "{}".format(request_id), {"request_id": request_id}
+            )
+            self._remember_finalized(request_id)
         record["status"] = status
         if error is not None:
             record["error"] = error

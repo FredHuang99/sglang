@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.request_profiling import (
     RequestCsvProfiler,
@@ -179,6 +180,8 @@ class DiffusionServer:
         self._denoiser_tta: deque[_RoleTTAEntry] = deque()
         self._decoder_tta: deque[_RoleTTAEntry] = deque()
 
+        # Legacy/stat-only flag retained for compatibility. The current
+        # disaggregation path always uses the transfer protocol.
         self._transfer_mode = p2p_mode
         self._transfer_state: dict[str, _TransferRequestState] = {}
         self._server_profile_writer = None
@@ -336,6 +339,39 @@ class DiffusionServer:
         except Exception:
             logger.exception("DiffusionServer: failed to destroy ZMQ context")
 
+    def _make_output_batch(self, *, output=None, error: str | None = None):
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+            OutputBatch,
+        )
+
+        return OutputBatch(output=output, error=error)
+
+    def _send_client_response(
+        self,
+        socket: zmq.Socket,
+        client_identity: bytes,
+        response,
+        *,
+        nonblock: bool = True,
+    ) -> None:
+        flags = zmq.NOBLOCK if nonblock else 0
+        try:
+            socket.send_multipart(
+                [client_identity, b"", pickle.dumps(response)],
+                flags,
+            )
+        except zmq.ZMQError as e:
+            logger.warning("DiffusionServer: failed to send client response: %s", e)
+
+    def _send_client_error(
+        self, socket: zmq.Socket, client_identity: bytes, error_msg: str
+    ) -> None:
+        self._send_client_response(
+            socket,
+            client_identity,
+            self._make_output_batch(error=error_msg),
+        )
+
     def start(self) -> None:
         if self._running:
             return
@@ -362,16 +398,28 @@ class DiffusionServer:
 
     def stop(self) -> None:
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=5.0)
-            if self._thread.is_alive():
-                logger.warning(
-                    "DiffusionServer: stop timed out while waiting for event loop thread"
-                )
-                return
-            self._thread = None
-        self._close_control_push_sockets()
-        self._destroy_context_if_needed()
+        try:
+            if self._thread is not None:
+                self._thread.join(timeout=5.0)
+                if self._thread.is_alive():
+                    logger.warning(
+                        "DiffusionServer: stop timed out while waiting for event loop "
+                        "thread; destroying context to unblock sockets"
+                    )
+                    self._destroy_context_if_needed()
+                    self._thread.join(timeout=1.0)
+                    if self._thread.is_alive():
+                        logger.warning(
+                            "DiffusionServer: event loop thread still alive after "
+                            "context cleanup"
+                        )
+                    else:
+                        self._thread = None
+                else:
+                    self._thread = None
+        finally:
+            self._close_control_push_sockets()
+            self._destroy_context_if_needed()
 
     def _event_loop(self) -> None:
         frontend, _ = get_zmq_socket(
@@ -475,6 +523,10 @@ class DiffusionServer:
             return
 
         if len(parts) < 3:
+            if parts:
+                self._send_client_error(
+                    frontend, parts[0], "Malformed request envelope"
+                )
             return
 
         client_identity = parts[0]
@@ -484,22 +536,34 @@ class DiffusionServer:
             reqs = pickle.loads(payload)
         except (pickle.UnpicklingError, EOFError):
             logger.warning("DiffusionServer: failed to deserialize request")
+            self._send_client_error(
+                frontend, client_identity, "Failed to deserialize request"
+            )
             return
 
         if not isinstance(reqs, list):
             reqs = [reqs]
+        if not reqs:
+            self._send_client_error(frontend, client_identity, "Empty request batch")
+            return
 
         req = reqs[0]
 
+        if isinstance(req, GetDisaggStatsReq):
+            self._send_client_response(
+                frontend,
+                client_identity,
+                self._make_output_batch(output=self.get_stats()),
+            )
+            return
+
         if isinstance(req, dict) or not hasattr(req, "request_id"):
-            # Send empty reply so REQ socket doesn't hang
-            try:
-                frontend.send_multipart(
-                    [client_identity, b"", pickle.dumps({"status": "ignored"})],
-                    zmq.NOBLOCK,
-                )
-            except zmq.Again:
-                pass
+            req_type = "dict" if isinstance(req, dict) else type(req).__name__
+            self._send_client_error(
+                frontend,
+                client_identity,
+                f"Unsupported request type for DiffusionServer: {req_type}",
+            )
             return
 
         request_id = getattr(req, "request_id", None)
@@ -514,6 +578,11 @@ class DiffusionServer:
             self._tracker.submit(request_id, submit_time_s=request_arrival_time_s)
         except ValueError:
             logger.warning("DiffusionServer: duplicate request_id %s", request_id)
+            self._send_client_error(
+                frontend,
+                client_identity,
+                f"Duplicate request_id: {request_id}",
+            )
             return
 
         with self._lock:
@@ -709,44 +778,6 @@ class DiffusionServer:
             return metadata.get("scalar_fields", {}).get("request_id")
         except (json.JSONDecodeError, IndexError, TypeError):
             return None
-
-    def _complete_terminal(
-        self,
-        request_id: str,
-        terminal_state: RequestState,
-        error_msg: str,
-    ) -> None:
-        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-            OutputBatch,
-        )
-
-        logger.error("DiffusionServer: request %s failed: %s", request_id, error_msg)
-
-        try:
-            self._tracker.transition(request_id, terminal_state, error=error_msg)
-        except ValueError:
-            pass
-
-        with self._lock:
-            client_identity = self._pending.pop(request_id, None)
-
-        if client_identity is None:
-            self._tracker.remove(request_id)
-            return
-
-        error_batch = OutputBatch(error=error_msg)
-        try:
-            self._frontend.send_multipart(
-                [client_identity, b"", pickle.dumps(error_batch)]
-            )
-        except zmq.ZMQError as e:
-            logger.error(
-                "DiffusionServer: failed to send error for %s: %s",
-                request_id,
-                e,
-            )
-
-        self._tracker.remove(request_id)
 
     def _handle_timeouts(self) -> None:
         now = time.monotonic()

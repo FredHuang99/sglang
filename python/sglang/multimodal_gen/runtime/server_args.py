@@ -252,8 +252,8 @@ class ServerArgs:
 
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
-    disagg_timeout: int = 1200  # seconds, timeout for pending disagg requests
-    disagg_downstream_wait_timeout: int = 600  # seconds, wait for downstream slot
+    disagg_timeout: int = 3600  # seconds, timeout for pending disagg requests
+    disagg_downstream_wait_timeout: int = 1800  # seconds, wait for downstream slot
     disagg_dispatch_policy: str = "round_robin"  # "round_robin" or "max_free_slots"
     disagg_mode: bool = False  # True when running as a disaggregated instance
     disagg_instance_id: int = 0  # Stable per-role instance ID inside a pool
@@ -851,7 +851,7 @@ class ServerArgs:
             help="Timeout in seconds for pending disagg requests. "
             "Encoder returns an error if the decoder result is not received "
             "within this period. Also used as recv timeout for denoiser/decoder. "
-            "Default: 600.",
+            f"Default: {ServerArgs.disagg_timeout}.",
         )
         parser.add_argument(
             "--disagg-downstream-wait-timeout",
@@ -859,7 +859,8 @@ class ServerArgs:
             default=ServerArgs.disagg_downstream_wait_timeout,
             help="Timeout in seconds for a request whose upstream role has already "
             "staged output but is still waiting for a downstream role to accept a slot. "
-            "Shared by encoder->denoiser and denoiser->decoder handoff. Default: 120.",
+            "Shared by encoder->denoiser and denoiser->decoder handoff. "
+            f"Default: {ServerArgs.disagg_downstream_wait_timeout}.",
         )
         parser.add_argument(
             "--disagg-dispatch-policy",

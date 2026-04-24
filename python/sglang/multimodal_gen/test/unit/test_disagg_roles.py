@@ -30,6 +30,7 @@ class TestRoleType(unittest.TestCase):
         self.assertIn("monolithic", choices)
         self.assertIn("encoder", choices)
         self.assertIn("denoiser", choices)
+        self.assertIn("denoising", choices)
         self.assertIn("decoder", choices)
 
 

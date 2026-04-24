@@ -145,6 +145,18 @@ class TestCreateTransferEngine(unittest.TestCase):
                 "mooncake",
             )
 
+    def test_auto_backend_non_loopback_fails_fast_without_mooncake(self):
+        with patch(
+            "sglang.multimodal_gen.runtime.disaggregation.transport.engine._check_mooncake",
+            return_value=False,
+        ):
+            self.assertEqual(
+                resolve_transfer_backend("auto", hostname="10.0.0.5"),
+                "mooncake",
+            )
+            with self.assertRaisesRegex(RuntimeError, "Mooncake transfer backend"):
+                create_transfer_engine(backend="auto", hostname="10.0.0.5")
+
     def test_explicit_mooncake_backend_requires_availability(self):
         with patch(
             "sglang.multimodal_gen.runtime.disaggregation.transport.engine._check_mooncake",

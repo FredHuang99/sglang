@@ -43,11 +43,11 @@ class TimestepPreparationStage(PipelineStage):
         scheduler,
         prepare_extra_set_timesteps_kwargs: list[
             Callable[[Req, ServerArgs], Tuple[str, Any]]
-        ] = [],
+        ] | None = None,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
-        self.prepare_extra_set_timesteps_kwargs = (
+        self.prepare_extra_set_timesteps_kwargs = list(
             prepare_extra_set_timesteps_kwargs or []
         )
 

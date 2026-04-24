@@ -392,6 +392,11 @@ class DiffusionTransferManager:
         scalar_fields: dict | None = None,
         stream: torch.cuda.Stream | None = None,
     ) -> StagedTransfer | None:
+        """Compatibility wrapper for tests/debugging.
+
+        Production role code uses stage_tensors_async() with background send
+        completion so CUDA streams do not block the scheduler loop.
+        """
         staged, ready_event = self.stage_tensors_async(
             request_id, tensor_fields, scalar_fields, stream
         )
@@ -538,6 +543,10 @@ class DiffusionTransferManager:
         dest_addr: int,
         transfer_size: int,
     ) -> bool:
+        """Compatibility wrapper for tests/debugging.
+
+        Production role code queues sends through the background worker path.
+        """
         with self._lock:
             staged = self._staged.get(request_id)
         if staged is None:
@@ -592,6 +601,12 @@ class DiffusionTransferManager:
         device: torch.device | str = "cuda",
         stream: torch.cuda.Stream | None = None,
     ) -> dict[str, torch.Tensor | list[torch.Tensor]]:
+        """Compatibility wrapper for tests/debugging.
+
+        Production role code uses load_transfer_async() to preserve scalar fields
+        and defer CUDA synchronization to the caller.
+        """
+        del manifest
         tensors, _scalar_fields, load_event = self._load_received_transfer(
             request_id, device=device, stream=stream
         )
@@ -631,6 +646,7 @@ class DiffusionTransferManager:
             self._meta_buffer.free(pending.meta_slot)
 
     def get_receive_slot_addr(self, request_id: str) -> int | None:
+        """Test/debug accessor; production transfer uses peer info messages."""
         with self._lock:
             pending = self._pending_receives.get(request_id)
         if pending is None or pending.slot is None:
@@ -638,6 +654,7 @@ class DiffusionTransferManager:
         return self._buffer.pool_data_ptr + pending.slot.offset
 
     def get_receive_slot_offset(self, request_id: str) -> int | None:
+        """Test/debug accessor; production transfer uses peer info messages."""
         with self._lock:
             pending = self._pending_receives.get(request_id)
         if pending is None or pending.slot is None:
@@ -645,6 +662,7 @@ class DiffusionTransferManager:
         return pending.slot.offset
 
     def get_receive_meta_addr(self, request_id: str) -> int | None:
+        """Test/debug accessor; production transfer uses peer info messages."""
         with self._lock:
             pending = self._pending_receives.get(request_id)
         if pending is None or pending.meta_slot is None:
@@ -652,6 +670,7 @@ class DiffusionTransferManager:
         return self._meta_buffer.pool_data_ptr + pending.meta_slot.offset
 
     def get_receive_meta_offset(self, request_id: str) -> int | None:
+        """Test/debug accessor; production transfer uses peer info messages."""
         with self._lock:
             pending = self._pending_receives.get(request_id)
         if pending is None or pending.meta_slot is None:

@@ -25,7 +25,7 @@ class RoleType(str, Enum):
 
     @classmethod
     def choices(cls) -> list[str]:
-        return [role.value for role in cls]
+        return [role.value for role in cls] + sorted(_ROLE_ALIASES)
 
 
 def get_module_role(module_name: str) -> "RoleType | None":

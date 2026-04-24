@@ -2057,7 +2057,12 @@ class SchedulerDisaggMixin:
             )
 
     def _handle_transfer_non_rank0(self: Scheduler, frames: list) -> None:
-        """Transfer control is rank0-only; follower ranks only react to broadcasts."""
+        """Placeholder for rank0-only transfer control.
+
+        Follower ranks currently react only to broadcasts; keep this private hook
+        for compatibility with older tests and future rank-aware transfer control.
+        """
+        del frames
         return
 
     def _handle_transfer_alloc(self: Scheduler, msg: dict) -> None:

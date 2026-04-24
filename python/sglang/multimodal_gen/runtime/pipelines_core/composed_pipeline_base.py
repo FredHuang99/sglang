@@ -7,6 +7,7 @@ Base class for composed pipelines.
 This module defines the base class for pipelines that are composed of multiple stages.
 """
 
+import logging
 import os
 import re
 from abc import ABC, abstractmethod
@@ -98,11 +99,15 @@ class ComposedPipelineBase(ABC):
         self._stage_name_mapping: dict[str, PipelineStage] = {}
         self.executor = executor or self.build_executor(server_args=server_args)
 
-        if required_config_modules is not None:
-            self._required_config_modules = required_config_modules
-
-        if self._required_config_modules is None:
+        base_required_config_modules = (
+            required_config_modules
+            if required_config_modules is not None
+            else self._required_config_modules
+        )
+        if base_required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
+        self._required_config_modules = list(base_required_config_modules)
+        self._extra_config_module_map = dict(self._extra_config_module_map)
 
         # Filter modules based on disaggregation role
         if self._disagg_role != RoleType.MONOLITHIC:
@@ -475,35 +480,48 @@ class ComposedPipelineBase(ABC):
                     f"Required module: {module_name} was not found in loaded modules: {list(loaded_components.keys())}"
                 )
 
-        logger.debug(
-            "Memory usage of loaded modules (GiB): %s. avail mem: %s GB",
-            self.memory_usages,
-            round(current_platform.get_available_gpu_memory(), 2),
-        )
-        profile_ctx = get_profile_log_context(server_args)
         total_consumed_gb = sum(
             usage
             for usage in self.memory_usages.values()
             if isinstance(usage, (int, float))
         )
-        logger.info(
-            "ProfileModuleLoadSummary role=%s instance=%s rank=%s "
-            "physical_rank=%s world_size=%s device=%s mem_kind=%s "
-            "required_modules=%s loaded_modules=%s memory_usages_gb=%s "
-            "total_consumed_gb=%.2f available_after_gb=%.2f",
-            profile_ctx.role,
-            profile_ctx.instance_id,
-            profile_ctx.rank,
-            profile_ctx.physical_rank,
-            profile_ctx.world_size,
-            profile_ctx.device,
-            profile_ctx.mem_kind,
-            list(required_modules),
-            list(loaded_components.keys()),
+        available_after_gb = current_platform.get_available_gpu_memory()
+        logger.debug(
+            "Memory usage of loaded modules (GiB): %s. avail mem: %s GB",
             self.memory_usages,
-            total_consumed_gb,
-            current_platform.get_available_gpu_memory(),
+            round(available_after_gb, 2),
         )
+        if getattr(server_args, "profile_enabled", False) or logger.isEnabledFor(
+            logging.DEBUG
+        ):
+            profile_ctx = get_profile_log_context(server_args)
+            logger.info(
+                "ProfileModuleLoadSummary role=%s instance=%s rank=%s "
+                "physical_rank=%s world_size=%s device=%s mem_kind=%s "
+                "required_modules=%s loaded_modules=%s memory_usages_gb=%s "
+                "total_consumed_gb=%.2f available_after_gb=%.2f",
+                profile_ctx.role,
+                profile_ctx.instance_id,
+                profile_ctx.rank,
+                profile_ctx.physical_rank,
+                profile_ctx.world_size,
+                profile_ctx.device,
+                profile_ctx.mem_kind,
+                list(required_modules),
+                list(loaded_components.keys()),
+                self.memory_usages,
+                total_consumed_gb,
+                available_after_gb,
+            )
+        else:
+            logger.info(
+                "Loaded modules: required=%s loaded=%s total_consumed_gb=%.2f "
+                "available_after_gb=%.2f",
+                list(required_modules),
+                list(loaded_components.keys()),
+                total_consumed_gb,
+                available_after_gb,
+            )
 
         return loaded_components
 
@@ -605,12 +623,12 @@ class ComposedPipelineBase(ABC):
     def add_standard_timestep_preparation_stage(
         self,
         scheduler_key: str = "scheduler",
-        prepare_extra_kwargs: list[Callable] | None = [],
+        prepare_extra_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
         return self.add_stage(
             TimestepPreparationStage(
                 scheduler=self.get_module(scheduler_key),
-                prepare_extra_set_timesteps_kwargs=prepare_extra_kwargs,
+                prepare_extra_set_timesteps_kwargs=list(prepare_extra_kwargs or []),
             ),
         )
 
@@ -680,7 +698,7 @@ class ComposedPipelineBase(ABC):
     def add_standard_t2i_stages(
         self,
         include_input_validation: bool = True,
-        prepare_extra_timestep_kwargs: list[Callable] | None = [],
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
 
         if include_input_validation:
@@ -709,7 +727,7 @@ class ComposedPipelineBase(ABC):
         prompt_text_encoder_key: str = "text_encoder",
         image_vae_key: str = "vae",
         image_vae_stage_kwargs: dict[str, Any] | None = None,
-        prepare_extra_timestep_kwargs: list[Callable] | None = [],
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:
             self.add_stage(
@@ -761,7 +779,7 @@ class ComposedPipelineBase(ABC):
         image_vae_encoding_position: Literal[
             "before_timestep", "after_latent"
         ] = "before_timestep",
-        prepare_extra_timestep_kwargs: list[Callable] | None = [],
+        prepare_extra_timestep_kwargs: list[Callable] | None = None,
         denoising_stage_factory: Callable[[], PipelineStage] | None = None,
     ) -> "ComposedPipelineBase":
         if include_input_validation:

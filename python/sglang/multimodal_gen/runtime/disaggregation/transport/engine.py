@@ -58,7 +58,7 @@ def resolve_transfer_backend(
         return "mooncake"
     if _is_loopback_hostname(hostname):
         return "mock"
-    return "mooncake" if _check_mooncake() else "mock"
+    return "mooncake"
 
 
 class BaseTransferEngine(ABC):

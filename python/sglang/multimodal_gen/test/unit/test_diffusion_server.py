@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for DiffusionServer pool-based pipeline orchestrator."""
 
+import pickle
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.multimodal_gen.runtime.disaggregation.diffusion_server import (
@@ -22,6 +24,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     decode_transfer_msg,
     encode_transfer_msg,
 )
+from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
 
 
 class TestDiffusionServerInit(unittest.TestCase):
@@ -40,6 +43,65 @@ class TestDiffusionServerInit(unittest.TestCase):
         self.assertEqual(server._encoder_free_slots, [3])
         self.assertEqual(server._denoiser_free_slots, [3])
         self.assertEqual(server._decoder_free_slots, [3])
+
+
+class TestDiffusionServerClientRequests(unittest.TestCase):
+    def setUp(self):
+        self.server = DiffusionServer(
+            frontend_endpoint="tcp://127.0.0.1:19800",
+            encoder_work_endpoints=["tcp://127.0.0.1:19801"],
+            denoiser_work_endpoints=["tcp://127.0.0.1:19802"],
+            decoder_work_endpoints=["tcp://127.0.0.1:19803"],
+            encoder_result_endpoint="tcp://127.0.0.1:19804",
+            denoiser_result_endpoint="tcp://127.0.0.1:19805",
+            decoder_result_endpoint="tcp://127.0.0.1:19806",
+        )
+        self.addCleanup(self.server.stop)
+
+    def _frontend_with_payload(self, payload):
+        frontend = MagicMock()
+        frontend.recv_multipart.return_value = [b"client", b"", payload]
+        return frontend
+
+    def _response_from_frontend(self, frontend):
+        frames = frontend.send_multipart.call_args[0][0]
+        return pickle.loads(frames[-1])
+
+    def test_stats_request_returns_output_batch(self):
+        frontend = self._frontend_with_payload(pickle.dumps(GetDisaggStatsReq()))
+
+        self.server._handle_client_request(frontend)
+
+        response = self._response_from_frontend(frontend)
+        self.assertIsNone(response.error)
+        self.assertEqual(response.output["role"], "diffusion_server")
+
+    def test_bad_pickle_returns_error_response(self):
+        frontend = self._frontend_with_payload(b"not-a-pickle")
+
+        self.server._handle_client_request(frontend)
+
+        response = self._response_from_frontend(frontend)
+        self.assertIn("deserialize", response.error)
+
+    def test_unsupported_dict_request_returns_error_response(self):
+        frontend = self._frontend_with_payload(pickle.dumps({"method": "ping"}))
+
+        self.server._handle_client_request(frontend)
+
+        response = self._response_from_frontend(frontend)
+        self.assertIn("Unsupported request type", response.error)
+
+    def test_duplicate_request_id_returns_error_response(self):
+        self.server._tracker.submit("dup-req")
+        frontend = self._frontend_with_payload(
+            pickle.dumps(SimpleNamespace(request_id="dup-req", metrics=None))
+        )
+
+        self.server._handle_client_request(frontend)
+
+        response = self._response_from_frontend(frontend)
+        self.assertIn("Duplicate request_id", response.error)
 
 
 class TestDiffusionServerTransferProtocol(unittest.TestCase):

@@ -276,8 +276,8 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
     def test_disagg_defaults_match_reviewed_values(self):
         args = _from_dict_without_model_resolution({"model_path": "/fake"})
         self.assertEqual(args.disagg_max_slots_per_instance, 8)
-        self.assertEqual(args.disagg_downstream_wait_timeout, 600)
-        self.assertEqual(args.disagg_timeout, 1200)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 1800)
+        self.assertEqual(args.disagg_timeout, 3600)
 
     def test_downstream_wait_timeout_cli_arg_is_parsed(self):
         parser = FlexibleArgumentParser()
@@ -291,6 +291,32 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
         args, _unknown = parser.parse_known_args(argv)
         self.assertEqual(args.disagg_downstream_wait_timeout, 45)
+
+    def test_disagg_timeout_help_uses_current_defaults(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        help_text = parser.format_help()
+
+        self.assertIn("Default: 3600.", help_text)
+        self.assertIn("Default: 1800.", help_text)
+
+    def test_disagg_role_alias_cli_arg_is_accepted(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            ["--model-path", "/fake", "--disagg-role", "denoising"]
+        )
+
+        self.assertEqual(args.disagg_role, "denoising")
+
+    def test_disagg_role_alias_normalizes_to_denoiser(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "disagg_role": "denoising"}
+        )
+
+        self.assertEqual(args.disagg_role, RoleType.DENOISER)
 
 
 class TestDisaggTransferBackendArgs(unittest.TestCase):
