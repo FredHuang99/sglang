@@ -1088,11 +1088,13 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
                 measured_meta_bytes=1024,
             )
 
-        buffer_cls.assert_called_once_with(
-            pool_size=expected_pool_size,
-            device="cpu",
-            role_name=RoleType.ENCODER.value,
-        )
+        buffer_cls.assert_called_once()
+        buffer_kwargs = buffer_cls.call_args.kwargs
+        self.assertEqual(buffer_kwargs["pool_size"], expected_pool_size)
+        self.assertEqual(buffer_kwargs["device"], "cpu")
+        self.assertEqual(buffer_kwargs["role_name"], RoleType.ENCODER.value)
+        self.assertFalse(buffer_kwargs["pin_memory"])
+        self.assertFalse(buffer_kwargs["pin_memory_strict"])
         sent_frames = scheduler._pool_result_push.send_multipart.call_args[0][0]
         register_msg = decode_transfer_msg(sent_frames)
         self.assertEqual(register_msg["capacity_slot_size"], expected_slot_size)

@@ -618,12 +618,13 @@ class SchedulerDisaggMixin:
             self._init_disagg_transfer_manager()
 
     def _profile_role_update(self: Scheduler, request_id: str, **fields: Any) -> None:
-        if self._role_profile_writer is None or self.gpu_id != 0:
+        role_profile_writer = getattr(self, "_role_profile_writer", None)
+        if role_profile_writer is None or getattr(self, "gpu_id", 0) != 0:
             return
         fields.setdefault(
             "instance_id", getattr(self.server_args, "disagg_instance_id", 0)
         )
-        record = self._role_profile_writer.update(request_id, **fields)
+        record = role_profile_writer.update(request_id, **fields)
         accept_time_s = record.get("role_accept_time_s")
         start_time_s = record.get("role_start_time_s")
         if (
@@ -632,7 +633,7 @@ class SchedulerDisaggMixin:
             and "role_queue_duration_ms" not in record
             and float(start_time_s) >= float(accept_time_s)
         ):
-            self._role_profile_writer.update(
+            role_profile_writer.update(
                 request_id,
                 role_queue_duration_ms=(
                     float(start_time_s) - float(accept_time_s)
@@ -648,12 +649,13 @@ class SchedulerDisaggMixin:
         error: str | None = None,
         **extra_fields: Any,
     ) -> None:
-        if self._role_profile_writer is None or self.gpu_id != 0:
+        role_profile_writer = getattr(self, "_role_profile_writer", None)
+        if role_profile_writer is None or getattr(self, "gpu_id", 0) != 0:
             return
         extra_fields.setdefault(
             "instance_id", getattr(self.server_args, "disagg_instance_id", 0)
         )
-        self._role_profile_writer.finalize(
+        role_profile_writer.finalize(
             request_id,
             status=status,
             error=error,
