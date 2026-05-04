@@ -4,7 +4,9 @@ import asyncio
 import csv
 import os
 import tempfile
+import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from sglang.multimodal_gen.benchmarks.wan_ti2v_profile import (
@@ -24,6 +26,7 @@ from sglang.multimodal_gen.runtime.disaggregation.request_state import (
     RequestState,
     RequestTracker,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.runtime.utils.request_profiling import (
     CsvProfileWriter,
@@ -32,6 +35,15 @@ from sglang.multimodal_gen.runtime.utils.request_profiling import (
     flatten_request_metrics,
     resolve_profile_dir,
 )
+
+
+class _ProfiledNoopStage(PipelineStage):
+    def __init__(self):
+        self.server_args = SimpleNamespace(comfyui_mode=False)
+
+    def forward(self, batch, server_args):
+        time.sleep(0.001)
+        return batch
 
 
 class TestRequestProfilingUtils(unittest.TestCase):
@@ -67,13 +79,41 @@ class TestRequestProfilingUtils(unittest.TestCase):
         metrics.total_duration_ms = 100.0
         metrics.stages = {
             "text_encoder": 20.0,
+            "ImageVAEEncodingStage": 5.0,
             "denoising": 50.0,
             "vae_decode": 10.0,
         }
         logical = aggregate_logical_stage_durations(metrics)
         self.assertEqual(logical["denoiser"], 50.0)
         self.assertEqual(logical["decoder"], 10.0)
-        self.assertEqual(logical["encoder"], 20.0)
+        self.assertEqual(logical["encoder"], 25.0)
+
+    def test_logical_stage_aggregation_omits_unobserved_stages(self):
+        metrics = RequestMetrics(request_id="req-empty")
+
+        logical = aggregate_logical_stage_durations(metrics)
+        row = flatten_request_metrics(metrics)
+
+        self.assertEqual(logical, {})
+        self.assertNotIn("logical_encoder_duration_ms", row)
+        self.assertNotIn("logical_denoiser_duration_ms", row)
+        self.assertNotIn("logical_decoder_duration_ms", row)
+
+    def test_profile_enabled_records_stage_timing_without_perf_dump_path(self):
+        metrics = RequestMetrics(request_id="req-profile")
+        batch = SimpleNamespace(
+            is_warmup=False,
+            perf_dump_path=None,
+            metrics=metrics,
+        )
+        server_args = SimpleNamespace(profile_enabled=True, comfyui_mode=False)
+
+        _ProfiledNoopStage()(batch, server_args)
+
+        self.assertIn("_ProfiledNoopStage", metrics.stages)
+        self.assertGreater(metrics.stages["_ProfiledNoopStage"], 0.0)
+        logical = aggregate_logical_stage_durations(metrics)
+        self.assertGreater(logical["encoder"], 0.0)
 
     def test_flatten_request_metrics_exposes_queue_and_unattributed_time(self):
         metrics = RequestMetrics(request_id="req-queue")

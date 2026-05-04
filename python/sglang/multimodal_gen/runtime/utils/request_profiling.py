@@ -285,29 +285,35 @@ def flatten_request_metrics(metrics) -> dict[str, Any]:
     return row
 
 
+def _logical_stage_name_for_raw_stage(stage_name: str) -> str:
+    stage_key = stage_name.lower()
+    if "denois" in stage_key:
+        return "denoiser"
+    if "decod" in stage_key or ("vae" in stage_key and "encod" not in stage_key):
+        return "decoder"
+    return "encoder"
+
+
 def aggregate_logical_stage_durations(metrics) -> dict[str, float]:
     stages = dict(getattr(metrics, "stages", {}) or {})
     steps = list(getattr(metrics, "steps", []) or [])
 
-    decoder_ms = 0.0
-    denoiser_ms = 0.0
-    encoder_ms = 0.0
+    logical_durations_ms = {
+        stage_name: 0.0 for stage_name in LOGICAL_STAGE_NAMES
+    }
+    observed_stages: set[str] = set()
 
     for stage_name, duration_ms in stages.items():
-        stage_key = stage_name.lower()
-        duration_ms = float(duration_ms)
-        if "decod" in stage_key or "vae" in stage_key:
-            decoder_ms += duration_ms
-        elif "denois" in stage_key:
-            denoiser_ms += duration_ms
-        else:
-            encoder_ms += duration_ms
+        logical_stage_name = _logical_stage_name_for_raw_stage(stage_name)
+        logical_durations_ms[logical_stage_name] += float(duration_ms)
+        observed_stages.add(logical_stage_name)
 
-    if denoiser_ms <= 0.0 and steps:
-        denoiser_ms = sum(float(step_ms) for step_ms in steps)
+    if "denoiser" not in observed_stages and steps:
+        logical_durations_ms["denoiser"] = sum(float(step_ms) for step_ms in steps)
+        observed_stages.add("denoiser")
 
     return {
-        "encoder": encoder_ms,
-        "denoiser": denoiser_ms,
-        "decoder": decoder_ms,
+        stage_name: logical_durations_ms[stage_name]
+        for stage_name in LOGICAL_STAGE_NAMES
+        if stage_name in observed_stages
     }

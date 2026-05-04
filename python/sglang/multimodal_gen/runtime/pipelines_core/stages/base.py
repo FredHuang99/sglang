@@ -197,6 +197,10 @@ class PipelineStage(ABC):
             logger.error("Input verification failed for %s: %s", stage_name, str(e))
             raise
 
+        profile_timing_enabled = batch.perf_dump_path is not None or (
+            not batch.is_warmup and getattr(server_args, "profile_enabled", False)
+        )
+
         # Execute the actual stage logic with unified profiling
         with StageProfiler(
             stage_name,
@@ -204,7 +208,7 @@ class PipelineStage(ABC):
             metrics=batch.metrics,
             log_stage_start_end=not batch.is_warmup
             and not (self.server_args and self.server_args.comfyui_mode),
-            perf_dump_path_provided=batch.perf_dump_path is not None,
+            perf_dump_path_provided=profile_timing_enabled,
         ):
             result = self.forward(batch, server_args)
 
