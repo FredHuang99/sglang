@@ -18,9 +18,6 @@ TRANSFER_MAGIC = b"__transfer__"
 class TransferMsgType:
     # Instance → DiffusionServer
     STAGED = "transfer_staged"
-    # Compatibility with the v1 orchestrator/scheduler while this refactor is
-    # split across stacked PRs.  The v2 control plane uses ALLOC_ACCEPTED.
-    ALLOCATED = "transfer_allocated"
     PUSHED = "transfer_pushed"
     DONE = "transfer_done"
     ALLOC_ACCEPTED = "transfer_alloc_accepted"
@@ -28,9 +25,6 @@ class TransferMsgType:
 
     # DiffusionServer → Instance
     ALLOC = "transfer_alloc"
-    # Compatibility with the v1 direct-push protocol.  The v2 control plane
-    # sends PEER_INFO instead and lets the sender notify completion.
-    PUSH = "transfer_push"
     PEER_INFO = "transfer_peer_info"
     READY = "transfer_ready"
     FAILED = "transfer_failed"
@@ -67,25 +61,6 @@ class TransferAllocMsg:
     source_control_endpoint: str = ""
     source_host_id: str = ""
     preallocated_slot: dict | None = None
-
-
-@dataclass
-class TransferAllocatedMsg:
-    msg_type: str = TransferMsgType.ALLOCATED
-    request_id: str = ""
-    session_id: str = ""
-    pool_ptr: int = 0
-    slot_offset: int = 0
-    slot_size: int = 0
-
-
-@dataclass
-class TransferPushMsg:
-    msg_type: str = TransferMsgType.PUSH
-    request_id: str = ""
-    dest_session_id: str = ""
-    dest_addr: int = 0
-    transfer_size: int = 0
 
 
 @dataclass

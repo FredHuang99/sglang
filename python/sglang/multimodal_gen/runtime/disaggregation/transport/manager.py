@@ -108,21 +108,13 @@ class DiffusionTransferManager:
         self,
         engine: BaseTransferEngine,
         buffer: TransferTensorBuffer,
-        meta_buffer: TransferMetaBuffer | None = None,
+        meta_buffer: TransferMetaBuffer,
         *,
         host_id: str = "",
         send_retry_limit: int = 2,
     ):
         self._engine = engine
         self._buffer = buffer
-        if meta_buffer is None:
-            # Temporary v1 compatibility: the old scheduler constructs only a
-            # tensor buffer and carries metadata in TransferReadyMsg frames.
-            meta_buffer = TransferMetaBuffer(
-                slot_count=16,
-                slot_size=64 * 1024,
-                role_name=getattr(buffer, "_role_name", "compat"),
-            )
         self._meta_buffer = meta_buffer
         self._host_id = host_id
         self._send_retry_limit = max(0, int(send_retry_limit))
@@ -541,32 +533,6 @@ class DiffusionTransferManager:
         device: torch.device | str = "cuda",
         stream: torch.cuda.Stream | None = None,
     ) -> tuple[dict[str, torch.Tensor | list[torch.Tensor]], object | None]:
-        if manifest is not None:
-            # Temporary v1 compatibility: old TransferReadyMsg carries the
-            # manifest/scalars in the control message and only RDMA-copies
-            # tensor bytes.  Load directly from that manifest instead of
-            # reading the v2 metadata buffer.
-            with self._lock:
-                pending = self._pending_receives.get(request_id)
-            if pending is None:
-                raise ValueError(
-                    f"TransferManager: no pending receive slot for {request_id}"
-                )
-            tensors = self._buffer.read_tensors_from_manifest(
-                pending.slot,
-                manifest,
-                device=device,
-                stream=stream,
-            )
-            load_event = None
-            if stream is not None and str(device).startswith("cuda"):
-                load_event = torch.cuda.Event()
-                load_event.record(stream)
-            elif str(device).startswith("cuda") and torch.cuda.is_available():
-                load_event = torch.cuda.Event()
-                load_event.record(torch.cuda.current_stream())
-            return tensors, load_event
-
         tensors, _scalar_fields, load_event = self._load_received_transfer(
             request_id, device=device, stream=stream
         )
@@ -615,7 +581,7 @@ class DiffusionTransferManager:
             self._meta_buffer.free(staged.meta_slot)
 
     def allocate_receive_slot(
-        self, request_id: str, size: int, meta_size: int = 0
+        self, request_id: str, size: int, meta_size: int
     ) -> PendingReceive | None:
         slot = self._buffer.allocate(size, request_id) if size > 0 else None
         meta_slot = self._meta_buffer.allocate(request_id)
@@ -655,17 +621,7 @@ class DiffusionTransferManager:
         Production role code uses load_transfer_async() to preserve scalar fields
         and defer CUDA synchronization to the caller.
         """
-        if manifest is not None:
-            tensors, load_event = self.load_tensors_async(
-                request_id,
-                manifest=manifest,
-                device=device,
-                stream=stream,
-            )
-            if load_event is not None and hasattr(load_event, "synchronize"):
-                load_event.synchronize()
-            return tensors
-
+        del manifest
         tensors, _scalar_fields, load_event = self._load_received_transfer(
             request_id, device=device, stream=stream
         )
@@ -677,15 +633,9 @@ class DiffusionTransferManager:
         self,
         request_id: str,
         slot: SlotHandle | None,
-        meta_slot: SlotHandle | None = None,
+        meta_slot: SlotHandle,
         slot_id: int | None = None,
     ) -> PendingReceive:
-        if meta_slot is None:
-            meta_slot = self._meta_buffer.allocate(request_id)
-            if meta_slot is None:
-                raise RuntimeError(
-                    f"TransferManager: failed to allocate receive meta slot for {request_id}"
-                )
         pending = PendingReceive(
             request_id=request_id,
             slot=slot,
