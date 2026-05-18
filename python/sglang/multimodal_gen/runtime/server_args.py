@@ -53,6 +53,8 @@ from sglang.multimodal_gen.utils import (
 
 logger = init_logger(__name__)
 
+DIFFUSION_WEIGHT_STAGING_CHOICES = ("none", "pageable", "pinned", "auto")
+
 
 def _normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
     if gpu_ids is None:
@@ -227,6 +229,7 @@ class ServerArgs:
     request_profile_enabled: bool = False
     profile_output_dir: str = DEFAULT_PROFILE_OUTPUT_DIR
     profile_run_id: str | None = None
+    diffusion_weight_staging: Literal["none", "pageable", "pinned", "auto"] = "none"
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -417,6 +420,7 @@ class ServerArgs:
         """check consistency and raise errors for invalid configs"""
         self._validate_pipeline()
         self._validate_offload()
+        self._validate_weight_loading()
         self._validate_parallelism()
         self._validate_cfg_parallel()
 
@@ -1207,6 +1211,16 @@ class ServerArgs:
             default=ServerArgs.profile_run_id,
             help="Run identifier used to namespace profiling outputs.",
         )
+        parser.add_argument(
+            "--diffusion-weight-staging",
+            type=str,
+            choices=DIFFUSION_WEIGHT_STAGING_CHOICES,
+            default=ServerArgs.diffusion_weight_staging,
+            help=(
+                "Optional diffusion checkpoint staging mode for rank0. "
+                "Use pinned or auto to try pinned CPU tensors before H2D copy."
+            ),
+        )
 
         # LoRA
         parser.add_argument(
@@ -1491,6 +1505,15 @@ class ServerArgs:
                     "causing shape mismatch errors. "
                     "Please disable either --dit-layerwise-offload or SGLANG_CACHE_DIT_ENABLED."
                 )
+
+    def _validate_weight_loading(self):
+        self.diffusion_weight_staging = str(self.diffusion_weight_staging).lower()
+        if self.diffusion_weight_staging not in DIFFUSION_WEIGHT_STAGING_CHOICES:
+            raise ValueError(
+                "--diffusion-weight-staging must be one of "
+                f"{DIFFUSION_WEIGHT_STAGING_CHOICES}, got "
+                f"{self.diffusion_weight_staging!r}"
+            )
 
     def _validate_parallelism(self):
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:

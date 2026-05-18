@@ -233,6 +233,7 @@ class TransformerLoader(ComponentLoader):
             output_dtype=None,
             strict=False,
             weight_load_profile=weight_load_profile,
+            weight_staging_mode=server_args.diffusion_weight_staging,
         )
 
         if nunchaku_config is not None:

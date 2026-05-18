@@ -33,6 +33,9 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.loader.weight_staging import (
+    maybe_stage_weight_iterator,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.weight_load_profiler import (
@@ -80,6 +83,7 @@ def maybe_load_fsdp_model(
     pin_cpu_memory: bool = True,
     strict: bool = True,
     weight_load_profile: DiffusionWeightLoadProfiler | None = None,
+    weight_staging_mode: str = "none",
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -143,6 +147,11 @@ def maybe_load_fsdp_model(
         weight_iterator = weight_load_profile.profile_safetensors_iterator(
             weight_iterator
         )
+    weight_iterator = maybe_stage_weight_iterator(
+        weight_iterator,
+        staging_mode=weight_staging_mode,
+        weight_load_profile=weight_load_profile,
+    )
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     load_model_from_full_model_state_dict(
         model,

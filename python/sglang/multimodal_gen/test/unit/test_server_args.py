@@ -252,6 +252,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertTrue(args.request_profile_enabled)
         self.assertEqual(args.profile_output_dir, "/tmp/profile")
         self.assertEqual(args.profile_run_id, "run-123")
+        self.assertEqual(args.diffusion_weight_staging, "none")
 
     def test_request_profile_cli_default_is_disabled(self):
         parser = FlexibleArgumentParser()
@@ -267,6 +268,15 @@ class TestPerRoleParallelism(unittest.TestCase):
         )
         self.assertTrue(args.profile_enabled)
         self.assertFalse(args.request_profile_enabled)
+
+    def test_diffusion_weight_staging_cli_args_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for mode in ("none", "pageable", "pinned", "auto"):
+            args, _unknown = parser.parse_known_args(
+                ["--model-path", "/fake", "--diffusion-weight-staging", mode]
+            )
+            self.assertEqual(args.diffusion_weight_staging, mode)
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):

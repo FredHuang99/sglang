@@ -28,6 +28,12 @@ WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS = "weight_load:h2d_or_param_copy_ms"
 WEIGHT_LOAD_NCCL_BROADCAST_MS = "weight_load:nccl_broadcast_ms"
 WEIGHT_LOAD_RANK0_WAIT_MS = "weight_load:rank0_wait_ms"
 WEIGHT_LOAD_TOTAL_BYTES = "weight_load:total_bytes"
+WEIGHT_LOAD_STAGING_REQUESTED = "weight_load:staging_requested"
+WEIGHT_LOAD_STAGING_EFFECTIVE = "weight_load:staging_effective"
+WEIGHT_LOAD_STAGED_TENSOR_COUNT = "weight_load:staged_tensor_count"
+WEIGHT_LOAD_PINNED_TENSOR_COUNT = "weight_load:pinned_tensor_count"
+WEIGHT_LOAD_PINNED_BYTES = "weight_load:pinned_bytes"
+WEIGHT_LOAD_PIN_MEMORY_ERROR = "weight_load:pin_memory_error"
 
 WEIGHT_LOAD_TIMING_FIELDS = (
     WEIGHT_LOAD_DISCOVER_FILES_MS,
@@ -98,6 +104,14 @@ class DiffusionWeightLoadProfiler:
         self.enabled = bool(enabled)
         self._timings_ms = {field: 0.0 for field in WEIGHT_LOAD_TIMING_FIELDS}
         self._total_bytes = 0
+        self._staging_fields: dict[str, Any] = {
+            WEIGHT_LOAD_STAGING_REQUESTED: "none",
+            WEIGHT_LOAD_STAGING_EFFECTIVE: "none",
+            WEIGHT_LOAD_STAGED_TENSOR_COUNT: 0,
+            WEIGHT_LOAD_PINNED_TENSOR_COUNT: 0,
+            WEIGHT_LOAD_PINNED_BYTES: 0,
+            WEIGHT_LOAD_PIN_MEMORY_ERROR: None,
+        }
         self._status = "running"
         self._error: str | None = None
         self._finalized = False
@@ -161,6 +175,32 @@ class DiffusionWeightLoadProfiler:
             if isinstance(tensor, torch.Tensor):
                 self.add_tensor_bytes(tensor)
 
+    def set_staging_requested(self, mode: str) -> None:
+        if not self.active:
+            return
+        self._staging_fields[WEIGHT_LOAD_STAGING_REQUESTED] = mode
+
+    def set_staging_effective(self, mode: str) -> None:
+        if not self.active:
+            return
+        self._staging_fields[WEIGHT_LOAD_STAGING_EFFECTIVE] = mode
+
+    def add_staged_tensor(self, tensor: torch.Tensor) -> None:
+        if not self.active:
+            return
+        self._staging_fields[WEIGHT_LOAD_STAGED_TENSOR_COUNT] += 1
+
+    def add_pinned_tensor(self, tensor: torch.Tensor) -> None:
+        if not self.active:
+            return
+        self._staging_fields[WEIGHT_LOAD_PINNED_TENSOR_COUNT] += 1
+        self._staging_fields[WEIGHT_LOAD_PINNED_BYTES] += _safe_tensor_nbytes(tensor)
+
+    def set_pin_memory_error(self, error: str | None) -> None:
+        if not self.active:
+            return
+        self._staging_fields[WEIGHT_LOAD_PIN_MEMORY_ERROR] = error
+
     def profile_safetensors_iterator(
         self, iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -198,6 +238,7 @@ class DiffusionWeightLoadProfiler:
             **self._context,
             **self._timings_ms,
             WEIGHT_LOAD_TOTAL_BYTES: self._total_bytes,
+            **self._staging_fields,
         }
         return record
 

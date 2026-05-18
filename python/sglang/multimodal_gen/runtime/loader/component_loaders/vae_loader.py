@@ -15,6 +15,13 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
 )
+from sglang.multimodal_gen.runtime.loader.weight_staging import (
+    maybe_stage_weight_iterator,
+    should_stage_weights_on_current_rank,
+)
+from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    safetensors_weights_iterator,
+)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -32,6 +39,35 @@ from sglang.multimodal_gen.runtime.utils.weight_load_profiler import (
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 
 logger = init_logger(__name__)
+
+
+def _load_vae_state_dict_from_safetensors(
+    safetensors_list: list[str],
+    server_args: ServerArgs,
+    weight_load_profile: DiffusionWeightLoadProfiler,
+) -> dict[str, torch.Tensor]:
+    loaded: dict[str, torch.Tensor] = {}
+    if should_stage_weights_on_current_rank(server_args.diffusion_weight_staging):
+        weight_iterator = safetensors_weights_iterator(safetensors_list)
+        weight_iterator = weight_load_profile.profile_safetensors_iterator(
+            weight_iterator
+        )
+        weight_iterator = maybe_stage_weight_iterator(
+            weight_iterator,
+            staging_mode=server_args.diffusion_weight_staging,
+            weight_load_profile=weight_load_profile,
+        )
+        for name, tensor in weight_iterator:
+            with weight_load_profile.timing_scope(WEIGHT_LOAD_CPU_MATERIALIZE_MS):
+                loaded[name] = tensor
+    else:
+        for sf_path in safetensors_list:
+            with weight_load_profile.timing_scope(WEIGHT_LOAD_READ_SAFETENSORS_MS):
+                tensors = safetensors_load_file(sf_path)
+            weight_load_profile.add_tensor_collection_bytes(tensors.values())
+            with weight_load_profile.timing_scope(WEIGHT_LOAD_CPU_MATERIALIZE_MS):
+                loaded.update(tensors)
+    return loaded
 
 
 def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
@@ -166,13 +202,11 @@ class VAELoader(ComponentLoader):
         assert (
             len(safetensors_list) >= 1
         ), f"Found no safetensors files in {component_model_path}"
-        loaded = {}
-        for sf_path in safetensors_list:
-            with weight_load_profile.timing_scope(WEIGHT_LOAD_READ_SAFETENSORS_MS):
-                tensors = safetensors_load_file(sf_path)
-            weight_load_profile.add_tensor_collection_bytes(tensors.values())
-            with weight_load_profile.timing_scope(WEIGHT_LOAD_CPU_MATERIALIZE_MS):
-                loaded.update(tensors)
+        loaded = _load_vae_state_dict_from_safetensors(
+            safetensors_list,
+            server_args,
+            weight_load_profile,
+        )
         with weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS):
             vae.load_state_dict(loaded, strict=False)
 
