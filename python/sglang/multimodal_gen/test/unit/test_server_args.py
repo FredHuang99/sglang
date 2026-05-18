@@ -240,6 +240,8 @@ class TestPerRoleParallelism(unittest.TestCase):
             "/fake",
             "--profile-enabled",
             "true",
+            "--request-profile-enabled",
+            "true",
             "--profile-output-dir",
             "/tmp/profile",
             "--profile-run-id",
@@ -247,8 +249,24 @@ class TestPerRoleParallelism(unittest.TestCase):
         ]
         args, _unknown = parser.parse_known_args(argv)
         self.assertTrue(args.profile_enabled)
+        self.assertTrue(args.request_profile_enabled)
         self.assertEqual(args.profile_output_dir, "/tmp/profile")
         self.assertEqual(args.profile_run_id, "run-123")
+
+    def test_request_profile_cli_default_is_disabled(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(["--model-path", "/fake"])
+        self.assertFalse(args.request_profile_enabled)
+
+    def test_profile_enabled_does_not_enable_request_profile_by_default(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            ["--model-path", "/fake", "--profile-enabled", "true"]
+        )
+        self.assertTrue(args.profile_enabled)
+        self.assertFalse(args.request_profile_enabled)
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):

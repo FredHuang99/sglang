@@ -128,7 +128,7 @@ class Scheduler(SchedulerDisaggMixin):
         if (
             self.gpu_id == 0
             and self._disagg_role == RoleType.MONOLITHIC
-            and getattr(server_args, "profile_enabled", False)
+            and getattr(server_args, "request_profile_enabled", False)
         ):
             profile_dir = resolve_profile_dir(
                 server_args.profile_output_dir,

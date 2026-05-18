@@ -600,7 +600,10 @@ class SchedulerDisaggMixin:
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
-            if getattr(server_args, "profile_enabled", False) and self.gpu_id == 0:
+            if (
+                getattr(server_args, "request_profile_enabled", False)
+                and self.gpu_id == 0
+            ):
                 profile_dir = resolve_profile_dir(
                     server_args.profile_output_dir,
                     server_args.profile_run_id,

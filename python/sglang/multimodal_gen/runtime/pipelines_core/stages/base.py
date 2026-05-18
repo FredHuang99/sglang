@@ -198,7 +198,8 @@ class PipelineStage(ABC):
             raise
 
         profile_timing_enabled = batch.perf_dump_path is not None or (
-            not batch.is_warmup and getattr(server_args, "profile_enabled", False)
+            not batch.is_warmup
+            and getattr(server_args, "request_profile_enabled", False)
         )
 
         # Execute the actual stage logic with unified profiling

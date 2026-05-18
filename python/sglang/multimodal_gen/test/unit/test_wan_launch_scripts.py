@@ -36,6 +36,12 @@ class TestWanLaunchScripts(unittest.TestCase):
         )
         self.assertEqual(self.monolithic_module._resolve_gpu_group(args), [0, 1, 6, 7])
 
+    def test_monolithic_profile_enables_request_profile(self):
+        args = self.monolithic_module.build_parser().parse_args(["--profile-enabled"])
+        kwargs = self.monolithic_module._build_server_kwargs(args)
+        self.assertTrue(kwargs["profile_enabled"])
+        self.assertTrue(kwargs["request_profile_enabled"])
+
     def test_gpu_ids_accept_comma_separated_values(self):
         args = self.disagg_module.build_parser().parse_args(
             ["--denoiser-gpu-ids", "0,1,6,7"]

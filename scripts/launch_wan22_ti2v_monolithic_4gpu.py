@@ -152,6 +152,33 @@ def _validate_zimage_topology(args: argparse.Namespace) -> None:
         )
 
 
+def _build_server_kwargs(args: argparse.Namespace) -> dict:
+    return {
+        "model_path": args.model_path,
+        "model_id": args.model_id,
+        "host": args.host,
+        "port": args.port,
+        "scheduler_port": args.scheduler_port,
+        "num_gpus": args.num_gpus,
+        "tp_size": args.tp_size,
+        "sp_degree": args.sp_degree,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "warmup": args.warmup,
+        "log_level": args.log_level,
+        "profile_enabled": args.profile_enabled,
+        "request_profile_enabled": args.profile_enabled,
+        "profile_output_dir": args.profile_output_dir,
+        "profile_run_id": args.profile_run_id,
+        "text_encoder_cpu_offload": args.text_encoder_cpu_offload,
+        "image_encoder_cpu_offload": args.image_encoder_cpu_offload,
+        "vae_cpu_offload": args.vae_cpu_offload,
+        "dit_cpu_offload": args.dit_cpu_offload,
+        "dit_layerwise_offload": args.dit_layerwise_offload,
+        "pin_cpu_memory": args.pin_cpu_memory,
+    }
+
+
 def main() -> None:
     parser = build_parser()
     raw_argv = sys.argv[1:]
@@ -183,29 +210,7 @@ def main() -> None:
     from sglang.multimodal_gen.runtime.launch_server import launch_server
     from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
-    server_args = ServerArgs.from_kwargs(
-        model_path=args.model_path,
-        model_id=args.model_id,
-        host=args.host,
-        port=args.port,
-        scheduler_port=args.scheduler_port,
-        num_gpus=args.num_gpus,
-        tp_size=args.tp_size,
-        sp_degree=args.sp_degree,
-        ulysses_degree=args.ulysses_degree,
-        ring_degree=args.ring_degree,
-        warmup=args.warmup,
-        log_level=args.log_level,
-        profile_enabled=args.profile_enabled,
-        profile_output_dir=args.profile_output_dir,
-        profile_run_id=args.profile_run_id,
-        text_encoder_cpu_offload=args.text_encoder_cpu_offload,
-        image_encoder_cpu_offload=args.image_encoder_cpu_offload,
-        vae_cpu_offload=args.vae_cpu_offload,
-        dit_cpu_offload=args.dit_cpu_offload,
-        dit_layerwise_offload=args.dit_layerwise_offload,
-        pin_cpu_memory=args.pin_cpu_memory,
-    )
+    server_args = ServerArgs.from_kwargs(**_build_server_kwargs(args))
 
     print("Launching monolithic Wan2.2 TI2V server")
     print(f"  model_path      : {args.model_path}")

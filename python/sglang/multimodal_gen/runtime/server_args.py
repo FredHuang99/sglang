@@ -224,6 +224,7 @@ class ServerArgs:
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
     profile_enabled: bool = False
+    request_profile_enabled: bool = False
     profile_output_dir: str = DEFAULT_PROFILE_OUTPUT_DIR
     profile_run_id: str | None = None
 
@@ -1183,7 +1184,16 @@ class ServerArgs:
             "--profile-enabled",
             action=StoreBoolean,
             default=ServerArgs.profile_enabled,
-            help="Enable structured per-request profiling CSV outputs.",
+            help="Enable launch-time profiling, including component and weight-load metrics.",
+        )
+        parser.add_argument(
+            "--request-profile-enabled",
+            action=StoreBoolean,
+            default=ServerArgs.request_profile_enabled,
+            help=(
+                "Enable request-level runtime profiling CSV outputs. "
+                "This is separate from launch-time weight-load profiling."
+            ),
         )
         parser.add_argument(
             "--profile-output-dir",

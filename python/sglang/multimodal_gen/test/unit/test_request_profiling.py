@@ -99,14 +99,18 @@ class TestRequestProfilingUtils(unittest.TestCase):
         self.assertNotIn("logical_denoiser_duration_ms", row)
         self.assertNotIn("logical_decoder_duration_ms", row)
 
-    def test_profile_enabled_records_stage_timing_without_perf_dump_path(self):
+    def test_request_profile_enabled_records_stage_timing_without_perf_dump_path(self):
         metrics = RequestMetrics(request_id="req-profile")
         batch = SimpleNamespace(
             is_warmup=False,
             perf_dump_path=None,
             metrics=metrics,
         )
-        server_args = SimpleNamespace(profile_enabled=True, comfyui_mode=False)
+        server_args = SimpleNamespace(
+            profile_enabled=True,
+            request_profile_enabled=True,
+            comfyui_mode=False,
+        )
 
         _ProfiledNoopStage()(batch, server_args)
 
@@ -114,6 +118,23 @@ class TestRequestProfilingUtils(unittest.TestCase):
         self.assertGreater(metrics.stages["_ProfiledNoopStage"], 0.0)
         logical = aggregate_logical_stage_durations(metrics)
         self.assertGreater(logical["encoder"], 0.0)
+
+    def test_launch_profile_does_not_record_stage_timing_without_request_profile(self):
+        metrics = RequestMetrics(request_id="req-launch-profile")
+        batch = SimpleNamespace(
+            is_warmup=False,
+            perf_dump_path=None,
+            metrics=metrics,
+        )
+        server_args = SimpleNamespace(
+            profile_enabled=True,
+            request_profile_enabled=False,
+            comfyui_mode=False,
+        )
+
+        _ProfiledNoopStage()(batch, server_args)
+
+        self.assertNotIn("_ProfiledNoopStage", metrics.stages)
 
     def test_flatten_request_metrics_exposes_queue_and_unattributed_time(self):
         metrics = RequestMetrics(request_id="req-queue")
