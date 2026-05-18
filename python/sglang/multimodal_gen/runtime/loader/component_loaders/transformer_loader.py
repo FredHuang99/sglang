@@ -25,6 +25,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import get_log_level, init_logger
+from sglang.multimodal_gen.runtime.utils.weight_load_profiler import (
+    WEIGHT_LOAD_DISCOVER_FILES_MS,
+    DiffusionWeightLoadProfiler,
+)
 from sglang.multimodal_gen.runtime.utils.quantization_utils import (
     get_metadata_from_safetensors_file,
     get_quant_config,
@@ -128,13 +132,40 @@ class TransformerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, component_name: str
     ):
         """Load the transformer based on the model path, and inference args."""
+        weight_load_profile = DiffusionWeightLoadProfiler.from_server_args(
+            server_args, component_name
+        )
+        error: str | None = None
+        try:
+            return self._load_customized_with_profile(
+                component_model_path,
+                server_args,
+                component_name,
+                weight_load_profile,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            weight_load_profile.finalize(
+                status="error" if error else "success", error=error
+            )
+
+    def _load_customized_with_profile(
+        self,
+        component_model_path: str,
+        server_args: ServerArgs,
+        component_name: str,
+        weight_load_profile: DiffusionWeightLoadProfiler,
+    ):
         # 1. hf config
         config = get_diffusers_component_config(component_path=component_model_path)
 
         # 2. quant config
-        safetensors_list = self.get_list_of_safetensors_to_load(
-            server_args, component_model_path
-        )
+        with weight_load_profile.timing_scope(WEIGHT_LOAD_DISCOVER_FILES_MS):
+            safetensors_list = self.get_list_of_safetensors_to_load(
+                server_args, component_model_path
+            )
 
         quant_config = self._resolve_quant_config(
             config, server_args, safetensors_list, component_model_path
@@ -201,6 +232,7 @@ class TransformerLoader(ComponentLoader):
             reduce_dtype=torch.float32,
             output_dtype=None,
             strict=False,
+            weight_load_profile=weight_load_profile,
         )
 
         if nunchaku_config is not None:

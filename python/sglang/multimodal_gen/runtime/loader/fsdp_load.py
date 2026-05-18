@@ -6,7 +6,9 @@
 # Copyright 2024 The TorchTune Authors.
 # Copyright 2025 The sglang-diffusion Authors.
 
+import time
 from collections.abc import Callable, Generator
+from contextlib import nullcontext
 from itertools import chain
 from typing import Any
 
@@ -33,6 +35,12 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.weight_load_profiler import (
+    WEIGHT_LOAD_CPU_MATERIALIZE_MS,
+    WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS,
+    WEIGHT_LOAD_READ_SAFETENSORS_MS,
+    DiffusionWeightLoadProfiler,
+)
 from sglang.multimodal_gen.utils import set_mixed_precision_policy
 from sglang.srt.utils import is_npu
 
@@ -71,6 +79,7 @@ def maybe_load_fsdp_model(
     output_dtype: torch.dtype | None = None,
     pin_cpu_memory: bool = True,
     strict: bool = True,
+    weight_load_profile: DiffusionWeightLoadProfiler | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -130,6 +139,10 @@ def maybe_load_fsdp_model(
         )
 
     weight_iterator = safetensors_weights_iterator(weight_dir_list)
+    if weight_load_profile is not None:
+        weight_iterator = weight_load_profile.profile_safetensors_iterator(
+            weight_iterator
+        )
     param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
     load_model_from_full_model_state_dict(
         model,
@@ -139,6 +152,7 @@ def maybe_load_fsdp_model(
         strict=strict,
         cpu_offload=cpu_offload,
         param_names_mapping=param_names_mapping_fn,
+        weight_load_profile=weight_load_profile,
     )
 
     for _, module in model.named_modules():
@@ -236,6 +250,7 @@ def load_model_from_full_model_state_dict(
     strict: bool = False,
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
+    weight_load_profile: DiffusionWeightLoadProfiler | None = None,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -258,9 +273,25 @@ def load_model_from_full_model_state_dict(
     param_dict = dict(model.named_parameters())
 
     # map names from checkpoint to customized names
+    materialize_start = time.perf_counter()
+    read_before_ms = (
+        weight_load_profile.get_ms(WEIGHT_LOAD_READ_SAFETENSORS_MS)
+        if weight_load_profile is not None
+        else 0.0
+    )
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
+    if weight_load_profile is not None:
+        elapsed_ms = (time.perf_counter() - materialize_start) * 1000.0
+        read_delta_ms = (
+            weight_load_profile.get_ms(WEIGHT_LOAD_READ_SAFETENSORS_MS)
+            - read_before_ms
+        )
+        weight_load_profile.add_ms(
+            WEIGHT_LOAD_CPU_MATERIALIZE_MS,
+            max(0.0, elapsed_ms - read_delta_ms),
+        )
 
     is_fsdp_model = isinstance(model, FSDPModule) or any(
         hasattr(p, "device_mesh") for p in meta_sd.values()
@@ -296,31 +327,37 @@ def load_model_from_full_model_state_dict(
             target_dtype = meta_sharded_param.dtype
 
         if not hasattr(meta_sharded_param, "device_mesh"):
-            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
-            actual_param = param_dict.get(target_param_name)
-            weight_loader = (
-                getattr(actual_param, "weight_loader", None)
-                if actual_param is not None
-                else None
-            )
-            if weight_loader is not None:
-                assert actual_param is not None
-                sharded_tensor = torch.empty_like(
-                    meta_sharded_param, device=device, dtype=target_dtype
+            with (
+                weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS)
+                if weight_load_profile is not None
+                else nullcontext()
+            ):
+                full_tensor = full_tensor.to(device=device, dtype=target_dtype)
+                actual_param = param_dict.get(target_param_name)
+                weight_loader = (
+                    getattr(actual_param, "weight_loader", None)
+                    if actual_param is not None
+                    else None
                 )
-                # Preserve requires_grad flag to avoid errors with non-floating dtypes
-                requires_grad = getattr(meta_sharded_param, "requires_grad", False)
-                temp_param = _make_param_like(actual_param, sharded_tensor)
-                if not (
-                    sharded_tensor.is_floating_point() or sharded_tensor.is_complex()
-                ):
-                    requires_grad = False
-                temp_param.requires_grad = requires_grad
-                weight_loader(temp_param, full_tensor)
-                sharded_tensor = temp_param.data
-            else:
-                # In cases where parts of the model aren't sharded, some parameters will be plain tensors
-                sharded_tensor = full_tensor
+                if weight_loader is not None:
+                    assert actual_param is not None
+                    sharded_tensor = torch.empty_like(
+                        meta_sharded_param, device=device, dtype=target_dtype
+                    )
+                    # Preserve requires_grad flag to avoid errors with non-floating dtypes
+                    requires_grad = getattr(meta_sharded_param, "requires_grad", False)
+                    temp_param = _make_param_like(actual_param, sharded_tensor)
+                    if not (
+                        sharded_tensor.is_floating_point()
+                        or sharded_tensor.is_complex()
+                    ):
+                        requires_grad = False
+                    temp_param.requires_grad = requires_grad
+                    weight_loader(temp_param, full_tensor)
+                    sharded_tensor = temp_param.data
+                else:
+                    # In cases where parts of the model aren't sharded, some parameters will be plain tensors
+                    sharded_tensor = full_tensor
 
             # Important: `cpu_offload` is intended for FSDP-managed parameter movement.
             # If a parameter is not sharded into a DTensor (i.e., no `device_mesh`), FSDP
@@ -334,12 +371,17 @@ def load_model_from_full_model_state_dict(
             if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
-            full_tensor = full_tensor.to(device=device, dtype=target_dtype)
-            sharded_tensor = distribute_tensor(
-                full_tensor,
-                meta_sharded_param.device_mesh,
-                meta_sharded_param.placements,
-            )
+            with (
+                weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS)
+                if weight_load_profile is not None
+                else nullcontext()
+            ):
+                full_tensor = full_tensor.to(device=device, dtype=target_dtype)
+                sharded_tensor = distribute_tensor(
+                    full_tensor,
+                    meta_sharded_param.device_mesh,
+                    meta_sharded_param.placements,
+                )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.to("cpu")
 
@@ -402,23 +444,38 @@ def load_model_from_full_model_state_dict(
             init_like = torch.zeros_like
 
         if not hasattr(meta_sharded_param, "device_mesh"):
-            sharded_tensor = init_like(
-                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
-            )
+            with (
+                weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS)
+                if weight_load_profile is not None
+                else nullcontext()
+            ):
+                sharded_tensor = init_like(
+                    meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
+                )
             if cpu_offload and not is_fsdp_model:
                 sharded_tensor = sharded_tensor.cpu()
         else:
-            full_tensor = init_like(
-                meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
-            )
-            sharded_tensor = distribute_tensor(
-                full_tensor,
-                meta_sharded_param.device_mesh,
-                meta_sharded_param.placements,
-            )
+            with (
+                weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS)
+                if weight_load_profile is not None
+                else nullcontext()
+            ):
+                full_tensor = init_like(
+                    meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
+                )
+                sharded_tensor = distribute_tensor(
+                    full_tensor,
+                    meta_sharded_param.device_mesh,
+                    meta_sharded_param.placements,
+                )
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
         sharded_sd[new_param_name] = nn.Parameter(sharded_tensor)
 
     # choose `assign=True` since we cannot call `copy_` on meta tensor
-    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
+    with (
+        weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS)
+        if weight_load_profile is not None
+        else nullcontext()
+    ):
+        return model.load_state_dict(sharded_sd, strict=strict, assign=True)
