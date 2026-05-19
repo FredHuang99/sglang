@@ -182,7 +182,26 @@ def maybe_load_fsdp_model(
         )
 
     def _load_weights_on_current_rank(*, force_device_resident: bool = False) -> None:
-        weight_iterator = safetensors_weights_iterator(weight_dir_list)
+        stage_callback = None
+        if broadcast_decision.enabled and broadcast_decision.sp_rank == 0:
+
+            def _record_rank0_iterator_stage(
+                stage: str, detail: str | None = None
+            ) -> None:
+                log_broadcast_stage(
+                    stage,
+                    broadcast_decision.sp_group,
+                    component_name=weight_component,
+                    detail=detail,
+                    weight_load_profile=weight_load_profile,
+                )
+
+            stage_callback = _record_rank0_iterator_stage
+
+        weight_iterator = safetensors_weights_iterator(
+            weight_dir_list,
+            stage_callback=stage_callback,
+        )
         if weight_load_profile is not None:
             weight_iterator = weight_load_profile.profile_safetensors_iterator(
                 weight_iterator

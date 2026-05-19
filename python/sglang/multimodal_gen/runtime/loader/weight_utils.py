@@ -8,7 +8,7 @@ import hashlib
 import json
 import os
 import tempfile
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from pathlib import Path
 
 import filelock
@@ -24,6 +24,7 @@ try:
 except ImportError:
     HAS_RUNAI_MODEL_STREAMER = False
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -132,23 +133,62 @@ def _validate_safetensors_file(file_path: str) -> bool:
         return False
 
 
+WeightLoadStageCallback = Callable[[str, str | None], None]
+
+
+def _resolve_use_runai_model_streamer(
+    use_runai_model_streamer: bool | None,
+) -> bool:
+    if use_runai_model_streamer is not None:
+        if use_runai_model_streamer and not HAS_RUNAI_MODEL_STREAMER:
+            logger.warning(
+                "RunAI model streamer was explicitly requested but "
+                "runai_model_streamer is not installed; falling back to safe_open."
+            )
+        return bool(use_runai_model_streamer and HAS_RUNAI_MODEL_STREAMER)
+    return bool(HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER)
+
+
+def _record_weight_load_stage(
+    stage_callback: WeightLoadStageCallback | None,
+    stage: str,
+    detail: str | None = None,
+) -> None:
+    if stage_callback is not None:
+        stage_callback(stage, detail)
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,
-    use_runai_model_streamer: bool = HAS_RUNAI_MODEL_STREAMER,
+    use_runai_model_streamer: bool | None = None,
+    stage_callback: WeightLoadStageCallback | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
     device = "cpu" if to_cpu else str(get_local_torch_device())
+    use_runai = _resolve_use_runai_model_streamer(use_runai_model_streamer)
 
     # Validate files before loading
+    if use_runai:
+        _record_weight_load_stage(
+            stage_callback,
+            "runai_validate_start",
+            detail=f"file_count={len(hf_weights_files)}",
+        )
     corrupted_files = [
         st_file
         for st_file in hf_weights_files
         if not _validate_safetensors_file(st_file)
     ]
+    if use_runai:
+        _record_weight_load_stage(
+            stage_callback,
+            "runai_validate_done",
+            detail=f"corrupted_count={len(corrupted_files)}",
+        )
 
     if corrupted_files:
         # Delete corrupted files (both symlink and blob if applicable)
@@ -179,14 +219,57 @@ def safetensors_weights_iterator(
             "Please retry - the files will be re-downloaded automatically."
         )
 
-    if use_runai_model_streamer:
+    if use_runai:
+        first_tensor_seen = False
+        _record_weight_load_stage(stage_callback, "runai_streamer_enter_start")
         with SafetensorsStreamer() as streamer:
-            streamer.stream_files(hf_weights_files)
-            for name, tensor in streamer.get_tensors():
-                if to_cpu:
-                    yield name, tensor.clone().detach()
-                else:
-                    yield name, tensor.to(device)
+            _record_weight_load_stage(stage_callback, "runai_streamer_enter_done")
+            _record_weight_load_stage(
+                stage_callback,
+                "runai_stream_files_start",
+                detail=f"file_count={len(hf_weights_files)}",
+            )
+            for file_index, st_file in enumerate(hf_weights_files):
+                file_detail = (
+                    f"index={file_index} file={os.path.basename(st_file)} "
+                    f"file_count={len(hf_weights_files)}"
+                )
+                _record_weight_load_stage(
+                    stage_callback,
+                    "runai_stream_file_start",
+                    detail=file_detail,
+                )
+                streamer.stream_file(st_file)
+                _record_weight_load_stage(
+                    stage_callback,
+                    "runai_stream_file_done",
+                    detail=file_detail,
+                )
+                _record_weight_load_stage(
+                    stage_callback,
+                    "runai_get_tensors_start",
+                    detail=file_detail,
+                )
+                for name, tensor in streamer.get_tensors():
+                    if not first_tensor_seen:
+                        first_tensor_seen = True
+                        _record_weight_load_stage(
+                            stage_callback,
+                            "runai_first_tensor",
+                            detail=(
+                                f"name={name} shape={tuple(tensor.shape)} "
+                                f"dtype={tensor.dtype}"
+                            ),
+                        )
+                    if to_cpu:
+                        yield name, tensor.clone().detach()
+                    else:
+                        yield name, tensor.to(device)
+            _record_weight_load_stage(
+                stage_callback,
+                "runai_stream_files_done",
+                detail=f"file_count={len(hf_weights_files)}",
+            )
     else:
         for st_file in tqdm(
             hf_weights_files,
