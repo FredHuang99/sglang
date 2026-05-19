@@ -7,7 +7,7 @@
 # Copyright 2025 The sglang-diffusion Authors.
 
 import time
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Iterable
 from contextlib import nullcontext
 from itertools import chain
 from typing import Any
@@ -35,6 +35,10 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
     broadcast_module_tensors,
+    broadcast_rank0_load_status,
+    confirm_rank0_broadcast_entry,
+    confirm_tensor_broadcast_ready,
+    log_broadcast_stage,
     materialize_empty_model_state_dict,
     offload_model_tensors_to_cpu,
     resolve_rank0_broadcast_decision,
@@ -58,6 +62,7 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 logger = init_logger(__name__)
+_WEIGHT_READ_PROGRESS_BYTES = 1 << 30
 
 
 def _make_param_like(
@@ -172,6 +177,8 @@ def maybe_load_fsdp_model(
             broadcast_decision.sp_rank,
             broadcast_decision.sp_world_size,
             broadcast_decision.reason,
+            main_process_only=False,
+            local_main_process_only=False,
         )
 
     def _load_weights_on_current_rank(*, force_device_resident: bool = False) -> None:
@@ -185,6 +192,13 @@ def maybe_load_fsdp_model(
             staging_mode=weight_staging_mode,
             weight_load_profile=weight_load_profile,
         )
+        if broadcast_decision.enabled and broadcast_decision.sp_rank == 0:
+            weight_iterator = _log_weight_iterator_progress(
+                weight_iterator,
+                component_name=weight_component,
+                sp_group=broadcast_decision.sp_group,
+                weight_load_profile=weight_load_profile,
+            )
         param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
         load_model_from_full_model_state_dict(
             model,
@@ -198,18 +212,119 @@ def maybe_load_fsdp_model(
         )
 
     if broadcast_decision.enabled:
+        confirm_rank0_broadcast_entry(
+            broadcast_decision.sp_group,
+            component_name=weight_component,
+            weight_load_profile=weight_load_profile,
+        )
+        rank0_load_exc: Exception | None = None
+        rank0_load_status: dict[str, Any] | None = None
+        local_ready_for_tensor_broadcast = True
+        local_ready_error: str | None = None
         if broadcast_decision.sp_rank == 0:
-            _load_weights_on_current_rank(force_device_resident=cpu_offload)
+            log_broadcast_stage(
+                "rank0_load_start",
+                broadcast_decision.sp_group,
+                component_name=weight_component,
+                detail=f"file_count={len(weight_dir_list)}",
+                weight_load_profile=weight_load_profile,
+            )
+            try:
+                _load_weights_on_current_rank(force_device_resident=cpu_offload)
+            except Exception as exc:
+                rank0_load_exc = exc
+                error = f"rank0_load_error:{type(exc).__name__}: {exc}"
+                rank0_load_status = {"ok": False, "error": error}
+                if weight_load_profile is not None:
+                    weight_load_profile.set_broadcast_error(error)
+                log_broadcast_stage(
+                    "rank0_load_error",
+                    broadcast_decision.sp_group,
+                    component_name=weight_component,
+                    detail=error,
+                    weight_load_profile=weight_load_profile,
+                )
+            else:
+                rank0_load_status = {"ok": True, "error": None}
+                log_broadcast_stage(
+                    "rank0_load_done",
+                    broadcast_decision.sp_group,
+                    component_name=weight_component,
+                    weight_load_profile=weight_load_profile,
+                )
         else:
-            materialize_empty_model_state_dict(model, device=device, strict=strict)
+            log_broadcast_stage(
+                "nonrank_empty_materialize_start",
+                broadcast_decision.sp_group,
+                component_name=weight_component,
+                weight_load_profile=weight_load_profile,
+            )
+            try:
+                materialize_empty_model_state_dict(model, device=device, strict=strict)
+            except Exception as exc:
+                local_ready_for_tensor_broadcast = False
+                local_ready_error = (
+                    f"nonrank_empty_materialize_error:"
+                    f"{type(exc).__name__}: {exc}"
+                )
+                if weight_load_profile is not None:
+                    weight_load_profile.set_broadcast_error(local_ready_error)
+                log_broadcast_stage(
+                    "nonrank_empty_materialize_error",
+                    broadcast_decision.sp_group,
+                    component_name=weight_component,
+                    detail=local_ready_error,
+                    weight_load_profile=weight_load_profile,
+                )
+            else:
+                log_broadcast_stage(
+                    "nonrank_empty_materialize_done",
+                    broadcast_decision.sp_group,
+                    component_name=weight_component,
+                    weight_load_profile=weight_load_profile,
+                )
+
+        received_status = broadcast_rank0_load_status(
+            broadcast_decision.sp_group,
+            rank0_status=rank0_load_status,
+            component_name=weight_component,
+            weight_load_profile=weight_load_profile,
+        )
+        if not received_status.get("ok"):
+            error = str(received_status.get("error") or "rank0 load failed")
+            if weight_load_profile is not None:
+                weight_load_profile.set_broadcast_error(error)
+            if rank0_load_exc is not None:
+                raise rank0_load_exc
+            raise RuntimeError(error)
+        confirm_tensor_broadcast_ready(
+            broadcast_decision.sp_group,
+            local_ok=local_ready_for_tensor_broadcast,
+            component_name=weight_component,
+            local_error=local_ready_error,
+            weight_load_profile=weight_load_profile,
+        )
 
         broadcast_module_tensors(
             model,
             broadcast_decision.sp_group,
+            component_name=weight_component,
             weight_load_profile=weight_load_profile,
         )
         if cpu_offload:
+            log_broadcast_stage(
+                "cpu_offload_start",
+                broadcast_decision.sp_group,
+                component_name=weight_component,
+                weight_load_profile=weight_load_profile,
+            )
             offload_model_tensors_to_cpu(model)
+            log_broadcast_stage(
+                "cpu_offload_done",
+                broadcast_decision.sp_group,
+                component_name=weight_component,
+                weight_load_profile=weight_load_profile,
+            )
     else:
         _load_weights_on_current_rank()
 
@@ -233,6 +348,60 @@ def maybe_load_fsdp_model(
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
     return model
+
+
+def _log_weight_iterator_progress(
+    iterator: Iterable[tuple[str, torch.Tensor]],
+    *,
+    component_name: str | None,
+    sp_group,
+    weight_load_profile: DiffusionWeightLoadProfiler | None,
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    tensor_count = 0
+    total_bytes = 0
+    next_progress_bytes = _WEIGHT_READ_PROGRESS_BYTES
+    log_broadcast_stage(
+        "rank0_weight_iterator_enter",
+        sp_group,
+        component_name=component_name,
+        weight_load_profile=weight_load_profile,
+    )
+    try:
+        for name, tensor in iterator:
+            tensor_count += 1
+            total_bytes += int(tensor.numel() * tensor.element_size())
+            if tensor_count == 1:
+                log_broadcast_stage(
+                    "rank0_weight_first_tensor",
+                    sp_group,
+                    component_name=component_name,
+                    detail=(
+                        f"name={name} shape={tuple(tensor.shape)} "
+                        f"dtype={tensor.dtype} bytes={total_bytes}"
+                    ),
+                    weight_load_profile=weight_load_profile,
+                )
+            if total_bytes >= next_progress_bytes:
+                log_broadcast_stage(
+                    "rank0_weight_read_progress",
+                    sp_group,
+                    component_name=component_name,
+                    detail=(
+                        f"bytes={total_bytes} tensor_count={tensor_count} "
+                        f"last_tensor={name}"
+                    ),
+                    weight_load_profile=weight_load_profile,
+                )
+                next_progress_bytes += _WEIGHT_READ_PROGRESS_BYTES
+            yield name, tensor
+    finally:
+        log_broadcast_stage(
+            "rank0_weight_iterator_exit",
+            sp_group,
+            component_name=component_name,
+            detail=f"bytes={total_bytes} tensor_count={tensor_count}",
+            weight_load_profile=weight_load_profile,
+        )
 
 
 def shard_model(

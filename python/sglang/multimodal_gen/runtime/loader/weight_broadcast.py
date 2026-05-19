@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ DIFFUSION_WEIGHT_LOAD_MODE_CHOICES: tuple[str, ...] = (
     "rank0-broadcast",
 )
 SUPPORTED_BROADCAST_COMPONENTS: tuple[str, ...] = ("transformer",)
+_BROADCAST_PROGRESS_BYTES = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -197,6 +199,177 @@ def set_profile_load_mode(
     profile.set_load_mode_effective(decision.effective_mode)
 
 
+def _group_rank(sp_group) -> int | str:
+    return getattr(sp_group, "rank", "unknown")
+
+
+def _sp_rank(sp_group) -> int | str:
+    return getattr(sp_group, "rank_in_group", "unknown")
+
+
+def _sp_world_size(sp_group) -> int | str:
+    return getattr(sp_group, "world_size", "unknown")
+
+
+def log_broadcast_stage(
+    stage: str,
+    sp_group=None,
+    *,
+    component_name: str | None = None,
+    detail: str | None = None,
+    weight_load_profile: DiffusionWeightLoadProfiler | None = None,
+) -> None:
+    logger.info(
+        "DiffusionRank0BroadcastStage stage=%s component=%s rank=%s "
+        "sp_rank=%s sp_world_size=%s pid=%s%s",
+        stage,
+        component_name or "unknown",
+        _group_rank(sp_group),
+        _sp_rank(sp_group),
+        _sp_world_size(sp_group),
+        os.getpid(),
+        f" {detail}" if detail else "",
+        main_process_only=False,
+        local_main_process_only=False,
+    )
+    if weight_load_profile is not None:
+        weight_load_profile.record_stage(stage, detail=detail)
+
+
+def _cpu_control_all_reduce_min(local_ok: bool, sp_group) -> bool:
+    ok_tensor = torch.tensor([1 if local_ok else 0], dtype=torch.int32)
+    if getattr(sp_group, "world_size", 1) <= 1:
+        return bool(ok_tensor.item())
+
+    cpu_group = getattr(sp_group, "cpu_group", None)
+    if cpu_group is not None:
+        dist.all_reduce(ok_tensor, op=dist.ReduceOp.MIN, group=cpu_group)
+    else:
+        sp_group.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
+    return bool(ok_tensor.item())
+
+
+def confirm_rank0_broadcast_entry(
+    sp_group,
+    *,
+    component_name: str | None = None,
+    weight_load_profile: DiffusionWeightLoadProfiler | None = None,
+) -> None:
+    """Confirm every SP rank has entered the rank0-broadcast branch."""
+    log_broadcast_stage(
+        "entry_confirm_enter",
+        sp_group,
+        component_name=component_name,
+        weight_load_profile=weight_load_profile,
+    )
+    local_metadata = (
+        component_name or "unknown",
+        int(getattr(sp_group, "world_size", 1)),
+    )
+    rank0_metadata = sp_group.broadcast_object(
+        local_metadata if getattr(sp_group, "rank_in_group", 0) == 0 else None,
+        src=0,
+    )
+    local_ok = local_metadata == rank0_metadata
+    if not _cpu_control_all_reduce_min(local_ok, sp_group):
+        error = (
+            "rank0-broadcast entry mismatch before weight read: "
+            f"local={local_metadata} rank0={rank0_metadata}"
+        )
+        if weight_load_profile is not None:
+            weight_load_profile.set_broadcast_error(error)
+        log_broadcast_stage(
+            "entry_confirm_error",
+            sp_group,
+            component_name=component_name,
+            detail=error,
+            weight_load_profile=weight_load_profile,
+        )
+        raise RuntimeError(error)
+    log_broadcast_stage(
+        "entry_confirm_exit",
+        sp_group,
+        component_name=component_name,
+        weight_load_profile=weight_load_profile,
+    )
+
+
+def broadcast_rank0_load_status(
+    sp_group,
+    *,
+    rank0_status: dict[str, Any] | None,
+    component_name: str | None = None,
+    weight_load_profile: DiffusionWeightLoadProfiler | None = None,
+) -> dict[str, Any]:
+    log_broadcast_stage(
+        "rank0_status_broadcast_enter",
+        sp_group,
+        component_name=component_name,
+        weight_load_profile=weight_load_profile,
+    )
+    start = time.perf_counter()
+    status = sp_group.broadcast_object(
+        rank0_status if getattr(sp_group, "rank_in_group", 0) == 0 else None,
+        src=0,
+    )
+    if weight_load_profile is not None:
+        weight_load_profile.add_ms(
+            WEIGHT_LOAD_RANK0_WAIT_MS,
+            (time.perf_counter() - start) * 1000.0,
+        )
+    log_broadcast_stage(
+        "rank0_status_broadcast_exit",
+        sp_group,
+        component_name=component_name,
+        detail=f"ok={bool(status and status.get('ok'))}",
+        weight_load_profile=weight_load_profile,
+    )
+    if not isinstance(status, dict):
+        error = f"rank0 load status must be dict, got {type(status).__name__}"
+        if weight_load_profile is not None:
+            weight_load_profile.set_broadcast_error(error)
+        raise RuntimeError(error)
+    return status
+
+
+def confirm_tensor_broadcast_ready(
+    sp_group,
+    *,
+    local_ok: bool,
+    component_name: str | None = None,
+    local_error: str | None = None,
+    weight_load_profile: DiffusionWeightLoadProfiler | None = None,
+) -> None:
+    log_broadcast_stage(
+        "tensor_ready_confirm_enter",
+        sp_group,
+        component_name=component_name,
+        detail=f"local_ok={local_ok}",
+        weight_load_profile=weight_load_profile,
+    )
+    if _cpu_control_all_reduce_min(local_ok, sp_group):
+        log_broadcast_stage(
+            "tensor_ready_confirm_exit",
+            sp_group,
+            component_name=component_name,
+            detail="ok=True",
+            weight_load_profile=weight_load_profile,
+        )
+        return
+
+    error = local_error or "some SP rank failed before tensor broadcast"
+    if weight_load_profile is not None:
+        weight_load_profile.set_broadcast_error(error)
+    log_broadcast_stage(
+        "tensor_ready_confirm_error",
+        sp_group,
+        component_name=component_name,
+        detail=error,
+        weight_load_profile=weight_load_profile,
+    )
+    raise RuntimeError(error)
+
+
 def materialize_empty_model_state_dict(
     model: nn.Module,
     *,
@@ -248,21 +421,20 @@ def metadata_for_entries(
     ]
 
 
-def _collective_device(
-    entries: list[tuple[str, torch.Tensor, str]], sp_group
-) -> torch.device:
-    if entries:
-        return entries[0][1].device
-    device = getattr(sp_group, "device", torch.device("cpu"))
-    return torch.device(device)
-
-
 def validate_broadcast_metadata(
     entries: list[tuple[str, torch.Tensor, str]],
     sp_group,
     *,
+    component_name: str | None = None,
     weight_load_profile: DiffusionWeightLoadProfiler | None = None,
 ) -> None:
+    log_broadcast_stage(
+        "metadata_broadcast_enter",
+        sp_group,
+        component_name=component_name,
+        detail=f"tensor_count={len(entries)}",
+        weight_load_profile=weight_load_profile,
+    )
     local_metadata = metadata_for_entries(entries)
     rank0_metadata = sp_group.broadcast_object(
         local_metadata if sp_group.rank_in_group == 0 else None,
@@ -270,66 +442,81 @@ def validate_broadcast_metadata(
     )
     local_ok = local_metadata == rank0_metadata
 
-    device = _collective_device(entries, sp_group)
-    ok_tensor = torch.tensor(
-        [1 if local_ok else 0],
-        device=device,
-        dtype=torch.int32,
-    )
-    sp_group.all_reduce(ok_tensor, op=dist.ReduceOp.MIN)
-    if int(ok_tensor.item()) != 1:
+    if not _cpu_control_all_reduce_min(local_ok, sp_group):
         error = "rank0-broadcast metadata mismatch before tensor broadcast"
         if weight_load_profile is not None:
             weight_load_profile.set_broadcast_error(error)
-        raise RuntimeError(error)
-
-
-def wait_for_rank0_ready(
-    entries: list[tuple[str, torch.Tensor, str]],
-    sp_group,
-    *,
-    weight_load_profile: DiffusionWeightLoadProfiler | None = None,
-) -> None:
-    device = _collective_device(entries, sp_group)
-    ready = torch.ones(1, device=device, dtype=torch.int32)
-    start = time.perf_counter()
-    sp_group.broadcast(ready, src=0)
-    if weight_load_profile is not None:
-        weight_load_profile.add_ms(
-            WEIGHT_LOAD_RANK0_WAIT_MS,
-            (time.perf_counter() - start) * 1000.0,
+        log_broadcast_stage(
+            "metadata_broadcast_error",
+            sp_group,
+            component_name=component_name,
+            detail=error,
+            weight_load_profile=weight_load_profile,
         )
-
+        raise RuntimeError(error)
+    log_broadcast_stage(
+        "metadata_broadcast_exit",
+        sp_group,
+        component_name=component_name,
+        detail=f"tensor_count={len(entries)}",
+        weight_load_profile=weight_load_profile,
+    )
 
 def broadcast_module_tensors(
     model: nn.Module,
     sp_group,
     *,
+    component_name: str | None = None,
     weight_load_profile: DiffusionWeightLoadProfiler | None = None,
 ) -> None:
     entries = iter_module_tensors(model)
-    wait_for_rank0_ready(
-        entries,
-        sp_group,
-        weight_load_profile=weight_load_profile,
-    )
     validate_broadcast_metadata(
         entries,
         sp_group,
+        component_name=component_name,
         weight_load_profile=weight_load_profile,
     )
 
+    log_broadcast_stage(
+        "tensor_broadcast_start",
+        sp_group,
+        component_name=component_name,
+        detail=f"tensor_count={len(entries)}",
+        weight_load_profile=weight_load_profile,
+    )
     start = time.perf_counter()
+    broadcast_bytes = 0
+    next_progress_bytes = _BROADCAST_PROGRESS_BYTES
     try:
-        for _name, tensor, _kind in entries:
+        for name, tensor, _kind in entries:
             if tensor.numel() == 0:
                 continue
             sp_group.broadcast(tensor, src=0)
             if weight_load_profile is not None:
                 weight_load_profile.add_broadcast_tensor(tensor)
+            broadcast_bytes += int(tensor.numel() * tensor.element_size())
+            if broadcast_bytes >= next_progress_bytes:
+                log_broadcast_stage(
+                    "tensor_broadcast_progress",
+                    sp_group,
+                    component_name=component_name,
+                    detail=(
+                        f"bytes={broadcast_bytes} last_tensor={name} "
+                        f"tensor_count={len(entries)}"
+                    ),
+                    weight_load_profile=weight_load_profile,
+                )
+                next_progress_bytes += _BROADCAST_PROGRESS_BYTES
     except Exception as exc:
         if weight_load_profile is not None:
             weight_load_profile.set_broadcast_error(f"{type(exc).__name__}: {exc}")
+        log_broadcast_stage(
+            "tensor_broadcast_error",
+            sp_group,
+            component_name=component_name,
+            detail=f"{type(exc).__name__}: {exc}",
+            weight_load_profile=weight_load_profile,
+        )
         raise
     finally:
         if weight_load_profile is not None:
@@ -337,3 +524,10 @@ def broadcast_module_tensors(
                 WEIGHT_LOAD_NCCL_BROADCAST_MS,
                 (time.perf_counter() - start) * 1000.0,
             )
+    log_broadcast_stage(
+        "tensor_broadcast_done",
+        sp_group,
+        component_name=component_name,
+        detail=f"bytes={broadcast_bytes} tensor_count={len(entries)}",
+        weight_load_profile=weight_load_profile,
+    )

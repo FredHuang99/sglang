@@ -7,6 +7,8 @@ import torch
 
 from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
     broadcast_module_tensors,
+    broadcast_rank0_load_status,
+    confirm_rank0_broadcast_entry,
     iter_module_tensors,
     materialize_empty_model_state_dict,
     resolve_rank0_broadcast_decision,
@@ -124,6 +126,23 @@ class TestDiffusionWeightBroadcast(unittest.TestCase):
         record = profile.as_dict()
         self.assertIn("metadata mismatch", record[WEIGHT_LOAD_BROADCAST_ERROR])
 
+    def test_entry_confirm_detects_component_mismatch_before_weight_read(self):
+        group = FakeSPGroup(
+            rank_in_group=1,
+            rank0_metadata=("transformer", 2),
+        )
+        profile = self._profile()
+
+        with self.assertRaisesRegex(RuntimeError, "entry mismatch"):
+            confirm_rank0_broadcast_entry(
+                group,
+                component_name="vae",
+                weight_load_profile=profile,
+            )
+
+        record = profile.as_dict()
+        self.assertIn("entry mismatch", record[WEIGHT_LOAD_BROADCAST_ERROR])
+
     def test_broadcast_records_tensor_count_and_bytes(self):
         module = torch.nn.Linear(2, 2)
         group = FakeSPGroup(rank_in_group=0)
@@ -140,7 +159,20 @@ class TestDiffusionWeightBroadcast(unittest.TestCase):
             sum(t.numel() * t.element_size() for t in module.state_dict().values()),
         )
         self.assertGreaterEqual(record[WEIGHT_LOAD_NCCL_BROADCAST_MS], 0.0)
-        self.assertEqual(group.broadcast_calls, 3)
+        self.assertEqual(group.broadcast_calls, 2)
+
+    def test_rank0_load_status_uses_object_broadcast(self):
+        group = FakeSPGroup(rank_in_group=1, rank0_metadata={"ok": True})
+        profile = self._profile()
+
+        status = broadcast_rank0_load_status(
+            group,
+            rank0_status=None,
+            component_name="transformer",
+            weight_load_profile=profile,
+        )
+
+        self.assertEqual(status, {"ok": True})
 
     def test_iter_module_tensors_is_stably_sorted_by_name(self):
         module = torch.nn.Sequential(

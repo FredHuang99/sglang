@@ -236,6 +236,60 @@ class DiffusionWeightLoadProfiler:
             return
         self._load_mode_fields[WEIGHT_LOAD_BROADCAST_ERROR] = error
 
+    def record_stage(self, stage: str, detail: Any | None = None) -> str | None:
+        if not self.active:
+            return None
+
+        record: dict[str, Any] = {
+            "schema_version": 1,
+            "component": self.component,
+            "stage": stage,
+            "detail": detail,
+            "stage_time_s": time.time(),
+            "pid": os.getpid(),
+            "status": self._status,
+            "error": self._error,
+            **self._context,
+            **self._timings_ms,
+            WEIGHT_LOAD_TOTAL_BYTES: self._total_bytes,
+            **self._staging_fields,
+            **self._load_mode_fields,
+        }
+        logger.info(
+            "ProfileWeightLoadStage %s",
+            json.dumps(record, sort_keys=True),
+            main_process_only=False,
+            local_main_process_only=False,
+        )
+
+        if not self.enabled:
+            return None
+
+        try:
+            profile_dir = _resolve_launch_weight_profile_dir(self.server_args)
+            component = _sanitize_filename_part(self.component)
+            rank = _sanitize_filename_part(record["rank"])
+            physical_rank = _sanitize_filename_part(record["physical_rank"])
+            path = os.path.join(
+                profile_dir,
+                f"weight_load_{component}_rank{rank}_local{physical_rank}_pid{os.getpid()}_stage.json",
+            )
+            tmp_path = f"{path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as fp:
+                json.dump(record, fp, indent=2, sort_keys=True)
+                fp.write("\n")
+            os.replace(tmp_path, path)
+            return path
+        except Exception as exc:
+            logger.warning(
+                "Failed to write weight-load stage profile. component=%s "
+                "stage=%s error=%s",
+                self.component,
+                stage,
+                exc,
+            )
+            return None
+
     def profile_safetensors_iterator(
         self, iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
