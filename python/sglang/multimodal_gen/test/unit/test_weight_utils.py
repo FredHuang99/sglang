@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.loader import weight_utils
 class FakeSafetensorsStreamer:
     def __init__(self):
         self.calls = []
-        self.current_file = None
+        self.streamed_files = []
 
     def __enter__(self):
         self.calls.append("enter")
@@ -23,17 +23,23 @@ class FakeSafetensorsStreamer:
         self.calls.append("exit")
 
     def stream_file(self, st_file):
-        self.current_file = st_file
         self.calls.append(("stream_file", st_file))
 
     def stream_files(self, hf_weights_files):
-        del hf_weights_files
-        raise AssertionError("batch stream_files must not be used")
+        self.streamed_files = list(hf_weights_files)
+        self.calls.append(("stream_files", tuple(hf_weights_files)))
 
     def get_tensors(self):
-        self.calls.append(("get_tensors", self.current_file))
-        name = os.path.basename(str(self.current_file)) + ".weight"
-        return iter([(name, torch.ones((1,), dtype=torch.float32))])
+        self.calls.append("get_tensors")
+        return iter(
+            [
+                (
+                    os.path.basename(str(st_file)) + ".weight",
+                    torch.ones((1,), dtype=torch.float32),
+                )
+                for st_file in self.streamed_files
+            ]
+        )
 
 
 class FakeSafeOpen:
@@ -55,9 +61,8 @@ class FakeSafeOpen:
 
 
 class TestSafetensorsWeightsIterator(unittest.TestCase):
-    def test_runai_streams_one_file_at_a_time(self):
+    def test_runai_uses_batch_stream_files_for_default_path(self):
         fake_streamer = FakeSafetensorsStreamer()
-        stages = []
 
         with (
             patch.object(weight_utils, "HAS_RUNAI_MODEL_STREAMER", True),
@@ -76,9 +81,6 @@ class TestSafetensorsWeightsIterator(unittest.TestCase):
             tensors = list(
                 weight_utils.safetensors_weights_iterator(
                     ["file0.safetensors", "file1.safetensors"],
-                    stage_callback=lambda stage, detail=None: stages.append(
-                        (stage, detail)
-                    ),
                 )
             )
 
@@ -86,10 +88,11 @@ class TestSafetensorsWeightsIterator(unittest.TestCase):
             fake_streamer.calls,
             [
                 "enter",
-                ("stream_file", "file0.safetensors"),
-                ("get_tensors", "file0.safetensors"),
-                ("stream_file", "file1.safetensors"),
-                ("get_tensors", "file1.safetensors"),
+                (
+                    "stream_files",
+                    ("file0.safetensors", "file1.safetensors"),
+                ),
+                "get_tensors",
                 "exit",
             ],
         )
@@ -100,13 +103,6 @@ class TestSafetensorsWeightsIterator(unittest.TestCase):
                 "file1.safetensors.weight",
             ],
         )
-        stage_names = [stage for stage, _detail in stages]
-        self.assertIn("runai_stream_files_start", stage_names)
-        self.assertIn("runai_stream_file_start", stage_names)
-        self.assertIn("runai_stream_file_done", stage_names)
-        self.assertIn("runai_get_tensors_start", stage_names)
-        self.assertIn("runai_first_tensor", stage_names)
-        self.assertIn("runai_stream_files_done", stage_names)
 
     def test_runai_env_gate_is_evaluated_at_call_time(self):
         with (
@@ -122,7 +118,6 @@ class TestSafetensorsWeightsIterator(unittest.TestCase):
 
     def test_explicit_false_disables_runai_streamer(self):
         safe_open_calls = []
-        stages = []
 
         def fake_safe_open(st_file, framework, device):
             safe_open_calls.append((st_file, framework, device))
@@ -136,6 +131,7 @@ class TestSafetensorsWeightsIterator(unittest.TestCase):
                 side_effect=AssertionError("RunAI streamer should stay disabled"),
                 create=True,
             ),
+            patch.object(weight_utils, "_validate_safetensors_file", return_value=True),
             patch.object(weight_utils, "safe_open", side_effect=fake_safe_open),
             patch.object(weight_utils, "tqdm", lambda iterable, **kwargs: iterable),
             patch.dict(
@@ -147,9 +143,6 @@ class TestSafetensorsWeightsIterator(unittest.TestCase):
                 weight_utils.safetensors_weights_iterator(
                     ["file0.safetensors"],
                     use_runai_model_streamer=False,
-                    stage_callback=lambda stage, detail=None: stages.append(
-                        (stage, detail)
-                    ),
                 )
             )
 
@@ -159,7 +152,6 @@ class TestSafetensorsWeightsIterator(unittest.TestCase):
             safe_open_calls,
             [("file0.safetensors", "pt", "cpu")],
         )
-        self.assertEqual(stages, [])
 
 
 if __name__ == "__main__":

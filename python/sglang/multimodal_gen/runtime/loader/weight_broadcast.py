@@ -26,7 +26,7 @@ DIFFUSION_WEIGHT_LOAD_MODE_CHOICES: tuple[str, ...] = (
     "default",
     "rank0-broadcast",
 )
-SUPPORTED_BROADCAST_COMPONENTS: tuple[str, ...] = ("transformer",)
+SUPPORTED_BROADCAST_COMPONENTS: tuple[str, ...] = ("transformer", "vae")
 _BROADCAST_PROGRESS_BYTES = 1 << 30
 
 
@@ -219,7 +219,8 @@ def log_broadcast_stage(
     detail: str | None = None,
     weight_load_profile: DiffusionWeightLoadProfiler | None = None,
 ) -> None:
-    logger.info(
+    log_fn = logger.warning if stage.endswith("_error") else logger.debug
+    log_fn(
         "DiffusionRank0BroadcastStage stage=%s component=%s rank=%s "
         "sp_rank=%s sp_world_size=%s pid=%s%s",
         stage,
@@ -232,8 +233,6 @@ def log_broadcast_stage(
         main_process_only=False,
         local_main_process_only=False,
     )
-    if weight_load_profile is not None:
-        weight_load_profile.record_stage(stage, detail=detail)
 
 
 def _cpu_control_all_reduce_min(local_ok: bool, sp_group) -> bool:
@@ -461,6 +460,7 @@ def validate_broadcast_metadata(
         detail=f"tensor_count={len(entries)}",
         weight_load_profile=weight_load_profile,
     )
+
 
 def broadcast_module_tensors(
     model: nn.Module,

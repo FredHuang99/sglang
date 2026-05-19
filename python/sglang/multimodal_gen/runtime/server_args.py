@@ -55,7 +55,7 @@ logger = init_logger(__name__)
 
 DIFFUSION_WEIGHT_STAGING_CHOICES = ("none", "pageable", "pinned", "auto")
 DIFFUSION_WEIGHT_LOAD_MODE_CHOICES = ("default", "rank0-broadcast")
-DIFFUSION_WEIGHT_BROADCAST_COMPONENT_CHOICES = ("transformer",)
+DIFFUSION_WEIGHT_BROADCAST_COMPONENT_CHOICES = ("transformer", "vae")
 
 
 def _normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:

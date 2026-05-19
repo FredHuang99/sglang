@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.loader import fsdp_load
+from sglang.multimodal_gen.runtime.loader.component_loaders import vae_loader
 from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
     broadcast_module_tensors,
     broadcast_rank0_load_status,
@@ -61,6 +62,12 @@ class TinyBroadcastModel(torch.nn.Module):
         self.linear = torch.nn.Linear(1, 1, bias=False)
 
 
+class TinyVAE(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(1, 1, bias=True)
+
+
 class TestDiffusionWeightBroadcast(unittest.TestCase):
     def _profile(self):
         return DiffusionWeightLoadProfiler(
@@ -99,6 +106,38 @@ class TestDiffusionWeightBroadcast(unittest.TestCase):
         self.assertFalse(decision.enabled)
         self.assertEqual(decision.effective_mode, "default")
         self.assertIn("tp_size_not_supported", decision.reason)
+
+    def test_precondition_enables_vae_component(self):
+        group = FakeSPGroup(rank_in_group=0)
+        with (
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.model_parallel_is_initialized",
+                return_value=True,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.get_sp_group",
+                return_value=group,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.get_sp_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "sglang.multimodal_gen.runtime.distributed.parallel_state.get_sp_world_size",
+                return_value=2,
+            ),
+        ):
+            decision = resolve_rank0_broadcast_decision(
+                load_mode="rank0-broadcast",
+                broadcast_components=["vae"],
+                component_name="vae",
+                tp_size=1,
+                fsdp_inference=False,
+            )
+
+        self.assertTrue(decision.enabled)
+        self.assertEqual(decision.effective_mode, "rank0-broadcast")
+        self.assertEqual(decision.sp_group, group)
 
     def test_empty_materialization_replaces_meta_tensors(self):
         with torch.device("meta"):
@@ -213,13 +252,10 @@ class TestDiffusionWeightBroadcast(unittest.TestCase):
             hf_weights_files,
             to_cpu=True,
             use_runai_model_streamer=None,
-            stage_callback=None,
         ):
             captured["hf_weights_files"] = hf_weights_files
             captured["to_cpu"] = to_cpu
             captured["use_runai_model_streamer"] = use_runai_model_streamer
-            if stage_callback is not None:
-                stage_callback("fake_iterator_enter")
             return iter([("linear.weight", torch.ones((1, 1), dtype=torch.float32))])
 
         def fake_load(model, full_sd_iterator, device, *args, **kwargs):
@@ -266,6 +302,96 @@ class TestDiffusionWeightBroadcast(unittest.TestCase):
         self.assertEqual(captured["hf_weights_files"], ["file0.safetensors"])
         self.assertTrue(captured["to_cpu"])
         self.assertFalse(captured["use_runai_model_streamer"])
+
+    def test_vae_default_load_reports_key_mismatch(self):
+        module = TinyVAE()
+        profile = DiffusionWeightLoadProfiler(
+            component="vae",
+            server_args=SimpleNamespace(
+                profile_enabled=True,
+                num_gpus=1,
+                disagg_role_device="cuda",
+            ),
+            enabled=True,
+        )
+        server_args = SimpleNamespace(diffusion_weight_staging="none")
+
+        with patch.object(
+            vae_loader,
+            "_load_vae_state_dict_from_safetensors",
+            return_value={
+                "linear.weight": torch.ones((1, 1), dtype=torch.float32),
+                "extra.weight": torch.ones((1,), dtype=torch.float32),
+            },
+        ):
+            missing_keys, unexpected_keys = vae_loader._load_vae_weights_default(
+                module,
+                ["vae.safetensors"],
+                server_args,
+                profile,
+            )
+
+        self.assertEqual(missing_keys, ["linear.bias"])
+        self.assertEqual(unexpected_keys, ["extra.weight"])
+
+    def test_vae_nonrank_broadcast_skips_safetensors_load(self):
+        module = TinyVAE()
+        group = FakeSPGroup(rank_in_group=1)
+        decision = SimpleNamespace(
+            enabled=True,
+            requested_mode="rank0-broadcast",
+            effective_mode="rank0-broadcast",
+            reason="enabled",
+            sp_rank=1,
+            sp_world_size=2,
+            sp_group=group,
+        )
+        profile = DiffusionWeightLoadProfiler(
+            component="vae",
+            server_args=SimpleNamespace(
+                profile_enabled=True,
+                num_gpus=2,
+                disagg_role_device="cuda",
+            ),
+            enabled=True,
+        )
+        server_args = SimpleNamespace(diffusion_weight_staging="pageable")
+
+        with (
+            patch.object(
+                vae_loader,
+                "_load_vae_state_dict_from_safetensors",
+                side_effect=AssertionError("non-rank0 must not read VAE weights"),
+            ),
+            patch.object(vae_loader, "confirm_rank0_broadcast_entry"),
+            patch.object(
+                vae_loader,
+                "broadcast_rank0_load_status",
+                return_value={"ok": True, "missing_keys": [], "unexpected_keys": []},
+            ),
+            patch.object(vae_loader, "confirm_tensor_broadcast_ready") as ready_mock,
+            patch.object(vae_loader, "broadcast_module_tensors") as broadcast_mock,
+        ):
+            missing_keys, unexpected_keys = (
+                vae_loader._load_vae_weights_rank0_broadcast(
+                    module,
+                    ["vae.safetensors"],
+                    server_args,
+                    "vae",
+                    profile,
+                    decision,
+                )
+            )
+
+        self.assertEqual(missing_keys, [])
+        self.assertEqual(unexpected_keys, [])
+        ready_mock.assert_called_once()
+        broadcast_mock.assert_called_once_with(
+            module,
+            group,
+            component_name="vae",
+            weight_load_profile=profile,
+        )
 
 
 if __name__ == "__main__":

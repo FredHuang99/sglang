@@ -311,7 +311,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(server_args.diffusion_weight_load_mode, "rank0-broadcast")
         self.assertEqual(
             server_args.diffusion_weight_broadcast_components,
-            ["transformer"],
+            ["transformer", "vae"],
         )
 
 

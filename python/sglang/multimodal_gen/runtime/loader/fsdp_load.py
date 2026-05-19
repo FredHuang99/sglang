@@ -7,7 +7,7 @@
 # Copyright 2025 The sglang-diffusion Authors.
 
 import time
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator
 from contextlib import nullcontext
 from itertools import chain
 from typing import Any
@@ -62,7 +62,6 @@ from sglang.srt.utils import is_npu
 _is_npu = is_npu()
 
 logger = init_logger(__name__)
-_WEIGHT_READ_PROGRESS_BYTES = 1 << 30
 
 
 def _make_param_like(
@@ -182,35 +181,15 @@ def maybe_load_fsdp_model(
         )
 
     def _load_weights_on_current_rank(*, force_device_resident: bool = False) -> None:
-        stage_callback = None
         use_runai_model_streamer = None
         if broadcast_decision.enabled and broadcast_decision.sp_rank == 0:
-
-            def _record_rank0_iterator_stage(
-                stage: str, detail: str | None = None
-            ) -> None:
-                log_broadcast_stage(
-                    stage,
-                    broadcast_decision.sp_group,
-                    component_name=weight_component,
-                    detail=detail,
-                    weight_load_profile=weight_load_profile,
-                )
-
-            stage_callback = _record_rank0_iterator_stage
+            # RunAI model streamer can synchronize across ranks while non-rank0
+            # waits for rank0 load status in rank0-broadcast mode.
             use_runai_model_streamer = False
-            log_broadcast_stage(
-                "rank0_iterator_config",
-                broadcast_decision.sp_group,
-                component_name=weight_component,
-                detail="runai_model_streamer=False reason=rank0_broadcast",
-                weight_load_profile=weight_load_profile,
-            )
 
         weight_iterator = safetensors_weights_iterator(
             weight_dir_list,
             use_runai_model_streamer=use_runai_model_streamer,
-            stage_callback=stage_callback,
         )
         if weight_load_profile is not None:
             weight_iterator = weight_load_profile.profile_safetensors_iterator(
@@ -221,13 +200,6 @@ def maybe_load_fsdp_model(
             staging_mode=weight_staging_mode,
             weight_load_profile=weight_load_profile,
         )
-        if broadcast_decision.enabled and broadcast_decision.sp_rank == 0:
-            weight_iterator = _log_weight_iterator_progress(
-                weight_iterator,
-                component_name=weight_component,
-                sp_group=broadcast_decision.sp_group,
-                weight_load_profile=weight_load_profile,
-            )
         param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
         load_model_from_full_model_state_dict(
             model,
@@ -377,60 +349,6 @@ def maybe_load_fsdp_model(
         if isinstance(p, torch.nn.Parameter):
             p.requires_grad = False
     return model
-
-
-def _log_weight_iterator_progress(
-    iterator: Iterable[tuple[str, torch.Tensor]],
-    *,
-    component_name: str | None,
-    sp_group,
-    weight_load_profile: DiffusionWeightLoadProfiler | None,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    tensor_count = 0
-    total_bytes = 0
-    next_progress_bytes = _WEIGHT_READ_PROGRESS_BYTES
-    log_broadcast_stage(
-        "rank0_weight_iterator_enter",
-        sp_group,
-        component_name=component_name,
-        weight_load_profile=weight_load_profile,
-    )
-    try:
-        for name, tensor in iterator:
-            tensor_count += 1
-            total_bytes += int(tensor.numel() * tensor.element_size())
-            if tensor_count == 1:
-                log_broadcast_stage(
-                    "rank0_weight_first_tensor",
-                    sp_group,
-                    component_name=component_name,
-                    detail=(
-                        f"name={name} shape={tuple(tensor.shape)} "
-                        f"dtype={tensor.dtype} bytes={total_bytes}"
-                    ),
-                    weight_load_profile=weight_load_profile,
-                )
-            if total_bytes >= next_progress_bytes:
-                log_broadcast_stage(
-                    "rank0_weight_read_progress",
-                    sp_group,
-                    component_name=component_name,
-                    detail=(
-                        f"bytes={total_bytes} tensor_count={tensor_count} "
-                        f"last_tensor={name}"
-                    ),
-                    weight_load_profile=weight_load_profile,
-                )
-                next_progress_bytes += _WEIGHT_READ_PROGRESS_BYTES
-            yield name, tensor
-    finally:
-        log_broadcast_stage(
-            "rank0_weight_iterator_exit",
-            sp_group,
-            component_name=component_name,
-            detail=f"bytes={total_bytes} tensor_count={tensor_count}",
-            weight_load_profile=weight_load_profile,
-        )
 
 
 def shard_model(

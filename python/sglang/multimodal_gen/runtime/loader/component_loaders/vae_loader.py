@@ -15,6 +15,16 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
 )
+from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
+    Rank0BroadcastDecision,
+    broadcast_module_tensors,
+    broadcast_rank0_load_status,
+    confirm_rank0_broadcast_entry,
+    confirm_tensor_broadcast_ready,
+    log_broadcast_stage,
+    resolve_rank0_broadcast_decision,
+    set_profile_load_mode,
+)
 from sglang.multimodal_gen.runtime.loader.weight_staging import (
     maybe_stage_weight_iterator,
     should_stage_weights_on_current_rank,
@@ -65,6 +75,151 @@ def _load_vae_state_dict_from_safetensors(
             with weight_load_profile.timing_scope(WEIGHT_LOAD_CPU_MATERIALIZE_MS):
                 loaded.update(tensors)
     return loaded
+
+
+def _get_vae_key_mismatches(
+    vae: nn.Module, loaded_keys: set[str]
+) -> tuple[list[str], list[str]]:
+    state_keys = set(vae.state_dict().keys())
+    missing_keys = sorted(state_keys - loaded_keys)
+    unexpected_keys = sorted(loaded_keys - state_keys)
+    return missing_keys, unexpected_keys
+
+
+def _warn_vae_key_mismatches(
+    missing_keys: list[str],
+    unexpected_keys: list[str],
+    *,
+    should_log: bool,
+) -> None:
+    if not should_log:
+        return
+    if missing_keys:
+        logger.warning("VAE missing keys: %s", missing_keys)
+    if unexpected_keys:
+        logger.warning("VAE unexpected keys: %s", unexpected_keys)
+
+
+def _load_vae_weights_default(
+    vae: nn.Module,
+    safetensors_list: list[str],
+    server_args: ServerArgs,
+    weight_load_profile: DiffusionWeightLoadProfiler,
+) -> tuple[list[str], list[str]]:
+    loaded = _load_vae_state_dict_from_safetensors(
+        safetensors_list,
+        server_args,
+        weight_load_profile,
+    )
+    with weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS):
+        vae.load_state_dict(loaded, strict=False)
+    return _get_vae_key_mismatches(vae, set(loaded.keys()))
+
+
+def _module_has_meta_tensor(module: nn.Module) -> str | None:
+    for name, tensor in module.state_dict().items():
+        if isinstance(tensor, torch.Tensor) and tensor.is_meta:
+            return name
+    return None
+
+
+def _load_vae_weights_rank0_broadcast(
+    vae: nn.Module,
+    safetensors_list: list[str],
+    server_args: ServerArgs,
+    component_name: str,
+    weight_load_profile: DiffusionWeightLoadProfiler,
+    broadcast_decision: Rank0BroadcastDecision,
+) -> tuple[list[str], list[str]]:
+    confirm_rank0_broadcast_entry(
+        broadcast_decision.sp_group,
+        component_name=component_name,
+        weight_load_profile=weight_load_profile,
+    )
+
+    rank0_load_exc: Exception | None = None
+    rank0_load_status: dict | None = None
+    if broadcast_decision.sp_rank == 0:
+        log_broadcast_stage(
+            "rank0_load_start",
+            broadcast_decision.sp_group,
+            component_name=component_name,
+            detail=f"file_count={len(safetensors_list)}",
+            weight_load_profile=weight_load_profile,
+        )
+        try:
+            missing_keys, unexpected_keys = _load_vae_weights_default(
+                vae,
+                safetensors_list,
+                server_args,
+                weight_load_profile,
+            )
+        except Exception as exc:
+            rank0_load_exc = exc
+            error = f"rank0_load_error:{type(exc).__name__}: {exc}"
+            rank0_load_status = {"ok": False, "error": error}
+            weight_load_profile.set_broadcast_error(error)
+            log_broadcast_stage(
+                "rank0_load_error",
+                broadcast_decision.sp_group,
+                component_name=component_name,
+                detail=error,
+                weight_load_profile=weight_load_profile,
+            )
+        else:
+            rank0_load_status = {
+                "ok": True,
+                "error": None,
+                "missing_keys": missing_keys,
+                "unexpected_keys": unexpected_keys,
+            }
+            log_broadcast_stage(
+                "rank0_load_done",
+                broadcast_decision.sp_group,
+                component_name=component_name,
+                weight_load_profile=weight_load_profile,
+            )
+
+    received_status = broadcast_rank0_load_status(
+        broadcast_decision.sp_group,
+        rank0_status=rank0_load_status,
+        component_name=component_name,
+        weight_load_profile=weight_load_profile,
+    )
+    if not received_status.get("ok"):
+        error = str(received_status.get("error") or "rank0 VAE load failed")
+        weight_load_profile.set_broadcast_error(error)
+        if rank0_load_exc is not None:
+            raise rank0_load_exc
+        raise RuntimeError(error)
+
+    meta_tensor_name = _module_has_meta_tensor(vae)
+    local_ok = meta_tensor_name is None
+    local_error = (
+        None
+        if local_ok
+        else f"vae_meta_tensor_before_broadcast:{meta_tensor_name}"
+    )
+    if local_error is not None:
+        weight_load_profile.set_broadcast_error(local_error)
+    confirm_tensor_broadcast_ready(
+        broadcast_decision.sp_group,
+        local_ok=local_ok,
+        component_name=component_name,
+        local_error=local_error,
+        weight_load_profile=weight_load_profile,
+    )
+
+    broadcast_module_tensors(
+        vae,
+        broadcast_decision.sp_group,
+        component_name=component_name,
+        weight_load_profile=weight_load_profile,
+    )
+    return (
+        list(received_status.get("missing_keys") or []),
+        list(received_status.get("unexpected_keys") or []),
+    )
 
 
 def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
@@ -199,22 +354,67 @@ class VAELoader(ComponentLoader):
         assert (
             len(safetensors_list) >= 1
         ), f"Found no safetensors files in {component_model_path}"
-        loaded = _load_vae_state_dict_from_safetensors(
-            safetensors_list,
-            server_args,
-            weight_load_profile,
-        )
-        with weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS):
-            vae.load_state_dict(loaded, strict=False)
 
-        state_keys = set(vae.state_dict().keys())
-        loaded_keys = set(loaded.keys())
-        missing_keys = sorted(state_keys - loaded_keys)
-        unexpected_keys = sorted(loaded_keys - state_keys)
-        if missing_keys:
-            logger.warning("VAE missing keys: %s", missing_keys)
-        if unexpected_keys:
-            logger.warning("VAE unexpected keys: %s", unexpected_keys)
+        broadcast_decision = resolve_rank0_broadcast_decision(
+            load_mode=server_args.diffusion_weight_load_mode,
+            broadcast_components=server_args.diffusion_weight_broadcast_components,
+            component_name=component_name,
+            tp_size=1,
+            fsdp_inference=False,
+        )
+        if broadcast_decision.enabled and target_device.type == "cpu":
+            logger.warning(
+                "Diffusion rank0-broadcast for VAE requires device-resident "
+                "weights; falling back to default loader because vae_cpu_offload "
+                "is enabled."
+            )
+            broadcast_decision = Rank0BroadcastDecision(
+                enabled=False,
+                requested_mode=broadcast_decision.requested_mode,
+                effective_mode="default",
+                reason="vae_cpu_offload_enabled",
+                sp_rank=broadcast_decision.sp_rank,
+                sp_world_size=broadcast_decision.sp_world_size,
+                sp_group=broadcast_decision.sp_group,
+            )
+        set_profile_load_mode(weight_load_profile, broadcast_decision)
+        if broadcast_decision.requested_mode == "rank0-broadcast":
+            logger.info(
+                "Diffusion weight load mode requested=%s effective=%s "
+                "component=%s sp_rank=%s sp_world_size=%s reason=%s",
+                broadcast_decision.requested_mode,
+                broadcast_decision.effective_mode,
+                component_name,
+                broadcast_decision.sp_rank,
+                broadcast_decision.sp_world_size,
+                broadcast_decision.reason,
+                main_process_only=False,
+                local_main_process_only=False,
+            )
+
+        if broadcast_decision.enabled:
+            missing_keys, unexpected_keys = _load_vae_weights_rank0_broadcast(
+                vae,
+                safetensors_list,
+                server_args,
+                component_name,
+                weight_load_profile,
+                broadcast_decision,
+            )
+        else:
+            missing_keys, unexpected_keys = _load_vae_weights_default(
+                vae,
+                safetensors_list,
+                server_args,
+                weight_load_profile,
+            )
+        _warn_vae_key_mismatches(
+            missing_keys,
+            unexpected_keys,
+            should_log=(
+                not broadcast_decision.enabled or broadcast_decision.sp_rank == 0
+            ),
+        )
 
         if (
             component_name in ("vae", "video_vae")
