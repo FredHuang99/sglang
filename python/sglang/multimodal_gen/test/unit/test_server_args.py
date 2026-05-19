@@ -253,6 +253,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.profile_output_dir, "/tmp/profile")
         self.assertEqual(args.profile_run_id, "run-123")
         self.assertEqual(args.diffusion_weight_staging, "none")
+        self.assertEqual(args.diffusion_weight_load_mode, "default")
 
     def test_request_profile_cli_default_is_disabled(self):
         parser = FlexibleArgumentParser()
@@ -277,6 +278,41 @@ class TestPerRoleParallelism(unittest.TestCase):
                 ["--model-path", "/fake", "--diffusion-weight-staging", mode]
             )
             self.assertEqual(args.diffusion_weight_staging, mode)
+
+    def test_diffusion_weight_broadcast_cli_args_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            [
+                "--model-path",
+                "/fake",
+                "--diffusion-weight-load-mode",
+                "rank0-broadcast",
+                "--diffusion-weight-broadcast-components",
+                "transformer,vae",
+            ]
+        )
+
+        self.assertEqual(args.diffusion_weight_load_mode, "rank0-broadcast")
+        self.assertEqual(
+            args.diffusion_weight_broadcast_components,
+            "transformer,vae",
+        )
+
+    def test_diffusion_weight_broadcast_components_normalized(self):
+        server_args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "diffusion_weight_load_mode": "rank0-broadcast",
+                "diffusion_weight_broadcast_components": "transformer,vae",
+            }
+        )
+
+        self.assertEqual(server_args.diffusion_weight_load_mode, "rank0-broadcast")
+        self.assertEqual(
+            server_args.diffusion_weight_broadcast_components,
+            ["transformer"],
+        )
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):

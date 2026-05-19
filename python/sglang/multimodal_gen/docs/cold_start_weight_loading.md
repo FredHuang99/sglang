@@ -61,6 +61,11 @@ weight_load:staged_tensor_count
 weight_load:pinned_tensor_count
 weight_load:pinned_bytes
 weight_load:pin_memory_error
+weight_load:load_mode_requested
+weight_load:load_mode_effective
+weight_load:broadcast_tensor_count
+weight_load:broadcast_bytes
+weight_load:broadcast_error
 ```
 
 Phase 1 fills `discover_files`, `read_safetensors`, `cpu_materialize`,
@@ -72,6 +77,11 @@ Phase 2 fills the staging fields only when `--diffusion-weight-staging` is not
 `none` and the current process is SP rank0. Non-rank0 processes keep the default
 loading path so Phase 2 can be compared with the Phase 1 baseline before
 broadcast is introduced.
+
+Phase 3 fills the load-mode and broadcast fields when
+`--diffusion-weight-load-mode rank0-broadcast` is requested. In fallback cases,
+`load_mode_requested` stays `rank0-broadcast` while `load_mode_effective` is
+`default`.
 
 ## Phase 2 Rank0 Staging
 
@@ -148,6 +158,84 @@ Interpretation:
 - SP multi-card launch wall time may not improve in Phase 2 because non-rank0
   still performs the duplicated default read. The useful signal is whether
   rank0 produces stable staged tensors and meaningful pin/H2D timings.
+
+## Phase 3 Transformer Rank0 Broadcast
+
+Phase 3 adds an opt-in load mode for Z-Image transformer/denoiser weights under
+`tp=1, sp=N`. Rank0 reads and materializes the checkpoint, non-rank0 ranks
+materialize empty tensors with the same model structure, and the SP group then
+broadcasts parameters and buffers from rank0.
+
+Supported component:
+
+```text
+transformer
+```
+
+Unsupported components such as `vae` are ignored with a warning and keep the
+default loader. VAE/decoder broadcast is reserved for Phase 4.
+
+Example command:
+
+```bash
+python -m sglang.multimodal_gen.runtime.launch_server \
+  --model-path <Z-Image model path> \
+  --model-id Z-Image \
+  --profile-enabled \
+  --profile-output-dir /data/profile \
+  --profile-run-id zimage-sp2-rank0-broadcast-pageable \
+  --diffusion-weight-staging pageable \
+  --diffusion-weight-load-mode rank0-broadcast \
+  --diffusion-weight-broadcast-components transformer \
+  --num-gpus 2 \
+  --sp-degree 2 \
+  --ulysses-degree 2 \
+  --ring-degree 1 \
+  --attention-backend fa
+```
+
+Preconditions and fallback:
+
+- `tp_size` must be 1.
+- SP model-parallel state must be initialized and `sp_world_size > 1`.
+- FSDP inference is not supported in Phase 3.
+- Only `transformer` enters the broadcast path.
+- If a precondition fails before collectives start, the loader falls back to
+  default and records `load_mode_effective=default`.
+- If a collective fails after broadcast has started, the error is recorded in
+  `weight_load:broadcast_error` and the launch raises. Automatic fallback at
+  that point is intentionally avoided because ranks could otherwise diverge and
+  hang.
+
+Profile checks:
+
+```text
+rank0 transformer:
+  weight_load:total_bytes ~= full transformer size
+  weight_load:load_mode_effective = rank0-broadcast
+  weight_load:broadcast_bytes ~= full transformer size
+
+non-rank0 transformer:
+  weight_load:total_bytes = 0
+  weight_load:read_safetensors_ms ~= 0
+  weight_load:load_mode_effective = rank0-broadcast
+  weight_load:rank0_wait_ms captures waiting for rank0 read/materialize
+  weight_load:broadcast_bytes ~= full transformer size
+```
+
+For the first functional run, use `--diffusion-weight-staging pageable` so
+pinned-memory overhead does not hide the broadcast effect. After correctness is
+stable, repeat with `none`, `pinned`, and `auto`.
+
+Benefit tests:
+
+1. SP2 smoke: compare default vs rank0-broadcast and confirm cluster
+   safetensors read bytes drop from two full transformer copies to one.
+2. SP4/SP8 scaling: run at least three trials per mode and compare max
+   transformer load time, cluster read bytes, rank0 wait, NCCL broadcast time,
+   and launch wall time.
+3. Use SP4/SP8 for paper scaling claims; SP2 is only a minimal functional and
+   benefit smoke test.
 
 ## Baseline Procedure
 

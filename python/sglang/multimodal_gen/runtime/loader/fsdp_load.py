@@ -33,6 +33,13 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
 )
+from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
+    broadcast_module_tensors,
+    materialize_empty_model_state_dict,
+    offload_model_tensors_to_cpu,
+    resolve_rank0_broadcast_decision,
+    set_profile_load_mode,
+)
 from sglang.multimodal_gen.runtime.loader.weight_staging import (
     maybe_stage_weight_iterator,
 )
@@ -41,6 +48,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.weight_load_profiler import (
     WEIGHT_LOAD_CPU_MATERIALIZE_MS,
     WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS,
+    WEIGHT_LOAD_PIN_MEMORY_MS,
     WEIGHT_LOAD_READ_SAFETENSORS_MS,
     DiffusionWeightLoadProfiler,
 )
@@ -84,6 +92,10 @@ def maybe_load_fsdp_model(
     strict: bool = True,
     weight_load_profile: DiffusionWeightLoadProfiler | None = None,
     weight_staging_mode: str = "none",
+    weight_load_mode: str = "default",
+    weight_broadcast_components: list[str] | tuple[str, ...] | str | None = None,
+    weight_component: str | None = None,
+    weight_tp_size: int | None = 1,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -142,27 +154,64 @@ def maybe_load_fsdp_model(
             pin_cpu_memory=pin_cpu_memory,
         )
 
-    weight_iterator = safetensors_weights_iterator(weight_dir_list)
-    if weight_load_profile is not None:
-        weight_iterator = weight_load_profile.profile_safetensors_iterator(
-            weight_iterator
+    broadcast_decision = resolve_rank0_broadcast_decision(
+        load_mode=weight_load_mode,
+        broadcast_components=weight_broadcast_components,
+        component_name=weight_component,
+        tp_size=weight_tp_size,
+        fsdp_inference=use_fsdp,
+    )
+    set_profile_load_mode(weight_load_profile, broadcast_decision)
+    if broadcast_decision.requested_mode == "rank0-broadcast":
+        logger.info(
+            "Diffusion weight load mode requested=%s effective=%s "
+            "component=%s sp_rank=%s sp_world_size=%s reason=%s",
+            broadcast_decision.requested_mode,
+            broadcast_decision.effective_mode,
+            weight_component,
+            broadcast_decision.sp_rank,
+            broadcast_decision.sp_world_size,
+            broadcast_decision.reason,
         )
-    weight_iterator = maybe_stage_weight_iterator(
-        weight_iterator,
-        staging_mode=weight_staging_mode,
-        weight_load_profile=weight_load_profile,
-    )
-    param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
-    load_model_from_full_model_state_dict(
-        model,
-        weight_iterator,
-        device,
-        param_dtype,
-        strict=strict,
-        cpu_offload=cpu_offload,
-        param_names_mapping=param_names_mapping_fn,
-        weight_load_profile=weight_load_profile,
-    )
+
+    def _load_weights_on_current_rank(*, force_device_resident: bool = False) -> None:
+        weight_iterator = safetensors_weights_iterator(weight_dir_list)
+        if weight_load_profile is not None:
+            weight_iterator = weight_load_profile.profile_safetensors_iterator(
+                weight_iterator
+            )
+        weight_iterator = maybe_stage_weight_iterator(
+            weight_iterator,
+            staging_mode=weight_staging_mode,
+            weight_load_profile=weight_load_profile,
+        )
+        param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
+        load_model_from_full_model_state_dict(
+            model,
+            weight_iterator,
+            device,
+            param_dtype,
+            strict=strict,
+            cpu_offload=(cpu_offload and not force_device_resident),
+            param_names_mapping=param_names_mapping_fn,
+            weight_load_profile=weight_load_profile,
+        )
+
+    if broadcast_decision.enabled:
+        if broadcast_decision.sp_rank == 0:
+            _load_weights_on_current_rank(force_device_resident=cpu_offload)
+        else:
+            materialize_empty_model_state_dict(model, device=device, strict=strict)
+
+        broadcast_module_tensors(
+            model,
+            broadcast_decision.sp_group,
+            weight_load_profile=weight_load_profile,
+        )
+        if cpu_offload:
+            offload_model_tensors_to_cpu(model)
+    else:
+        _load_weights_on_current_rank()
 
     for _, module in model.named_modules():
         quant_method = getattr(module, "quant_method", None)
@@ -288,6 +337,11 @@ def load_model_from_full_model_state_dict(
         if weight_load_profile is not None
         else 0.0
     )
+    pin_before_ms = (
+        weight_load_profile.get_ms(WEIGHT_LOAD_PIN_MEMORY_MS)
+        if weight_load_profile is not None
+        else 0.0
+    )
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
         full_sd_iterator, param_names_mapping
     )  # type: ignore
@@ -297,9 +351,12 @@ def load_model_from_full_model_state_dict(
             weight_load_profile.get_ms(WEIGHT_LOAD_READ_SAFETENSORS_MS)
             - read_before_ms
         )
+        pin_delta_ms = (
+            weight_load_profile.get_ms(WEIGHT_LOAD_PIN_MEMORY_MS) - pin_before_ms
+        )
         weight_load_profile.add_ms(
             WEIGHT_LOAD_CPU_MATERIALIZE_MS,
-            max(0.0, elapsed_ms - read_delta_ms),
+            max(0.0, elapsed_ms - read_delta_ms - pin_delta_ms),
         )
 
     is_fsdp_model = isinstance(model, FSDPModule) or any(

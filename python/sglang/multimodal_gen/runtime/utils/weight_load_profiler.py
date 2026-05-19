@@ -34,6 +34,11 @@ WEIGHT_LOAD_STAGED_TENSOR_COUNT = "weight_load:staged_tensor_count"
 WEIGHT_LOAD_PINNED_TENSOR_COUNT = "weight_load:pinned_tensor_count"
 WEIGHT_LOAD_PINNED_BYTES = "weight_load:pinned_bytes"
 WEIGHT_LOAD_PIN_MEMORY_ERROR = "weight_load:pin_memory_error"
+WEIGHT_LOAD_MODE_REQUESTED = "weight_load:load_mode_requested"
+WEIGHT_LOAD_MODE_EFFECTIVE = "weight_load:load_mode_effective"
+WEIGHT_LOAD_BROADCAST_TENSOR_COUNT = "weight_load:broadcast_tensor_count"
+WEIGHT_LOAD_BROADCAST_BYTES = "weight_load:broadcast_bytes"
+WEIGHT_LOAD_BROADCAST_ERROR = "weight_load:broadcast_error"
 
 WEIGHT_LOAD_TIMING_FIELDS = (
     WEIGHT_LOAD_DISCOVER_FILES_MS,
@@ -111,6 +116,13 @@ class DiffusionWeightLoadProfiler:
             WEIGHT_LOAD_PINNED_TENSOR_COUNT: 0,
             WEIGHT_LOAD_PINNED_BYTES: 0,
             WEIGHT_LOAD_PIN_MEMORY_ERROR: None,
+        }
+        self._load_mode_fields: dict[str, Any] = {
+            WEIGHT_LOAD_MODE_REQUESTED: "default",
+            WEIGHT_LOAD_MODE_EFFECTIVE: "default",
+            WEIGHT_LOAD_BROADCAST_TENSOR_COUNT: 0,
+            WEIGHT_LOAD_BROADCAST_BYTES: 0,
+            WEIGHT_LOAD_BROADCAST_ERROR: None,
         }
         self._status = "running"
         self._error: str | None = None
@@ -201,6 +213,29 @@ class DiffusionWeightLoadProfiler:
             return
         self._staging_fields[WEIGHT_LOAD_PIN_MEMORY_ERROR] = error
 
+    def set_load_mode_requested(self, mode: str) -> None:
+        if not self.active:
+            return
+        self._load_mode_fields[WEIGHT_LOAD_MODE_REQUESTED] = mode
+
+    def set_load_mode_effective(self, mode: str) -> None:
+        if not self.active:
+            return
+        self._load_mode_fields[WEIGHT_LOAD_MODE_EFFECTIVE] = mode
+
+    def add_broadcast_tensor(self, tensor: torch.Tensor) -> None:
+        if not self.active:
+            return
+        self._load_mode_fields[WEIGHT_LOAD_BROADCAST_TENSOR_COUNT] += 1
+        self._load_mode_fields[WEIGHT_LOAD_BROADCAST_BYTES] += _safe_tensor_nbytes(
+            tensor
+        )
+
+    def set_broadcast_error(self, error: str | None) -> None:
+        if not self.active:
+            return
+        self._load_mode_fields[WEIGHT_LOAD_BROADCAST_ERROR] = error
+
     def profile_safetensors_iterator(
         self, iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -239,6 +274,7 @@ class DiffusionWeightLoadProfiler:
             **self._timings_ms,
             WEIGHT_LOAD_TOTAL_BYTES: self._total_bytes,
             **self._staging_fields,
+            **self._load_mode_fields,
         }
         return record
 

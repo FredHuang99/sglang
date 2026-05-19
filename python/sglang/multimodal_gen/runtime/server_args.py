@@ -54,6 +54,8 @@ from sglang.multimodal_gen.utils import (
 logger = init_logger(__name__)
 
 DIFFUSION_WEIGHT_STAGING_CHOICES = ("none", "pageable", "pinned", "auto")
+DIFFUSION_WEIGHT_LOAD_MODE_CHOICES = ("default", "rank0-broadcast")
+DIFFUSION_WEIGHT_BROADCAST_COMPONENT_CHOICES = ("transformer",)
 
 
 def _normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
@@ -230,6 +232,10 @@ class ServerArgs:
     profile_output_dir: str = DEFAULT_PROFILE_OUTPUT_DIR
     profile_run_id: str | None = None
     diffusion_weight_staging: Literal["none", "pageable", "pinned", "auto"] = "none"
+    diffusion_weight_load_mode: Literal["default", "rank0-broadcast"] = "default"
+    diffusion_weight_broadcast_components: list[str] | str | None = field(
+        default_factory=list
+    )
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -1221,6 +1227,25 @@ class ServerArgs:
                 "Use pinned or auto to try pinned CPU tensors before H2D copy."
             ),
         )
+        parser.add_argument(
+            "--diffusion-weight-load-mode",
+            type=str,
+            choices=DIFFUSION_WEIGHT_LOAD_MODE_CHOICES,
+            default=ServerArgs.diffusion_weight_load_mode,
+            help=(
+                "Diffusion checkpoint load mode. Phase 3 supports "
+                "rank0-broadcast for transformer SP duplicate weights."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-weight-broadcast-components",
+            type=str,
+            default="",
+            help=(
+                "Comma-separated component names eligible for rank0-broadcast. "
+                "Phase 3 supports transformer only."
+            ),
+        )
 
         # LoRA
         parser.add_argument(
@@ -1514,6 +1539,48 @@ class ServerArgs:
                 f"{DIFFUSION_WEIGHT_STAGING_CHOICES}, got "
                 f"{self.diffusion_weight_staging!r}"
             )
+
+        self.diffusion_weight_load_mode = str(
+            self.diffusion_weight_load_mode
+        ).lower()
+        if self.diffusion_weight_load_mode not in DIFFUSION_WEIGHT_LOAD_MODE_CHOICES:
+            raise ValueError(
+                "--diffusion-weight-load-mode must be one of "
+                f"{DIFFUSION_WEIGHT_LOAD_MODE_CHOICES}, got "
+                f"{self.diffusion_weight_load_mode!r}"
+            )
+
+        raw_components = self.diffusion_weight_broadcast_components
+        if raw_components is None:
+            components: list[str] = []
+        elif isinstance(raw_components, str):
+            components = [
+                item.strip().lower()
+                for item in raw_components.replace(";", ",").split(",")
+                if item.strip()
+            ]
+        else:
+            components = [str(item).strip().lower() for item in raw_components if item]
+
+        unsupported = [
+            item
+            for item in components
+            if item not in DIFFUSION_WEIGHT_BROADCAST_COMPONENT_CHOICES
+        ]
+        if unsupported:
+            logger.warning(
+                "Ignoring unsupported --diffusion-weight-broadcast-components %s. "
+                "Supported components: %s",
+                unsupported,
+                DIFFUSION_WEIGHT_BROADCAST_COMPONENT_CHOICES,
+            )
+            components = [
+                item
+                for item in components
+                if item in DIFFUSION_WEIGHT_BROADCAST_COMPONENT_CHOICES
+            ]
+
+        self.diffusion_weight_broadcast_components = components
 
     def _validate_parallelism(self):
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
