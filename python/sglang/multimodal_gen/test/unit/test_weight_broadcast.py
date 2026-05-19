@@ -2,9 +2,11 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.loader import fsdp_load
 from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
     broadcast_module_tensors,
     broadcast_rank0_load_status,
@@ -48,6 +50,15 @@ class FakeSPGroup:
         del src
         self.broadcast_calls += 1
         return tensor
+
+
+class TinyBroadcastModel(torch.nn.Module):
+    _fsdp_shard_conditions = []
+
+    def __init__(self):
+        super().__init__()
+        self.param_names_mapping = {}
+        self.linear = torch.nn.Linear(1, 1, bias=False)
 
 
 class TestDiffusionWeightBroadcast(unittest.TestCase):
@@ -184,6 +195,77 @@ class TestDiffusionWeightBroadcast(unittest.TestCase):
         names = [name for name, _tensor, _kind in entries]
 
         self.assertEqual(names, sorted(names))
+
+    def test_rank0_broadcast_loader_disables_runai_streamer(self):
+        group = FakeSPGroup(rank_in_group=0)
+        decision = SimpleNamespace(
+            enabled=True,
+            requested_mode="rank0-broadcast",
+            effective_mode="rank0-broadcast",
+            reason="enabled",
+            sp_rank=0,
+            sp_world_size=2,
+            sp_group=group,
+        )
+        captured = {}
+
+        def fake_iterator(
+            hf_weights_files,
+            to_cpu=True,
+            use_runai_model_streamer=None,
+            stage_callback=None,
+        ):
+            captured["hf_weights_files"] = hf_weights_files
+            captured["to_cpu"] = to_cpu
+            captured["use_runai_model_streamer"] = use_runai_model_streamer
+            if stage_callback is not None:
+                stage_callback("fake_iterator_enter")
+            return iter([("linear.weight", torch.ones((1, 1), dtype=torch.float32))])
+
+        def fake_load(model, full_sd_iterator, device, *args, **kwargs):
+            del args, kwargs
+            list(full_sd_iterator)
+            return materialize_empty_model_state_dict(
+                model,
+                device=device,
+                strict=False,
+            )
+
+        with (
+            patch.object(
+                fsdp_load,
+                "resolve_rank0_broadcast_decision",
+                return_value=decision,
+            ),
+            patch.object(
+                fsdp_load,
+                "safetensors_weights_iterator",
+                side_effect=fake_iterator,
+            ),
+            patch.object(
+                fsdp_load,
+                "load_model_from_full_model_state_dict",
+                side_effect=fake_load,
+            ),
+            patch.object(fsdp_load, "broadcast_module_tensors"),
+        ):
+            fsdp_load.maybe_load_fsdp_model(
+                model_cls=TinyBroadcastModel,
+                init_params={},
+                weight_dir_list=["file0.safetensors"],
+                device=torch.device("cpu"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                weight_load_mode="rank0-broadcast",
+                weight_broadcast_components=["transformer"],
+                weight_component="transformer",
+            )
+
+        self.assertEqual(captured["hf_weights_files"], ["file0.safetensors"])
+        self.assertTrue(captured["to_cpu"])
+        self.assertFalse(captured["use_runai_model_streamer"])
 
 
 if __name__ == "__main__":

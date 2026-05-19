@@ -183,6 +183,7 @@ def maybe_load_fsdp_model(
 
     def _load_weights_on_current_rank(*, force_device_resident: bool = False) -> None:
         stage_callback = None
+        use_runai_model_streamer = None
         if broadcast_decision.enabled and broadcast_decision.sp_rank == 0:
 
             def _record_rank0_iterator_stage(
@@ -197,9 +198,18 @@ def maybe_load_fsdp_model(
                 )
 
             stage_callback = _record_rank0_iterator_stage
+            use_runai_model_streamer = False
+            log_broadcast_stage(
+                "rank0_iterator_config",
+                broadcast_decision.sp_group,
+                component_name=weight_component,
+                detail="runai_model_streamer=False reason=rank0_broadcast",
+                weight_load_profile=weight_load_profile,
+            )
 
         weight_iterator = safetensors_weights_iterator(
             weight_dir_list,
+            use_runai_model_streamer=use_runai_model_streamer,
             stage_callback=stage_callback,
         )
         if weight_load_profile is not None:
