@@ -19,9 +19,6 @@ from sglang.multimodal_gen.runtime.loader.weight_staging import (
     maybe_stage_weight_iterator,
     should_stage_weights_on_current_rank,
 )
-from sglang.multimodal_gen.runtime.loader.weight_utils import (
-    safetensors_weights_iterator,
-)
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -47,24 +44,24 @@ def _load_vae_state_dict_from_safetensors(
     weight_load_profile: DiffusionWeightLoadProfiler,
 ) -> dict[str, torch.Tensor]:
     loaded: dict[str, torch.Tensor] = {}
-    if should_stage_weights_on_current_rank(server_args.diffusion_weight_staging):
-        weight_iterator = safetensors_weights_iterator(safetensors_list)
-        weight_iterator = weight_load_profile.profile_safetensors_iterator(
-            weight_iterator
-        )
-        weight_iterator = maybe_stage_weight_iterator(
-            weight_iterator,
-            staging_mode=server_args.diffusion_weight_staging,
-            weight_load_profile=weight_load_profile,
-        )
-        for name, tensor in weight_iterator:
-            with weight_load_profile.timing_scope(WEIGHT_LOAD_CPU_MATERIALIZE_MS):
-                loaded[name] = tensor
-    else:
-        for sf_path in safetensors_list:
-            with weight_load_profile.timing_scope(WEIGHT_LOAD_READ_SAFETENSORS_MS):
-                tensors = safetensors_load_file(sf_path)
-            weight_load_profile.add_tensor_collection_bytes(tensors.values())
+    stage_weights = should_stage_weights_on_current_rank(
+        server_args.diffusion_weight_staging
+    )
+    for sf_path in safetensors_list:
+        with weight_load_profile.timing_scope(WEIGHT_LOAD_READ_SAFETENSORS_MS):
+            tensors = safetensors_load_file(sf_path)
+        weight_load_profile.add_tensor_collection_bytes(tensors.values())
+
+        if stage_weights:
+            weight_iterator = maybe_stage_weight_iterator(
+                tensors.items(),
+                staging_mode=server_args.diffusion_weight_staging,
+                weight_load_profile=weight_load_profile,
+            )
+            for name, tensor in weight_iterator:
+                with weight_load_profile.timing_scope(WEIGHT_LOAD_CPU_MATERIALIZE_MS):
+                    loaded[name] = tensor
+        else:
             with weight_load_profile.timing_scope(WEIGHT_LOAD_CPU_MATERIALIZE_MS):
                 loaded.update(tensors)
     return loaded

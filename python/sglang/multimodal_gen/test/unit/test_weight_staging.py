@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from safetensors.torch import load_file as safetensors_test_load_file
 from safetensors.torch import save_file
 
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import (
@@ -22,6 +23,7 @@ from sglang.multimodal_gen.runtime.utils.weight_load_profiler import (
     WEIGHT_LOAD_PIN_MEMORY_MS,
     WEIGHT_LOAD_PINNED_BYTES,
     WEIGHT_LOAD_PINNED_TENSOR_COUNT,
+    WEIGHT_LOAD_READ_SAFETENSORS_MS,
     WEIGHT_LOAD_STAGED_TENSOR_COUNT,
     WEIGHT_LOAD_STAGING_EFFECTIVE,
     WEIGHT_LOAD_STAGING_REQUESTED,
@@ -175,12 +177,16 @@ class TestDiffusionWeightStaging(unittest.TestCase):
             with mock.patch(
                 "sglang.multimodal_gen.runtime.loader.weight_staging.is_weight_staging_rank0",
                 return_value=True,
-            ):
+            ), mock.patch(
+                "sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader.safetensors_load_file",
+                side_effect=safetensors_test_load_file,
+            ) as load_file_mock:
                 loaded = _load_vae_state_dict_from_safetensors(
                     [safetensors_path],
                     server_args,
                     profile,
                 )
+                load_file_mock.assert_called_once_with(safetensors_path)
 
         module = torch.nn.Linear(2, 2)
         incompatible = module.load_state_dict(loaded, strict=False)
@@ -192,6 +198,7 @@ class TestDiffusionWeightStaging(unittest.TestCase):
         self.assertEqual(record[WEIGHT_LOAD_STAGING_REQUESTED], "pageable")
         self.assertEqual(record[WEIGHT_LOAD_STAGING_EFFECTIVE], "pageable")
         self.assertEqual(record[WEIGHT_LOAD_STAGED_TENSOR_COUNT], 2)
+        self.assertGreater(record[WEIGHT_LOAD_READ_SAFETENSORS_MS], 0.0)
 
 
 if __name__ == "__main__":
