@@ -264,12 +264,13 @@ def terminate_process(proc: subprocess.Popen[str]) -> None:
             pass
 
 
-def _enqueue_stdout(stdout, queue: Queue[str], log_fp) -> None:
+def _enqueue_stdout(stdout, queue: Queue[str], log_path: Path) -> None:
     try:
-        for line in iter(stdout.readline, ""):
-            log_fp.write(line)
-            log_fp.flush()
-            queue.put(line)
+        with open(log_path, "w", encoding="utf-8") as log_fp:
+            for line in iter(stdout.readline, ""):
+                log_fp.write(line)
+                log_fp.flush()
+                queue.put(line)
     finally:
         try:
             stdout.close()
@@ -318,10 +319,9 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
     proc = subprocess.Popen(command, **popen_kwargs)
     assert proc.stdout is not None
     output_queue: Queue[str] = Queue()
-    log_fp = open(server_log_path, "w", encoding="utf-8")
     reader_thread = threading.Thread(
         target=_enqueue_stdout,
-        args=(proc.stdout, output_queue, log_fp),
+        args=(proc.stdout, output_queue, server_log_path),
         daemon=True,
     )
     reader_thread.start()
@@ -364,8 +364,7 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
         else:
             wall_s = elapsed_s
         terminate_process(proc)
-        reader_thread.join(timeout=2)
-        log_fp.close()
+        reader_thread.join(timeout=5)
     if exit_code is None:
         exit_code = proc.poll()
 
