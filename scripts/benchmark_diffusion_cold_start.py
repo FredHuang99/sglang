@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Benchmark diffusion cold-start weight loading setups.
 
-This script launches ``multimodal_gen/runtime/launch_server.py`` repeatedly,
+This script launches the diffusion ``serve`` entrypoint repeatedly,
 keeps every per-run weight-load JSON as backup, and writes a compact Markdown
 and CSV summary. Phase5 warm-pool support is in-process; subprocess repeats are
 still useful for launch baselines, but cross-process warm-pool hits require a
@@ -63,22 +63,53 @@ ERROR_FIELDS = (
 
 COMPAT_PROFILE_FLAGS = {
     "none": [],
-    "zimage-launch-breakdown": [
-        "--warmup",
-        "false",
-        "--dit-cpu-offload",
-        "false",
-        "--dit-layerwise-offload",
-        "false",
-        "--text-encoder-cpu-offload",
-        "false",
-        "--image-encoder-cpu-offload",
-        "false",
-        "--vae-cpu-offload",
-        "false",
-        "--pin-cpu-memory",
-        "false",
-    ],
+    # Kept for backward CLI compatibility. The Z-Image launch-breakdown flags
+    # are now part of the always-on reference template below.
+    "zimage-launch-breakdown": [],
+}
+
+REFERENCE_TEMPLATE_FLAGS = [
+    "--warmup",
+    "false",
+    "--log-level",
+    "info",
+    "--dit-cpu-offload",
+    "false",
+    "--dit-layerwise-offload",
+    "false",
+    "--text-encoder-cpu-offload",
+    "false",
+    "--image-encoder-cpu-offload",
+    "false",
+    "--vae-cpu-offload",
+    "false",
+    "--pin-cpu-memory",
+    "false",
+    "--tp-size",
+    "1",
+]
+
+REFERENCE_IGNORED_ARGS = {
+    "model-path",
+    "port",
+    "scheduler-port",
+    "master-port",
+    "output-path",
+    "input-save-path",
+    "profile-enabled",
+    "profile-output-dir",
+    "profile-run-id",
+}
+
+SERVER_ARGS_EXPECTED = {
+    "dit_cpu_offload": False,
+    "dit_layerwise_offload": False,
+    "text_encoder_cpu_offload": False,
+    "image_encoder_cpu_offload": False,
+    "vae_cpu_offload": False,
+    "pin_cpu_memory": False,
+    "use_fsdp_inference": False,
+    "tp_size": 1,
 }
 
 SETUP_FLAGS = {
@@ -136,17 +167,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-run-id", default=None)
     parser.add_argument(
         "--launch-cwd",
-        default=str(
-            Path(__file__).resolve().parents[1]
-            / "python"
-            / "sglang"
-            / "multimodal_gen"
-            / "runtime"
-        ),
+        default=str(Path(__file__).resolve().parents[1]),
     )
     parser.add_argument("--python", default=sys.executable or "python3")
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--attention-backend", default="fa")
+    parser.add_argument(
+        "--launch-entrypoint",
+        choices=("module", "script"),
+        default="module",
+        help="Use the module serve entrypoint by default; script is legacy/debug only.",
+    )
+    parser.add_argument(
+        "--attention-backend",
+        default=None,
+        help=(
+            "Optional debug override. The reference-aligned Z-Image benchmark "
+            "does not pass this flag by default."
+        ),
+    )
     parser.add_argument("--timeout-s", type=float, default=900.0)
     parser.add_argument(
         "--ready-mode",
@@ -158,7 +196,17 @@ def parse_args() -> argparse.Namespace:
         "--compat-profile-preset",
         choices=tuple(COMPAT_PROFILE_FLAGS),
         default="none",
-        help="Append flags needed to match an older launch-profile baseline.",
+        help="Deprecated compatibility option; reference flags are always applied.",
+    )
+    parser.add_argument(
+        "--reference-launch-summary",
+        default=None,
+        help="Path to server_launch_breakdown_summary_diffusion.json for command diff checks.",
+    )
+    parser.add_argument(
+        "--diagnostic-module-profile",
+        action="store_true",
+        help="Also write launch module-load JSON; disabled for reference-aligned benchmark runs.",
     )
     parser.add_argument(
         "--fail-on-native-text-encoder-fallback",
@@ -200,39 +248,78 @@ def extra_launch_args(args: argparse.Namespace) -> list[str]:
     return values
 
 
+def _run_benchmark_dir(args: argparse.Namespace, run_id: str) -> Path:
+    return Path(args.profile_output_dir) / f"{run_id}_launch_benchmark"
+
+
 def build_command(args: argparse.Namespace, setup: str, run_id: str) -> list[str]:
     ports = getattr(args, "_current_ports", None) or {}
-    command = [
-        args.python,
-        "launch_server.py",
-        "--model-path",
-        args.model_path,
-        "--host",
-        args.host,
-        "--port",
-        str(ports.get("port", find_free_port(args.host))),
-        "--scheduler-port",
-        str(ports.get("scheduler_port", find_free_port(args.host))),
-        "--master-port",
-        str(ports.get("master_port", find_free_port(args.host))),
-        "--profile-enabled",
-        "--profile-output-dir",
-        args.profile_output_dir,
-        "--profile-run-id",
-        run_id,
-        "--num-gpus",
-        str(args.num_gpus),
-        "--sp-degree",
-        str(args.sp_degree),
-        "--ulysses-degree",
-        str(args.ulysses_degree),
-        "--ring-degree",
-        str(args.ring_degree),
-        "--attention-backend",
-        args.attention_backend,
-    ]
+    run_profile_dir = Path(
+        getattr(args, "_current_run_profile_dir", _run_benchmark_dir(args, run_id))
+    )
+    if getattr(args, "launch_entrypoint", "module") == "module":
+        command = [
+            args.python,
+            "-m",
+            "sglang.multimodal_gen.runtime.entrypoints.cli.main",
+            "serve",
+        ]
+    else:
+        script_path = (
+            Path(__file__).resolve().parents[1]
+            / "python"
+            / "sglang"
+            / "multimodal_gen"
+            / "runtime"
+            / "launch_server.py"
+        )
+        command = [args.python, str(script_path)]
+    output_path = run_profile_dir / "outputs"
+    input_save_path = run_profile_dir / "uploads"
+    command.extend(
+        [
+            "--model-path",
+            args.model_path,
+            "--host",
+            args.host,
+            "--port",
+            str(ports.get("port", find_free_port(args.host))),
+            "--scheduler-port",
+            str(ports.get("scheduler_port", find_free_port(args.host))),
+            "--master-port",
+            str(ports.get("master_port", find_free_port(args.host))),
+            "--num-gpus",
+            str(args.num_gpus),
+            "--warmup",
+            "false",
+            "--output-path",
+            str(output_path),
+            "--input-save-path",
+            str(input_save_path),
+        ]
+    )
+    command.extend(REFERENCE_TEMPLATE_FLAGS[2:])
     if args.model_id:
         command.extend(["--model-id", args.model_id])
+    command.extend(
+        [
+            "--sp-degree",
+            str(args.sp_degree),
+            "--ulysses-degree",
+            str(args.ulysses_degree),
+            "--ring-degree",
+            str(args.ring_degree),
+            "--profile-enabled",
+            "--profile-output-dir",
+            args.profile_output_dir,
+            "--profile-run-id",
+            run_id,
+        ]
+    )
+    if args.attention_backend:
+        command.extend(["--attention-backend", args.attention_backend])
+    if getattr(args, "diagnostic_module_profile", False):
+        command.append("--launch-module-profile-enabled")
     command.extend(COMPAT_PROFILE_FLAGS[args.compat_profile_preset])
     command.extend(SETUP_FLAGS[setup])
     command.extend(extra_launch_args(args))
@@ -286,20 +373,198 @@ def _probe_http(url: str) -> bool:
         return False
 
 
+def _extract_server_arg_tokens(command: list[str]) -> list[str]:
+    if "serve" in command:
+        return command[command.index("serve") + 1 :]
+    for index, token in enumerate(command):
+        if token.endswith("launch_server.py"):
+            return command[index + 1 :]
+    return command
+
+
+def _parse_server_arg_map(tokens: list[str]) -> dict[str, list[str]]:
+    parsed: dict[str, list[str]] = {}
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not token.startswith("--"):
+            index += 1
+            continue
+        key = token[2:]
+        if index + 1 < len(tokens) and not tokens[index + 1].startswith("--"):
+            value = tokens[index + 1]
+            index += 2
+        else:
+            value = "true"
+            index += 1
+        parsed.setdefault(key, []).append(str(value))
+    return parsed
+
+
+def normalized_server_arg_map(command: list[str]) -> dict[str, list[str]]:
+    parsed = _parse_server_arg_map(_extract_server_arg_tokens(command))
+    return {
+        key: values
+        for key, values in parsed.items()
+        if key not in REFERENCE_IGNORED_ARGS
+        and not key.startswith("profile-")
+        and not key.startswith("diffusion-weight-")
+    }
+
+
+def diff_reference_command(
+    reference_command: list[str],
+    command: list[str],
+) -> list[str]:
+    reference = normalized_server_arg_map(reference_command)
+    current = normalized_server_arg_map(command)
+    diffs: list[str] = []
+    for key in sorted(set(reference) | set(current)):
+        expected = reference.get(key)
+        actual = current.get(key)
+        if expected != actual:
+            diffs.append(f"--{key}: expected={expected} actual={actual}")
+    return diffs
+
+
+def load_reference_case(args: argparse.Namespace) -> dict[str, Any] | None:
+    if not args.reference_launch_summary:
+        return None
+    with open(args.reference_launch_summary, encoding="utf-8") as fp:
+        data = json.load(fp)
+    for case in data.get("cases", []):
+        parallelism = case.get("resolved_parallelism", {})
+        if (
+            case.get("model_key") == "z-image"
+            and int(case.get("gpu_count", -1)) == int(args.num_gpus)
+            and int(parallelism.get("tp_size", -1)) == 1
+            and int(parallelism.get("sp_degree", -1)) == int(args.sp_degree)
+            and int(parallelism.get("ulysses_degree", -1))
+            == int(args.ulysses_degree)
+            and int(parallelism.get("ring_degree", -1)) == int(args.ring_degree)
+        ):
+            return case
+    raise ValueError(
+        "No matching z-image reference case found for "
+        f"num_gpus={args.num_gpus}, tp_size=1, sp_degree={args.sp_degree}, "
+        f"ulysses_degree={args.ulysses_degree}, ring_degree={args.ring_degree}"
+    )
+
+
+def _failed_run_result(
+    *,
+    args: argparse.Namespace,
+    setup: str,
+    run_id: str,
+    command: list[str],
+    ports: dict[str, int],
+    run_meta_path: Path,
+    server_log_path: Path,
+    failure_reason: str,
+    command_diff: list[str],
+    reference_case: dict[str, Any] | None,
+) -> dict[str, Any]:
+    result = {
+        "setup": setup,
+        "run_id": run_id,
+        "launch_wall_s": 0.0,
+        "ready": False,
+        "http_ready": False,
+        "health_ready_s": None,
+        "models_ready_s": None,
+        "log_ready_s": None,
+        "exit_code": None,
+        "failure_reason": failure_reason,
+        "command": " ".join(shlex.quote(part) for part in command),
+        "command_argv": command,
+        "command_diff": command_diff,
+        "reference_aligned": False,
+        "reference_case_name": reference_case.get("case_name") if reference_case else None,
+        "reference_launch_time_s": reference_case.get("launch_time_s")
+        if reference_case
+        else None,
+        "ports": ports,
+        "host": args.host,
+        "ready_mode": args.ready_mode,
+        "compat_profile_preset": args.compat_profile_preset,
+        "start_epoch_s": time.time(),
+        "server_log_path": str(server_log_path),
+        "run_meta_path": str(run_meta_path),
+        "launch_weight_load_dir": str(
+            Path(args.profile_output_dir) / f"{run_id}_launch_weight_load"
+        ),
+        "launch_module_load_dir": str(
+            Path(args.profile_output_dir) / f"{run_id}_launch_module_load"
+        ),
+    }
+    with open(run_meta_path, "w", encoding="utf-8") as fp:
+        json.dump(result, fp, indent=2, sort_keys=True)
+        fp.write("\n")
+    return result
+
+
+def load_server_args_from_log(server_log_path: str | Path) -> dict[str, Any] | None:
+    path = Path(server_log_path)
+    if not path.exists():
+        return None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        marker = "server_args:"
+        if marker not in line:
+            continue
+        payload = line.split(marker, 1)[1].strip()
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def validate_server_args(server_args: dict[str, Any] | None) -> list[str]:
+    if server_args is None:
+        return ["server_args: missing"]
+    errors: list[str] = []
+    for key, expected in SERVER_ARGS_EXPECTED.items():
+        actual = server_args.get(key)
+        if actual != expected:
+            errors.append(f"{key}: expected={expected!r} actual={actual!r}")
+    return errors
+
+
 def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, Any]:
     ports = {
         "port": find_free_port(args.host),
         "scheduler_port": find_free_port(args.host),
         "master_port": find_free_port(args.host),
     }
-    args._current_ports = ports
-    command = build_command(args, setup, run_id)
-    delattr(args, "_current_ports")
-    run_profile_dir = Path(args.profile_output_dir) / f"{run_id}_launch_benchmark"
+    run_profile_dir = _run_benchmark_dir(args, run_id)
     run_profile_dir.mkdir(parents=True, exist_ok=True)
     server_log_path = run_profile_dir / "server.log"
     run_meta_path = run_profile_dir / "run_meta.json"
+    args._current_ports = ports
+    args._current_run_profile_dir = run_profile_dir
+    command = build_command(args, setup, run_id)
+    delattr(args, "_current_ports")
+    delattr(args, "_current_run_profile_dir")
     command_str = " ".join(shlex.quote(part) for part in command)
+    reference_case = getattr(args, "_reference_case", None)
+    command_diff = (
+        diff_reference_command(reference_case["launch_command"], command)
+        if reference_case is not None
+        else []
+    )
+    if command_diff:
+        return _failed_run_result(
+            args=args,
+            setup=setup,
+            run_id=run_id,
+            command=command,
+            ports=ports,
+            run_meta_path=run_meta_path,
+            server_log_path=server_log_path,
+            failure_reason="reference_command_diff",
+            command_diff=command_diff,
+            reference_case=reference_case,
+        )
     health_url = f"http://{args.host}:{ports['port']}/health"
     models_url = f"http://{args.host}:{ports['port']}/v1/models"
     start = time.perf_counter()
@@ -380,6 +645,14 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
         "exit_code": exit_code,
         "command": command_str,
         "command_argv": command,
+        "command_diff": command_diff,
+        "reference_aligned": not command_diff if reference_case is not None else None,
+        "reference_case_name": reference_case.get("case_name")
+        if reference_case
+        else None,
+        "reference_launch_time_s": reference_case.get("launch_time_s")
+        if reference_case
+        else None,
         "ports": ports,
         "host": args.host,
         "ready_mode": args.ready_mode,
@@ -495,6 +768,10 @@ def summarize_run(
         "ready": 1.0 if run_result["ready"] else 0.0,
     }
     for field in ("health_ready_s", "models_ready_s", "log_ready_s"):
+        value = _numeric(run_result.get(field))
+        if value is not None:
+            summary[field] = value
+    for field in ("reference_launch_time_s", "reference_aligned"):
         value = _numeric(run_result.get(field))
         if value is not None:
             summary[field] = value
@@ -662,17 +939,20 @@ def write_outputs(
         fp.write("\n## Runs\n\n")
         fp.write(
             "| setup | run_id | ready | launch_wall_s | health_ready_s | "
-            "models_ready_s | log_ready_s | ready_mode | compat_profile_preset | "
-            "text_encoder_sources | text_encoder_fallback_count | exit_code | command |\n"
+            "models_ready_s | log_ready_s | ready_mode | reference_case_name | "
+            "reference_launch_time_s | reference_aligned | failure_reason | "
+            "command_diff | text_encoder_sources | text_encoder_fallback_count | "
+            "exit_code | command |\n"
         )
         fp.write(
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
         )
         for result in run_results:
             fp.write(
                 "| {setup} | {run_id} | {ready} | {wall:.2f} | {health} | "
-                "{models} | {log} | {ready_mode} | {preset} | {sources} | "
-                "{fallback} | {exit_code} | `{command}` |\n".format(
+                "{models} | {log} | {ready_mode} | {ref_case} | {ref_time} | "
+                "{ref_aligned} | {failure} | {diff} | {sources} | {fallback} | "
+                "{exit_code} | `{command}` |\n".format(
                     setup=result["setup"],
                     run_id=result["run_id"],
                     ready=result["ready"],
@@ -681,7 +961,11 @@ def write_outputs(
                     models=_format_cell(result.get("models_ready_s")),
                     log=_format_cell(result.get("log_ready_s")),
                     ready_mode=result.get("ready_mode", ""),
-                    preset=result.get("compat_profile_preset", ""),
+                    ref_case=result.get("reference_case_name", ""),
+                    ref_time=_format_cell(result.get("reference_launch_time_s")),
+                    ref_aligned=_format_cell(result.get("reference_aligned")),
+                    failure=result.get("failure_reason", ""),
+                    diff="<br>".join(result.get("command_diff", [])),
                     sources=", ".join(result.get("text_encoder_sources", [])),
                     fallback=result.get("text_encoder_fallback_count", 0),
                     exit_code=result["exit_code"],
@@ -697,6 +981,7 @@ def main() -> None:
     setups = split_setups(args.setups)
     if args.repeat_k <= 0:
         raise ValueError("--repeat-k must be positive")
+    args._reference_case = load_reference_case(args)
     base_run_id = args.base_run_id or time.strftime("diffusion_cold_start_%Y%m%d_%H%M%S")
 
     run_results: list[dict[str, Any]] = []
@@ -705,6 +990,15 @@ def main() -> None:
         for index in range(args.repeat_k):
             run_id = f"{base_run_id}_{setup.replace('-', '_')}_r{index + 1}"
             result = run_launch(args, setup, run_id)
+            if result.get("failure_reason") != "reference_command_diff":
+                resolved_server_args = load_server_args_from_log(
+                    result["server_log_path"]
+                )
+                server_args_errors = validate_server_args(resolved_server_args)
+                result["server_args_validation_errors"] = server_args_errors
+                if server_args_errors:
+                    result["ready"] = False
+                    result["failure_reason"] = "reference_args_violation"
             records = load_profile_records(args.profile_output_dir, run_id)
             module_records = load_module_records(args.profile_output_dir, run_id)
             text_encoder_sources, text_encoder_fallback_count = (

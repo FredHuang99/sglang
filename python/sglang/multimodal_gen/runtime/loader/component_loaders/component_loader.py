@@ -102,7 +102,7 @@ class ComponentLoader(ABC):
                 component_path=component_model_path,
                 available_before_gb=mem_before_loading,
             )
-            if profile_logs_enabled
+            if getattr(server_args, "launch_module_profile_enabled", False)
             else None
         )
         if profile_ctx is not None:

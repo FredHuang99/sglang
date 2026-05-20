@@ -231,6 +231,7 @@ class ServerArgs:
     input_save_path: str | None = "inputs/uploads"
     profile_enabled: bool = False
     request_profile_enabled: bool = False
+    launch_module_profile_enabled: bool = False
     profile_output_dir: str = DEFAULT_PROFILE_OUTPUT_DIR
     profile_run_id: str | None = None
     diffusion_weight_staging: Literal["none", "pageable", "pinned", "auto"] = "none"
@@ -1201,7 +1202,7 @@ class ServerArgs:
             "--profile-enabled",
             action=StoreBoolean,
             default=ServerArgs.profile_enabled,
-            help="Enable launch-time profiling, including component and weight-load metrics.",
+            help="Enable launch-time weight-load profiling.",
         )
         parser.add_argument(
             "--request-profile-enabled",
@@ -1210,6 +1211,15 @@ class ServerArgs:
             help=(
                 "Enable request-level runtime profiling CSV outputs. "
                 "This is separate from launch-time weight-load profiling."
+            ),
+        )
+        parser.add_argument(
+            "--launch-module-profile-enabled",
+            action=StoreBoolean,
+            default=ServerArgs.launch_module_profile_enabled,
+            help=(
+                "Enable diagnostic module-load JSON outputs. This is disabled "
+                "by default so formal launch benchmarks only write weight-load JSON."
             ),
         )
         parser.add_argument(

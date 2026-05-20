@@ -98,7 +98,7 @@ class DiffusionModuleLoadProfiler:
             component=component,
             component_path=component_path,
             server_args=server_args,
-            enabled=bool(getattr(server_args, "profile_enabled", False)),
+            enabled=bool(getattr(server_args, "launch_module_profile_enabled", False)),
             available_before_gb=available_before_gb,
         )
 

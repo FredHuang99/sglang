@@ -91,19 +91,21 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
         self.assertEqual(rows[0]["launch_wall_s_max"], 12.0)
         self.assertEqual(rows[0]["launch_wall_s_std"], 1.0)
 
-    def test_compat_preset_adds_old_zimage_flags(self):
+    def test_reference_aligned_command_uses_old_zimage_template(self):
         class Args:
             python = "python3"
             model_path = "/data/Z_Image"
             model_id = "Z-Image"
             profile_output_dir = "/data/profile"
-            num_gpus = 8
-            sp_degree = 8
+            num_gpus = 4
+            sp_degree = 4
             ulysses_degree = 2
-            ring_degree = 4
-            attention_backend = "fa"
+            ring_degree = 2
+            attention_backend = None
             host = "127.0.0.1"
-            compat_profile_preset = "zimage-launch-breakdown"
+            launch_entrypoint = "module"
+            diagnostic_module_profile = False
+            compat_profile_preset = "none"
             extra_launch_arg = []
             extra_launch_args = ""
             _current_ports = {
@@ -111,15 +113,138 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
                 "scheduler_port": 30002,
                 "master_port": 30003,
             }
+            _current_run_profile_dir = pathlib.Path("/tmp/run0_launch_benchmark")
 
         command = self.benchmark.build_command(Args, "baseline", "run0")
 
+        self.assertEqual(
+            command[:4],
+            [
+                "python3",
+                "-m",
+                "sglang.multimodal_gen.runtime.entrypoints.cli.main",
+                "serve",
+            ],
+        )
         self.assertIn("--port", command)
         self.assertIn("30001", command)
+        self.assertNotIn("--attention-backend", command)
+        self.assertIn("--warmup", command)
+        self.assertEqual(command[command.index("--warmup") + 1], "false")
         self.assertIn("--text-encoder-cpu-offload", command)
         idx = command.index("--text-encoder-cpu-offload")
         self.assertEqual(command[idx + 1], "false")
+        self.assertIn("--dit-layerwise-offload", command)
+        self.assertIn("--tp-size", command)
+        self.assertEqual(command[command.index("--tp-size") + 1], "1")
         self.assertIn("--pin-cpu-memory", command)
+
+    def test_weight_load_setups_only_add_allowed_diffusion_weight_args(self):
+        class Args:
+            python = "python3"
+            model_path = "/data/Z_Image"
+            model_id = "Z-Image"
+            profile_output_dir = "/data/profile"
+            num_gpus = 4
+            sp_degree = 4
+            ulysses_degree = 2
+            ring_degree = 2
+            attention_backend = None
+            host = "127.0.0.1"
+            launch_entrypoint = "module"
+            diagnostic_module_profile = False
+            compat_profile_preset = "none"
+            extra_launch_arg = []
+            extra_launch_args = ""
+            _current_ports = {
+                "port": 30001,
+                "scheduler_port": 30002,
+                "master_port": 30003,
+            }
+            _current_run_profile_dir = pathlib.Path("/tmp/run0_launch_benchmark")
+
+        baseline = self.benchmark.build_command(Args, "baseline", "run0")
+        pageable = self.benchmark.build_command(Args, "pageable", "run0")
+
+        self.assertEqual(
+            self.benchmark.normalized_server_arg_map(baseline),
+            self.benchmark.normalized_server_arg_map(pageable),
+        )
+        self.assertIn("--diffusion-weight-load-mode", pageable)
+
+    def test_reference_diff_detects_attention_backend_drift(self):
+        reference = [
+            "python3",
+            "-m",
+            "sglang.multimodal_gen.runtime.entrypoints.cli.main",
+            "serve",
+            "--model-path",
+            "/old/Z_Image",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "1",
+            "--scheduler-port",
+            "2",
+            "--master-port",
+            "3",
+            "--num-gpus",
+            "4",
+            "--warmup",
+            "false",
+            "--output-path",
+            "/old/outputs",
+            "--input-save-path",
+            "/old/uploads",
+            "--log-level",
+            "info",
+            "--dit-cpu-offload",
+            "false",
+            "--dit-layerwise-offload",
+            "false",
+            "--text-encoder-cpu-offload",
+            "false",
+            "--image-encoder-cpu-offload",
+            "false",
+            "--vae-cpu-offload",
+            "false",
+            "--pin-cpu-memory",
+            "false",
+            "--model-id",
+            "Z-Image",
+            "--tp-size",
+            "1",
+            "--sp-degree",
+            "4",
+            "--ulysses-degree",
+            "2",
+            "--ring-degree",
+            "2",
+        ]
+        current = reference + ["--profile-enabled", "--attention-backend", "fa"]
+
+        diff = self.benchmark.diff_reference_command(reference, current)
+
+        self.assertEqual(diff, ["--attention-backend: expected=None actual=['fa']"])
+
+    def test_validate_server_args_detects_offload_violation(self):
+        errors = self.benchmark.validate_server_args(
+            {
+                "dit_cpu_offload": False,
+                "dit_layerwise_offload": False,
+                "text_encoder_cpu_offload": True,
+                "image_encoder_cpu_offload": False,
+                "vae_cpu_offload": False,
+                "pin_cpu_memory": False,
+                "use_fsdp_inference": False,
+                "tp_size": 1,
+            }
+        )
+
+        self.assertEqual(
+            errors,
+            ["text_encoder_cpu_offload: expected=False actual=True"],
+        )
 
     def test_text_encoder_fallback_source_info(self):
         sources, fallback_count = self.benchmark.collect_text_encoder_source_info(
