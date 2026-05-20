@@ -6,7 +6,6 @@ import importlib
 import logging
 import os
 import pkgutil
-import traceback
 from abc import ABC
 from typing import Any, Type
 
@@ -26,6 +25,9 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.module_load_profiler import (
+    DiffusionModuleLoadProfiler,
+)
 from sglang.multimodal_gen.runtime.utils.profile_log_utils import (
     get_profile_log_context,
 )
@@ -93,6 +95,16 @@ class ComponentLoader(ABC):
             get_profile_log_context(server_args) if profile_logs_enabled else None
         )
         mem_before_loading = current_platform.get_available_gpu_memory()
+        module_profile = (
+            DiffusionModuleLoadProfiler.from_server_args(
+                server_args,
+                component=component_name,
+                component_path=component_model_path,
+                available_before_gb=mem_before_loading,
+            )
+            if profile_logs_enabled
+            else None
+        )
         if profile_ctx is not None:
             logger.info(
                 "ProfileModuleLoadStart role=%s instance=%s rank=%s physical_rank=%s "
@@ -116,76 +128,128 @@ class ComponentLoader(ABC):
                 component_model_path,
                 mem_before_loading,
             )
+        source: str | None = None
+        fallback = False
+        fallback_reason: str | None = None
+        customized_error_type: str | None = None
+        component_class: str | None = None
+        model_size: Any | None = None
+        current_mem: float | None = None
+        consumed: float | None = None
         try:
-            component = self.load_customized(
-                component_model_path, server_args, component_name
-            )
-            source = "sgl-diffusion"
-        except Exception as e:
-            if "Unsupported model architecture" in str(e):
-                logger.info(
-                    f"Component: {component_name} doesn't have a customized version yet, using native version"
+            try:
+                component = self.load_customized(
+                    component_model_path, server_args, component_name
                 )
-            else:
-                traceback.print_exc()
-                logger.error(
-                    f"Error while loading customized {component_name}, falling back to native version"
+                source = "sgl-diffusion"
+            except Exception as e:
+                fallback = True
+                fallback_reason = str(e)
+                customized_error_type = type(e).__name__
+                if "Unsupported model architecture" in str(e):
+                    logger.info(
+                        "Component %s does not have a customized version yet; "
+                        "using native version.",
+                        component_name,
+                    )
+                else:
+                    logger.warning(
+                        "Customized component load failed; falling back to native. "
+                        "component=%s rank=%s error_type=%s fallback_source=native "
+                        "error=%s",
+                        component_name,
+                        getattr(profile_ctx, "rank", "unknown"),
+                        customized_error_type,
+                        fallback_reason,
+                        exc_info=logger.isEnabledFor(logging.DEBUG),
+                    )
+                # fallback to native version
+                component = self.load_native(
+                    component_model_path, server_args, transformers_or_diffusers
                 )
-            # fallback to native version
-            component = self.load_native(
-                component_model_path, server_args, transformers_or_diffusers
-            )
-            should_offload = self.should_offload(server_args)
-            target_device = self.target_device(should_offload)
-            component = component.to(device=target_device)
-            source = "native"
-            logger.warning(
-                "Native component %s: %s is loaded, performance may be sub-optimal",
-                component_name,
-                component.__class__.__name__,
-            )
+                should_offload = self.should_offload(server_args)
+                target_device = self.target_device(should_offload)
+                component = component.to(device=target_device)
+                source = "native"
+                logger.warning(
+                    "Native component %s: %s is loaded, performance may be sub-optimal",
+                    component_name,
+                    component.__class__.__name__,
+                )
 
-        if component is None:
-            logger.error("Load %s failed", component_name)
-            consumed = 0.0
-        else:
-            if isinstance(component, nn.Module):
-                component = component.eval()
-            current_mem = current_platform.get_available_gpu_memory()
-            model_size = get_memory_usage_of_component(component) or "NA"
-            consumed = mem_before_loading - current_mem
-            if profile_ctx is not None:
-                logger.info(
-                    "ProfileModuleLoadDone role=%s instance=%s rank=%s "
-                    "physical_rank=%s world_size=%s device=%s component=%s "
-                    "class=%s source=%s model_size_gb=%s mem_kind=%s "
-                    "consumed_gb=%.2f available_after_gb=%.2f",
-                    profile_ctx.role,
-                    profile_ctx.instance_id,
-                    profile_ctx.rank,
-                    profile_ctx.physical_rank,
-                    profile_ctx.world_size,
-                    profile_ctx.device,
-                    component_name,
-                    component.__class__.__name__,
-                    source,
-                    model_size,
-                    profile_ctx.mem_kind,
-                    consumed,
-                    current_mem,
-                )
+            if component is None:
+                logger.error("Load %s failed", component_name)
+                consumed = 0.0
             else:
-                logger.info(
-                    "Loaded %s: %s (%s version). model size: %s GB, "
-                    "consumed: %.2f GB, avail mem: %.2f GB",
-                    component_name,
-                    component.__class__.__name__,
-                    source,
-                    model_size,
-                    consumed,
-                    current_mem,
+                if isinstance(component, nn.Module):
+                    component = component.eval()
+                current_mem = current_platform.get_available_gpu_memory()
+                model_size = get_memory_usage_of_component(component) or "NA"
+                consumed = mem_before_loading - current_mem
+                component_class = component.__class__.__name__
+                if profile_ctx is not None:
+                    logger.info(
+                        "ProfileModuleLoadDone role=%s instance=%s rank=%s "
+                        "physical_rank=%s world_size=%s device=%s component=%s "
+                        "class=%s source=%s model_size_gb=%s mem_kind=%s "
+                        "consumed_gb=%.2f available_after_gb=%.2f",
+                        profile_ctx.role,
+                        profile_ctx.instance_id,
+                        profile_ctx.rank,
+                        profile_ctx.physical_rank,
+                        profile_ctx.world_size,
+                        profile_ctx.device,
+                        component_name,
+                        component_class,
+                        source,
+                        model_size,
+                        profile_ctx.mem_kind,
+                        consumed,
+                        current_mem,
+                    )
+                else:
+                    logger.info(
+                        "Loaded %s: %s (%s version). model size: %s GB, "
+                        "consumed: %.2f GB, avail mem: %.2f GB",
+                        component_name,
+                        component_class,
+                        source,
+                        model_size,
+                        consumed,
+                        current_mem,
+                    )
+            if module_profile is not None:
+                module_profile.finalize(
+                    status="success" if component is not None else "error",
+                    source=source,
+                    component_class=component_class,
+                    model_size_gb=model_size,
+                    available_after_gb=current_mem,
+                    consumed_gb=consumed,
+                    error=None if component is not None else "component_none",
+                    fallback=fallback,
+                    fallback_reason=fallback_reason,
+                    customized_error_type=customized_error_type,
+                    transformers_or_diffusers=transformers_or_diffusers,
                 )
-        return component, consumed
+        except Exception as exc:
+            current_mem = current_platform.get_available_gpu_memory()
+            if module_profile is not None:
+                module_profile.finalize(
+                    status="error",
+                    source=source,
+                    component_class=component_class,
+                    model_size_gb=model_size,
+                    available_after_gb=current_mem,
+                    consumed_gb=mem_before_loading - current_mem,
+                    error=f"{type(exc).__name__}: {exc}",
+                    fallback=fallback,
+                    fallback_reason=fallback_reason,
+                    customized_error_type=customized_error_type,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                )
+            raise
+        return component, float(consumed or 0.0)
 
     def load_native(
         self,

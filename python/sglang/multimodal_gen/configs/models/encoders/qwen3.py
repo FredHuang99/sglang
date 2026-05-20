@@ -70,6 +70,12 @@ class Qwen3TextArchConfig(TextEncoderArchConfig):
     )
 
     def __post_init__(self) -> None:
+        existing_rope_parameters = getattr(self, "rope_parameters", None)
+        if existing_rope_parameters is None:
+            rope_parameters = {"rope_theta": self.rope_theta}
+            if self.rope_scaling:
+                rope_parameters.update(self.rope_scaling)
+            self.rope_parameters = rope_parameters
         self.tokenizer_kwargs = {
             "padding": "max_length",
             "truncation": True,

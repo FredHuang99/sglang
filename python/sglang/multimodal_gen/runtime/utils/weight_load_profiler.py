@@ -25,6 +25,7 @@ WEIGHT_LOAD_READ_SAFETENSORS_MS = "weight_load:read_safetensors_ms"
 WEIGHT_LOAD_CPU_MATERIALIZE_MS = "weight_load:cpu_materialize_ms"
 WEIGHT_LOAD_PIN_MEMORY_MS = "weight_load:pin_memory_ms"
 WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS = "weight_load:h2d_or_param_copy_ms"
+WEIGHT_LOAD_D2H_OR_OFFLOAD_MS = "weight_load:d2h_or_offload_ms"
 WEIGHT_LOAD_NCCL_BROADCAST_MS = "weight_load:nccl_broadcast_ms"
 WEIGHT_LOAD_RANK0_WAIT_MS = "weight_load:rank0_wait_ms"
 WEIGHT_LOAD_TOTAL_BYTES = "weight_load:total_bytes"
@@ -51,6 +52,7 @@ WEIGHT_LOAD_TIMING_FIELDS = (
     WEIGHT_LOAD_CPU_MATERIALIZE_MS,
     WEIGHT_LOAD_PIN_MEMORY_MS,
     WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS,
+    WEIGHT_LOAD_D2H_OR_OFFLOAD_MS,
     WEIGHT_LOAD_NCCL_BROADCAST_MS,
     WEIGHT_LOAD_RANK0_WAIT_MS,
 )

@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.weight_load_profiler import (
     WEIGHT_LOAD_CPU_MATERIALIZE_MS,
+    WEIGHT_LOAD_D2H_OR_OFFLOAD_MS,
     WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS,
     WEIGHT_LOAD_PIN_MEMORY_MS,
     WEIGHT_LOAD_READ_SAFETENSORS_MS,
@@ -428,7 +429,12 @@ def maybe_load_fsdp_model(
                 component_name=weight_component,
                 weight_load_profile=weight_load_profile,
             )
-            offload_model_tensors_to_cpu(model)
+            with (
+                weight_load_profile.timing_scope(WEIGHT_LOAD_D2H_OR_OFFLOAD_MS)
+                if weight_load_profile is not None
+                else nullcontext()
+            ):
+                offload_model_tensors_to_cpu(model)
             log_broadcast_stage(
                 "cpu_offload_done",
                 broadcast_decision.sp_group,
@@ -677,7 +683,12 @@ def load_model_from_full_model_state_dict(
             # - For non-FSDP models, keep the historical behavior (allow CPU offload).
             # - For FSDP models, do NOT offload non-sharded parameters here.
             if cpu_offload and not is_fsdp_model:
-                sharded_tensor = sharded_tensor.cpu()
+                with (
+                    weight_load_profile.timing_scope(WEIGHT_LOAD_D2H_OR_OFFLOAD_MS)
+                    if weight_load_profile is not None
+                    else nullcontext()
+                ):
+                    sharded_tensor = sharded_tensor.cpu()
         else:
             with (
                 weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS)
@@ -691,7 +702,12 @@ def load_model_from_full_model_state_dict(
                     meta_sharded_param.placements,
                 )
             if cpu_offload:
-                sharded_tensor = sharded_tensor.to("cpu")
+                with (
+                    weight_load_profile.timing_scope(WEIGHT_LOAD_D2H_OR_OFFLOAD_MS)
+                    if weight_load_profile is not None
+                    else nullcontext()
+                ):
+                    sharded_tensor = sharded_tensor.to("cpu")
 
         requires_grad = False
         sharded_sd[target_param_name] = nn.Parameter(
@@ -761,7 +777,12 @@ def load_model_from_full_model_state_dict(
                     meta_sharded_param, device=device, dtype=meta_sharded_param_dtype
                 )
             if cpu_offload and not is_fsdp_model:
-                sharded_tensor = sharded_tensor.cpu()
+                with (
+                    weight_load_profile.timing_scope(WEIGHT_LOAD_D2H_OR_OFFLOAD_MS)
+                    if weight_load_profile is not None
+                    else nullcontext()
+                ):
+                    sharded_tensor = sharded_tensor.cpu()
         else:
             with (
                 weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS)
@@ -777,7 +798,12 @@ def load_model_from_full_model_state_dict(
                     meta_sharded_param.placements,
                 )
             if cpu_offload:
-                sharded_tensor = sharded_tensor.cpu()
+                with (
+                    weight_load_profile.timing_scope(WEIGHT_LOAD_D2H_OR_OFFLOAD_MS)
+                    if weight_load_profile is not None
+                    else nullcontext()
+                ):
+                    sharded_tensor = sharded_tensor.cpu()
         sharded_sd[new_param_name] = nn.Parameter(sharded_tensor)
 
     # choose `assign=True` since we cannot call `copy_` on meta tensor

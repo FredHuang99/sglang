@@ -27,6 +27,20 @@ from sglang.multimodal_gen.runtime.loader.weight_utils import (
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 
 
+def _get_rope_parameters(config: Qwen3TextConfig) -> tuple[float, dict[str, Any]]:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if rope_parameters is None:
+        rope_theta = getattr(config, "rope_theta", 1000000.0)
+        rope_parameters = {"rope_theta": rope_theta}
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if rope_scaling:
+            rope_parameters.update(rope_scaling)
+    else:
+        rope_parameters = dict(rope_parameters)
+        rope_parameters.setdefault("rope_theta", getattr(config, "rope_theta", 1000000.0))
+    return float(rope_parameters["rope_theta"]), rope_parameters
+
+
 class Qwen3MLP(nn.Module):
     """Qwen3 MLP with SwiGLU activation and tensor parallelism."""
 
@@ -204,8 +218,7 @@ class Qwen3DecoderLayer(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
-        rope_theta = config.rope_parameters["rope_theta"]
-        rope_scaling = config.rope_parameters
+        rope_theta, rope_scaling = _get_rope_parameters(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 40960)
         attention_bias = getattr(config, "attention_bias", False)
 
