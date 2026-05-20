@@ -33,6 +33,8 @@ def normalize_weight_staging_mode(mode: str | None) -> str:
             "Invalid diffusion weight staging mode: "
             f"{mode}. Must be one of {DIFFUSION_WEIGHT_STAGING_CHOICES}."
         )
+    if normalized == "auto":
+        return "pageable"
     return normalized
 
 
@@ -92,12 +94,10 @@ def stage_weight_iterator(
 
     if weight_load_profile is not None:
         weight_load_profile.set_staging_requested(mode)
-        weight_load_profile.set_staging_effective(
-            "pageable" if mode == "pageable" else "pinned"
-        )
+        weight_load_profile.set_staging_effective(mode)
 
     pin_fn = pin_tensor or (lambda tensor: tensor.pin_memory())
-    pin_disabled = mode == "pageable"
+    pin_disabled = mode != "pinned"
     warned_pin_failure = False
 
     for name, tensor in iterator:

@@ -240,6 +240,13 @@ class TransformerLoader(ComponentLoader):
             ),
             weight_component=component_name,
             weight_tp_size=server_args.tp_size,
+            weight_model_path=component_model_path,
+            weight_model_class=model_cls.__name__,
+            weight_warm_pool_mode=server_args.diffusion_weight_warm_pool,
+            weight_warm_pool_components=(
+                server_args.diffusion_weight_warm_pool_components
+            ),
+            weight_warm_pool_max_gb=server_args.diffusion_weight_warm_pool_max_gb,
         )
 
         if nunchaku_config is not None:

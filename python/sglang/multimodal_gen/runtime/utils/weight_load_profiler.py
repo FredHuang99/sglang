@@ -39,6 +39,11 @@ WEIGHT_LOAD_MODE_EFFECTIVE = "weight_load:load_mode_effective"
 WEIGHT_LOAD_BROADCAST_TENSOR_COUNT = "weight_load:broadcast_tensor_count"
 WEIGHT_LOAD_BROADCAST_BYTES = "weight_load:broadcast_bytes"
 WEIGHT_LOAD_BROADCAST_ERROR = "weight_load:broadcast_error"
+WEIGHT_LOAD_WARM_POOL_REQUESTED = "weight_load:warm_pool_requested"
+WEIGHT_LOAD_WARM_POOL_EFFECTIVE = "weight_load:warm_pool_effective"
+WEIGHT_LOAD_WARM_POOL_HIT = "weight_load:warm_pool_hit"
+WEIGHT_LOAD_WARM_POOL_STORE_BYTES = "weight_load:warm_pool_store_bytes"
+WEIGHT_LOAD_WARM_POOL_ERROR = "weight_load:warm_pool_error"
 
 WEIGHT_LOAD_TIMING_FIELDS = (
     WEIGHT_LOAD_DISCOVER_FILES_MS,
@@ -123,6 +128,13 @@ class DiffusionWeightLoadProfiler:
             WEIGHT_LOAD_BROADCAST_TENSOR_COUNT: 0,
             WEIGHT_LOAD_BROADCAST_BYTES: 0,
             WEIGHT_LOAD_BROADCAST_ERROR: None,
+        }
+        self._warm_pool_fields: dict[str, Any] = {
+            WEIGHT_LOAD_WARM_POOL_REQUESTED: "disabled",
+            WEIGHT_LOAD_WARM_POOL_EFFECTIVE: "disabled",
+            WEIGHT_LOAD_WARM_POOL_HIT: False,
+            WEIGHT_LOAD_WARM_POOL_STORE_BYTES: 0,
+            WEIGHT_LOAD_WARM_POOL_ERROR: None,
         }
         self._status = "running"
         self._error: str | None = None
@@ -236,6 +248,31 @@ class DiffusionWeightLoadProfiler:
             return
         self._load_mode_fields[WEIGHT_LOAD_BROADCAST_ERROR] = error
 
+    def set_warm_pool_requested(self, mode: str) -> None:
+        if not self.active:
+            return
+        self._warm_pool_fields[WEIGHT_LOAD_WARM_POOL_REQUESTED] = mode
+
+    def set_warm_pool_effective(self, mode: str) -> None:
+        if not self.active:
+            return
+        self._warm_pool_fields[WEIGHT_LOAD_WARM_POOL_EFFECTIVE] = mode
+
+    def set_warm_pool_hit(self, hit: bool) -> None:
+        if not self.active:
+            return
+        self._warm_pool_fields[WEIGHT_LOAD_WARM_POOL_HIT] = bool(hit)
+
+    def set_warm_pool_store_bytes(self, value: int) -> None:
+        if not self.active:
+            return
+        self._warm_pool_fields[WEIGHT_LOAD_WARM_POOL_STORE_BYTES] = int(value)
+
+    def set_warm_pool_error(self, error: str | None) -> None:
+        if not self.active:
+            return
+        self._warm_pool_fields[WEIGHT_LOAD_WARM_POOL_ERROR] = error
+
     def profile_safetensors_iterator(
         self, iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -275,6 +312,7 @@ class DiffusionWeightLoadProfiler:
             WEIGHT_LOAD_TOTAL_BYTES: self._total_bytes,
             **self._staging_fields,
             **self._load_mode_fields,
+            **self._warm_pool_fields,
         }
         return record
 

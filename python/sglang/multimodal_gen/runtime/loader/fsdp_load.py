@@ -46,6 +46,15 @@ from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_staging import (
     maybe_stage_weight_iterator,
+    normalize_weight_staging_mode,
+)
+from sglang.multimodal_gen.runtime.loader.weight_warm_pool import (
+    build_weight_warm_pool_key,
+    get_weight_warm_pool_entry,
+    is_weight_warm_pool_enabled,
+    make_weight_warm_pool_entry,
+    normalize_weight_warm_pool_mode,
+    put_weight_warm_pool_entry,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -100,6 +109,11 @@ def maybe_load_fsdp_model(
     weight_broadcast_components: list[str] | tuple[str, ...] | str | None = None,
     weight_component: str | None = None,
     weight_tp_size: int | None = 1,
+    weight_model_path: str | None = None,
+    weight_model_class: str | None = None,
+    weight_warm_pool_mode: str = "disabled",
+    weight_warm_pool_components: list[str] | tuple[str, ...] | str | None = None,
+    weight_warm_pool_max_gb: float = 0.0,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -181,25 +195,115 @@ def maybe_load_fsdp_model(
         )
 
     def _load_weights_on_current_rank(*, force_device_resident: bool = False) -> None:
+        warm_pool_requested = normalize_weight_warm_pool_mode(weight_warm_pool_mode)
+        warm_pool_key = None
+        warm_pool_entry = None
+        preloaded_custom_param_sd = None
+        preloaded_reverse_param_names_mapping = None
+
+        if weight_load_profile is not None:
+            weight_load_profile.set_warm_pool_requested(warm_pool_requested)
+            weight_load_profile.set_warm_pool_effective("disabled")
+            weight_load_profile.set_warm_pool_hit(False)
+
+        staging_mode = normalize_weight_staging_mode(weight_staging_mode)
+        warm_pool_enabled = (
+            broadcast_decision.enabled
+            and broadcast_decision.sp_rank == 0
+            and staging_mode == "pageable"
+            and is_weight_warm_pool_enabled(
+                mode=warm_pool_requested,
+                components=weight_warm_pool_components,
+                component=weight_component,
+            )
+        )
+        if (
+            broadcast_decision.enabled
+            and broadcast_decision.sp_rank == 0
+            and warm_pool_requested != "disabled"
+            and staging_mode != "pageable"
+            and weight_load_profile is not None
+        ):
+            weight_load_profile.set_warm_pool_error(
+                f"requires_pageable_staging:got_{staging_mode}"
+            )
+
+        if warm_pool_enabled:
+            if weight_load_profile is not None:
+                weight_load_profile.set_warm_pool_effective("pageable")
+            try:
+                warm_pool_key = build_weight_warm_pool_key(
+                    component=weight_component or "unknown",
+                    model_path=weight_model_path or "",
+                    safetensors_files=weight_dir_list,
+                    dtype=param_dtype,
+                    component_class=weight_model_class or model_cls.__name__,
+                )
+                warm_pool_entry = get_weight_warm_pool_entry(warm_pool_key)
+                if warm_pool_entry is not None:
+                    preloaded_custom_param_sd = warm_pool_entry.tensors
+                    preloaded_reverse_param_names_mapping = (
+                        warm_pool_entry.reverse_param_names_mapping
+                    )
+                    if weight_load_profile is not None:
+                        weight_load_profile.set_warm_pool_hit(True)
+            except Exception as exc:
+                warm_pool_key = None
+                if weight_load_profile is not None:
+                    weight_load_profile.set_warm_pool_effective("disabled")
+                    weight_load_profile.set_warm_pool_error(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
+        def _store_warm_pool_entry(
+            custom_param_sd: dict[str, torch.Tensor],
+            reverse_param_names_mapping: dict[str, Any],
+        ) -> None:
+            if warm_pool_key is None or warm_pool_entry is not None:
+                return
+            try:
+                entry = make_weight_warm_pool_entry(
+                    custom_param_sd,
+                    reverse_param_names_mapping=reverse_param_names_mapping,
+                )
+                stored = put_weight_warm_pool_entry(
+                    warm_pool_key,
+                    entry,
+                    max_gb=weight_warm_pool_max_gb,
+                )
+                if weight_load_profile is not None:
+                    weight_load_profile.set_warm_pool_store_bytes(
+                        entry.bytes if stored else 0
+                    )
+            except Exception as exc:
+                if weight_load_profile is not None:
+                    weight_load_profile.set_warm_pool_error(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+
         use_runai_model_streamer = None
         if broadcast_decision.enabled and broadcast_decision.sp_rank == 0:
             # RunAI model streamer can synchronize across ranks while non-rank0
             # waits for rank0 load status in rank0-broadcast mode.
             use_runai_model_streamer = False
 
-        weight_iterator = safetensors_weights_iterator(
-            weight_dir_list,
-            use_runai_model_streamer=use_runai_model_streamer,
-        )
-        if weight_load_profile is not None:
-            weight_iterator = weight_load_profile.profile_safetensors_iterator(
-                weight_iterator
+        if preloaded_custom_param_sd is None:
+            weight_iterator = safetensors_weights_iterator(
+                weight_dir_list,
+                use_runai_model_streamer=use_runai_model_streamer,
             )
-        weight_iterator = maybe_stage_weight_iterator(
-            weight_iterator,
-            staging_mode=weight_staging_mode,
-            weight_load_profile=weight_load_profile,
-        )
+            if weight_load_profile is not None:
+                weight_iterator = weight_load_profile.profile_safetensors_iterator(
+                    weight_iterator
+                )
+            weight_iterator = maybe_stage_weight_iterator(
+                weight_iterator,
+                staging_mode=staging_mode,
+                weight_load_profile=weight_load_profile,
+            )
+        else:
+            weight_iterator = iter(())
+
         param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
         load_model_from_full_model_state_dict(
             model,
@@ -210,6 +314,11 @@ def maybe_load_fsdp_model(
             cpu_offload=(cpu_offload and not force_device_resident),
             param_names_mapping=param_names_mapping_fn,
             weight_load_profile=weight_load_profile,
+            preloaded_custom_param_sd=preloaded_custom_param_sd,
+            preloaded_reverse_param_names_mapping=preloaded_reverse_param_names_mapping,
+            on_custom_param_sd_materialized=_store_warm_pool_entry
+            if warm_pool_enabled
+            else None,
         )
 
     if broadcast_decision.enabled:
@@ -425,6 +534,12 @@ def load_model_from_full_model_state_dict(
     cpu_offload: bool = False,
     param_names_mapping: Callable[[str], tuple[str, Any, Any]] | None = None,
     weight_load_profile: DiffusionWeightLoadProfiler | None = None,
+    preloaded_custom_param_sd: dict[str, torch.Tensor] | None = None,
+    preloaded_reverse_param_names_mapping: dict[str, Any] | None = None,
+    on_custom_param_sd_materialized: Callable[
+        [dict[str, torch.Tensor], dict[str, Any]], None
+    ]
+    | None = None,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -446,33 +561,44 @@ def load_model_from_full_model_state_dict(
     meta_sd = model.state_dict()
     param_dict = dict(model.named_parameters())
 
-    # map names from checkpoint to customized names
-    materialize_start = time.perf_counter()
-    read_before_ms = (
-        weight_load_profile.get_ms(WEIGHT_LOAD_READ_SAFETENSORS_MS)
-        if weight_load_profile is not None
-        else 0.0
-    )
-    pin_before_ms = (
-        weight_load_profile.get_ms(WEIGHT_LOAD_PIN_MEMORY_MS)
-        if weight_load_profile is not None
-        else 0.0
-    )
-    custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
-        full_sd_iterator, param_names_mapping
-    )  # type: ignore
-    if weight_load_profile is not None:
-        elapsed_ms = (time.perf_counter() - materialize_start) * 1000.0
-        read_delta_ms = (
+    if preloaded_custom_param_sd is None:
+        # map names from checkpoint to customized names
+        materialize_start = time.perf_counter()
+        read_before_ms = (
             weight_load_profile.get_ms(WEIGHT_LOAD_READ_SAFETENSORS_MS)
-            - read_before_ms
+            if weight_load_profile is not None
+            else 0.0
         )
-        pin_delta_ms = (
-            weight_load_profile.get_ms(WEIGHT_LOAD_PIN_MEMORY_MS) - pin_before_ms
+        pin_before_ms = (
+            weight_load_profile.get_ms(WEIGHT_LOAD_PIN_MEMORY_MS)
+            if weight_load_profile is not None
+            else 0.0
         )
-        weight_load_profile.add_ms(
-            WEIGHT_LOAD_CPU_MATERIALIZE_MS,
-            max(0.0, elapsed_ms - read_delta_ms - pin_delta_ms),
+        custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
+            full_sd_iterator, param_names_mapping
+        )  # type: ignore
+        if weight_load_profile is not None:
+            elapsed_ms = (time.perf_counter() - materialize_start) * 1000.0
+            read_delta_ms = (
+                weight_load_profile.get_ms(WEIGHT_LOAD_READ_SAFETENSORS_MS)
+                - read_before_ms
+            )
+            pin_delta_ms = (
+                weight_load_profile.get_ms(WEIGHT_LOAD_PIN_MEMORY_MS) - pin_before_ms
+            )
+            weight_load_profile.add_ms(
+                WEIGHT_LOAD_CPU_MATERIALIZE_MS,
+                max(0.0, elapsed_ms - read_delta_ms - pin_delta_ms),
+            )
+        if on_custom_param_sd_materialized is not None:
+            on_custom_param_sd_materialized(
+                custom_param_sd,
+                reverse_param_names_mapping,
+            )
+    else:
+        custom_param_sd = preloaded_custom_param_sd
+        reverse_param_names_mapping = dict(
+            preloaded_reverse_param_names_mapping or {}
         )
 
     is_fsdp_model = isinstance(model, FSDPModule) or any(

@@ -27,7 +27,16 @@ from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
 )
 from sglang.multimodal_gen.runtime.loader.weight_staging import (
     maybe_stage_weight_iterator,
+    normalize_weight_staging_mode,
     should_stage_weights_on_current_rank,
+)
+from sglang.multimodal_gen.runtime.loader.weight_warm_pool import (
+    build_weight_warm_pool_key,
+    get_weight_warm_pool_entry,
+    is_weight_warm_pool_enabled,
+    make_weight_warm_pool_entry,
+    normalize_weight_warm_pool_mode,
+    put_weight_warm_pool_entry,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -105,12 +114,19 @@ def _load_vae_weights_default(
     safetensors_list: list[str],
     server_args: ServerArgs,
     weight_load_profile: DiffusionWeightLoadProfiler,
+    preloaded_state_dict: dict[str, torch.Tensor] | None = None,
+    on_state_dict_loaded=None,
 ) -> tuple[list[str], list[str]]:
-    loaded = _load_vae_state_dict_from_safetensors(
-        safetensors_list,
-        server_args,
-        weight_load_profile,
-    )
+    if preloaded_state_dict is None:
+        loaded = _load_vae_state_dict_from_safetensors(
+            safetensors_list,
+            server_args,
+            weight_load_profile,
+        )
+        if on_state_dict_loaded is not None:
+            on_state_dict_loaded(loaded)
+    else:
+        loaded = preloaded_state_dict
     with weight_load_profile.timing_scope(WEIGHT_LOAD_H2D_OR_PARAM_COPY_MS):
         vae.load_state_dict(loaded, strict=False)
     return _get_vae_key_mismatches(vae, set(loaded.keys()))
@@ -128,6 +144,9 @@ def _load_vae_weights_rank0_broadcast(
     safetensors_list: list[str],
     server_args: ServerArgs,
     component_name: str,
+    component_model_path: str,
+    component_class: str,
+    component_dtype: torch.dtype,
     weight_load_profile: DiffusionWeightLoadProfiler,
     broadcast_decision: Rank0BroadcastDecision,
 ) -> tuple[list[str], list[str]]:
@@ -140,6 +159,72 @@ def _load_vae_weights_rank0_broadcast(
     rank0_load_exc: Exception | None = None
     rank0_load_status: dict | None = None
     if broadcast_decision.sp_rank == 0:
+        warm_pool_requested = normalize_weight_warm_pool_mode(
+            server_args.diffusion_weight_warm_pool
+        )
+        warm_pool_key = None
+        warm_pool_entry = None
+        preloaded_state_dict = None
+
+        weight_load_profile.set_warm_pool_requested(warm_pool_requested)
+        weight_load_profile.set_warm_pool_effective("disabled")
+        weight_load_profile.set_warm_pool_hit(False)
+
+        staging_mode = normalize_weight_staging_mode(
+            server_args.diffusion_weight_staging
+        )
+        warm_pool_enabled = (
+            staging_mode == "pageable"
+            and is_weight_warm_pool_enabled(
+                mode=warm_pool_requested,
+                components=server_args.diffusion_weight_warm_pool_components,
+                component=component_name,
+            )
+        )
+        if warm_pool_requested != "disabled" and staging_mode != "pageable":
+            weight_load_profile.set_warm_pool_error(
+                f"requires_pageable_staging:got_{staging_mode}"
+            )
+
+        if warm_pool_enabled:
+            weight_load_profile.set_warm_pool_effective("pageable")
+            try:
+                warm_pool_key = build_weight_warm_pool_key(
+                    component=component_name,
+                    model_path=component_model_path,
+                    safetensors_files=safetensors_list,
+                    dtype=component_dtype,
+                    component_class=component_class,
+                )
+                warm_pool_entry = get_weight_warm_pool_entry(warm_pool_key)
+                if warm_pool_entry is not None:
+                    preloaded_state_dict = warm_pool_entry.tensors
+                    weight_load_profile.set_warm_pool_hit(True)
+            except Exception as exc:
+                warm_pool_key = None
+                weight_load_profile.set_warm_pool_effective("disabled")
+                weight_load_profile.set_warm_pool_error(
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        def _store_warm_pool_entry(loaded: dict[str, torch.Tensor]) -> None:
+            if warm_pool_key is None or warm_pool_entry is not None:
+                return
+            try:
+                entry = make_weight_warm_pool_entry(loaded)
+                stored = put_weight_warm_pool_entry(
+                    warm_pool_key,
+                    entry,
+                    max_gb=server_args.diffusion_weight_warm_pool_max_gb,
+                )
+                weight_load_profile.set_warm_pool_store_bytes(
+                    entry.bytes if stored else 0
+                )
+            except Exception as exc:
+                weight_load_profile.set_warm_pool_error(
+                    f"{type(exc).__name__}: {exc}"
+                )
+
         log_broadcast_stage(
             "rank0_load_start",
             broadcast_decision.sp_group,
@@ -153,6 +238,10 @@ def _load_vae_weights_rank0_broadcast(
                 safetensors_list,
                 server_args,
                 weight_load_profile,
+                preloaded_state_dict=preloaded_state_dict,
+                on_state_dict_loaded=_store_warm_pool_entry
+                if warm_pool_enabled
+                else None,
             )
         except Exception as exc:
             rank0_load_exc = exc
@@ -398,6 +487,9 @@ class VAELoader(ComponentLoader):
                 safetensors_list,
                 server_args,
                 component_name,
+                component_model_path,
+                class_name,
+                PRECISION_TO_TYPE[vae_precision],
                 weight_load_profile,
                 broadcast_decision,
             )

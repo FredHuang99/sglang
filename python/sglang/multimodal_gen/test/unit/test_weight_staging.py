@@ -104,28 +104,28 @@ class TestDiffusionWeightStaging(unittest.TestCase):
         )
         self.assertIsNone(record[WEIGHT_LOAD_PIN_MEMORY_ERROR])
 
-    def test_auto_staging_falls_back_to_pageable_on_pin_error(self):
+    def test_auto_staging_resolves_to_pageable_without_pin(self):
         tensors = [("a", torch.arange(4, dtype=torch.float32))]
         profile = self._profile()
 
-        def fail_pin(_tensor):
-            raise RuntimeError("pin failed")
+        def fail_if_called(_tensor):
+            raise AssertionError("auto should not try pinned staging")
 
         staged = list(
             stage_weight_iterator(
                 tensors,
                 staging_mode="auto",
                 weight_load_profile=profile,
-                pin_tensor=fail_pin,
+                pin_tensor=fail_if_called,
             )
         )
 
         self.assertTrue(torch.equal(staged[0][1], tensors[0][1]))
         record = profile.as_dict()
-        self.assertEqual(record[WEIGHT_LOAD_STAGING_REQUESTED], "auto")
+        self.assertEqual(record[WEIGHT_LOAD_STAGING_REQUESTED], "pageable")
         self.assertEqual(record[WEIGHT_LOAD_STAGING_EFFECTIVE], "pageable")
         self.assertEqual(record[WEIGHT_LOAD_PINNED_TENSOR_COUNT], 0)
-        self.assertIn("pin failed", record[WEIGHT_LOAD_PIN_MEMORY_ERROR])
+        self.assertIsNone(record[WEIGHT_LOAD_PIN_MEMORY_ERROR])
 
     def test_non_rank0_skips_staging(self):
         tensors = [("a", torch.arange(4, dtype=torch.float32))]

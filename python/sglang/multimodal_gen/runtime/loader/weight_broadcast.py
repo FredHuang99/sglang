@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from collections.abc import Iterable
@@ -496,16 +497,17 @@ def broadcast_module_tensors(
                 weight_load_profile.add_broadcast_tensor(tensor)
             broadcast_bytes += int(tensor.numel() * tensor.element_size())
             if broadcast_bytes >= next_progress_bytes:
-                log_broadcast_stage(
-                    "tensor_broadcast_progress",
-                    sp_group,
-                    component_name=component_name,
-                    detail=(
-                        f"bytes={broadcast_bytes} last_tensor={name} "
-                        f"tensor_count={len(entries)}"
-                    ),
-                    weight_load_profile=weight_load_profile,
-                )
+                if logger.isEnabledFor(logging.DEBUG):
+                    log_broadcast_stage(
+                        "tensor_broadcast_progress",
+                        sp_group,
+                        component_name=component_name,
+                        detail=(
+                            f"bytes={broadcast_bytes} last_tensor={name} "
+                            f"tensor_count={len(entries)}"
+                        ),
+                        weight_load_profile=weight_load_profile,
+                    )
                 next_progress_bytes += _BROADCAST_PROGRESS_BYTES
     except Exception as exc:
         if weight_load_profile is not None:

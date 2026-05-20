@@ -254,6 +254,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.profile_run_id, "run-123")
         self.assertEqual(args.diffusion_weight_staging, "none")
         self.assertEqual(args.diffusion_weight_load_mode, "default")
+        self.assertEqual(args.diffusion_weight_warm_pool, "disabled")
 
     def test_request_profile_cli_default_is_disabled(self):
         parser = FlexibleArgumentParser()
@@ -313,6 +314,56 @@ class TestPerRoleParallelism(unittest.TestCase):
             server_args.diffusion_weight_broadcast_components,
             ["transformer", "vae"],
         )
+
+    def test_diffusion_weight_staging_auto_normalizes_to_pageable(self):
+        server_args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "diffusion_weight_staging": "auto",
+            }
+        )
+
+        self.assertEqual(server_args.diffusion_weight_staging, "pageable")
+
+    def test_diffusion_weight_warm_pool_cli_args_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            [
+                "--model-path",
+                "/fake",
+                "--diffusion-weight-warm-pool",
+                "pageable",
+                "--diffusion-weight-warm-pool-components",
+                "transformer,vae",
+                "--diffusion-weight-warm-pool-max-gb",
+                "32",
+            ]
+        )
+
+        self.assertEqual(args.diffusion_weight_warm_pool, "pageable")
+        self.assertEqual(
+            args.diffusion_weight_warm_pool_components,
+            "transformer,vae",
+        )
+        self.assertEqual(args.diffusion_weight_warm_pool_max_gb, 32.0)
+
+    def test_diffusion_weight_warm_pool_components_normalized(self):
+        server_args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "diffusion_weight_warm_pool": "pageable",
+                "diffusion_weight_warm_pool_components": "transformer,vae",
+                "diffusion_weight_warm_pool_max_gb": "16",
+            }
+        )
+
+        self.assertEqual(server_args.diffusion_weight_warm_pool, "pageable")
+        self.assertEqual(
+            server_args.diffusion_weight_warm_pool_components,
+            ["transformer", "vae"],
+        )
+        self.assertEqual(server_args.diffusion_weight_warm_pool_max_gb, 16.0)
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):

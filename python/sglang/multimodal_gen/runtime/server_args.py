@@ -56,6 +56,8 @@ logger = init_logger(__name__)
 DIFFUSION_WEIGHT_STAGING_CHOICES = ("none", "pageable", "pinned", "auto")
 DIFFUSION_WEIGHT_LOAD_MODE_CHOICES = ("default", "rank0-broadcast")
 DIFFUSION_WEIGHT_BROADCAST_COMPONENT_CHOICES = ("transformer", "vae")
+DIFFUSION_WEIGHT_WARM_POOL_CHOICES = ("disabled", "pageable")
+DIFFUSION_WEIGHT_WARM_POOL_COMPONENT_CHOICES = ("transformer", "vae")
 
 
 def _normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
@@ -236,6 +238,11 @@ class ServerArgs:
     diffusion_weight_broadcast_components: list[str] | str | None = field(
         default_factory=list
     )
+    diffusion_weight_warm_pool: Literal["disabled", "pageable"] = "disabled"
+    diffusion_weight_warm_pool_components: list[str] | str | None = field(
+        default_factory=list
+    )
+    diffusion_weight_warm_pool_max_gb: float = 0.0
 
     # Prompt text file for batch processing
     prompt_file_path: str | None = None
@@ -1224,7 +1231,9 @@ class ServerArgs:
             default=ServerArgs.diffusion_weight_staging,
             help=(
                 "Optional diffusion checkpoint staging mode for rank0. "
-                "Use pinned or auto to try pinned CPU tensors before H2D copy."
+                "pageable is the recommended cold-start path; pinned is an "
+                "experimental explicit mode for pin/register overhead studies. "
+                "auto currently resolves to pageable."
             ),
         )
         parser.add_argument(
@@ -1243,7 +1252,35 @@ class ServerArgs:
             default="",
             help=(
                 "Comma-separated component names eligible for rank0-broadcast. "
-                "Phase 3 supports transformer only."
+                "Supports transformer and vae."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-weight-warm-pool",
+            type=str,
+            choices=DIFFUSION_WEIGHT_WARM_POOL_CHOICES,
+            default=ServerArgs.diffusion_weight_warm_pool,
+            help=(
+                "In-process diffusion CPU weight warm-pool mode. "
+                "Use pageable to cache materialized CPU tensors on rank0."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-weight-warm-pool-components",
+            type=str,
+            default="",
+            help=(
+                "Comma-separated component names eligible for the in-process "
+                "pageable warm pool. Supports transformer and vae."
+            ),
+        )
+        parser.add_argument(
+            "--diffusion-weight-warm-pool-max-gb",
+            type=float,
+            default=ServerArgs.diffusion_weight_warm_pool_max_gb,
+            help=(
+                "Maximum GiB for the in-process diffusion weight warm pool. "
+                "0 means unlimited."
             ),
         )
 
@@ -1539,6 +1576,8 @@ class ServerArgs:
                 f"{DIFFUSION_WEIGHT_STAGING_CHOICES}, got "
                 f"{self.diffusion_weight_staging!r}"
             )
+        if self.diffusion_weight_staging == "auto":
+            self.diffusion_weight_staging = "pageable"
 
         self.diffusion_weight_load_mode = str(
             self.diffusion_weight_load_mode
@@ -1581,6 +1620,60 @@ class ServerArgs:
             ]
 
         self.diffusion_weight_broadcast_components = components
+
+        self.diffusion_weight_warm_pool = str(
+            self.diffusion_weight_warm_pool
+        ).lower()
+        if self.diffusion_weight_warm_pool not in DIFFUSION_WEIGHT_WARM_POOL_CHOICES:
+            raise ValueError(
+                "--diffusion-weight-warm-pool must be one of "
+                f"{DIFFUSION_WEIGHT_WARM_POOL_CHOICES}, got "
+                f"{self.diffusion_weight_warm_pool!r}"
+            )
+
+        raw_warm_pool_components = self.diffusion_weight_warm_pool_components
+        if raw_warm_pool_components is None:
+            warm_pool_components: list[str] = []
+        elif isinstance(raw_warm_pool_components, str):
+            warm_pool_components = [
+                item.strip().lower()
+                for item in raw_warm_pool_components.replace(";", ",").split(",")
+                if item.strip()
+            ]
+        else:
+            warm_pool_components = [
+                str(item).strip().lower()
+                for item in raw_warm_pool_components
+                if str(item).strip()
+            ]
+
+        unsupported_warm_pool = [
+            item
+            for item in warm_pool_components
+            if item not in DIFFUSION_WEIGHT_WARM_POOL_COMPONENT_CHOICES
+        ]
+        if unsupported_warm_pool:
+            logger.warning(
+                "Ignoring unsupported --diffusion-weight-warm-pool-components %s. "
+                "Supported components: %s",
+                unsupported_warm_pool,
+                DIFFUSION_WEIGHT_WARM_POOL_COMPONENT_CHOICES,
+            )
+            warm_pool_components = [
+                item
+                for item in warm_pool_components
+                if item in DIFFUSION_WEIGHT_WARM_POOL_COMPONENT_CHOICES
+            ]
+
+        self.diffusion_weight_warm_pool_components = warm_pool_components
+        self.diffusion_weight_warm_pool_max_gb = float(
+            self.diffusion_weight_warm_pool_max_gb or 0.0
+        )
+        if self.diffusion_weight_warm_pool_max_gb < 0:
+            raise ValueError(
+                "--diffusion-weight-warm-pool-max-gb must be >= 0, got "
+                f"{self.diffusion_weight_warm_pool_max_gb!r}"
+            )
 
     def _validate_parallelism(self):
         if self.sp_degree > self.num_gpus or self.num_gpus % self.sp_degree != 0:
