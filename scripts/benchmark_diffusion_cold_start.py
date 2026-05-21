@@ -119,7 +119,6 @@ SERVER_ARGS_EXPECTED = {
 
 SETUP_FLAGS = {
     "baseline": [],
-    "baseline-no-runai": [],
     "none": [],
     "pageable": [
         "--diffusion-weight-staging",
@@ -151,11 +150,10 @@ SETUP_FLAGS = {
     ],
 }
 
-SETUP_ENV_OVERRIDES = {
-    "baseline-no-runai": {
-        "SGLANG_USE_RUNAI_MODEL_STREAMER": "false",
-    },
+COMMON_ENV_OVERRIDES = {
+    "SGLANG_USE_RUNAI_MODEL_STREAMER": "false",
 }
+SETUP_ENV_OVERRIDES: dict[str, dict[str, str]] = {}
 
 MEASUREMENT_PASS_CHOICES = ("timing", "metrics", "both")
 
@@ -174,8 +172,9 @@ def parse_args() -> argparse.Namespace:
         "--setups",
         default="baseline,pageable,pinned,warm-pool",
         help=(
-            "Comma-separated setup names: baseline, baseline-no-runai, none, "
-            "pageable, pinned, warm-pool."
+            "Comma-separated setup names: baseline, none, pageable, pinned, "
+            "warm-pool. All setups disable RunAI model streamer for a fair "
+            "weight-loading comparison."
         ),
     )
     parser.add_argument("--repeat-k", type=int, default=3)
@@ -269,6 +268,12 @@ def measurement_passes(value: str) -> list[str]:
     if value not in ("timing", "metrics"):
         raise ValueError(f"Unknown measurement pass {value!r}")
     return [value]
+
+
+def setup_env_overrides(setup: str) -> dict[str, str]:
+    values = dict(COMMON_ENV_OVERRIDES)
+    values.update(SETUP_ENV_OVERRIDES.get(setup, {}))
+    return values
 
 
 def extra_launch_args(args: argparse.Namespace) -> list[str]:
@@ -629,7 +634,7 @@ def run_launch(
             command_diff=command_diff,
             reference_case=reference_case,
             measurement_pass=measurement_pass,
-            env_overrides=SETUP_ENV_OVERRIDES.get(setup, {}),
+            env_overrides=setup_env_overrides(setup),
         )
     health_url = f"http://{args.host}:{ports['port']}/health"
     models_url = f"http://{args.host}:{ports['port']}/v1/models"
@@ -648,7 +653,7 @@ def run_launch(
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     env = os.environ.copy()
     env["SGLANG_LAUNCH_TASK_LOG_PATH"] = str(launch_task_log_path)
-    env.update(SETUP_ENV_OVERRIDES.get(setup, {}))
+    env.update(setup_env_overrides(setup))
     popen_kwargs["env"] = env
 
     proc = subprocess.Popen(command, **popen_kwargs)
@@ -738,7 +743,7 @@ def run_launch(
             Path(args.profile_output_dir) / f"{run_id}_launch_module_load"
         ),
         "launch_task_log_path": str(launch_task_log_path),
-        "env_overrides": SETUP_ENV_OVERRIDES.get(setup, {}),
+        "env_overrides": setup_env_overrides(setup),
     }
     with open(run_meta_path, "w", encoding="utf-8") as fp:
         json.dump(result, fp, indent=2, sort_keys=True)
@@ -1114,7 +1119,6 @@ def summarize_combined_run(
         for key, value in metrics_runai.items():
             summary[f"metrics_{key}"] = value
     summary["setup_sample_count"] = 1.0
-    summary["setup_is_no_runai"] = 1.0 if setup == "baseline-no-runai" else 0.0
     return summary
 
 

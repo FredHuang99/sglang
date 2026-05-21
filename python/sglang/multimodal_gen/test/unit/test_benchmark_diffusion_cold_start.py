@@ -23,6 +23,8 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
     def test_split_setups_rejects_unknown(self):
         with self.assertRaisesRegex(ValueError, "Unknown setups"):
             self.benchmark.split_setups("baseline,missing")
+        with self.assertRaisesRegex(ValueError, "Unknown setups"):
+            self.benchmark.split_setups("baseline-no-runai")
 
     def test_measurement_pass_expansion(self):
         self.assertEqual(self.benchmark.measurement_passes("timing"), ["timing"])
@@ -219,13 +221,11 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
         )
         self.assertIn("--diffusion-weight-load-mode", pageable)
 
-    def test_baseline_no_runai_uses_env_only(self):
-        self.assertIn("baseline-no-runai", self.benchmark.SETUP_FLAGS)
-        self.assertEqual(self.benchmark.SETUP_FLAGS["baseline-no-runai"], [])
-        self.assertEqual(
-            self.benchmark.SETUP_ENV_OVERRIDES["baseline-no-runai"],
-            {"SGLANG_USE_RUNAI_MODEL_STREAMER": "false"},
-        )
+    def test_all_setups_disable_runai_by_common_env(self):
+        expected = {"SGLANG_USE_RUNAI_MODEL_STREAMER": "false"}
+        self.assertNotIn("baseline-no-runai", self.benchmark.SETUP_FLAGS)
+        for setup in ("baseline", "pageable", "pinned", "warm-pool"):
+            self.assertEqual(self.benchmark.setup_env_overrides(setup), expected)
 
     def test_reference_diff_detects_attention_backend_drift(self):
         reference = [
