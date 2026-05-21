@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
 )
+from sglang.multimodal_gen.runtime.utils.launch_task_logger import record_task
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
@@ -92,6 +93,8 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
+        worker_init_start = time.perf_counter()
+        device_bootstrap_start = time.perf_counter()
         role_device = self.server_args.resolved_role_device()
         if role_device == "cpu":
             os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
@@ -104,7 +107,14 @@ class GPUWorker:
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+        record_task(
+            "device_bootstrap",
+            start_perf=device_bootstrap_start,
+            rank=self.rank,
+            extra={"local_rank": self.local_rank, "role_device": role_device},
+        )
         # initialize the distributed environment
+        distributed_init_start = time.perf_counter()
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
             enable_cfg_parallel=self.server_args.enable_cfg_parallel,
@@ -116,6 +126,19 @@ class GPUWorker:
                 "127.0.0.1", self.master_port
             ).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
+        )
+        record_task(
+            "distributed_and_model_parallel_init_total",
+            start_perf=distributed_init_start,
+            rank=self.rank,
+            extra={
+                "world_size": self.server_args.num_gpus,
+                "tp_size": self.server_args.tp_size,
+                "sp_size": self.server_args.sp_degree,
+                "ulysses_degree": self.server_args.ulysses_degree,
+                "ring_degree": self.server_args.ring_degree,
+                "dp_size": self.server_args.dp_size,
+            },
         )
 
         # set proc title
@@ -140,7 +163,17 @@ class GPUWorker:
         else:
             setproctitle(f"{title_prefix}_{self.local_rank}")
 
+        build_pipeline_start = time.perf_counter()
         self.pipeline = build_pipeline(self.server_args)
+        record_task(
+            "build_pipeline_total",
+            start_perf=build_pipeline_start,
+            rank=self.rank,
+            extra={
+                "model_path": self.server_args.model_path,
+                "pipeline_class": self.pipeline.__class__.__name__,
+            },
+        )
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
@@ -166,6 +199,12 @@ class GPUWorker:
             "Worker %s: Initialized device=%s, model, and distributed environment.",
             self.rank,
             role_device,
+        )
+        record_task(
+            "worker_init_total",
+            start_perf=worker_init_start,
+            rank=self.rank,
+            extra={"local_rank": self.local_rank},
         )
 
     def do_mem_analysis(self, output_batch: OutputBatch):
@@ -547,10 +586,17 @@ def run_scheduler_process(
             local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
+        ready_signal_start = time.perf_counter()
         pipe_writer.send(
             {
                 "status": "ready",
             }
+        )
+        record_task(
+            "worker_ready_signal",
+            start_perf=ready_signal_start,
+            rank=rank,
+            extra={"local_rank": local_rank},
         )
         scheduler.event_loop()
     except _oom_exceptions() as _e:

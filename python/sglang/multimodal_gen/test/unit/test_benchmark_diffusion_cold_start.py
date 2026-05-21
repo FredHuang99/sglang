@@ -24,6 +24,13 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown setups"):
             self.benchmark.split_setups("baseline,missing")
 
+    def test_measurement_pass_expansion(self):
+        self.assertEqual(self.benchmark.measurement_passes("timing"), ["timing"])
+        self.assertEqual(self.benchmark.measurement_passes("metrics"), ["metrics"])
+        self.assertEqual(
+            self.benchmark.measurement_passes("both"), ["timing", "metrics"]
+        )
+
     def test_summary_handles_baseline_without_broadcast_fields(self):
         result = {
             "setup": "baseline",
@@ -115,7 +122,9 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
             }
             _current_run_profile_dir = pathlib.Path("/tmp/run0_launch_benchmark")
 
-        command = self.benchmark.build_command(Args, "baseline", "run0")
+        command = self.benchmark.build_command(
+            Args, "baseline", "run0", profile_enabled=False
+        )
 
         self.assertEqual(
             command[:4],
@@ -138,6 +147,40 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
         self.assertIn("--tp-size", command)
         self.assertEqual(command[command.index("--tp-size") + 1], "1")
         self.assertIn("--pin-cpu-memory", command)
+        self.assertNotIn("--profile-enabled", command)
+
+    def test_metrics_pass_adds_profile_flags(self):
+        class Args:
+            python = "python3"
+            model_path = "/data/Z_Image"
+            model_id = "Z-Image"
+            profile_output_dir = "/data/profile"
+            num_gpus = 4
+            sp_degree = 4
+            ulysses_degree = 2
+            ring_degree = 2
+            attention_backend = None
+            host = "127.0.0.1"
+            launch_entrypoint = "module"
+            diagnostic_module_profile = False
+            compat_profile_preset = "none"
+            extra_launch_arg = []
+            extra_launch_args = ""
+            _current_ports = {
+                "port": 30001,
+                "scheduler_port": 30002,
+                "master_port": 30003,
+            }
+            _current_run_profile_dir = pathlib.Path("/tmp/run0_launch_benchmark")
+
+        command = self.benchmark.build_command(
+            Args, "baseline", "run0", profile_enabled=True
+        )
+
+        self.assertIn("--profile-enabled", command)
+        self.assertIn("--profile-output-dir", command)
+        self.assertIn("--profile-run-id", command)
+        self.assertEqual(command[command.index("--profile-run-id") + 1], "run0")
 
     def test_weight_load_setups_only_add_allowed_diffusion_weight_args(self):
         class Args:
@@ -163,14 +206,26 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
             }
             _current_run_profile_dir = pathlib.Path("/tmp/run0_launch_benchmark")
 
-        baseline = self.benchmark.build_command(Args, "baseline", "run0")
-        pageable = self.benchmark.build_command(Args, "pageable", "run0")
+        baseline = self.benchmark.build_command(
+            Args, "baseline", "run0", profile_enabled=False
+        )
+        pageable = self.benchmark.build_command(
+            Args, "pageable", "run0", profile_enabled=False
+        )
 
         self.assertEqual(
             self.benchmark.normalized_server_arg_map(baseline),
             self.benchmark.normalized_server_arg_map(pageable),
         )
         self.assertIn("--diffusion-weight-load-mode", pageable)
+
+    def test_baseline_no_runai_uses_env_only(self):
+        self.assertIn("baseline-no-runai", self.benchmark.SETUP_FLAGS)
+        self.assertEqual(self.benchmark.SETUP_FLAGS["baseline-no-runai"], [])
+        self.assertEqual(
+            self.benchmark.SETUP_ENV_OVERRIDES["baseline-no-runai"],
+            {"SGLANG_USE_RUNAI_MODEL_STREAMER": "false"},
+        )
 
     def test_reference_diff_detects_attention_backend_drift(self):
         reference = [
@@ -269,6 +324,36 @@ class TestDiffusionColdStartBenchmarkSummary(unittest.TestCase):
 
         self.assertEqual(sources, ["native", "sgl-diffusion"])
         self.assertEqual(fallback_count, 1)
+
+    def test_launch_task_summary(self):
+        result = {"launch_wall_s": 10.0}
+        records = [
+            {
+                "task": "component_load",
+                "component": "transformer",
+                "elapsed_s": 3.0,
+                "timestamp_s": 105.0,
+            },
+            {
+                "task": "component_load",
+                "component": "transformer",
+                "elapsed_s": 5.0,
+                "timestamp_s": 108.0,
+            },
+            {
+                "task": "parent_wait_workers_ready",
+                "elapsed_ms": 9000.0,
+                "timestamp_s": 109.0,
+            },
+        ]
+
+        summary = self.benchmark.summarize_launch_tasks(result, records)
+
+        self.assertEqual(summary["launch_task_component_load_transformer_avg_s"], 4.0)
+        self.assertEqual(summary["launch_task_component_load_transformer_max_s"], 5.0)
+        self.assertEqual(summary["launch_task_parent_wait_workers_ready_max_s"], 9.0)
+        self.assertEqual(summary["launch_task_observed_span_s"], 9.0)
+        self.assertEqual(summary["launch_task_unexplained_s"], 1.0)
 
 
 if __name__ == "__main__":

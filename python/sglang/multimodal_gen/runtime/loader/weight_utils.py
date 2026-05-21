@@ -146,6 +146,16 @@ def _resolve_use_runai_model_streamer(
     return bool(HAS_RUNAI_MODEL_STREAMER and envs.SGLANG_USE_RUNAI_MODEL_STREAMER)
 
 
+def resolve_safetensors_read_backend(
+    use_runai_model_streamer: bool | None = None,
+) -> str:
+    return (
+        "runai"
+        if _resolve_use_runai_model_streamer(use_runai_model_streamer)
+        else "safetensors"
+    )
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     to_cpu: bool = True,

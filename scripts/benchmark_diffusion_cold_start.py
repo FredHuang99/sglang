@@ -15,6 +15,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import socket
 import shlex
 import signal
@@ -59,6 +60,10 @@ ERROR_FIELDS = (
     "weight_load:pin_memory_error",
     "weight_load:broadcast_error",
     "weight_load:warm_pool_error",
+)
+READ_BACKEND_FIELD = "weight_load:read_backend"
+RUNAI_STREAM_RE = re.compile(
+    r"\[RunAI Streamer\].*?stream\s+([0-9.]+)\s+GiB.*?:\s+([0-9.]+)s"
 )
 
 COMPAT_PROFILE_FLAGS = {
@@ -114,6 +119,7 @@ SERVER_ARGS_EXPECTED = {
 
 SETUP_FLAGS = {
     "baseline": [],
+    "baseline-no-runai": [],
     "none": [],
     "pageable": [
         "--diffusion-weight-staging",
@@ -145,6 +151,14 @@ SETUP_FLAGS = {
     ],
 }
 
+SETUP_ENV_OVERRIDES = {
+    "baseline-no-runai": {
+        "SGLANG_USE_RUNAI_MODEL_STREAMER": "false",
+    },
+}
+
+MEASUREMENT_PASS_CHOICES = ("timing", "metrics", "both")
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -159,7 +173,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--setups",
         default="baseline,pageable,pinned,warm-pool",
-        help="Comma-separated setup names: baseline, none, pageable, pinned, warm-pool.",
+        help=(
+            "Comma-separated setup names: baseline, baseline-no-runai, none, "
+            "pageable, pinned, warm-pool."
+        ),
     )
     parser.add_argument("--repeat-k", type=int, default=3)
     parser.add_argument("--profile-output-dir", required=True)
@@ -191,6 +208,16 @@ def parse_args() -> argparse.Namespace:
         choices=("health", "models"),
         default="models",
         help="Official launch wall-time endpoint. models uses /v1/models.",
+    )
+    parser.add_argument(
+        "--measurement-pass",
+        choices=MEASUREMENT_PASS_CHOICES,
+        default="timing",
+        help=(
+            "timing omits --profile-enabled for official wall time; metrics "
+            "emits weight-load JSON; both runs timing then metrics and reports "
+            "them separately."
+        ),
     )
     parser.add_argument(
         "--compat-profile-preset",
@@ -236,6 +263,14 @@ def split_setups(value: str) -> list[str]:
     return setups
 
 
+def measurement_passes(value: str) -> list[str]:
+    if value == "both":
+        return ["timing", "metrics"]
+    if value not in ("timing", "metrics"):
+        raise ValueError(f"Unknown measurement pass {value!r}")
+    return [value]
+
+
 def extra_launch_args(args: argparse.Namespace) -> list[str]:
     values: list[str] = []
     for item in args.extra_launch_arg:
@@ -252,7 +287,13 @@ def _run_benchmark_dir(args: argparse.Namespace, run_id: str) -> Path:
     return Path(args.profile_output_dir) / f"{run_id}_launch_benchmark"
 
 
-def build_command(args: argparse.Namespace, setup: str, run_id: str) -> list[str]:
+def build_command(
+    args: argparse.Namespace,
+    setup: str,
+    run_id: str,
+    *,
+    profile_enabled: bool,
+) -> list[str]:
     ports = getattr(args, "_current_ports", None) or {}
     run_profile_dir = Path(
         getattr(args, "_current_run_profile_dir", _run_benchmark_dir(args, run_id))
@@ -309,13 +350,18 @@ def build_command(args: argparse.Namespace, setup: str, run_id: str) -> list[str
             str(args.ulysses_degree),
             "--ring-degree",
             str(args.ring_degree),
-            "--profile-enabled",
-            "--profile-output-dir",
-            args.profile_output_dir,
-            "--profile-run-id",
-            run_id,
         ]
     )
+    if profile_enabled:
+        command.extend(
+            [
+                "--profile-enabled",
+                "--profile-output-dir",
+                args.profile_output_dir,
+                "--profile-run-id",
+                run_id,
+            ]
+        )
     if args.attention_backend:
         command.extend(["--attention-backend", args.attention_backend])
     if getattr(args, "diagnostic_module_profile", False):
@@ -463,9 +509,12 @@ def _failed_run_result(
     failure_reason: str,
     command_diff: list[str],
     reference_case: dict[str, Any] | None,
+    measurement_pass: str,
+    env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     result = {
         "setup": setup,
+        "measurement_pass": measurement_pass,
         "run_id": run_id,
         "launch_wall_s": 0.0,
         "ready": False,
@@ -496,6 +545,8 @@ def _failed_run_result(
         "launch_module_load_dir": str(
             Path(args.profile_output_dir) / f"{run_id}_launch_module_load"
         ),
+        "launch_task_log_path": str(run_meta_path.parent / "launch_tasks.jsonl"),
+        "env_overrides": env_overrides or {},
     }
     with open(run_meta_path, "w", encoding="utf-8") as fp:
         json.dump(result, fp, indent=2, sort_keys=True)
@@ -530,7 +581,14 @@ def validate_server_args(server_args: dict[str, Any] | None) -> list[str]:
     return errors
 
 
-def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, Any]:
+def run_launch(
+    args: argparse.Namespace,
+    setup: str,
+    run_id: str,
+    *,
+    measurement_pass: str,
+) -> dict[str, Any]:
+    profile_enabled = measurement_pass == "metrics"
     ports = {
         "port": find_free_port(args.host),
         "scheduler_port": find_free_port(args.host),
@@ -540,9 +598,15 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
     run_profile_dir.mkdir(parents=True, exist_ok=True)
     server_log_path = run_profile_dir / "server.log"
     run_meta_path = run_profile_dir / "run_meta.json"
+    launch_task_log_path = run_profile_dir / "launch_tasks.jsonl"
     args._current_ports = ports
     args._current_run_profile_dir = run_profile_dir
-    command = build_command(args, setup, run_id)
+    command = build_command(
+        args,
+        setup,
+        run_id,
+        profile_enabled=profile_enabled,
+    )
     delattr(args, "_current_ports")
     delattr(args, "_current_run_profile_dir")
     command_str = " ".join(shlex.quote(part) for part in command)
@@ -564,6 +628,8 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
             failure_reason="reference_command_diff",
             command_diff=command_diff,
             reference_case=reference_case,
+            measurement_pass=measurement_pass,
+            env_overrides=SETUP_ENV_OVERRIDES.get(setup, {}),
         )
     health_url = f"http://{args.host}:{ports['port']}/health"
     models_url = f"http://{args.host}:{ports['port']}/v1/models"
@@ -580,6 +646,10 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
         popen_kwargs["preexec_fn"] = os.setsid
     else:
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    env = os.environ.copy()
+    env["SGLANG_LAUNCH_TASK_LOG_PATH"] = str(launch_task_log_path)
+    env.update(SETUP_ENV_OVERRIDES.get(setup, {}))
+    popen_kwargs["env"] = env
 
     proc = subprocess.Popen(command, **popen_kwargs)
     assert proc.stdout is not None
@@ -635,6 +705,7 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
 
     result = {
         "setup": setup,
+        "measurement_pass": measurement_pass,
         "run_id": run_id,
         "launch_wall_s": wall_s,
         "ready": ready,
@@ -666,6 +737,8 @@ def run_launch(args: argparse.Namespace, setup: str, run_id: str) -> dict[str, A
         "launch_module_load_dir": str(
             Path(args.profile_output_dir) / f"{run_id}_launch_module_load"
         ),
+        "launch_task_log_path": str(launch_task_log_path),
+        "env_overrides": SETUP_ENV_OVERRIDES.get(setup, {}),
     }
     with open(run_meta_path, "w", encoding="utf-8") as fp:
         json.dump(result, fp, indent=2, sort_keys=True)
@@ -697,6 +770,121 @@ def load_module_records(profile_output_dir: str, run_id: str) -> list[dict[str, 
         record["_profile_json"] = str(path)
         records.append(record)
     return records
+
+
+def load_launch_task_records(path: str | Path | None) -> list[dict[str, Any]]:
+    if not path:
+        return []
+    task_path = Path(path)
+    if not task_path.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    for line in task_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return records
+
+
+def _safe_metric_name(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z_]+", "_", value).strip("_") or "unknown"
+
+
+def summarize_launch_tasks(
+    run_result: dict[str, Any],
+    task_records: list[dict[str, Any]],
+) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    grouped: dict[str, list[float]] = {}
+    starts: list[float] = []
+    ends: list[float] = []
+    for record in task_records:
+        elapsed_s = _numeric(record.get("elapsed_s"))
+        if elapsed_s is None:
+            elapsed_ms = _numeric(record.get("elapsed_ms"))
+            elapsed_s = elapsed_ms / 1000.0 if elapsed_ms is not None else None
+        if elapsed_s is None:
+            continue
+        task = _safe_metric_name(str(record.get("task") or "unknown"))
+        component = record.get("component")
+        prefix = f"launch_task_{task}"
+        if component:
+            prefix = f"{prefix}_{_safe_metric_name(str(component))}"
+        grouped.setdefault(prefix, []).append(elapsed_s)
+        end_s = _numeric(record.get("timestamp_s"))
+        if end_s is not None:
+            ends.append(end_s)
+            starts.append(end_s - elapsed_s)
+
+    for prefix, values in grouped.items():
+        summary[f"{prefix}_avg_s"] = statistics.mean(values)
+        summary[f"{prefix}_max_s"] = max(values)
+        summary[f"{prefix}_count"] = float(len(values))
+
+    if starts and ends:
+        observed_span_s = max(ends) - min(starts)
+        summary["launch_task_observed_span_s"] = max(0.0, observed_span_s)
+        wall_s = _numeric(run_result.get("launch_wall_s"))
+        if wall_s is not None:
+            summary["launch_task_unexplained_s"] = max(0.0, wall_s - observed_span_s)
+    return summary
+
+
+def collect_runai_stream_info(server_log_path: str | Path | None) -> dict[str, float]:
+    if not server_log_path:
+        return {}
+    path = Path(server_log_path)
+    if not path.exists():
+        return {}
+    result = {
+        "runai_transformer_stream_count": 0.0,
+        "runai_transformer_stream_time_s": 0.0,
+        "runai_text_encoder_stream_count": 0.0,
+        "runai_text_encoder_stream_time_s": 0.0,
+    }
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = RUNAI_STREAM_RE.search(line)
+        if not match:
+            continue
+        gib = float(match.group(1))
+        elapsed_s = float(match.group(2))
+        # Z-Image transformer shards total about 11.5 GiB. Text encoder shards
+        # are smaller in the reference setup, so this threshold is sufficient
+        # for diagnosis without adding intrusive runtime tags.
+        bucket = "transformer" if gib >= 8.0 else "text_encoder"
+        result[f"runai_{bucket}_stream_count"] += 1.0
+        result[f"runai_{bucket}_stream_time_s"] += elapsed_s
+    return result
+
+
+def collect_text_encoder_source_info_from_log(
+    server_log_path: str | Path | None,
+) -> tuple[list[str], int]:
+    if not server_log_path:
+        return [], 0
+    path = Path(server_log_path)
+    if not path.exists():
+        return [], 0
+    sources: set[str] = set()
+    fallback_count = 0
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "component=text_encoder" in line and "ProfileModuleLoadDone" in line:
+            match = re.search(r"\bsource=([^\s]+)", line)
+            if match:
+                sources.add(match.group(1))
+        if "Loaded text_encoder:" in line:
+            match = re.search(r"\(([^()]+)\s+version\)", line)
+            if match:
+                sources.add(match.group(1))
+        if "Native component text_encoder" in line:
+            sources.add("native")
+            fallback_count += 1
+        elif "falling back to native version" in line and "text_encoder" in line:
+            fallback_count += 1
+    return sorted(sources), fallback_count
 
 
 def collect_text_encoder_source_info(
@@ -762,11 +950,18 @@ def summarize_run(
     run_result: dict[str, Any],
     records: list[dict[str, Any]],
     module_records: list[dict[str, Any]] | None = None,
+    launch_task_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, float]:
     summary: dict[str, float] = {
         "launch_wall_s": float(run_result["launch_wall_s"]),
         "ready": 1.0 if run_result["ready"] else 0.0,
     }
+    measurement_pass = str(run_result.get("measurement_pass") or "")
+    if measurement_pass in ("timing", "metrics"):
+        pass_metric = (
+            "wall_timing_s" if measurement_pass == "timing" else "wall_profiled_s"
+        )
+        summary[pass_metric] = float(run_result["launch_wall_s"])
     for field in ("health_ready_s", "models_ready_s", "log_ready_s"):
         value = _numeric(run_result.get(field))
         if value is not None:
@@ -775,12 +970,22 @@ def summarize_run(
         value = _numeric(run_result.get(field))
         if value is not None:
             summary[field] = value
+    reference_launch_time_s = _numeric(run_result.get("reference_launch_time_s"))
+    if reference_launch_time_s is not None:
+        summary["wall_delta_vs_reference_s"] = (
+            float(run_result["launch_wall_s"]) - reference_launch_time_s
+        )
     grouped: dict[tuple[str, str], list[dict[str, float]]] = {}
+    backend_counts: dict[tuple[str, str, str], int] = {}
     for record in records:
         component = str(record.get("component", "unknown"))
-        grouped.setdefault((component, _rank_bucket(record)), []).append(
-            _metric_values(record)
-        )
+        bucket = _rank_bucket(record)
+        grouped.setdefault((component, bucket), []).append(_metric_values(record))
+        backend = record.get(READ_BACKEND_FIELD)
+        if backend:
+            backend_counts[(component, bucket, str(backend))] = (
+                backend_counts.get((component, bucket, str(backend)), 0) + 1
+            )
 
     metric_names = sorted(
         {
@@ -804,6 +1009,14 @@ def summarize_run(
                     metric_values
                 )
                 summary[f"{component}_nonrank_max_{metric}"] = max(metric_values)
+    for (component, bucket, backend), count in backend_counts.items():
+        backend_key = _safe_metric_name(backend)
+        if bucket == "rank0":
+            summary[f"{component}_rank0_read_backend_{backend_key}_count"] = float(count)
+        else:
+            summary[f"{component}_nonrank_read_backend_{backend_key}_count"] = float(
+                count
+            )
     module_records = module_records or []
     module_grouped: dict[tuple[str, str], list[dict[str, float]]] = {}
     max_module_end_s: float | None = None
@@ -845,6 +1058,63 @@ def summarize_run(
     if max_module_end_s is not None and run_result.get("start_epoch_s") is not None:
         explained_s = max_module_end_s - float(run_result["start_epoch_s"])
         summary["wall_unexplained_s"] = max(0.0, summary["launch_wall_s"] - explained_s)
+    runai_info = collect_runai_stream_info(run_result.get("server_log_path"))
+    summary.update(runai_info)
+    if launch_task_records is not None:
+        summary.update(summarize_launch_tasks(run_result, launch_task_records))
+    return summary
+
+
+def summarize_combined_run(
+    *,
+    setup: str,
+    timing_result: dict[str, Any] | None,
+    metrics_result: dict[str, Any] | None,
+    records: list[dict[str, Any]],
+    module_records: list[dict[str, Any]],
+) -> dict[str, float]:
+    official_result = timing_result or metrics_result
+    if official_result is None:
+        return {"ready": 0.0}
+
+    launch_task_records = load_launch_task_records(
+        official_result.get("launch_task_log_path")
+    )
+    summary = summarize_run(
+        official_result,
+        records,
+        module_records,
+        launch_task_records=launch_task_records,
+    )
+    summary["ready"] = 1.0 if official_result.get("ready") else 0.0
+    if timing_result is not None:
+        summary["wall_timing_s"] = float(timing_result["launch_wall_s"])
+        reference_launch_time_s = _numeric(timing_result.get("reference_launch_time_s"))
+        if reference_launch_time_s is not None:
+            summary["wall_delta_vs_reference_s"] = (
+                float(timing_result["launch_wall_s"]) - reference_launch_time_s
+            )
+    if metrics_result is not None:
+        summary["wall_profiled_s"] = float(metrics_result["launch_wall_s"])
+    if timing_result is not None and metrics_result is not None:
+        summary["profile_overhead_s"] = (
+            float(metrics_result["launch_wall_s"])
+            - float(timing_result["launch_wall_s"])
+        )
+        summary["profile_intrusive"] = (
+            1.0 if abs(summary["profile_overhead_s"]) > 2.0 else 0.0
+        )
+
+        # Keep RunAI stream diagnosis from both passes visible. The official
+        # timing pass explains production wall time; metrics pass explains JSONs.
+        timing_runai = collect_runai_stream_info(timing_result.get("server_log_path"))
+        metrics_runai = collect_runai_stream_info(metrics_result.get("server_log_path"))
+        for key, value in timing_runai.items():
+            summary[f"timing_{key}"] = value
+        for key, value in metrics_runai.items():
+            summary[f"metrics_{key}"] = value
+    summary["setup_sample_count"] = 1.0
+    summary["setup_is_no_runai"] = 1.0 if setup == "baseline-no-runai" else 0.0
     return summary
 
 
@@ -937,40 +1207,68 @@ def write_outputs(
             )
 
         fp.write("\n## Runs\n\n")
-        fp.write(
-            "| setup | run_id | ready | launch_wall_s | health_ready_s | "
-            "models_ready_s | log_ready_s | ready_mode | reference_case_name | "
-            "reference_launch_time_s | reference_aligned | failure_reason | "
-            "command_diff | text_encoder_sources | text_encoder_fallback_count | "
-            "exit_code | command |\n"
-        )
-        fp.write(
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
-        )
+        run_columns = [
+            "setup",
+            "measurement_pass",
+            "run_id",
+            "ready",
+            "launch_wall_s",
+            "health_ready_s",
+            "models_ready_s",
+            "log_ready_s",
+            "ready_mode",
+            "reference_case_name",
+            "reference_launch_time_s",
+            "reference_aligned",
+            "failure_reason",
+            "command_diff",
+            "text_encoder_sources",
+            "text_encoder_fallback_count",
+            "launch_task_log_path",
+            "env_overrides",
+            "exit_code",
+            "command",
+        ]
+        fp.write("| " + " | ".join(run_columns) + " |\n")
+        fp.write("| " + " | ".join("---" for _ in run_columns) + " |\n")
         for result in run_results:
+            values = {
+                "setup": result["setup"],
+                "measurement_pass": result.get("measurement_pass", ""),
+                "run_id": result["run_id"],
+                "ready": result["ready"],
+                "launch_wall_s": f"{float(result['launch_wall_s']):.2f}",
+                "health_ready_s": _format_cell(result.get("health_ready_s")),
+                "models_ready_s": _format_cell(result.get("models_ready_s")),
+                "log_ready_s": _format_cell(result.get("log_ready_s")),
+                "ready_mode": result.get("ready_mode", ""),
+                "reference_case_name": result.get("reference_case_name", ""),
+                "reference_launch_time_s": _format_cell(
+                    result.get("reference_launch_time_s")
+                ),
+                "reference_aligned": _format_cell(result.get("reference_aligned")),
+                "failure_reason": result.get("failure_reason", ""),
+                "command_diff": "<br>".join(result.get("command_diff", [])),
+                "text_encoder_sources": ", ".join(
+                    result.get("text_encoder_sources", [])
+                ),
+                "text_encoder_fallback_count": result.get(
+                    "text_encoder_fallback_count", 0
+                ),
+                "launch_task_log_path": result.get("launch_task_log_path", ""),
+                "env_overrides": json.dumps(
+                    result.get("env_overrides", {}), sort_keys=True
+                ),
+                "exit_code": result["exit_code"],
+                "command": f"`{str(result.get('command', '')).replace('|', '\\|')}`",
+            }
             fp.write(
-                "| {setup} | {run_id} | {ready} | {wall:.2f} | {health} | "
-                "{models} | {log} | {ready_mode} | {ref_case} | {ref_time} | "
-                "{ref_aligned} | {failure} | {diff} | {sources} | {fallback} | "
-                "{exit_code} | `{command}` |\n".format(
-                    setup=result["setup"],
-                    run_id=result["run_id"],
-                    ready=result["ready"],
-                    wall=float(result["launch_wall_s"]),
-                    health=_format_cell(result.get("health_ready_s")),
-                    models=_format_cell(result.get("models_ready_s")),
-                    log=_format_cell(result.get("log_ready_s")),
-                    ready_mode=result.get("ready_mode", ""),
-                    ref_case=result.get("reference_case_name", ""),
-                    ref_time=_format_cell(result.get("reference_launch_time_s")),
-                    ref_aligned=_format_cell(result.get("reference_aligned")),
-                    failure=result.get("failure_reason", ""),
-                    diff="<br>".join(result.get("command_diff", [])),
-                    sources=", ".join(result.get("text_encoder_sources", [])),
-                    fallback=result.get("text_encoder_fallback_count", 0),
-                    exit_code=result["exit_code"],
-                    command=str(result.get("command", "")).replace("|", "\\|"),
+                "| "
+                + " | ".join(
+                    str(values.get(column, "")).replace("|", "\\|")
+                    for column in run_columns
                 )
+                + " |\n"
             )
 
     return md_path, csv_path
@@ -979,6 +1277,7 @@ def write_outputs(
 def main() -> None:
     args = parse_args()
     setups = split_setups(args.setups)
+    passes = measurement_passes(args.measurement_pass)
     if args.repeat_k <= 0:
         raise ValueError("--repeat-k must be positive")
     args._reference_case = load_reference_case(args)
@@ -988,35 +1287,76 @@ def main() -> None:
     run_summaries: list[tuple[str, dict[str, float]]] = []
     for setup in setups:
         for index in range(args.repeat_k):
-            run_id = f"{base_run_id}_{setup.replace('-', '_')}_r{index + 1}"
-            result = run_launch(args, setup, run_id)
-            if result.get("failure_reason") != "reference_command_diff":
-                resolved_server_args = load_server_args_from_log(
-                    result["server_log_path"]
+            per_pass_results: dict[str, dict[str, Any]] = {}
+            for measurement_pass in passes:
+                pass_suffix = measurement_pass if len(passes) > 1 else measurement_pass
+                run_id = (
+                    f"{base_run_id}_{setup.replace('-', '_')}_r{index + 1}"
+                    f"_{pass_suffix}"
                 )
-                server_args_errors = validate_server_args(resolved_server_args)
-                result["server_args_validation_errors"] = server_args_errors
-                if server_args_errors:
+                result = run_launch(
+                    args,
+                    setup,
+                    run_id,
+                    measurement_pass=measurement_pass,
+                )
+                if result.get("failure_reason") != "reference_command_diff":
+                    resolved_server_args = load_server_args_from_log(
+                        result["server_log_path"]
+                    )
+                    server_args_errors = validate_server_args(resolved_server_args)
+                    result["server_args_validation_errors"] = server_args_errors
+                    if server_args_errors:
+                        result["ready"] = False
+                        result["failure_reason"] = "reference_args_violation"
+
+                module_records = load_module_records(args.profile_output_dir, run_id)
+                text_encoder_sources, text_encoder_fallback_count = (
+                    collect_text_encoder_source_info(module_records)
+                )
+                if not text_encoder_sources and text_encoder_fallback_count == 0:
+                    text_encoder_sources, text_encoder_fallback_count = (
+                        collect_text_encoder_source_info_from_log(
+                            result.get("server_log_path")
+                        )
+                    )
+                result["text_encoder_fallback_count"] = text_encoder_fallback_count
+                result["text_encoder_sources"] = text_encoder_sources
+                if (
+                    args.fail_on_native_text_encoder_fallback
+                    and text_encoder_fallback_count
+                ):
                     result["ready"] = False
-                    result["failure_reason"] = "reference_args_violation"
-            records = load_profile_records(args.profile_output_dir, run_id)
-            module_records = load_module_records(args.profile_output_dir, run_id)
-            text_encoder_sources, text_encoder_fallback_count = (
-                collect_text_encoder_source_info(module_records)
+                    result["failure_reason"] = "native_text_encoder_fallback"
+                run_results.append(result)
+                per_pass_results[measurement_pass] = result
+                with open(result["run_meta_path"], "w", encoding="utf-8") as fp:
+                    json.dump(result, fp, indent=2, sort_keys=True)
+                    fp.write("\n")
+
+            timing_result = per_pass_results.get("timing")
+            metrics_result = per_pass_results.get("metrics")
+            metrics_run_id = (
+                metrics_result.get("run_id")
+                if metrics_result is not None
+                else per_pass_results[passes[-1]].get("run_id")
             )
-            result["text_encoder_fallback_count"] = text_encoder_fallback_count
-            result["text_encoder_sources"] = text_encoder_sources
-            if args.fail_on_native_text_encoder_fallback and text_encoder_fallback_count:
-                result["ready"] = False
-                result["failure_reason"] = "native_text_encoder_fallback"
-            run_results.append(result)
-            if result["ready"]:
+            records = load_profile_records(args.profile_output_dir, metrics_run_id)
+            module_records = load_module_records(args.profile_output_dir, metrics_run_id)
+            official = timing_result or metrics_result
+            if official and official.get("ready"):
                 run_summaries.append(
-                    (setup, summarize_run(result, records, module_records))
+                    (
+                        setup,
+                        summarize_combined_run(
+                            setup=setup,
+                            timing_result=timing_result,
+                            metrics_result=metrics_result,
+                            records=records,
+                            module_records=module_records,
+                        ),
+                    )
                 )
-            with open(result["run_meta_path"], "w", encoding="utf-8") as fp:
-                json.dump(result, fp, indent=2, sort_keys=True)
-                fp.write("\n")
 
     columns, rows = aggregate_by_setup(run_summaries)
     md_path, csv_path = write_outputs(args.summary_output, columns, rows, run_results)

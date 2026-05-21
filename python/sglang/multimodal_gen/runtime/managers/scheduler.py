@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.warmup_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
+from sglang.multimodal_gen.runtime.utils.launch_task_logger import record_task
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.request_profiling import (
     RequestCsvProfiler,
@@ -78,10 +79,17 @@ class Scheduler(SchedulerDisaggMixin):
         endpoint = server_args.scheduler_endpoint
         if gpu_id == 0:
             # router allocates identify (envelope) for each connection
+            scheduler_bind_start = time.perf_counter()
             self.receiver, actual_endpoint = get_zmq_socket(
                 self.context, zmq.ROUTER, endpoint, True
             )
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
+            record_task(
+                "scheduler_bind",
+                start_perf=scheduler_bind_start,
+                rank=gpu_id,
+                extra={"endpoint": actual_endpoint},
+            )
         else:
             self.receiver = None
 

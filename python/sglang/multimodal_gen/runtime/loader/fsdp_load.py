@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
+    resolve_safetensors_read_backend,
     safetensors_weights_iterator,
 )
 from sglang.multimodal_gen.runtime.loader.weight_broadcast import (
@@ -289,6 +290,17 @@ def maybe_load_fsdp_model(
             use_runai_model_streamer = False
 
         if preloaded_custom_param_sd is None:
+            if weight_load_profile is not None:
+                read_backend = resolve_safetensors_read_backend(
+                    use_runai_model_streamer
+                )
+                if (
+                    broadcast_decision.enabled
+                    and broadcast_decision.sp_rank == 0
+                    and use_runai_model_streamer is False
+                ):
+                    read_backend = "rank0-broadcast-no-runai"
+                weight_load_profile.set_read_backend(read_backend)
             weight_iterator = safetensors_weights_iterator(
                 weight_dir_list,
                 use_runai_model_streamer=use_runai_model_streamer,
@@ -303,6 +315,8 @@ def maybe_load_fsdp_model(
                 weight_load_profile=weight_load_profile,
             )
         else:
+            if weight_load_profile is not None:
+                weight_load_profile.set_read_backend("warm-pool")
             weight_iterator = iter(())
 
         param_names_mapping_fn = get_param_names_mapping(model.param_names_mapping)
@@ -364,6 +378,8 @@ def maybe_load_fsdp_model(
                     weight_load_profile=weight_load_profile,
                 )
         else:
+            if weight_load_profile is not None:
+                weight_load_profile.set_read_backend("rank0-broadcast-receive")
             log_broadcast_stage(
                 "nonrank_empty_materialize_start",
                 broadcast_decision.sp_group,

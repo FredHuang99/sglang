@@ -26,6 +26,10 @@ from sglang.multimodal_gen.runtime.server_args import (
     set_global_server_args,
 )
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
+from sglang.multimodal_gen.runtime.utils.launch_task_logger import (
+    mark_task_start,
+    record_task,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.multimodal_gen.runtime.warmup_utils import build_server_warmup_reqs
 
@@ -302,6 +306,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     scheduler_pipe_readers = []
     scheduler_pipe_writers = []
 
+    parent_worker_spawn_start = time.perf_counter()
     for i in range(num_gpus):
         reader, writer = mp.Pipe(duplex=False)
         scheduler_pipe_writers.append(writer)
@@ -342,6 +347,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         scheduler_pipe_readers.append(reader)
         process.start()
         processes.append(process)
+    record_task(
+        "parent_worker_spawn",
+        start_perf=parent_worker_spawn_start,
+        rank=None,
+        extra={"num_gpus": num_gpus},
+    )
 
     # Wait for all workers to be ready
     scheduler_infos = []
@@ -358,6 +369,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     for p in result_pipes_from_slaves_r:
         p.close()
 
+    parent_wait_start = time.perf_counter()
     for i, reader in enumerate(scheduler_pipe_readers):
         try:
             data = reader.recv()
@@ -375,6 +387,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
             )
         scheduler_infos.append(data)
         reader.close()
+    record_task(
+        "parent_wait_workers_ready",
+        start_perf=parent_wait_start,
+        rank=None,
+        extra={"num_gpus": num_gpus},
+    )
 
     logger.debug("All workers are ready")
 
@@ -676,6 +694,7 @@ def _run_disagg_role_process(
 
 
 def launch_http_server_only(server_args):
+    mark_task_start("http_server_startup")
     # set for endpoints to access global_server_args
     set_global_server_args(server_args)
     app = create_app(server_args)
@@ -929,7 +948,9 @@ def dispatch_launch(server_args: ServerArgs):
 
 
 if __name__ == "__main__":
+    entrypoint_bootstrap_start = time.perf_counter()
     server_args = prepare_server_args(sys.argv[1:])
+    record_task("entrypoint_bootstrap", start_perf=entrypoint_bootstrap_start, rank=None)
 
     try:
         dispatch_launch(server_args)

@@ -6,6 +6,7 @@ import importlib
 import logging
 import os
 import pkgutil
+import time
 from abc import ABC
 from typing import Any, Type
 
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import get_hf_config
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.launch_task_logger import record_task
 from sglang.multimodal_gen.runtime.utils.module_load_profiler import (
     DiffusionModuleLoadProfiler,
 )
@@ -88,6 +90,12 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
+        launch_task_start = time.perf_counter()
+        launch_task_extra = {
+            "component_model_path": component_model_path,
+            "loader": self.__class__.__name__,
+            "library": transformers_or_diffusers,
+        }
         profile_logs_enabled = getattr(
             server_args, "profile_enabled", False
         ) or logger.isEnabledFor(logging.DEBUG)
@@ -248,7 +256,23 @@ class ComponentLoader(ABC):
                     customized_error_type=customized_error_type,
                     transformers_or_diffusers=transformers_or_diffusers,
                 )
+            record_task(
+                "component_load",
+                start_perf=launch_task_start,
+                component=component_name,
+                status="error",
+                extra=launch_task_extra,
+                error=f"{type(exc).__name__}: {exc}",
+            )
             raise
+        record_task(
+            "component_load",
+            start_perf=launch_task_start,
+            component=component_name,
+            status="ok" if component is not None else "error",
+            extra=launch_task_extra,
+            error=None if component is not None else "component_none",
+        )
         return component, float(consumed or 0.0)
 
     def load_native(

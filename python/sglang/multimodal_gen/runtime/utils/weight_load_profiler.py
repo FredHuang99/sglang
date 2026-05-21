@@ -45,6 +45,7 @@ WEIGHT_LOAD_WARM_POOL_EFFECTIVE = "weight_load:warm_pool_effective"
 WEIGHT_LOAD_WARM_POOL_HIT = "weight_load:warm_pool_hit"
 WEIGHT_LOAD_WARM_POOL_STORE_BYTES = "weight_load:warm_pool_store_bytes"
 WEIGHT_LOAD_WARM_POOL_ERROR = "weight_load:warm_pool_error"
+WEIGHT_LOAD_READ_BACKEND = "weight_load:read_backend"
 
 WEIGHT_LOAD_TIMING_FIELDS = (
     WEIGHT_LOAD_DISCOVER_FILES_MS,
@@ -137,6 +138,9 @@ class DiffusionWeightLoadProfiler:
             WEIGHT_LOAD_WARM_POOL_HIT: False,
             WEIGHT_LOAD_WARM_POOL_STORE_BYTES: 0,
             WEIGHT_LOAD_WARM_POOL_ERROR: None,
+        }
+        self._read_fields: dict[str, Any] = {
+            WEIGHT_LOAD_READ_BACKEND: "unknown",
         }
         self._status = "running"
         self._error: str | None = None
@@ -275,6 +279,11 @@ class DiffusionWeightLoadProfiler:
             return
         self._warm_pool_fields[WEIGHT_LOAD_WARM_POOL_ERROR] = error
 
+    def set_read_backend(self, backend: str) -> None:
+        if not self.active:
+            return
+        self._read_fields[WEIGHT_LOAD_READ_BACKEND] = backend
+
     def profile_safetensors_iterator(
         self, iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -315,6 +324,7 @@ class DiffusionWeightLoadProfiler:
             **self._staging_fields,
             **self._load_mode_fields,
             **self._warm_pool_fields,
+            **self._read_fields,
         }
         return record
 

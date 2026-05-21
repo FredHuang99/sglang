@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
+from sglang.multimodal_gen.runtime.utils.launch_task_logger import finish_marked_task
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.version import __version__
 
@@ -49,6 +50,16 @@ async def lifespan(app: FastAPI):
 
     # 2. Start the ZMQ Broker in the background to handle offline requests
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
+    finish_marked_task(
+        "http_server_startup",
+        "http_server_startup",
+        rank=None,
+        extra={
+            "host": server_args.host,
+            "port": server_args.port,
+            "url": f"http://{server_args.host}:{server_args.port}/health",
+        },
+    )
 
     yield
 
