@@ -486,7 +486,7 @@ def load_reference_case(args: argparse.Namespace) -> dict[str, Any] | None:
     for case in data.get("cases", []):
         parallelism = case.get("resolved_parallelism", {})
         if (
-            case.get("model_key") == "wan2.2-ti2v-5b"
+            case.get("model_key") == "z-image"
             and int(case.get("gpu_count", -1)) == int(args.num_gpus)
             and int(parallelism.get("tp_size", -1)) == 1
             and int(parallelism.get("sp_degree", -1)) == int(args.sp_degree)
