@@ -303,6 +303,19 @@ def prepare_request(
     if diffusers_kwargs:
         req.extra["diffusers_kwargs"] = diffusers_kwargs
 
+    for key in (
+        "resolution_key",
+        "ddit_resolution_key",
+        "ddit_initial_ranks",
+        "ddit_switch_plan",
+        "ddit_vae_k",
+        "ddit_vae_ranks",
+    ):
+        if hasattr(sampling_params, key):
+            value = getattr(sampling_params, key)
+            if value is not None:
+                req.extra[key] = value
+
     req.adjust_size(server_args)
 
     if not isinstance(req.prompt, str):

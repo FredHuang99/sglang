@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.runtime.ddit.logging import record_lifecycle
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
@@ -395,6 +396,14 @@ class Scheduler(SchedulerDisaggMixin):
                         and req.metrics.arrival_time_s is None
                     ):
                         req.metrics.arrival_time_s = now_s
+                    if isinstance(req, Req) and not req.is_warmup:
+                        record_lifecycle(
+                            self.server_args,
+                            req,
+                            "add",
+                            timestamp=now_s,
+                            status="queued",
+                        )
                 self.waiting_queue.extend(new_reqs)
                 # Reset error count on success
                 self._consecutive_error_count = 0

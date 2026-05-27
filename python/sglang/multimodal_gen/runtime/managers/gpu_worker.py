@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
+from sglang.multimodal_gen.runtime.ddit.dynamic_sp import prebuild_dynamic_sp_groups
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
@@ -99,7 +100,14 @@ class GPUWorker:
             os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cuda"
             torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
+        master_addr = (
+            self.server_args.ddit_advertised_host
+            or self.server_args.disagg_p2p_hostname
+            or "127.0.0.1"
+        )
+        if master_addr == "0.0.0.0":
+            master_addr = "127.0.0.1"
+        os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
@@ -112,11 +120,10 @@ class GPUWorker:
             ring_degree=self.server_args.ring_degree,
             sp_size=self.server_args.sp_degree,
             dp_size=self.server_args.dp_size,
-            distributed_init_method=NetworkAddress(
-                "127.0.0.1", self.master_port
-            ).to_tcp(),
+            distributed_init_method=NetworkAddress(master_addr, self.master_port).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+        prebuild_dynamic_sp_groups(self.server_args)
 
         # set proc title
         role = getattr(self.server_args, "disagg_role", "scheduler")

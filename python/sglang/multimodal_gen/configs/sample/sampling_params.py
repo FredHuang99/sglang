@@ -184,6 +184,14 @@ class SamplingParams:
     return_file_paths_only: bool = True
     enable_sequence_shard: bool | None = None
 
+    # Elastic DDiT request-level controls.
+    resolution_key: str | None = None
+    ddit_resolution_key: str | None = None
+    ddit_initial_ranks: str | list[int] | None = None
+    ddit_switch_plan: str | list[dict[str, Any]] | None = None
+    ddit_vae_k: int | None = None
+    ddit_vae_ranks: str | list[int] | None = None
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
@@ -833,6 +841,36 @@ class SamplingParams:
             "--enable-sequence-shard",
             action=StoreBoolean,
             help="Enable sequence dimension shard with sequence parallelism.",
+        )
+        add_argument(
+            "--resolution-key",
+            type=str,
+            help="Resolution label used by DDiT scheduling/logging, e.g. 144p or 720p.",
+        )
+        add_argument(
+            "--ddit-resolution-key",
+            type=str,
+            help="Alias for --resolution-key used by DDiT experiments.",
+        )
+        add_argument(
+            "--ddit-initial-ranks",
+            type=str,
+            help="Request-level DDiT initial ranks, e.g. '0' or '0,1'.",
+        )
+        add_argument(
+            "--ddit-switch-plan",
+            type=str,
+            help="Request-level DDiT switch plan, e.g. '15:1->2;30:2->4;45:4->8'.",
+        )
+        add_argument(
+            "--ddit-vae-k",
+            type=int,
+            help="Request-level DDiT VAE GPU count override.",
+        )
+        add_argument(
+            "--ddit-vae-ranks",
+            type=str,
+            help="Request-level explicit DDiT VAE ranks. Overrides --ddit-vae-k.",
         )
         add_argument(
             "--enable-frame-interpolation",

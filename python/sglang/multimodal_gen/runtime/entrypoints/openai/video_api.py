@@ -81,6 +81,12 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
         output_path=request.output_path,
         output_compression=request.output_compression,
         output_quality=request.output_quality,
+        resolution_key=request.resolution_key,
+        ddit_resolution_key=request.ddit_resolution_key,
+        ddit_initial_ranks=request.ddit_initial_ranks,
+        ddit_switch_plan=request.ddit_switch_plan,
+        ddit_vae_k=request.ddit_vae_k,
+        ddit_vae_ranks=request.ddit_vae_ranks,
     )
 
 
@@ -314,6 +320,9 @@ async def create_video(
             raise HTTPException(status_code=400, detail=f"Invalid request body: {e}")
 
     # Resolve per-request output_path override
+    if req.request_id:
+        request_id = req.request_id
+
     effective_output_path = req.output_path or server_args.output_path
     if effective_output_path is None:
         output_tmp = tempfile.mkdtemp(prefix="sglang_output_")

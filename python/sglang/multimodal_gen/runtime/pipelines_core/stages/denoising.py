@@ -32,6 +32,16 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
 )
+from sglang.multimodal_gen.runtime.ddit.config import build_execution_plan
+from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
+    broadcast_tensor_from_rank,
+    current_rank_in,
+    use_dynamic_sp_group,
+)
+from sglang.multimodal_gen.runtime.ddit.logging import (
+    record_lifecycle,
+    record_rank_switch,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -979,6 +989,250 @@ class DenoisingStage(PipelineStage):
 
         return latents
 
+    def _run_single_denoising_step(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        prepared_vars: dict[str, Any],
+        latents: torch.Tensor,
+        timestep_index: int,
+        t_host: torch.Tensor,
+        timesteps_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one denoising step using already prepared invariant state."""
+        target_dtype = prepared_vars["target_dtype"]
+        timesteps = prepared_vars["timesteps"]
+        boundary_timestep = prepared_vars["boundary_timestep"]
+        seq_len = prepared_vars["seq_len"]
+        reserved_frames_mask = prepared_vars["reserved_frames_mask"]
+        z = prepared_vars["z"]
+
+        t_int = int(t_host.item())
+        t_device = timesteps[timestep_index]
+        current_model, current_guidance_scale = self._select_and_manage_model(
+            t_int=t_int,
+            boundary_timestep=boundary_timestep,
+            server_args=server_args,
+            batch=batch,
+        )
+
+        latent_model_input = latents.to(target_dtype)
+        if batch.image_latent is not None:
+            assert (
+                not server_args.pipeline_config.task_type == ModelTaskType.TI2V
+            ), "image latents should not be provided for TI2V task"
+            latent_model_input = torch.cat(
+                [latent_model_input, batch.image_latent], dim=1
+            ).to(target_dtype)
+
+        timestep = self.expand_timestep_before_forward(
+            batch,
+            server_args,
+            t_device,
+            target_dtype,
+            seq_len,
+            reserved_frames_mask,
+        )
+
+        latent_model_input = self.scheduler.scale_model_input(
+            latent_model_input, t_device
+        )
+
+        attn_metadata = self._build_attn_metadata(
+            timestep_index,
+            batch,
+            server_args,
+            timestep_value=t_int,
+            timesteps=timesteps_cpu,
+        )
+        noise_pred = self._predict_noise_with_cfg(
+            current_model=current_model,
+            latent_model_input=latent_model_input,
+            timestep=timestep,
+            batch=batch,
+            timestep_index=timestep_index,
+            attn_metadata=attn_metadata,
+            target_dtype=target_dtype,
+            current_guidance_scale=current_guidance_scale,
+            image_kwargs=prepared_vars["image_kwargs"],
+            pos_cond_kwargs=prepared_vars["pos_cond_kwargs"],
+            neg_cond_kwargs=prepared_vars["neg_cond_kwargs"],
+            server_args=server_args,
+            guidance=prepared_vars["guidance"],
+            latents=latents,
+        )
+
+        if server_args.comfyui_mode:
+            batch.noise_pred = noise_pred
+
+        latents = self.scheduler.step(
+            model_output=noise_pred,
+            timestep=t_device,
+            sample=latents,
+            **prepared_vars["extra_step_kwargs"],
+            return_dict=False,
+        )[0]
+
+        return self.post_forward_for_ti2v_task(
+            batch, server_args, reserved_frames_mask, latents, z
+        )
+
+    def _canonicalize_ddit_latents(
+        self,
+        *,
+        batch: Req,
+        latents: torch.Tensor,
+        active_ranks: tuple[int, ...],
+    ) -> torch.Tensor:
+        """Gather active SP shards if needed, then broadcast full latents globally."""
+        with use_dynamic_sp_group(self.server_args, active_ranks):
+            if current_rank_in(active_ranks):
+                latents, _ = self._postprocess_sp_latents(batch, latents, None)
+                batch.did_sp_shard_latents = False
+
+        src_rank = active_ranks[0]
+        latents = broadcast_tensor_from_rank(latents.contiguous(), src=src_rank)
+        batch.latents = latents
+        batch.did_sp_shard_latents = False
+        if getattr(self.server_args, "ddit_debug_cpu_backup", False):
+            batch.extra["ddit_cpu_latent_backup"] = latents.detach().cpu()
+        return latents
+
+    def _prepare_ddit_segment(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        active_ranks: tuple[int, ...],
+        begin_index: int,
+    ) -> tuple[dict[str, Any], torch.Tensor]:
+        """Prepare denoising state under the current dynamic SP rank set."""
+        with use_dynamic_sp_group(server_args, active_ranks):
+            self.scheduler.set_begin_index(begin_index)
+            prepared_vars = self._prepare_denoising_loop(batch, server_args)
+            return prepared_vars, prepared_vars["latents"]
+
+    @torch.no_grad()
+    def _forward_ddit(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> Req:
+        """Run denoising with step-boundary DDiT rank switching."""
+        plan = build_execution_plan(
+            server_args, batch, world_size=get_world_group().world_size
+        )
+        active_ranks = plan.initial_ranks
+        batch.extra["ddit_initial_ranks"] = list(active_ranks)
+        record_lifecycle(server_args, batch, "dit_start")
+        prepared_vars, latents = self._prepare_ddit_segment(
+            batch=batch,
+            server_args=server_args,
+            active_ranks=active_ranks,
+            begin_index=0,
+        )
+
+        target_dtype = prepared_vars["target_dtype"]
+        autocast_enabled = prepared_vars["autocast_enabled"]
+        timesteps = prepared_vars["timesteps"]
+        num_inference_steps = prepared_vars["num_inference_steps"]
+        num_warmup_steps = prepared_vars["num_warmup_steps"]
+        is_warmup = batch.is_warmup
+        timesteps_cpu = timesteps.cpu()
+        num_timesteps = timesteps_cpu.shape[0]
+        trajectory_timesteps: list[torch.Tensor] = []
+        trajectory_latents: list[torch.Tensor] = []
+        denoising_start_time = time.time()
+
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=target_dtype,
+            enabled=autocast_enabled,
+        ):
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for i, t_host in enumerate(timesteps_cpu):
+                    with use_dynamic_sp_group(server_args, active_ranks):
+                        if current_rank_in(active_ranks):
+                            with StageProfiler(
+                                f"denoising_step_{i}",
+                                logger=logger,
+                                metrics=batch.metrics,
+                                perf_dump_path_provided=batch.perf_dump_path is not None,
+                            ):
+                                latents = self._run_single_denoising_step(
+                                    batch=batch,
+                                    server_args=server_args,
+                                    prepared_vars=prepared_vars,
+                                    latents=latents,
+                                    timestep_index=i,
+                                    t_host=t_host,
+                                    timesteps_cpu=timesteps_cpu,
+                                )
+
+                    completed_step = i + 1
+                    batch.step_index = completed_step
+
+                    if current_rank_in(active_ranks) and batch.return_trajectory_latents:
+                        trajectory_timesteps.append(t_host)
+                        trajectory_latents.append(latents)
+
+                    if i == num_timesteps - 1 or (
+                        completed_step > num_warmup_steps
+                        and completed_step % self.scheduler.order == 0
+                        and progress_bar is not None
+                    ):
+                        progress_bar.update()
+
+                    if not is_warmup and current_rank_in(active_ranks):
+                        self.step_profile()
+
+                    switch_event = plan.switch_after(completed_step)
+                    if switch_event is not None and completed_step < num_timesteps:
+                        old_ranks = active_ranks
+                        latents = self._canonicalize_ddit_latents(
+                            batch=batch, latents=latents, active_ranks=old_ranks
+                        )
+                        active_ranks = switch_event.ranks
+                        record_rank_switch(
+                            server_args,
+                            batch,
+                            stage="dit",
+                            step=completed_step,
+                            old_ranks=old_ranks,
+                            new_ranks=active_ranks,
+                            reason=switch_event.reason,
+                            policy="forced_switch_plan",
+                        )
+                        prepared_vars, latents = self._prepare_ddit_segment(
+                            batch=batch,
+                            server_args=server_args,
+                            active_ranks=active_ranks,
+                            begin_index=completed_step,
+                        )
+
+        denoising_end_time = time.time()
+        if num_timesteps > 0 and not is_warmup:
+            self.log_info(
+                "average time per DDiT step: %.4f seconds",
+                (denoising_end_time - denoising_start_time) / len(timesteps),
+            )
+
+        latents = self._canonicalize_ddit_latents(
+            batch=batch, latents=latents, active_ranks=active_ranks
+        )
+        batch.extra["ddit_final_dit_ranks"] = list(active_ranks)
+        record_lifecycle(server_args, batch, "dit_end")
+        self._post_denoising_loop(
+            batch=batch,
+            latents=latents,
+            trajectory_latents=trajectory_latents,
+            trajectory_timesteps=trajectory_timesteps,
+            server_args=server_args,
+            is_warmup=is_warmup,
+        )
+        return batch
+
     @torch.no_grad()
     def forward(
         self,
@@ -988,24 +1242,23 @@ class DenoisingStage(PipelineStage):
         """
         Run the denoising loop.
         """
+        if getattr(server_args, "enable_ddit", False) and not batch.is_warmup:
+            plan = build_execution_plan(
+                server_args, batch, world_size=get_world_group().world_size
+            )
+            if plan.enabled:
+                return self._forward_ddit(batch, server_args)
+            record_lifecycle(server_args, batch, "dit_start")
+
         # Prepare variables for the denoising loop
 
         prepared_vars = self._prepare_denoising_loop(batch, server_args)
-        extra_step_kwargs = prepared_vars["extra_step_kwargs"]
         target_dtype = prepared_vars["target_dtype"]
         autocast_enabled = prepared_vars["autocast_enabled"]
         timesteps = prepared_vars["timesteps"]
         num_inference_steps = prepared_vars["num_inference_steps"]
         num_warmup_steps = prepared_vars["num_warmup_steps"]
-        image_kwargs = prepared_vars["image_kwargs"]
-        pos_cond_kwargs = prepared_vars["pos_cond_kwargs"]
-        neg_cond_kwargs = prepared_vars["neg_cond_kwargs"]
         latents = prepared_vars["latents"]
-        boundary_timestep = prepared_vars["boundary_timestep"]
-        z = prepared_vars["z"]
-        reserved_frames_mask = prepared_vars["reserved_frames_mask"]
-        seq_len = prepared_vars["seq_len"]
-        guidance = prepared_vars["guidance"]
 
         # Initialize lists for ODE trajectory
         trajectory_timesteps: list[torch.Tensor] = []
@@ -1032,81 +1285,14 @@ class DenoisingStage(PipelineStage):
                         metrics=batch.metrics,
                         perf_dump_path_provided=batch.perf_dump_path is not None,
                     ):
-                        t_int = int(t_host.item())
-                        t_device = timesteps[i]
-                        current_model, current_guidance_scale = (
-                            self._select_and_manage_model(
-                                t_int=t_int,
-                                boundary_timestep=boundary_timestep,
-                                server_args=server_args,
-                                batch=batch,
-                            )
-                        )
-
-                        # Expand latents for I2V
-                        latent_model_input = latents.to(target_dtype)
-                        if batch.image_latent is not None:
-                            assert (
-                                not server_args.pipeline_config.task_type
-                                == ModelTaskType.TI2V
-                            ), "image latents should not be provided for TI2V task"
-                            latent_model_input = torch.cat(
-                                [latent_model_input, batch.image_latent], dim=1
-                            ).to(target_dtype)
-
-                        timestep = self.expand_timestep_before_forward(
-                            batch,
-                            server_args,
-                            t_device,
-                            target_dtype,
-                            seq_len,
-                            reserved_frames_mask,
-                        )
-
-                        latent_model_input = self.scheduler.scale_model_input(
-                            latent_model_input, t_device
-                        )
-
-                        # Predict noise residual
-                        attn_metadata = self._build_attn_metadata(
-                            i,
-                            batch,
-                            server_args,
-                            timestep_value=t_int,
-                            timesteps=timesteps_cpu,
-                        )
-                        noise_pred = self._predict_noise_with_cfg(
-                            current_model=current_model,
-                            latent_model_input=latent_model_input,
-                            timestep=timestep,
+                        latents = self._run_single_denoising_step(
                             batch=batch,
-                            timestep_index=i,
-                            attn_metadata=attn_metadata,
-                            target_dtype=target_dtype,
-                            current_guidance_scale=current_guidance_scale,
-                            image_kwargs=image_kwargs,
-                            pos_cond_kwargs=pos_cond_kwargs,
-                            neg_cond_kwargs=neg_cond_kwargs,
                             server_args=server_args,
-                            guidance=guidance,
+                            prepared_vars=prepared_vars,
                             latents=latents,
-                        )
-
-                        # Save noise_pred to batch for external access (e.g., ComfyUI)
-                        if server_args.comfyui_mode:
-                            batch.noise_pred = noise_pred
-
-                        # Compute the previous noisy sample
-                        latents = self.scheduler.step(
-                            model_output=noise_pred,
-                            timestep=t_device,
-                            sample=latents,
-                            **extra_step_kwargs,
-                            return_dict=False,
-                        )[0]
-
-                        latents = self.post_forward_for_ti2v_task(
-                            batch, server_args, reserved_frames_mask, latents, z
+                            timestep_index=i,
+                            t_host=t_host,
+                            timesteps_cpu=timesteps_cpu,
                         )
 
                         # save trajectory latents if needed
@@ -1141,6 +1327,7 @@ class DenoisingStage(PipelineStage):
             server_args=server_args,
             is_warmup=is_warmup,
         )
+        record_lifecycle(server_args, batch, "dit_end")
         return batch
 
     # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare

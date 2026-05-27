@@ -8,8 +8,21 @@ Decoding stage for diffusion pipelines.
 import weakref
 
 import torch
+import torch.distributed as dist
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.ddit.config import resolve_vae_ranks
+from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
+    current_rank_in,
+    use_dynamic_sp_group,
+)
+from sglang.multimodal_gen.runtime.ddit.logging import (
+    record_lifecycle,
+    record_rank_switch,
+)
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    get_world_group,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders.vae_loader import VAELoader
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
@@ -191,6 +204,84 @@ class DecodingStage(PipelineStage):
                 del pipeline.modules[self.component_name]
             self.server_args.model_loaded[self.component_name] = False
 
+    def _forward_ddit_vae(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        self.load_model()
+        final_dit_ranks = tuple(
+            int(rank) for rank in batch.extra.get("ddit_final_dit_ranks", [])
+        )
+        vae_ranks = resolve_vae_ranks(
+            server_args,
+            batch,
+            world_size=get_world_group().world_size,
+            final_dit_ranks=final_dit_ranks,
+        )
+        batch.extra["ddit_vae_ranks"] = list(vae_ranks)
+        record_lifecycle(server_args, batch, "vae_start")
+        record_rank_switch(
+            server_args,
+            batch,
+            stage="vae",
+            step=getattr(batch, "step_index", None),
+            old_ranks=final_dit_ranks,
+            new_ranks=vae_ranks,
+            reason="dit_to_vae",
+            policy="ddit_vae_gpus",
+        )
+
+        frames = None
+        trajectory_decoded = None
+        with use_dynamic_sp_group(server_args, vae_ranks):
+            if current_rank_in(vae_ranks):
+                frames = self.decode(batch.latents, server_args)
+
+                if batch.return_trajectory_decoded:
+                    assert (
+                        batch.trajectory_latents is not None
+                    ), "batch should have trajectory latents"
+                    B, T, C, F, H, W = batch.trajectory_latents.shape
+                    flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
+                    logger.info("decoding %s trajectory latents in batch", B * T)
+                    all_decoded = self.decode(flat_latents, server_args)
+                    decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
+                    trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
+
+        frames = self._broadcast_ddit_tensor(frames, src=vae_ranks[0])
+
+        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        output_batch = OutputBatch(
+            output=frames,
+            trajectory_timesteps=batch.trajectory_timesteps,
+            trajectory_latents=batch.trajectory_latents,
+            trajectory_decoded=trajectory_decoded,
+            metrics=batch.metrics,
+        )
+        if not getattr(batch, "is_warmup", False):
+            self.offload_model()
+        record_lifecycle(server_args, batch, "vae_end")
+        return output_batch
+
+    def _broadcast_ddit_tensor(
+        self, tensor: torch.Tensor | None, *, src: int
+    ) -> torch.Tensor:
+        if not dist.is_available() or not dist.is_initialized():
+            assert tensor is not None
+            return tensor
+
+        rank = dist.get_rank()
+        if rank == src:
+            assert tensor is not None
+            meta = (tuple(tensor.shape), str(tensor.dtype).replace("torch.", ""))
+        else:
+            meta = None
+        obj_list = [meta]
+        dist.broadcast_object_list(obj_list, src=src, group=get_world_group().cpu_group)
+        shape, dtype_name = obj_list[0]
+        dtype = getattr(torch, dtype_name)
+        if rank != src:
+            tensor = torch.empty(shape, dtype=dtype, device=get_local_torch_device())
+        dist.broadcast(tensor, src=src, group=get_world_group().device_group)
+        return tensor
+
     @torch.no_grad()
     def forward(
         self,
@@ -205,6 +296,10 @@ class DecodingStage(PipelineStage):
         trajectory latents for visualization purposes.
 
         """
+        if getattr(server_args, "enable_ddit", False) and not batch.is_warmup:
+            return self._forward_ddit_vae(batch, server_args)
+
+        record_lifecycle(server_args, batch, "vae_start")
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 
@@ -250,4 +345,5 @@ class DecodingStage(PipelineStage):
         if not getattr(batch, "is_warmup", False):
             self.offload_model()
 
+        record_lifecycle(server_args, batch, "vae_end")
         return output_batch

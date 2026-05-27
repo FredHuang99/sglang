@@ -957,9 +957,10 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         **kwargs,
     ) -> torch.Tensor:
         forward_batch = get_forward_context().forward_batch
+        sp_size = get_sp_world_size()
         if forward_batch is not None:
             sequence_shard_enabled = (
-                forward_batch.enable_sequence_shard and self.sp_size > 1
+                forward_batch.enable_sequence_shard and sp_size > 1
             )
         else:
             sequence_shard_enabled = False
@@ -989,7 +990,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             # The rotary embedding layer correctly handles SP offsets internally.
             freqs_cos, freqs_sin = self.rotary_emb.forward_from_grid(
                 (
-                    post_patch_num_frames * self.sp_size,
+                    post_patch_num_frames * sp_size,
                     post_patch_height,
                     post_patch_width,
                 ),
@@ -1012,8 +1013,8 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         seq_len_orig = hidden_states.shape[1]
         seq_shard_pad = 0
         if sequence_shard_enabled:
-            if seq_len_orig % self.sp_size != 0:
-                seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
+            if seq_len_orig % sp_size != 0:
+                seq_shard_pad = sp_size - (seq_len_orig % sp_size)
                 pad = torch.zeros(
                     (batch_size, seq_shard_pad, hidden_states.shape[2]),
                     dtype=hidden_states.dtype,
@@ -1021,9 +1022,9 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 )
                 hidden_states = torch.cat([hidden_states, pad], dim=1)
             sp_rank = get_sp_group().rank_in_group
-            local_seq_len = hidden_states.shape[1] // self.sp_size
+            local_seq_len = hidden_states.shape[1] // sp_size
             hidden_states = hidden_states.view(
-                batch_size, self.sp_size, local_seq_len, hidden_states.shape[2]
+                batch_size, sp_size, local_seq_len, hidden_states.shape[2]
             )
             hidden_states = hidden_states[:, sp_rank, :, :]
 
@@ -1075,7 +1076,7 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                 timestep_proj = torch.cat([timestep_proj, pad], dim=1)
             timestep_proj = timestep_proj.view(
                 batch_size,
-                self.sp_size,
+                sp_size,
                 local_seq_len,
                 timestep_proj.shape[2],
                 timestep_proj.shape[3],

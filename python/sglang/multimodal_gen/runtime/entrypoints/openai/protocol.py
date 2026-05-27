@@ -77,6 +77,7 @@ class VideoResponse(BaseModel):
 
 
 class VideoGenerationsRequest(BaseModel):
+    request_id: Optional[str] = None
     prompt: str
     input_reference: Optional[str] = None
     reference_url: Optional[str] = None
@@ -109,6 +110,12 @@ class VideoGenerationsRequest(BaseModel):
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
+    resolution_key: Optional[str] = None
+    ddit_resolution_key: Optional[str] = None
+    ddit_initial_ranks: Optional[str] = None
+    ddit_switch_plan: Optional[Any] = None
+    ddit_vae_k: Optional[int] = None
+    ddit_vae_ranks: Optional[str] = None
 
 
 class VideoListResponse(BaseModel):

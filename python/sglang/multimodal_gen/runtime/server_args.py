@@ -288,6 +288,22 @@ class ServerArgs:
     pool_control_endpoint: str | None = None  # Instance PULL socket (peer control)
     pool_control_advertised_endpoint: str | None = None  # Reachable peer control URL
 
+    # Elastic DDiT / FlexDiT-style step-wise SP scheduling.
+    enable_ddit: bool = False
+    ddit_node_id: str = "node0"
+    ddit_advertised_host: str | None = None
+    ddit_local_ranks: str | None = None
+    ddit_allowed_gpu_counts: str = "1,2,4,8"
+    ddit_initial_gpus: int = 1
+    ddit_initial_ranks: str | None = None
+    ddit_switch_plan: str | None = None
+    ddit_vae_gpus: int = 1
+    ddit_sp_degree_map: str | None = None
+    ddit_prebuild_sp_groups: bool = True
+    ddit_log_dir: str | None = None
+    ddit_profile_path: str | None = None
+    ddit_debug_cpu_backup: bool = False
+
     # Logging
     log_level: str = "info"
 
@@ -417,7 +433,40 @@ class ServerArgs:
         self._validate_pipeline()
         self._validate_offload()
         self._validate_parallelism()
+        self._validate_ddit()
         self._validate_cfg_parallel()
+
+    def _validate_ddit(self):
+        if not self.enable_ddit:
+            return
+        from sglang.multimodal_gen.runtime.ddit.config import (
+            parse_allowed_gpu_counts,
+            parse_sp_degree_map,
+            parse_switch_plan,
+        )
+
+        allowed = parse_allowed_gpu_counts(self.ddit_allowed_gpu_counts, self.num_gpus)
+        if self.ddit_vae_gpus not in allowed:
+            raise ValueError(
+                f"--ddit-vae-gpus must be one of {allowed}, got {self.ddit_vae_gpus}"
+            )
+        if self.ddit_initial_gpus not in allowed:
+            raise ValueError(
+                f"--ddit-initial-gpus must be one of {allowed}, got {self.ddit_initial_gpus}"
+            )
+        parse_switch_plan(self.ddit_switch_plan)
+        degree_map = parse_sp_degree_map(self.ddit_sp_degree_map)
+        for gpu_count, (ulysses, ring) in degree_map.items():
+            if gpu_count not in allowed:
+                raise ValueError(
+                    f"--ddit-sp-degree-map contains unsupported GPU count "
+                    f"{gpu_count}; allowed counts are {allowed}"
+                )
+            if ulysses * ring != gpu_count:
+                raise ValueError(
+                    f"--ddit-sp-degree-map entry {gpu_count}={ulysses}x{ring} "
+                    f"does not multiply to {gpu_count}"
+                )
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -1030,6 +1079,96 @@ class ServerArgs:
             default=None,
             help="ZMQ endpoint for decoder->encoder result return (e.g., tcp://127.0.0.1:6003). "
             "Auto-assigned if not specified.",
+        )
+
+        # Elastic DDiT / FlexDiT-style step-wise SP scheduling
+        parser.add_argument(
+            "--enable-ddit",
+            action=StoreBoolean,
+            default=ServerArgs.enable_ddit,
+            help="Enable elastic DDiT step-wise rank switching and experiment logs.",
+        )
+        parser.add_argument(
+            "--ddit-node-id",
+            type=str,
+            default=ServerArgs.ddit_node_id,
+            help="Node identifier recorded in DDiT rank-switch logs.",
+        )
+        parser.add_argument(
+            "--ddit-advertised-host",
+            type=str,
+            default=ServerArgs.ddit_advertised_host,
+            help="Reachable host/IP advertised to the DDiT control plane. "
+            "Use a real host address for multi-node deployments.",
+        )
+        parser.add_argument(
+            "--ddit-local-ranks",
+            type=str,
+            default=ServerArgs.ddit_local_ranks,
+            help="Comma-separated global ranks that belong to this node. "
+            "Defaults to all ranks in the local server process.",
+        )
+        parser.add_argument(
+            "--ddit-allowed-gpu-counts",
+            type=str,
+            default=ServerArgs.ddit_allowed_gpu_counts,
+            help="Comma-separated power-of-two GPU counts allowed for DDiT SP groups.",
+        )
+        parser.add_argument(
+            "--ddit-initial-gpus",
+            type=int,
+            default=ServerArgs.ddit_initial_gpus,
+            help="Default number of GPUs assigned to a DDiT request at DiT start.",
+        )
+        parser.add_argument(
+            "--ddit-initial-ranks",
+            type=str,
+            default=ServerArgs.ddit_initial_ranks,
+            help="Optional explicit default initial DDiT ranks, e.g. '0' or '0,1'.",
+        )
+        parser.add_argument(
+            "--ddit-switch-plan",
+            type=str,
+            default=ServerArgs.ddit_switch_plan,
+            help="Default forced DDiT switch plan, e.g. '15:1->2;30:2->4;45:4->8' "
+            "or '15:0,1;30:0,1,2,3'.",
+        )
+        parser.add_argument(
+            "--ddit-vae-gpus",
+            type=int,
+            default=ServerArgs.ddit_vae_gpus,
+            help="Default number of GPUs used by the DDiT VAE stage. Supports 1/2/4/8; default: 1.",
+        )
+        parser.add_argument(
+            "--ddit-sp-degree-map",
+            type=str,
+            default=ServerArgs.ddit_sp_degree_map,
+            help="Optional map from GPU count to Ulysses x Ring degrees, "
+            "e.g. '1=1x1,2=2x1,4=2x2,8=4x2'. Defaults to Ulysses-only.",
+        )
+        parser.add_argument(
+            "--ddit-prebuild-sp-groups",
+            action=StoreBoolean,
+            default=ServerArgs.ddit_prebuild_sp_groups,
+            help="Prebuild cached DDiT SP groups at worker startup.",
+        )
+        parser.add_argument(
+            "--ddit-log-dir",
+            type=str,
+            default=ServerArgs.ddit_log_dir,
+            help="Directory for DDiT lifecycle CSV and rank-switch JSONL logs.",
+        )
+        parser.add_argument(
+            "--ddit-profile-path",
+            type=str,
+            default=ServerArgs.ddit_profile_path,
+            help="Optional JSON profile path for DDiT scheduler latency tables.",
+        )
+        parser.add_argument(
+            "--ddit-debug-cpu-backup",
+            action=StoreBoolean,
+            default=ServerArgs.ddit_debug_cpu_backup,
+            help="Keep debug CPU copies of canonical DDiT latent state at switch points.",
         )
 
         # Prompt text file for batch processing
