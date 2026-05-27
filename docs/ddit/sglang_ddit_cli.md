@@ -137,6 +137,7 @@ python examples\multimodal_gen\ddit_mixed_workload_client.py `
 - DiT 时间：`dit_end_time - dit_start_time`
 - VAE 时间：`vae_end_time - vae_start_time`
 - E2E 时间：`vae_end_time - add_time`
+- CSV 最后三行自动追加 lifespan time 汇总：`p50,<seconds>`、`p90,<seconds>`、`p99,<seconds>`。统计只使用已完成且同时具备 `add_time` 与 `vae_end_time` 的请求。
 
 rank 切换 JSONL：
 
@@ -175,4 +176,3 @@ rank 切换 JSONL：
 - 跨节点故障处理：节点断连、请求失败、rank 释放、日志补全。
 - 多机日志汇总：按 `request_id` 合并各节点 CSV/JSONL。
 - 多机验收：同一请求的 DiT/VAE ranks 必须来自同一节点；不同请求可分布在不同节点。
-

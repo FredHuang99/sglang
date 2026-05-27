@@ -89,6 +89,7 @@ class DynamicSPGroupRegistry:
 输出：
 
 - `ddit_lifecycle.csv`：一行一个请求，记录 add/DiT/VAE 时间戳。
+- `ddit_lifecycle.csv` 最后三行：`p50/p90/p99` lifespan time，即 `vae_end_time - add_time`。
 - `ddit_rank_switch.jsonl`：一行一个 rank switch 事件。
 
 关键函数：
@@ -261,4 +262,3 @@ OpenAI video endpoint 也支持这些字段，并支持 client 指定 `request_i
 - 跨节点 SP。
 - 跨节点 latent migration。
 - 同一请求跨节点 VAE。
-

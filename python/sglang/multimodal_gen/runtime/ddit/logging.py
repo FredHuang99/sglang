@@ -26,6 +26,7 @@ LIFECYCLE_COLUMNS = [
     "status",
     "error",
 ]
+SUMMARY_ROW_NAMES = ("p50", "p90", "p99")
 
 
 def _is_rank_zero() -> bool:
@@ -34,6 +35,14 @@ def _is_rank_zero() -> bool:
 
 def _now() -> float:
     return time.time()
+
+
+def _percentile_nearest_rank(values: list[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = max(1, int((percentile / 100.0) * len(ordered) + 0.999999999))
+    return ordered[min(rank, len(ordered)) - 1]
 
 
 @dataclass
@@ -59,6 +68,8 @@ class LifecycleCsvLogger:
         with open(self.path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 request_id = row.get("request_id")
+                if request_id in SUMMARY_ROW_NAMES:
+                    continue
                 if request_id:
                     self._rows[request_id] = dict(row)
 
@@ -126,10 +137,31 @@ class LifecycleCsvLogger:
                             for column in LIFECYCLE_COLUMNS
                         }
                     )
+                for name, value in self._lifespan_summary_rows():
+                    f.write(f"{name},{value:.6f}\n")
             os.replace(tmp_path, self.path)
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def _lifespan_summary_rows(self) -> list[tuple[str, float]]:
+        lifespans = []
+        for row in self._rows.values():
+            try:
+                add_time = float(row.get("add_time") or "")
+                vae_end_time = float(row.get("vae_end_time") or "")
+            except (TypeError, ValueError):
+                continue
+            if vae_end_time >= add_time:
+                lifespans.append(vae_end_time - add_time)
+
+        if not lifespans:
+            return []
+        return [
+            ("p50", _percentile_nearest_rank(lifespans, 50)),
+            ("p90", _percentile_nearest_rank(lifespans, 90)),
+            ("p99", _percentile_nearest_rank(lifespans, 99)),
+        ]
 
 
 class RankSwitchJsonlLogger:

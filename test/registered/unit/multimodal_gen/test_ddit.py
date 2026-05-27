@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ from sglang.multimodal_gen.runtime.ddit.config import (
     parse_switch_plan,
     resolve_vae_ranks,
 )
+from sglang.multimodal_gen.runtime.ddit.logging import LifecycleCsvLogger
 from sglang.multimodal_gen.runtime.ddit.scheduler import (
     DDiTRequestState,
     DDiTSchedulerConfig,
@@ -126,6 +128,41 @@ class TestMixedWorkloadClient(CustomTestCase):
         )
         self.assertEqual([item.resolution for item in workload_a], [item.resolution for item in workload_b])
         self.assertEqual(len(workload_a), 6)
+
+
+class TestLifecycleCsvLogger(CustomTestCase):
+    def test_appends_lifespan_percentile_rows(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "ddit_lifecycle.csv")
+            logger = LifecycleCsvLogger(path)
+            for request_id, add_time, vae_end_time in (
+                ("r1", 10.0, 11.0),
+                ("r2", 10.0, 15.0),
+                ("r3", 10.0, 20.0),
+            ):
+                logger.record(
+                    request_id=request_id,
+                    resolution="720p",
+                    event="add",
+                    timestamp=add_time,
+                )
+                logger.record(
+                    request_id=request_id,
+                    resolution="720p",
+                    event="vae_end",
+                    timestamp=vae_end_time,
+                )
+
+            with open(path, encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+
+            self.assertEqual(
+                lines[-3:],
+                ["p50,5.000000", "p90,10.000000", "p99,10.000000"],
+            )
+
+            reloaded = LifecycleCsvLogger(path)
+            self.assertNotIn("p50", reloaded._rows)
 
 
 if __name__ == "__main__":
