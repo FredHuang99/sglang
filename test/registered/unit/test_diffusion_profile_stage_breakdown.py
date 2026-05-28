@@ -48,7 +48,34 @@ register_cpu_ci(est_time=2, suite="stage-a-cpu-only")
 psb = load_profile_module()
 
 
+def make_case_result(row_name, durations_s, status="ok"):
+    return psb.CaseResult(
+        row_name=row_name,
+        model="z-image",
+        model_path="Tongyi-MAI/Z-Image",
+        gpu_num=1,
+        resolution="144p",
+        width=256,
+        height=144,
+        ulysses_degree=1,
+        ring_degree=1,
+        status=status,
+        returncode=0,
+        elapsed_s=1.0,
+        durations_s=durations_s,
+        perf_path=f"/tmp/{row_name}.json",
+        case_dir=f"/tmp/{row_name}",
+        error_tail="",
+        command=["python", "-m", "sglang"],
+    )
+
+
 class TestDiffusionProfileStageBreakdown(unittest.TestCase):
+    def test_default_repeat_args(self):
+        args = psb.parse_args(["--model", "z-image"])
+        self.assertEqual(args.num_runs, 5)
+        self.assertEqual(args.num_warmup_runs, 2)
+
     def test_resolution_mapping(self):
         self.assertEqual(psb.resolve_resolution("wan2.2-ti2v-5b", "720p"), (1280, 704))
         self.assertEqual(psb.resolve_resolution("wan2.2-ti2v-5b", "144p"), (256, 128))
@@ -142,6 +169,37 @@ class TestDiffusionProfileStageBreakdown(unittest.TestCase):
         self.assertEqual(durations["text_encoder"], 0.1)
         self.assertEqual(durations["denoising"], 0.03)
         self.assertEqual(durations["decoder"], 0.3)
+
+    def test_average_measured_durations_excludes_warmup(self):
+        run_results = [
+            make_case_result(
+                "1_144p",
+                {"text_encoder": 100.0, "denoising": 100.0, "decoder": 100.0},
+            ),
+            make_case_result(
+                "1_144p",
+                {"text_encoder": 200.0, "denoising": 200.0, "decoder": 200.0},
+            ),
+            make_case_result(
+                "1_144p",
+                {"text_encoder": 1.0, "denoising": 10.0, "decoder": 100.0},
+            ),
+            make_case_result(
+                "1_144p",
+                {"text_encoder": 2.0, "denoising": 20.0, "decoder": 200.0},
+            ),
+            make_case_result(
+                "1_144p",
+                {"text_encoder": 3.0, "denoising": 30.0, "decoder": 300.0},
+            ),
+        ]
+        durations = psb.average_measured_durations(
+            run_results,
+            num_warmup_runs=2,
+        )
+        self.assertEqual(durations["text_encoder"], 2.0)
+        self.assertEqual(durations["denoising"], 20.0)
+        self.assertEqual(durations["decoder"], 200.0)
 
     def test_write_csv_failure_row(self):
         with tempfile.TemporaryDirectory(dir=repo_root()) as temp_dir:

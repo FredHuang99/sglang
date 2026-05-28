@@ -25,6 +25,8 @@ from typing import Any, Mapping, Sequence
 
 ALL_RESOLUTIONS = ("144p", "240p", "360p", "480p", "720p", "1k", "2k")
 DEFAULT_GPU_NUMS = (1, 2, 4, 8)
+DEFAULT_NUM_RUNS = 5
+DEFAULT_NUM_WARMUP_RUNS = 2
 WAN22_DEFAULT_IMAGE_RELATIVE_PATH = Path("examples") / "assets" / "example_image.png"
 
 CANONICAL_RESOLUTIONS: dict[str, tuple[int, int]] = {
@@ -44,6 +46,7 @@ STAGE_NAME_TO_COLUMN = {
 }
 
 CSV_COLUMNS = ("row_name", "text_encoder", "denoising", "decoder")
+STAGE_COLUMNS = ("text_encoder", "denoising", "decoder")
 DETAIL_COLUMNS = (
     "row_name",
     "model",
@@ -57,6 +60,11 @@ DETAIL_COLUMNS = (
     "status",
     "returncode",
     "elapsed_s",
+    "num_runs",
+    "num_warmup_runs",
+    "measured_runs",
+    "successful_measured_runs",
+    "run_statuses",
     "text_encoder",
     "denoising",
     "decoder",
@@ -153,6 +161,12 @@ class CaseResult:
     case_dir: str
     error_tail: str
     command: list[str]
+    num_runs: int = 1
+    num_warmup_runs: int = 0
+    measured_runs: int = 1
+    successful_measured_runs: int = 0
+    run_statuses: list[str] = dataclasses.field(default_factory=list)
+    run_results: list[dict[str, Any]] = dataclasses.field(default_factory=list)
 
     def to_csv_row(self) -> dict[str, str]:
         return {
@@ -176,6 +190,11 @@ class CaseResult:
             "status": self.status,
             "returncode": none_to_empty(self.returncode),
             "elapsed_s": format_duration(self.elapsed_s),
+            "num_runs": str(self.num_runs),
+            "num_warmup_runs": str(self.num_warmup_runs),
+            "measured_runs": str(self.measured_runs),
+            "successful_measured_runs": str(self.successful_measured_runs),
+            "run_statuses": "|".join(self.run_statuses),
             "text_encoder": format_duration(self.durations_s.get("text_encoder")),
             "denoising": format_duration(self.durations_s.get("denoising")),
             "decoder": format_duration(self.durations_s.get("decoder")),
@@ -195,6 +214,13 @@ def format_duration(value: float | None) -> str:
     if value is None:
         return "nan"
     return f"{value:.6f}"
+
+
+def average_values(values: Sequence[float | None]) -> float | None:
+    valid_values = [value for value in values if value is not None]
+    if not valid_values:
+        return None
+    return sum(valid_values) / len(valid_values)
 
 
 def round_down_to_multiple(value: int, multiple: int) -> int:
@@ -711,6 +737,122 @@ def write_csv_outputs(
     )
 
 
+def make_run_detail(
+    result: CaseResult,
+    *,
+    run_index: int,
+    is_warmup: bool,
+) -> dict[str, Any]:
+    return {
+        "run_index": run_index,
+        "is_warmup": is_warmup,
+        "status": result.status,
+        "returncode": result.returncode,
+        "elapsed_s": result.elapsed_s,
+        "durations_s": result.durations_s,
+        "perf_path": result.perf_path,
+        "case_dir": result.case_dir,
+        "error_tail": result.error_tail,
+        "command": result.command,
+        "command_text": format_command(result.command),
+        "ulysses_degree": result.ulysses_degree,
+        "ring_degree": result.ring_degree,
+    }
+
+
+def average_measured_durations(
+    run_results: Sequence[CaseResult],
+    *,
+    num_warmup_runs: int,
+) -> dict[str, float | None]:
+    measured_results = run_results[num_warmup_runs:]
+    return {
+        stage: average_values(
+            [result.durations_s.get(stage) for result in measured_results]
+        )
+        for stage in STAGE_COLUMNS
+    }
+
+
+def aggregate_repeated_results(
+    run_results: Sequence[CaseResult],
+    *,
+    num_warmup_runs: int,
+    case_dir: Path,
+) -> CaseResult:
+    if not run_results:
+        raise ValueError("run_results must not be empty")
+
+    first_result = run_results[0]
+    measured_results = list(run_results[num_warmup_runs:])
+    durations = average_measured_durations(
+        run_results, num_warmup_runs=num_warmup_runs
+    )
+    measured_statuses = [result.status for result in measured_results]
+    successful_measured_runs = sum(status == "ok" for status in measured_statuses)
+
+    if all(result.status == "dry_run" for result in run_results):
+        status = "dry_run"
+    elif measured_results and successful_measured_runs == len(measured_results):
+        status = "ok"
+    elif any(value is not None for value in durations.values()):
+        status = "partial_repeats"
+    else:
+        status = "failed_repeats"
+
+    elapsed_values = [result.elapsed_s for result in run_results if result.elapsed_s]
+    returncode = 0 if all(result.returncode == 0 for result in run_results) else None
+    if any(result.returncode not in (0, None) for result in run_results):
+        returncode = next(
+            result.returncode
+            for result in run_results
+            if result.returncode not in (0, None)
+        )
+
+    run_details = [
+        make_run_detail(
+            result,
+            run_index=index + 1,
+            is_warmup=index < num_warmup_runs,
+        )
+        for index, result in enumerate(run_results)
+    ]
+    measured_perf_paths = [
+        detail["perf_path"] for detail in run_details if not detail["is_warmup"]
+    ]
+    error_tail = "\n".join(
+        f"run_{index + 1}: {result.error_tail}"
+        for index, result in enumerate(run_results)
+        if result.error_tail
+    )
+
+    return CaseResult(
+        row_name=first_result.row_name,
+        model=first_result.model,
+        model_path=first_result.model_path,
+        gpu_num=first_result.gpu_num,
+        resolution=first_result.resolution,
+        width=first_result.width,
+        height=first_result.height,
+        ulysses_degree=first_result.ulysses_degree,
+        ring_degree=first_result.ring_degree,
+        status=status,
+        returncode=returncode,
+        elapsed_s=sum(elapsed_values) if elapsed_values else None,
+        durations_s=durations,
+        perf_path=";".join(measured_perf_paths),
+        case_dir=str(case_dir),
+        error_tail=error_tail,
+        command=first_result.command,
+        num_runs=len(run_results),
+        num_warmup_runs=num_warmup_runs,
+        measured_runs=len(measured_results),
+        successful_measured_runs=successful_measured_runs,
+        run_statuses=[result.status for result in run_results],
+        run_results=run_details,
+    )
+
+
 def make_failure_result(
     *,
     row_name: str,
@@ -979,6 +1121,56 @@ def run_case_with_optional_retry(
     return retry_result
 
 
+def run_repeated_case_with_optional_retry(
+    *,
+    preset: ModelPreset,
+    model_path: str,
+    prompt: str,
+    image_paths: Sequence[str] | None,
+    gpu_num: int,
+    resolution: str,
+    width: int,
+    height: int,
+    parallel: ParallelConfig,
+    case_dir: Path,
+    timeout_s: int,
+    dry_run: bool,
+    base_gpu_id: int | None,
+    num_runs: int,
+    num_warmup_runs: int,
+) -> CaseResult:
+    run_results: list[CaseResult] = []
+    for run_index in range(1, num_runs + 1):
+        run_kind = "warmup" if run_index <= num_warmup_runs else "measure"
+        run_case_dir = case_dir / f"run_{run_index:02d}_{run_kind}"
+        print(
+            f"  [request] {gpu_num}_{resolution} "
+            f"run {run_index}/{num_runs} ({run_kind})"
+        )
+        result = run_case_with_optional_retry(
+            preset=preset,
+            model_path=model_path,
+            prompt=prompt,
+            image_paths=image_paths,
+            gpu_num=gpu_num,
+            resolution=resolution,
+            width=width,
+            height=height,
+            parallel=parallel,
+            case_dir=run_case_dir,
+            timeout_s=timeout_s,
+            dry_run=dry_run,
+            base_gpu_id=base_gpu_id,
+        )
+        run_results.append(result)
+
+    return aggregate_repeated_results(
+        run_results,
+        num_warmup_runs=num_warmup_runs,
+        case_dir=case_dir,
+    )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -995,6 +1187,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--csv-path", type=Path, default=None)
     parser.add_argument("--prompt", default=None)
     parser.add_argument("--image-path", nargs="+", default=None)
+    parser.add_argument("--num-runs", type=int, default=DEFAULT_NUM_RUNS)
+    parser.add_argument(
+        "--num-warmup-runs",
+        type=int,
+        default=DEFAULT_NUM_WARMUP_RUNS,
+        help="Number of leading runs to exclude from the averaged CSV result.",
+    )
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--fail-fast", action="store_true")
@@ -1017,6 +1216,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         raise SystemExit("--gpu-nums values must be positive integers")
     if args.timeout_s <= 0:
         raise SystemExit("--timeout-s must be positive")
+    if args.num_runs <= 0:
+        raise SystemExit("--num-runs must be positive")
+    if args.num_warmup_runs < 0:
+        raise SystemExit("--num-warmup-runs must be >= 0")
+    if args.num_warmup_runs >= args.num_runs:
+        raise SystemExit("--num-warmup-runs must be smaller than --num-runs")
     return args
 
 
@@ -1108,7 +1313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{row_name}: {width}x{height}, gpu={gpu_num}, "
                 f"ulysses={parallel.ulysses_degree}, ring={parallel.ring_degree}"
             )
-            result = run_case_with_optional_retry(
+            result = run_repeated_case_with_optional_retry(
                 preset=preset,
                 model_path=model_path,
                 prompt=prompt,
@@ -1122,6 +1327,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 timeout_s=args.timeout_s,
                 dry_run=args.dry_run,
                 base_gpu_id=args.base_gpu_id,
+                num_runs=args.num_runs,
+                num_warmup_runs=args.num_warmup_runs,
             )
             results.append(result)
             print(f"[{result.status}] {row_name} -> {result.to_csv_row()}")
