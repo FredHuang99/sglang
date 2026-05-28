@@ -357,8 +357,23 @@ def resolve_vae_ranks(
             )
         return ranks
 
+    local_rank_tuple = parse_local_ranks(
+        getattr(server_args, "ddit_local_ranks", None), world_size
+    )
+    allowed = parse_allowed_gpu_counts(
+        getattr(server_args, "ddit_allowed_gpu_counts", None), world_size
+    )
+    local_ranks = set(local_rank_tuple)
     explicit_ranks = parse_rank_list(_as_extra_value(batch, "ddit_vae_ranks"))
     if explicit_ranks:
+        validate_node_local_power_of_two(
+            explicit_ranks, local_world_size=world_size, allowed_gpu_counts=allowed
+        )
+        if not set(explicit_ranks).issubset(local_ranks):
+            raise ValueError(
+                f"DDiT VAE ranks {explicit_ranks} must stay within local ranks "
+                f"{tuple(sorted(local_ranks))}"
+            )
         return explicit_ranks
 
     request_k = _as_extra_value(batch, "ddit_vae_k")
@@ -367,19 +382,12 @@ def resolve_vae_ranks(
         if request_k is not None
         else getattr(server_args, "ddit_vae_gpus", 1)
     )
-    local_rank_tuple = parse_local_ranks(
-        getattr(server_args, "ddit_local_ranks", None), world_size
-    )
     if final_dit_ranks and len(final_dit_ranks) >= vae_k:
         ranks = tuple(sorted(final_dit_ranks))[:vae_k]
     else:
         count = max(1, min(vae_k, len(local_rank_tuple)))
         ranks = tuple(local_rank_tuple[:count])
 
-    allowed = parse_allowed_gpu_counts(
-        getattr(server_args, "ddit_allowed_gpu_counts", None), world_size
-    )
-    local_ranks = set(local_rank_tuple)
     validate_node_local_power_of_two(
         ranks, local_world_size=world_size, allowed_gpu_counts=allowed
     )

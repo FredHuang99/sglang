@@ -27,8 +27,13 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tp_group,
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
+    get_world_group,
 )
 from sglang.multimodal_gen.runtime.ddit.dynamic_sp import prebuild_dynamic_sp_groups
+from sglang.multimodal_gen.runtime.ddit.transport import (
+    recv_tensor_p2p,
+    send_tensor_p2p,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
@@ -81,6 +86,7 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self._hungry_states: dict[str, dict] = {}
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -174,6 +180,282 @@ class GPUWorker:
             self.rank,
             role_device,
         )
+
+    def _finalize_output_batch(
+        self,
+        *,
+        req: Req,
+        output_batch: OutputBatch,
+        start_time: float,
+    ) -> OutputBatch:
+        if self.rank == 0 and output_batch.metrics:
+            peak_snapshot = capture_memory_snapshot()
+            output_batch.metrics.record_memory_snapshot("after_forward", peak_snapshot)
+
+        if (
+            self.rank == 0
+            and not req.suppress_logs
+            and (current_platform.is_cuda_alike() or current_platform.is_npu())
+        ):
+            self.do_mem_analysis(output_batch)
+
+        duration_ms = (time.monotonic() - start_time) * 1000
+        if output_batch.metrics is not None:
+            output_batch.metrics.total_duration_ms = duration_ms
+            output_batch.metrics.finish_time_s = time.time()
+
+        if req.save_output and req.return_file_paths_only:
+            if self.rank == 0 and output_batch.output is not None:
+                output_paths = save_outputs(
+                    output_batch.output,
+                    req.data_type,
+                    req.fps,
+                    True,
+                    lambda idx: req.output_file_path(len(output_batch.output), idx),
+                    audio=output_batch.audio,
+                    audio_sample_rate=output_batch.audio_sample_rate,
+                    output_compression=req.output_compression,
+                    enable_frame_interpolation=req.enable_frame_interpolation,
+                    frame_interpolation_exp=req.frame_interpolation_exp,
+                    frame_interpolation_scale=req.frame_interpolation_scale,
+                    frame_interpolation_model_path=req.frame_interpolation_model_path,
+                    enable_upscaling=req.enable_upscaling,
+                    upscaling_model_path=req.upscaling_model_path,
+                    upscaling_scale=req.upscaling_scale,
+                )
+                output_batch.output_file_paths = output_paths
+
+            output_batch.output = None
+            output_batch.audio = None
+            output_batch.audio_sample_rate = None
+
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+
+        if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
+            if not req.is_warmup:
+                PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+        return output_batch
+
+    def _hungry_stage_parts(self):
+        stages = list(self.pipeline.stages)
+        denoising_idx = next(
+            idx for idx, stage in enumerate(stages)
+            if self.pipeline._infer_stage_name(stage) == "denoising_stage"
+        )
+        decoding_idx = next(
+            idx for idx, stage in enumerate(stages)
+            if self.pipeline._infer_stage_name(stage) == "decoding_stage"
+        )
+        return (
+            stages[:denoising_idx],
+            stages[denoising_idx],
+            stages[denoising_idx + 1 : decoding_idx],
+            stages[decoding_idx],
+        )
+
+    def prepare_hungry_request(self, req: Req) -> dict:
+        assert self.pipeline is not None
+        start_time = time.monotonic()
+        if self.rank == 0 and (
+            current_platform.is_cuda_alike() or current_platform.is_npu()
+        ):
+            torch.get_device_module().reset_peak_memory_stats()
+        if self.rank == 0 and req.metrics:
+            baseline_snapshot = capture_memory_snapshot()
+            req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
+
+        req.log(server_args=self.server_args)
+        pre_dit_stages, _denoising_stage, post_dit_stages, _decoding_stage = (
+            self._hungry_stage_parts()
+        )
+        req = self.pipeline.executor.execute(pre_dit_stages, req, self.server_args)
+        self._hungry_states[req.request_id] = {
+            "batch": req,
+            "start_time": start_time,
+            "post_dit_stages": post_dit_stages,
+            "denoising_state": None,
+        }
+        return {
+            "request_id": req.request_id,
+            "num_timesteps": int(len(req.timesteps)),
+            "num_inference_steps": int(req.num_inference_steps),
+        }
+
+    def start_hungry_dit(
+        self,
+        request_id: str,
+        ranks: tuple[int, ...],
+        *,
+        log_events: bool = True,
+        log_stage: str = "dit",
+        log_reason: str = "waiting_queue",
+        log_policy: str = "hungry_first",
+    ) -> dict:
+        _pre, denoising_stage, _post, _decode = self._hungry_stage_parts()
+        state = self._hungry_states[request_id]
+        state["denoising_state"] = denoising_stage.ddit_hungry_start(
+            batch=state["batch"],
+            server_args=self.server_args,
+            active_ranks=tuple(ranks),
+            log_events=log_events,
+            log_stage=log_stage,
+            log_reason=log_reason,
+            log_policy=log_policy,
+        )
+        return {"request_id": request_id, "ranks": tuple(ranks)}
+
+    def run_hungry_dit_step(
+        self,
+        request_id: str,
+        ranks: tuple[int, ...],
+        *,
+        log_events: bool = True,
+    ) -> dict:
+        _pre, denoising_stage, _post, _decode = self._hungry_stage_parts()
+        state = self._hungry_states[request_id]
+        result = denoising_stage.ddit_hungry_step(
+            state=state["denoising_state"],
+            server_args=self.server_args,
+            target_ranks=tuple(ranks),
+            log_events=log_events,
+        )
+        state["batch"] = state["denoising_state"]["batch"]
+        return result
+
+    def migrate_hungry_dit(
+        self,
+        request_id: str,
+        old_ranks: tuple[int, ...],
+        new_ranks: tuple[int, ...],
+        step_index: int,
+    ) -> dict:
+        _pre, denoising_stage, _post, _decode = self._hungry_stage_parts()
+        state = self._hungry_states[request_id]
+        new_denoising_state = denoising_stage.ddit_hungry_migrate(
+            state=state.get("denoising_state"),
+            batch=state["batch"],
+            server_args=self.server_args,
+            old_ranks=tuple(old_ranks),
+            new_ranks=tuple(new_ranks),
+            step_index=int(step_index),
+        )
+        rank = get_world_group().rank
+        if rank in set(new_ranks):
+            state["denoising_state"] = new_denoising_state
+            state["batch"] = new_denoising_state["batch"]
+        else:
+            state["denoising_state"] = None
+        return {"request_id": request_id, "ranks": tuple(new_ranks)}
+
+    def finish_hungry_dit(
+        self,
+        request_id: str,
+        *,
+        log_events: bool = True,
+        broadcast_world: bool = True,
+    ) -> dict:
+        _pre, denoising_stage, post_dit_stages, _decode = self._hungry_stage_parts()
+        state = self._hungry_states[request_id]
+        batch = denoising_stage.ddit_hungry_finish(
+            state=state["denoising_state"],
+            server_args=self.server_args,
+            log_events=log_events,
+            broadcast_world=broadcast_world,
+        )
+        if post_dit_stages:
+            batch = self.pipeline.executor.execute(post_dit_stages, batch, self.server_args)
+        state["batch"] = batch
+        return {"request_id": request_id}
+
+    def prepare_hungry_vae(
+        self,
+        request_id: str,
+        final_dit_ranks: tuple[int, ...],
+        vae_ranks: tuple[int, ...],
+    ) -> dict:
+        state = self._hungry_states[request_id]
+        batch = state["batch"]
+        final_dit_ranks = tuple(final_dit_ranks)
+        vae_ranks = tuple(vae_ranks)
+        src = final_dit_ranks[0]
+        rank = get_world_group().rank
+        if rank == src:
+            for dst in vae_ranks:
+                if dst not in final_dit_ranks:
+                    send_tensor_p2p(batch.latents, dst=dst)
+        if rank in vae_ranks and rank not in final_dit_ranks:
+            batch.latents = recv_tensor_p2p(src=src)
+            batch.did_sp_shard_latents = False
+        if rank in vae_ranks:
+            batch.extra["ddit_final_dit_ranks"] = list(final_dit_ranks)
+            batch.extra["ddit_vae_ranks"] = list(vae_ranks)
+            state["batch"] = batch
+        return {"request_id": request_id, "vae_ranks": vae_ranks}
+
+    def run_concurrent_vae(
+        self, request_id: str, vae_ranks: tuple[int, ...]
+    ) -> dict | OutputBatch:
+        _pre, _denoising_stage, _post, decoding_stage = self._hungry_stage_parts()
+        state = self._hungry_states[request_id]
+        batch = state["batch"]
+        batch.extra["ddit_vae_ranks"] = list(vae_ranks)
+        output_batch = decoding_stage.ddit_decode_local(
+            batch,
+            self.server_args,
+            tuple(vae_ranks),
+        )
+        leader = tuple(vae_ranks)[0]
+        if self.rank != leader:
+            return {"request_id": request_id, "status": "vae_participant"}
+        if leader == 0:
+            output_batch = self._finalize_output_batch(
+                req=batch,
+                output_batch=output_batch,
+                start_time=state["start_time"],
+            )
+            self._hungry_states.pop(request_id, None)
+            return output_batch
+        state["vae_output_batch"] = output_batch
+        return {"request_id": request_id, "status": "vae_output_ready", "leader": leader}
+
+    def transfer_concurrent_output(
+        self, request_id: str, src_rank: int
+    ) -> dict | OutputBatch:
+        state = self._hungry_states[request_id]
+        if self.rank == src_rank:
+            output_batch = state["vae_output_batch"]
+            send_tensor_p2p(output_batch.output, dst=0)
+            self._hungry_states.pop(request_id, None)
+            return {"request_id": request_id, "status": "output_sent"}
+        if self.rank == 0:
+            batch = state["batch"]
+            frames = recv_tensor_p2p(src=src_rank)
+            output_batch = OutputBatch(output=frames, metrics=batch.metrics)
+            output_batch = self._finalize_output_batch(
+                req=batch,
+                output_batch=output_batch,
+                start_time=state["start_time"],
+            )
+            self._hungry_states.pop(request_id, None)
+            return output_batch
+        return {"request_id": request_id, "status": "output_idle"}
+
+    def run_hungry_vae(
+        self, request_id: str, vae_ranks: tuple[int, ...]
+    ) -> OutputBatch:
+        _pre, _denoising_stage, _post, decoding_stage = self._hungry_stage_parts()
+        state = self._hungry_states[request_id]
+        batch = state["batch"]
+        batch.extra["ddit_vae_ranks"] = list(vae_ranks)
+        output_batch = decoding_stage(batch, self.server_args)
+        output_batch = self._finalize_output_batch(
+            req=batch,
+            output_batch=output_batch,
+            start_time=state["start_time"],
+        )
+        self._hungry_states.pop(request_id, None)
+        return output_batch
 
     def do_mem_analysis(self, output_batch: OutputBatch):
         if not (current_platform.is_cuda_alike() or current_platform.is_npu()):
@@ -279,62 +561,11 @@ class GPUWorker:
             else:
                 output_batch = result
 
-            # capture memory after forward (peak)
-            if self.rank == 0 and output_batch.metrics:
-                peak_snapshot = capture_memory_snapshot()
-                output_batch.metrics.record_memory_snapshot(
-                    "after_forward", peak_snapshot
-                )
-
-            if (
-                self.rank == 0
-                and not req.suppress_logs
-                and (current_platform.is_cuda_alike() or current_platform.is_npu())
-            ):
-                self.do_mem_analysis(output_batch)
-
-            duration_ms = (time.monotonic() - start_time) * 1000
-            if output_batch.metrics is not None:
-                output_batch.metrics.total_duration_ms = duration_ms
-                output_batch.metrics.finish_time_s = time.time()
-
-            # Save output to file and return file path only if requested. Avoid the serialization
-            # and deserialization overhead between scheduler_client and gpu_worker.
-            if req.save_output and req.return_file_paths_only:
-                if self.rank == 0 and output_batch.output is not None:
-                    output_paths = save_outputs(
-                        output_batch.output,
-                        req.data_type,
-                        req.fps,
-                        True,
-                        lambda idx: req.output_file_path(len(output_batch.output), idx),
-                        audio=output_batch.audio,
-                        audio_sample_rate=output_batch.audio_sample_rate,
-                        output_compression=req.output_compression,
-                        enable_frame_interpolation=req.enable_frame_interpolation,
-                        frame_interpolation_exp=req.frame_interpolation_exp,
-                        frame_interpolation_scale=req.frame_interpolation_scale,
-                        frame_interpolation_model_path=req.frame_interpolation_model_path,
-                        enable_upscaling=req.enable_upscaling,
-                        upscaling_model_path=req.upscaling_model_path,
-                        upscaling_scale=req.upscaling_scale,
-                    )
-                    output_batch.output_file_paths = output_paths
-
-                # No rank needs to hold on to generated tensors once the file-path
-                # response has been materialized on rank 0
-                output_batch.output = None
-                output_batch.audio = None
-                output_batch.audio_sample_rate = None
-
-                if torch.cuda.is_initialized():
-                    torch.cuda.empty_cache()
-
-            # TODO: extract to avoid duplication
-            if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                # Avoid logging warmup perf records that share the same request_id.
-                if not req.is_warmup:
-                    PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
+            output_batch = self._finalize_output_batch(
+                req=req,
+                output_batch=output_batch,
+                start_time=start_time,
+            )
         except Exception as e:
             logger.error(
                 f"Error executing request {req.request_id}: {e}", exc_info=True

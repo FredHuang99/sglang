@@ -7,13 +7,19 @@ policy can be unit tested without a CUDA runtime.
 from __future__ import annotations
 
 import heapq
+import json
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from .config import is_power_of_two, select_preferred_rank_tuple
+from .config import (
+    is_power_of_two,
+    parse_allowed_gpu_counts,
+    parse_local_ranks,
+    select_preferred_rank_tuple,
+)
 
 
 class RequestPhase(str, Enum):
@@ -175,6 +181,27 @@ class HungryFirstScheduler:
         req.ranks = keep
         return keep
 
+    def transition_to_vae(
+        self, request_id: str, vae_ranks: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        req = self.requests[request_id]
+        vae_ranks = tuple(sorted(int(rank) for rank in vae_ranks))
+        old_ranks = set(req.ranks)
+        new_ranks = set(vae_ranks)
+        for rank in old_ranks - new_ranks:
+            self.gpu_owner[rank] = None
+        for rank in new_ranks - old_ranks:
+            if self.gpu_owner.get(rank) not in (None, request_id):
+                raise RuntimeError(
+                    f"Rank {rank} is already owned by {self.gpu_owner[rank]}"
+                )
+            self.gpu_owner[rank] = request_id
+        for rank in new_ranks & old_ranks:
+            self.gpu_owner[rank] = request_id
+        req.ranks = vae_ranks
+        req.phase = RequestPhase.VAE
+        return vae_ranks
+
     def complete_vae(self, request_id: str) -> None:
         req = self.requests[request_id]
         for rank in req.ranks:
@@ -291,3 +318,49 @@ class HungryFirstScheduler:
             )
 
         return decisions
+
+
+def build_hungry_scheduler_config(server_args: Any, world_size: int) -> DDiTSchedulerConfig:
+    local_ranks = parse_local_ranks(
+        getattr(server_args, "ddit_local_ranks", None), world_size
+    )
+    allowed_gpu_counts = parse_allowed_gpu_counts(
+        getattr(server_args, "ddit_allowed_gpu_counts", None), len(local_ranks)
+    )
+    config = DDiTSchedulerConfig(
+        local_ranks=local_ranks,
+        allowed_gpu_counts=allowed_gpu_counts,
+    )
+    profile_path = getattr(server_args, "ddit_profile_path", None)
+    if not profile_path:
+        return config
+    with open(profile_path, encoding="utf-8") as f:
+        payload = json.load(f)
+    if "opt_gpus_num" in payload:
+        config.opt_gpus_num = {
+            str(resolution): int(count)
+            for resolution, count in payload["opt_gpus_num"].items()
+        }
+    if "dit_step_times" in payload:
+        config.dit_step_times = {
+            str(resolution): {int(k): float(v) for k, v in times.items()}
+            for resolution, times in payload["dit_step_times"].items()
+        }
+    return config
+
+
+def build_fixed_baseline_scheduler_config(
+    server_args: Any, world_size: int
+) -> FixedBaselineSchedulerConfig:
+    local_ranks = parse_local_ranks(
+        getattr(server_args, "ddit_local_ranks", None), world_size
+    )
+    allowed_gpu_counts = parse_allowed_gpu_counts(
+        getattr(server_args, "ddit_allowed_gpu_counts", None), len(local_ranks)
+    )
+    baseline_gpus = int(getattr(server_args, "ddit_baseline_gpus", 1))
+    return FixedBaselineSchedulerConfig(
+        local_ranks=local_ranks,
+        baseline_gpus=baseline_gpus,
+        allowed_gpu_counts=allowed_gpu_counts,
+    )

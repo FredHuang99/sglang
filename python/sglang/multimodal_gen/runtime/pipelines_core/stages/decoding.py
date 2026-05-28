@@ -294,6 +294,49 @@ class DecodingStage(PipelineStage):
         dist.broadcast(tensor, src=src, group=get_world_group().device_group)
         return tensor
 
+    def ddit_decode_local(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        vae_ranks: tuple[int, ...],
+    ) -> OutputBatch | None:
+        """Decode on VAE ranks and return an OutputBatch only on the VAE leader."""
+        self.load_model()
+        frames = None
+        trajectory_decoded = None
+        with use_dynamic_sp_group(server_args, vae_ranks):
+            if current_rank_in(vae_ranks):
+                frames = self.decode(batch.latents, server_args)
+                if batch.return_trajectory_decoded:
+                    assert (
+                        batch.trajectory_latents is not None
+                    ), "batch should have trajectory latents"
+                    B, T, C, F, H, W = batch.trajectory_latents.shape
+                    flat_latents = batch.trajectory_latents.view(B * T, C, F, H, W)
+                    logger.info("decoding %s trajectory latents in batch", B * T)
+                    all_decoded = self.decode(flat_latents, server_args)
+                    decoded_tensor = all_decoded.view(B, T, *all_decoded.shape[1:])
+                    trajectory_decoded = [decoded_tensor[:, i] for i in range(T)]
+
+        if not current_rank_in(vae_ranks):
+            return None
+        if get_world_group().rank != vae_ranks[0]:
+            if not getattr(batch, "is_warmup", False):
+                self.offload_model()
+            return None
+
+        frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        output_batch = OutputBatch(
+            output=frames,
+            trajectory_timesteps=batch.trajectory_timesteps,
+            trajectory_latents=batch.trajectory_latents,
+            trajectory_decoded=trajectory_decoded,
+            metrics=batch.metrics,
+        )
+        if not getattr(batch, "is_warmup", False):
+            self.offload_model()
+        return output_batch
+
     @torch.no_grad()
     def forward(
         self,

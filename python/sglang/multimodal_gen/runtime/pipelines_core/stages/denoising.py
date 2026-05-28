@@ -42,6 +42,10 @@ from sglang.multimodal_gen.runtime.ddit.logging import (
     record_lifecycle,
     record_rank_switch,
 )
+from sglang.multimodal_gen.runtime.ddit.transport import (
+    recv_tensor_p2p,
+    send_tensor_p2p,
+)
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -1099,6 +1103,23 @@ class DenoisingStage(PipelineStage):
             batch.extra["ddit_cpu_latent_backup"] = latents.detach().cpu()
         return latents
 
+    def _canonicalize_ddit_latents_local(
+        self,
+        *,
+        batch: Req,
+        latents: torch.Tensor,
+        active_ranks: tuple[int, ...],
+    ) -> torch.Tensor:
+        """Gather active SP shards without broadcasting outside active ranks."""
+        with use_dynamic_sp_group(self.server_args, active_ranks):
+            latents, _ = self._postprocess_sp_latents(batch, latents, None)
+            batch.did_sp_shard_latents = False
+        batch.latents = latents.contiguous()
+        batch.did_sp_shard_latents = False
+        if getattr(self.server_args, "ddit_debug_cpu_backup", False):
+            batch.extra["ddit_cpu_latent_backup"] = batch.latents.detach().cpu()
+        return batch.latents
+
     def _prepare_ddit_segment(
         self,
         *,
@@ -1112,6 +1133,251 @@ class DenoisingStage(PipelineStage):
             self.scheduler.set_begin_index(begin_index)
             prepared_vars = self._prepare_denoising_loop(batch, server_args)
             return prepared_vars, prepared_vars["latents"]
+
+    def ddit_hungry_start(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        active_ranks: tuple[int, ...],
+        log_events: bool = True,
+        log_stage: str = "dit",
+        log_reason: str = "waiting_queue",
+        log_policy: str = "hungry_first",
+    ) -> dict[str, Any]:
+        """Initialize request-local denoising state for hungry scheduling."""
+        batch.extra["ddit_initial_ranks"] = list(active_ranks)
+        if log_events:
+            record_lifecycle(server_args, batch, "dit_start")
+            record_rank_switch(
+                server_args,
+                batch,
+                stage=log_stage,
+                step=None,
+                old_ranks=(),
+                new_ranks=active_ranks,
+                reason=log_reason,
+                policy=log_policy,
+            )
+        prepared_vars, latents = self._prepare_ddit_segment(
+            batch=batch,
+            server_args=server_args,
+            active_ranks=active_ranks,
+            begin_index=0,
+        )
+        timesteps_cpu = prepared_vars["timesteps"].cpu()
+        return {
+            "batch": batch,
+            "active_ranks": active_ranks,
+            "prepared_vars": prepared_vars,
+            "latents": latents,
+            "timesteps_cpu": timesteps_cpu,
+            "num_timesteps": timesteps_cpu.shape[0],
+            "next_step_index": 0,
+            "trajectory_timesteps": [],
+            "trajectory_latents": [],
+            "denoising_start_time": time.time(),
+        }
+
+    def ddit_hungry_step(
+        self,
+        *,
+        state: dict[str, Any],
+        server_args: ServerArgs,
+        target_ranks: tuple[int, ...],
+        log_events: bool = True,
+    ) -> dict[str, Any]:
+        """Run one denoising step under the scheduler-selected rank tuple."""
+        batch = state["batch"]
+        active_ranks = tuple(state["active_ranks"])
+        target_ranks = tuple(target_ranks)
+        step_index = int(state["next_step_index"])
+        num_timesteps = int(state["num_timesteps"])
+        if step_index >= num_timesteps:
+            return {"done": True, "cur_step": step_index}
+
+        if target_ranks != active_ranks:
+            old_ranks = active_ranks
+            latents = self._canonicalize_ddit_latents(
+                batch=batch,
+                latents=state["latents"],
+                active_ranks=old_ranks,
+            )
+            if log_events:
+                record_rank_switch(
+                    server_args,
+                    batch,
+                    stage="dit",
+                    step=step_index,
+                    old_ranks=old_ranks,
+                    new_ranks=target_ranks,
+                    reason="hungry_first",
+                    policy="hungry_first",
+                )
+            prepared_vars, latents = self._prepare_ddit_segment(
+                batch=batch,
+                server_args=server_args,
+                active_ranks=target_ranks,
+                begin_index=step_index,
+            )
+            state["active_ranks"] = target_ranks
+            state["prepared_vars"] = prepared_vars
+            state["latents"] = latents
+
+        prepared_vars = state["prepared_vars"]
+        timesteps_cpu = state["timesteps_cpu"]
+        t_host = timesteps_cpu[step_index]
+        with torch.autocast(
+            device_type=current_platform.device_type,
+            dtype=prepared_vars["target_dtype"],
+            enabled=prepared_vars["autocast_enabled"],
+        ):
+            with use_dynamic_sp_group(server_args, tuple(state["active_ranks"])):
+                if current_rank_in(tuple(state["active_ranks"])):
+                    with StageProfiler(
+                        f"denoising_step_{step_index}",
+                        logger=logger,
+                        metrics=batch.metrics,
+                        perf_dump_path_provided=batch.perf_dump_path is not None,
+                    ):
+                        state["latents"] = self._run_single_denoising_step(
+                            batch=batch,
+                            server_args=server_args,
+                            prepared_vars=prepared_vars,
+                            latents=state["latents"],
+                            timestep_index=step_index,
+                            t_host=t_host,
+                            timesteps_cpu=timesteps_cpu,
+                        )
+
+        completed_step = step_index + 1
+        batch.step_index = completed_step
+        state["next_step_index"] = completed_step
+        if current_rank_in(tuple(state["active_ranks"])) and batch.return_trajectory_latents:
+            state["trajectory_timesteps"].append(t_host)
+            state["trajectory_latents"].append(state["latents"])
+        if not batch.is_warmup and current_rank_in(tuple(state["active_ranks"])):
+            self.step_profile()
+        return {"done": completed_step >= num_timesteps, "cur_step": completed_step}
+
+    def ddit_hungry_migrate(
+        self,
+        *,
+        state: dict[str, Any] | None,
+        batch: Req,
+        server_args: ServerArgs,
+        old_ranks: tuple[int, ...],
+        new_ranks: tuple[int, ...],
+        step_index: int,
+    ) -> dict[str, Any] | None:
+        """Move DiT latent state from old ranks to new ranks via P2P."""
+        rank = get_world_group().rank
+        old_ranks = tuple(old_ranks)
+        new_ranks = tuple(new_ranks)
+        old_leader = old_ranks[0]
+        latents = None
+
+        if rank in old_ranks:
+            assert state is not None
+            batch = state["batch"]
+            latents = self._canonicalize_ddit_latents_local(
+                batch=batch,
+                latents=state["latents"],
+                active_ranks=old_ranks,
+            )
+            if rank == old_leader:
+                for dst in new_ranks:
+                    if dst not in old_ranks:
+                        send_tensor_p2p(latents, dst=dst)
+
+        if rank in new_ranks and rank not in old_ranks:
+            latents = recv_tensor_p2p(src=old_leader)
+            batch.latents = latents
+            batch.did_sp_shard_latents = False
+
+        if rank not in new_ranks:
+            return None
+
+        if latents is not None:
+            batch.latents = latents
+            batch.did_sp_shard_latents = False
+        prepared_vars, prepared_latents = self._prepare_ddit_segment(
+            batch=batch,
+            server_args=server_args,
+            active_ranks=new_ranks,
+            begin_index=step_index,
+        )
+        timesteps_cpu = (
+            state["timesteps_cpu"]
+            if state is not None and "timesteps_cpu" in state
+            else prepared_vars["timesteps"].cpu()
+        )
+        trajectory_timesteps = (
+            list(state.get("trajectory_timesteps", [])) if state is not None else []
+        )
+        trajectory_latents = (
+            list(state.get("trajectory_latents", [])) if state is not None else []
+        )
+        denoising_start_time = (
+            state.get("denoising_start_time", time.time())
+            if state is not None
+            else time.time()
+        )
+        return {
+            "batch": batch,
+            "active_ranks": new_ranks,
+            "prepared_vars": prepared_vars,
+            "latents": prepared_latents,
+            "timesteps_cpu": timesteps_cpu,
+            "num_timesteps": timesteps_cpu.shape[0],
+            "next_step_index": step_index,
+            "trajectory_timesteps": trajectory_timesteps,
+            "trajectory_latents": trajectory_latents,
+            "denoising_start_time": denoising_start_time,
+        }
+
+    def ddit_hungry_finish(
+        self,
+        *,
+        state: dict[str, Any],
+        server_args: ServerArgs,
+        log_events: bool = True,
+        broadcast_world: bool = True,
+    ) -> Req:
+        """Finalize hungry-scheduled DiT and materialize canonical latents."""
+        batch = state["batch"]
+        active_ranks = tuple(state["active_ranks"])
+        if broadcast_world:
+            latents = self._canonicalize_ddit_latents(
+                batch=batch,
+                latents=state["latents"],
+                active_ranks=active_ranks,
+            )
+        else:
+            latents = self._canonicalize_ddit_latents_local(
+                batch=batch,
+                latents=state["latents"],
+                active_ranks=active_ranks,
+            )
+        batch.extra["ddit_final_dit_ranks"] = list(active_ranks)
+        if log_events:
+            record_lifecycle(server_args, batch, "dit_end")
+        self._post_denoising_loop(
+            batch=batch,
+            latents=latents,
+            trajectory_latents=state["trajectory_latents"],
+            trajectory_timesteps=state["trajectory_timesteps"],
+            server_args=server_args,
+            is_warmup=batch.is_warmup,
+        )
+        denoising_time = time.time() - float(state["denoising_start_time"])
+        num_timesteps = int(state["num_timesteps"])
+        if num_timesteps > 0 and not batch.is_warmup:
+            self.log_info(
+                "average time per hungry DDiT step: %.4f seconds",
+                denoising_time / num_timesteps,
+            )
+        return batch
 
     @torch.no_grad()
     def _forward_ddit(

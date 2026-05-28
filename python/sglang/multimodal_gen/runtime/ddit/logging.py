@@ -50,6 +50,7 @@ class DDiTLogPaths:
     log_dir: str
     lifecycle_csv: str
     rank_switch_jsonl: str
+    op_trace_jsonl: str
 
 
 class LifecycleCsvLogger:
@@ -203,7 +204,26 @@ class RankSwitchJsonlLogger:
                 f.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
-_LOGGER_CACHE: dict[str, tuple[LifecycleCsvLogger, RankSwitchJsonlLogger]] = {}
+class OpTraceJsonlLogger:
+    """Append-only rank operation trace logger written by rank 0."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    def record_many(self, rows: list[dict[str, Any]]) -> None:
+        if not rows:
+            return
+        with self._lock:
+            with open(self.path, "a", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+_LOGGER_CACHE: dict[
+    str, tuple[LifecycleCsvLogger, RankSwitchJsonlLogger, OpTraceJsonlLogger]
+] = {}
 
 
 def resolve_log_paths(server_args: Any) -> DDiTLogPaths:
@@ -212,22 +232,27 @@ def resolve_log_paths(server_args: Any) -> DDiTLogPaths:
     )
     lifecycle_csv = os.path.join(log_dir, "ddit_lifecycle.csv")
     rank_switch_jsonl = os.path.join(log_dir, "ddit_rank_switch.jsonl")
+    op_trace_jsonl = os.path.join(log_dir, "ddit_op_trace.jsonl")
     return DDiTLogPaths(
         log_dir=log_dir,
         lifecycle_csv=lifecycle_csv,
         rank_switch_jsonl=rank_switch_jsonl,
+        op_trace_jsonl=op_trace_jsonl,
     )
 
 
-def get_loggers(server_args: Any) -> tuple[LifecycleCsvLogger, RankSwitchJsonlLogger]:
+def get_loggers(
+    server_args: Any,
+) -> tuple[LifecycleCsvLogger, RankSwitchJsonlLogger, OpTraceJsonlLogger]:
     paths = resolve_log_paths(server_args)
     cached = _LOGGER_CACHE.get(paths.log_dir)
     if cached is not None:
         return cached
     lifecycle = LifecycleCsvLogger(paths.lifecycle_csv)
     switches = RankSwitchJsonlLogger(paths.rank_switch_jsonl)
-    _LOGGER_CACHE[paths.log_dir] = (lifecycle, switches)
-    return lifecycle, switches
+    op_trace = OpTraceJsonlLogger(paths.op_trace_jsonl)
+    _LOGGER_CACHE[paths.log_dir] = (lifecycle, switches, op_trace)
+    return lifecycle, switches, op_trace
 
 
 def record_lifecycle(
@@ -243,7 +268,7 @@ def record_lifecycle(
         return
     request_id = str(getattr(batch, "request_id", None) or "unknown")
     resolution = resolve_resolution_key(batch)
-    lifecycle, _ = get_loggers(server_args)
+    lifecycle, _, _ = get_loggers(server_args)
     lifecycle.record(
         request_id=request_id,
         resolution=resolution,
@@ -267,7 +292,7 @@ def record_rank_switch(
 ) -> None:
     if not getattr(server_args, "enable_ddit", False) or not _is_rank_zero():
         return
-    _, switch_logger = get_loggers(server_args)
+    _, switch_logger, _ = get_loggers(server_args)
     switch_logger.record(
         request_id=str(getattr(batch, "request_id", None) or "unknown"),
         resolution=resolve_resolution_key(batch),
@@ -279,3 +304,10 @@ def record_rank_switch(
         reason=reason,
         policy=policy,
     )
+
+
+def record_op_trace_rows(server_args: Any, rows: list[dict[str, Any]]) -> None:
+    if not getattr(server_args, "enable_ddit", False) or not _is_rank_zero():
+        return
+    _, _, op_trace = get_loggers(server_args)
+    op_trace.record_many(rows)
