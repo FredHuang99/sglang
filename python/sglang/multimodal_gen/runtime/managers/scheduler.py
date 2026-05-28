@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.ddit.scheduler import (
     RequestPhase,
     build_fixed_baseline_scheduler_config,
     build_hungry_scheduler_config,
+    build_profile_scheduler,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
@@ -397,7 +398,15 @@ class Scheduler(SchedulerDisaggMixin):
         schedule_policy = resolve_schedule_policy(self.server_args)
         if (
             getattr(self.server_args, "enable_ddit", False)
-            and schedule_policy in ("hungry_first", "fixed_baseline")
+            and schedule_policy
+            in (
+                "hungry_first",
+                "fixed_baseline",
+                "naive",
+                "naive_greedy",
+                "wsjf",
+                "wsjf_scale_up",
+            )
         ):
             self._ddit_concurrent_event_loop(schedule_policy)
             return
@@ -692,7 +701,9 @@ class Scheduler(SchedulerDisaggMixin):
         return policy.requests
 
     def _ddit_policy_complete(self, policy: Any, request_id: str) -> None:
-        if isinstance(policy, HungryFirstScheduler):
+        if getattr(policy, "vae_same_as_dit", False):
+            policy.complete_request(request_id)
+        elif isinstance(policy, HungryFirstScheduler):
             policy.complete_vae(request_id)
         else:
             policy.complete_request(request_id)
@@ -700,7 +711,7 @@ class Scheduler(SchedulerDisaggMixin):
     def _ddit_policy_update_step(
         self, policy: Any, request_id: str, cur_step: int
     ) -> None:
-        if isinstance(policy, HungryFirstScheduler):
+        if hasattr(policy, "update_cur_step"):
             policy.update_cur_step(request_id, cur_step)
         else:
             policy.requests[request_id].cur_step = int(cur_step)
@@ -714,9 +725,7 @@ class Scheduler(SchedulerDisaggMixin):
     ) -> bool:
         if any(queue for queue in pending_ops):
             return True
-        if isinstance(policy, HungryFirstScheduler) and policy.waiting:
-            return True
-        if isinstance(policy, FixedBaselineScheduler) and policy.dit_waiting:
+        if hasattr(policy, "has_waiting_requests") and policy.has_waiting_requests():
             return True
         for request_id in running_order:
             req_state = policy.requests.get(request_id)
@@ -751,8 +760,8 @@ class Scheduler(SchedulerDisaggMixin):
                     step=step,
                     old_ranks=old_ranks,
                     new_ranks=new_ranks,
-                    reason="hungry_first",
-                    policy="hungry_first",
+                    reason=str(decision.get("reason", schedule_policy)),
+                    policy=str(decision.get("policy", schedule_policy)),
                 )
                 pending_migrate.append(
                     DDiTOp(
@@ -774,32 +783,30 @@ class Scheduler(SchedulerDisaggMixin):
                 continue
             ranks = tuple(decision["new_ranks"])
             req = req_by_id[request_id]
-            is_baseline = schedule_policy == "fixed_baseline"
+            log_stage = "baseline" if decision.get("stage") == "baseline" else "dit"
+            log_reason = str(decision.get("reason", schedule_policy))
+            log_policy = str(decision.get("policy", schedule_policy))
             record_lifecycle(self.server_args, req, "dit_start")
             record_rank_switch(
                 self.server_args,
                 req,
-                stage="baseline" if is_baseline else "dit",
+                stage=log_stage,
                 step=None,
                 old_ranks=(),
                 new_ranks=ranks,
-                reason="fixed_baseline" if is_baseline else "waiting_queue",
-                policy="fixed_baseline" if is_baseline else "hungry_first",
+                reason=log_reason,
+                policy=log_policy,
             )
             pending_init.append(
                 DDiTOp(
                     action="dit_init",
                     request_id=request_id,
                     ranks=ranks,
-                    stage="baseline" if is_baseline else "dit",
+                    stage=log_stage,
                     payload={
-                        "log_stage": "baseline" if is_baseline else "dit",
-                        "log_reason": (
-                            "fixed_baseline" if is_baseline else "waiting_queue"
-                        ),
-                        "log_policy": (
-                            "fixed_baseline" if is_baseline else "hungry_first"
-                        ),
+                        "log_stage": log_stage,
+                        "log_reason": log_reason,
+                        "log_policy": log_policy,
                     },
                 )
             )
@@ -1018,9 +1025,13 @@ class Scheduler(SchedulerDisaggMixin):
             policy = FixedBaselineScheduler(
                 build_fixed_baseline_scheduler_config(self.server_args, world_size)
             )
-        else:
+        elif schedule_policy == "hungry_first":
             policy = HungryFirstScheduler(
                 build_hungry_scheduler_config(self.server_args, world_size)
+            )
+        else:
+            policy = build_profile_scheduler(
+                schedule_policy, self.server_args, world_size
             )
 
         identities: dict[str, bytes | None] = {}
@@ -1198,7 +1209,7 @@ class Scheduler(SchedulerDisaggMixin):
                         req_state = policy.requests[request_id]
                         final_ranks = req_state.ranks
                         record_lifecycle(self.server_args, req, "dit_end")
-                        if isinstance(policy, FixedBaselineScheduler):
+                        if getattr(policy, "vae_same_as_dit", False):
                             vae_ranks = final_ranks
                             req_state.phase = RequestPhase.VAE
                         else:
@@ -1217,13 +1228,13 @@ class Scheduler(SchedulerDisaggMixin):
                             old_ranks=final_ranks,
                             new_ranks=vae_ranks,
                             reason=(
-                                "fixed_baseline_same_ranks"
-                                if schedule_policy == "fixed_baseline"
+                                f"{schedule_policy}_same_ranks"
+                                if getattr(policy, "vae_same_as_dit", False)
                                 else "dit_to_vae"
                             ),
                             policy=(
-                                "fixed_baseline"
-                                if schedule_policy == "fixed_baseline"
+                                schedule_policy
+                                if getattr(policy, "vae_same_as_dit", False)
                                 else "ddit_vae_gpus"
                             ),
                         )

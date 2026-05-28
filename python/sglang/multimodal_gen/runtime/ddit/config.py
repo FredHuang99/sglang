@@ -5,7 +5,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-DDIT_SCHEDULE_POLICIES = ("forced_switch", "hungry_first", "fixed_baseline")
+DDIT_SCHEDULE_POLICIES = (
+    "forced_switch",
+    "hungry_first",
+    "fixed_baseline",
+    "naive",
+    "naive_greedy",
+    "wsjf",
+    "wsjf_scale_up",
+)
 
 
 @dataclass(frozen=True)

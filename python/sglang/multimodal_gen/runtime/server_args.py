@@ -294,9 +294,15 @@ class ServerArgs:
     ddit_advertised_host: str | None = None
     ddit_local_ranks: str | None = None
     ddit_allowed_gpu_counts: str = "1,2,4,8"
-    ddit_schedule_policy: Literal["forced_switch", "hungry_first", "fixed_baseline"] = (
-        "forced_switch"
-    )
+    ddit_schedule_policy: Literal[
+        "forced_switch",
+        "hungry_first",
+        "fixed_baseline",
+        "naive",
+        "naive_greedy",
+        "wsjf",
+        "wsjf_scale_up",
+    ] = "forced_switch"
     ddit_baseline_gpus: int = 1
     ddit_initial_gpus: int = 1
     ddit_initial_ranks: str | None = None
@@ -306,6 +312,8 @@ class ServerArgs:
     ddit_prebuild_sp_groups: bool = True
     ddit_log_dir: str | None = None
     ddit_profile_path: str | None = None
+    ddit_profile_model_id: str | None = None
+    ddit_window_size: int = 8
     ddit_debug_cpu_backup: bool = False
 
     # Logging
@@ -469,6 +477,10 @@ class ServerArgs:
             raise ValueError(
                 f"--ddit-initial-gpus must be one of {allowed}, got {self.ddit_initial_gpus}"
             )
+        if self.ddit_window_size <= 0:
+            raise ValueError(
+                f"--ddit-window-size must be positive, got {self.ddit_window_size}"
+            )
         if (
             self.ddit_schedule_policy == "fixed_baseline"
             and self.ddit_vae_gpus != self.ddit_baseline_gpus
@@ -478,6 +490,16 @@ class ServerArgs:
                 "use the same %s ranks.",
                 self.ddit_vae_gpus,
                 self.ddit_baseline_gpus,
+            )
+        if (
+            self.ddit_schedule_policy
+            in ("naive", "naive_greedy", "wsjf", "wsjf_scale_up")
+            and self.ddit_vae_gpus != 1
+        ):
+            logger.warning(
+                "--ddit-vae-gpus=%s is ignored by %s; VAE uses the same ranks as DiT.",
+                self.ddit_vae_gpus,
+                self.ddit_schedule_policy,
             )
         parse_switch_plan(self.ddit_switch_plan)
         degree_map = parse_sp_degree_map(self.ddit_sp_degree_map)
@@ -1142,10 +1164,20 @@ class ServerArgs:
         parser.add_argument(
             "--ddit-schedule-policy",
             type=str,
-            choices=("forced_switch", "hungry_first", "fixed_baseline"),
+            choices=(
+                "forced_switch",
+                "hungry_first",
+                "fixed_baseline",
+                "naive",
+                "naive_greedy",
+                "wsjf",
+                "wsjf_scale_up",
+            ),
             default=ServerArgs.ddit_schedule_policy,
             help="DDiT scheduling policy. fixed_baseline keeps text encoder on the "
-            "full-node TP group and runs DiT/VAE on a fixed k-rank subgroup.",
+            "full-node TP group and runs DiT/VAE on a fixed k-rank subgroup. "
+            "naive, naive_greedy, wsjf, and wsjf_scale_up use profile-backed "
+            "single-node concurrent DiT scheduling.",
         )
         parser.add_argument(
             "--ddit-baseline-gpus",
@@ -1202,7 +1234,21 @@ class ServerArgs:
             "--ddit-profile-path",
             type=str,
             default=ServerArgs.ddit_profile_path,
-            help="Optional JSON profile path for DDiT scheduler latency tables.",
+            help="Optional JSON profile path for DDiT scheduler latency tables. "
+            "Supports flat opt_gpus_num/dit_step_times or a models map.",
+        )
+        parser.add_argument(
+            "--ddit-profile-model-id",
+            type=str,
+            default=ServerArgs.ddit_profile_model_id,
+            help="Profile model id used for built-in or multi-model profile lookup. "
+            "Initially supports z-image and wan2.1-t2v-1.3b.",
+        )
+        parser.add_argument(
+            "--ddit-window-size",
+            type=int,
+            default=ServerArgs.ddit_window_size,
+            help="Window size for wsjf and wsjf_scale_up scheduling.",
         )
         parser.add_argument(
             "--ddit-debug-cpu-backup",
