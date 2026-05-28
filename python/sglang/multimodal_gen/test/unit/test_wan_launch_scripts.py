@@ -23,6 +23,9 @@ class TestWanLaunchScripts(unittest.TestCase):
             "launch_wan22_ti2v_monolithic_4gpu.py"
         )
         cls.disagg_module = _load_script_module("launch_pool_wan22_ti2v_4gpu.py")
+        cls.ddit_disagg_module = _load_script_module(
+            "launch_ddit_disagg_wan_t2v.py"
+        )
 
     def test_launchers_disable_server_warmup_by_default(self):
         mono_args = self.monolithic_module.build_parser().parse_args([])
@@ -102,6 +105,87 @@ class TestWanLaunchScripts(unittest.TestCase):
             self.disagg_module._resolve_role_transfer_backend(args, "denoiser"),
             "mock",
         )
+
+    def test_ddit_disagg_launcher_accepts_forced_switch(self):
+        args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "forced_switch",
+            ]
+        )
+
+        self.assertEqual(args.ddit_schedule_policy, "forced_switch")
+
+    def test_ddit_disagg_launcher_defaults_max_slots_by_policy(self):
+        forced_args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "forced_switch",
+            ]
+        )
+        wsjf_args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "wsjf",
+                "--ddit-window-size",
+                "6",
+            ]
+        )
+
+        self.assertEqual(
+            self.ddit_disagg_module._resolve_disagg_max_slots(forced_args), 1
+        )
+        self.assertEqual(
+            self.ddit_disagg_module._resolve_disagg_max_slots(wsjf_args), 6
+        )
+
+    def test_ddit_disagg_launcher_passes_buffer_and_warmup_args(self):
+        args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "hungry_first",
+                "--disagg-max-slots-per-instance",
+                "3",
+                "--disagg-transfer-pool-size",
+                "536870912",
+                "--disagg-transfer-redundancy",
+                "1.5",
+                "--disagg-warmup",
+                "--disagg-warmup-resolutions",
+                "1280x720,256x144",
+                "--disagg-warmup-steps",
+                "2",
+            ]
+        )
+        kwargs = self.ddit_disagg_module._common_kwargs(args)
+
+        self.assertEqual(kwargs["disagg_max_slots_per_instance"], 3)
+        self.assertEqual(kwargs["disagg_transfer_pool_size"], 536870912)
+        self.assertEqual(kwargs["disagg_transfer_redundancy"], 1.5)
+        self.assertTrue(kwargs["warmup"])
+        self.assertEqual(kwargs["warmup_resolutions"], ["1280x720", "256x144"])
+        self.assertEqual(kwargs["warmup_steps"], 2)
+
+    def test_ddit_disagg_launcher_passes_shortpath_sp_degree_map(self):
+        args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-sp-degree-map",
+                "shortpath",
+            ]
+        )
+        kwargs = self.ddit_disagg_module._common_kwargs(args)
+
+        self.assertEqual(kwargs["ddit_sp_degree_map"], "shortpath")
 
 
 if __name__ == "__main__":

@@ -543,6 +543,11 @@ class ComposedPipelineBase(ABC):
             return True
         if role_affinity == self._disagg_role:
             return True
+        if self._disagg_role == RoleType.DDIT_WORKER and role_affinity in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+        ):
+            return True
 
         logger.info(
             "Disagg role=%s: skipping stage %s (affinity=%s)",

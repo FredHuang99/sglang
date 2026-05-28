@@ -12,7 +12,13 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport.codec import send_tensors
+from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
+    TransferCreditMsg,
+    encode_transfer_msg,
+)
 from sglang.multimodal_gen.runtime.ddit.config import (
+    build_execution_plan,
     resolve_resolution_key,
     resolve_schedule_policy,
     resolve_vae_ranks,
@@ -28,9 +34,11 @@ from sglang.multimodal_gen.runtime.ddit.logging import record_rank_switch
 from sglang.multimodal_gen.runtime.ddit.scheduler import (
     DDiTRequestState,
     FixedBaselineScheduler,
+    ForcedSwitchScheduler,
     HungryFirstScheduler,
     RequestPhase,
     build_fixed_baseline_scheduler_config,
+    build_forced_switch_scheduler_config,
     build_hungry_scheduler_config,
     build_profile_scheduler,
 )
@@ -391,7 +399,14 @@ class Scheduler(SchedulerDisaggMixin):
         The main event loop that listens for ZMQ requests.
         Handles abortion
         """
-        # Pool mode: all roles use the pool event loop
+        # Pool mode: DDiT workers use the concurrent DiT/VAE runtime after
+        # receiving encoder-prepared requests through the disagg transfer path.
+        if self._disagg_role == RoleType.DDIT_WORKER:
+            self._ddit_concurrent_event_loop(
+                resolve_schedule_policy(self.server_args),
+                disagg_prepared=True,
+            )
+            return
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_event_loop()
             return
@@ -554,6 +569,15 @@ class Scheduler(SchedulerDisaggMixin):
             return {"status": "idle"}
         if action == "full_prepare":
             return self.worker.prepare_hungry_request(command["req"])
+        if action == "register_prepared":
+            req = self._build_disagg_compute_req(
+                command["scalar_fields"],
+                command.get("tensors"),
+            )
+            result = self.worker.register_hungry_prepared_request(req)
+            if self.gpu_id == 0:
+                result["req"] = req
+            return result
         if action == "full_forward":
             return self.worker.execute_forward([command["req"]])
         if action == "control":
@@ -652,11 +676,34 @@ class Scheduler(SchedulerDisaggMixin):
     def _ddit_run_wave(self, wave: CommandWave, world_size: int) -> list[dict[str, Any]]:
         commands = wave.commands_by_rank(world_size)
         for rank in range(1, world_size):
-            self.task_pipes_to_slaves[rank - 1].send(commands[rank])
+            command = commands[rank]
+            if command.get("action") == "register_prepared":
+                command = dict(command)
+                command.pop("tensors", None)
+            self.task_pipes_to_slaves[rank - 1].send(command)
         results = [self._ddit_execute_rank_command(commands[0])]
         for rank in range(1, world_size):
             results.append(self.result_pipes_from_slaves[rank - 1].recv())
-        record_op_trace_rows(self.server_args, [result["trace"] for result in results])
+        non_idle_results = [
+            result
+            for result in results
+            if result["command"].get("action") != "idle"
+        ]
+        warmup_only_wave = bool(non_idle_results) and all(
+            str(result["command"].get("request_id") or "").startswith("warmup-")
+            for result in non_idle_results
+        )
+        if not warmup_only_wave:
+            record_op_trace_rows(
+                self.server_args,
+                [
+                    result["trace"]
+                    for result in results
+                    if not str(result["trace"].get("request_id") or "").startswith(
+                        "warmup-"
+                    )
+                ],
+            )
         failed = [result for result in results if result["status"] != "ok"]
         if failed:
             raise RuntimeError(failed[0]["error"])
@@ -716,6 +763,36 @@ class Scheduler(SchedulerDisaggMixin):
         else:
             policy.requests[request_id].cur_step = int(cur_step)
 
+    @staticmethod
+    def _ddit_is_warmup_req(req: Req | None) -> bool:
+        return bool(getattr(req, "is_warmup", False))
+
+    def _ddit_build_request_state(
+        self,
+        *,
+        req: Req,
+        request_id: str,
+        num_timesteps: int,
+        world_size: int,
+        schedule_policy: str,
+    ) -> DDiTRequestState:
+        state = DDiTRequestState(
+            request_id=request_id,
+            resolution=resolve_resolution_key(req),
+            total_steps=int(num_timesteps),
+            arrival_time=(
+                req.metrics.arrival_time_s
+                if req.metrics and req.metrics.arrival_time_s
+                else time.time()
+            ),
+            vae_k=int(getattr(self.server_args, "ddit_vae_gpus", 1)),
+        )
+        if schedule_policy == "forced_switch":
+            plan = build_execution_plan(self.server_args, req, world_size=world_size)
+            state.initial_ranks = plan.initial_ranks
+            state.switch_plan = plan.switches
+        return state
+
     def _ddit_has_compute_work(
         self,
         *,
@@ -733,6 +810,166 @@ class Scheduler(SchedulerDisaggMixin):
                 if req_state.cur_step < req_state.total_steps:
                     return True
         return False
+
+    def _ddit_waiting_prepare_admitted(self, policy: Any, item: Any) -> bool:
+        if not isinstance(item, Req) or item.is_warmup:
+            return True
+        candidate = DDiTRequestState(
+            request_id=str(getattr(item, "request_id", "") or "pending"),
+            resolution=resolve_resolution_key(item),
+            total_steps=int(getattr(item, "num_inference_steps", 0) or 0),
+        )
+        if isinstance(policy, ForcedSwitchScheduler):
+            plan = build_execution_plan(
+                self.server_args,
+                item,
+                world_size=get_world_group().world_size,
+            )
+            candidate.initial_ranks = plan.initial_ranks
+            candidate.switch_plan = plan.switches
+        prepare_credit = getattr(policy, "prepare_credit", None)
+        if prepare_credit is None:
+            gpu_owner = getattr(policy, "gpu_owner", {})
+            return any(owner is None for owner in gpu_owner.values())
+        return int(prepare_credit(candidate)) > 0
+
+    def _ddit_record_prepare_backpressure(
+        self,
+        *,
+        wave_id: int,
+        item: Any,
+        reason: str,
+    ) -> None:
+        request_id = getattr(item, "request_id", None)
+        now = time.time()
+        record_op_trace_rows(
+            self.server_args,
+            [
+                {
+                    "timestamp_start": now,
+                    "timestamp_end": now,
+                    "request_id": request_id,
+                    "stage": "prepare",
+                    "step": None,
+                    "ranks": [],
+                    "wave_id": wave_id,
+                    "op_id": f"wave{wave_id}:prepare_backpressure",
+                    "rank": 0,
+                    "action": "prepare_backpressure",
+                    "status": "blocked",
+                    "error": reason,
+                }
+            ],
+        )
+
+    def _ddit_policy_prepare_credit(self, policy: Any) -> int:
+        prepare_credit = getattr(policy, "prepare_credit", None)
+        if prepare_credit is None:
+            gpu_owner = getattr(policy, "gpu_owner", {})
+            return 1 if any(owner is None for owner in gpu_owner.values()) else 0
+        return max(0, int(prepare_credit(None)))
+
+    def _ddit_send_worker_credit(self, policy: Any) -> None:
+        if self.gpu_id != 0 or self._pool_result_push is None:
+            return
+        credit = self._ddit_policy_prepare_credit(policy)
+        msg = TransferCreditMsg(
+            role=RoleType.DDIT_WORKER.value,
+            instance_id=int(getattr(self.server_args, "disagg_instance_id", 0)),
+            free_slots=credit,
+            capacity_slots=max(1, int(getattr(self.server_args, "ddit_window_size", 1))),
+        )
+        self._pool_result_push.send_multipart(encode_transfer_msg(msg))
+
+    def _ddit_drain_disagg_prepared(
+        self,
+        *,
+        pending_register: deque[DDiTOp],
+        registering: set[str],
+        full_ranks: tuple[int, ...],
+    ) -> bool:
+        if self.gpu_id != 0 or self._compute_ready_queue is None:
+            return False
+
+        handled = False
+        staging_backpressure = self._has_pending_outbound_staging_retry()
+        handled |= self._process_transfer_control_queue(
+            allow_new_work=not staging_backpressure
+        )
+        handled |= self._process_outbound_staging_retry_once()
+        handled |= self._process_swap_out_queue_once()
+        handled |= self._process_send_ready_queue_once()
+        handled |= self._maybe_apply_pending_transfer_reconfigure()
+        if staging_backpressure:
+            return handled
+        handled |= self._drain_disagg_work_socket() > 0
+        handled |= self._process_transfer_control_queue()
+        handled |= self._process_prefetch_queue_once()
+        handled |= self._process_swapping_queue_once()
+
+        while True:
+            try:
+                item = self._compute_ready_queue.get_nowait()
+            except Exception:
+                break
+            if self._is_request_aborted(item.request_id):
+                handled = True
+                continue
+            scalar_error = self._validate_inbound_scalar_fields(
+                item.request_id, item.scalar_fields
+            )
+            if scalar_error is not None:
+                self._fail_inbound_transfer(
+                    item.request_id,
+                    scalar_error,
+                    item.prealloc_slot_id,
+                )
+                handled = True
+                continue
+            self._release_pending_receive(item.request_id, item.prealloc_slot_id)
+            if item.request_id in registering:
+                handled = True
+                continue
+            if item.scalar_fields.get("is_warmup"):
+                inbound_sizes = self._warmup_inbound_sizes.pop(item.request_id, (0, 0))
+                self._schedule_transfer_reconfigure(
+                    inbound_sizes[0],
+                    inbound_sizes[1],
+                )
+            pending_register.append(
+                DDiTOp(
+                    action="register_prepared",
+                    request_id=item.request_id,
+                    ranks=full_ranks,
+                    stage="prepare",
+                    payload={
+                        "scalar_fields": item.scalar_fields,
+                        "tensors": item.tensors,
+                    },
+                )
+            )
+            registering.add(item.request_id)
+            handled = True
+        return handled
+
+    def _ddit_send_output_to_disagg_server(
+        self,
+        request_id: str,
+        output_batch: OutputBatch,
+    ) -> None:
+        if self._pool_result_push is None:
+            return
+        tensor_fields = {}
+        scalar_fields = {"request_id": request_id}
+        if output_batch.output is not None:
+            tensor_fields["output"] = output_batch.output
+        if output_batch.audio is not None:
+            tensor_fields["audio"] = output_batch.audio
+        if output_batch.audio_sample_rate is not None:
+            scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
+        if output_batch.error is not None:
+            scalar_fields["error"] = output_batch.error
+        send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
 
     def _ddit_enqueue_schedule_decisions(
         self,
@@ -753,16 +990,18 @@ class Scheduler(SchedulerDisaggMixin):
                 old_ranks = tuple(decision["old_ranks"])
                 new_ranks = tuple(decision["new_ranks"])
                 step = int(policy.requests[request_id].cur_step)
-                record_rank_switch(
-                    self.server_args,
-                    req_by_id[request_id],
-                    stage="dit",
-                    step=step,
-                    old_ranks=old_ranks,
-                    new_ranks=new_ranks,
-                    reason=str(decision.get("reason", schedule_policy)),
-                    policy=str(decision.get("policy", schedule_policy)),
-                )
+                req = req_by_id[request_id]
+                if not self._ddit_is_warmup_req(req):
+                    record_rank_switch(
+                        self.server_args,
+                        req,
+                        stage="dit",
+                        step=step,
+                        old_ranks=old_ranks,
+                        new_ranks=new_ranks,
+                        reason=str(decision.get("reason", schedule_policy)),
+                        policy=str(decision.get("policy", schedule_policy)),
+                    )
                 pending_migrate.append(
                     DDiTOp(
                         action="dit_migrate",
@@ -786,17 +1025,18 @@ class Scheduler(SchedulerDisaggMixin):
             log_stage = "baseline" if decision.get("stage") == "baseline" else "dit"
             log_reason = str(decision.get("reason", schedule_policy))
             log_policy = str(decision.get("policy", schedule_policy))
-            record_lifecycle(self.server_args, req, "dit_start")
-            record_rank_switch(
-                self.server_args,
-                req,
-                stage=log_stage,
-                step=None,
-                old_ranks=(),
-                new_ranks=ranks,
-                reason=log_reason,
-                policy=log_policy,
-            )
+            if not self._ddit_is_warmup_req(req):
+                record_lifecycle(self.server_args, req, "dit_start")
+                record_rank_switch(
+                    self.server_args,
+                    req,
+                    stage=log_stage,
+                    step=None,
+                    old_ranks=(),
+                    new_ranks=ranks,
+                    reason=log_reason,
+                    policy=log_policy,
+                )
             pending_init.append(
                 DDiTOp(
                     action="dit_init",
@@ -860,6 +1100,7 @@ class Scheduler(SchedulerDisaggMixin):
         world_size: int,
         policy: Any,
         running_order: deque[str],
+        pending_register: deque[DDiTOp],
         pending_output_transfer: deque[DDiTOp],
         pending_vae_run: deque[DDiTOp],
         pending_vae_prepare: deque[DDiTOp],
@@ -870,6 +1111,7 @@ class Scheduler(SchedulerDisaggMixin):
     ) -> CommandWave:
         builder = CommandWaveBuilder(wave_id, world_size)
         for queue in (
+            pending_register,
             pending_output_transfer,
             pending_vae_run,
             pending_vae_prepare,
@@ -1008,10 +1250,13 @@ class Scheduler(SchedulerDisaggMixin):
         if self.gpu_id == 0 and identity is not None:
             self.return_result(OutputBatch(error=error), identity, is_warmup=False)
 
-    def _ddit_concurrent_event_loop(self, schedule_policy: str) -> None:
+    def _ddit_concurrent_event_loop(
+        self, schedule_policy: str, *, disagg_prepared: bool = False
+    ) -> None:
         logger.info(
-            "Starting single-node concurrent DDiT event loop with policy=%s.",
+            "Starting single-node concurrent DDiT event loop with policy=%s disagg_prepared=%s.",
             schedule_policy,
+            disagg_prepared,
         )
         world_size = get_world_group().world_size
         full_ranks = tuple(range(world_size))
@@ -1024,6 +1269,10 @@ class Scheduler(SchedulerDisaggMixin):
         if schedule_policy == "fixed_baseline":
             policy = FixedBaselineScheduler(
                 build_fixed_baseline_scheduler_config(self.server_args, world_size)
+            )
+        elif schedule_policy == "forced_switch":
+            policy = ForcedSwitchScheduler(
+                build_forced_switch_scheduler_config(self.server_args, world_size)
             )
         elif schedule_policy == "hungry_first":
             policy = HungryFirstScheduler(
@@ -1038,6 +1287,7 @@ class Scheduler(SchedulerDisaggMixin):
         req_by_id: dict[str, Req] = {}
         running_order: deque[str] = deque()
         pending_init: deque[DDiTOp] = deque()
+        pending_register: deque[DDiTOp] = deque()
         pending_migrate: deque[DDiTOp] = deque()
         pending_finish: deque[DDiTOp] = deque()
         pending_vae_prepare: deque[DDiTOp] = deque()
@@ -1049,12 +1299,23 @@ class Scheduler(SchedulerDisaggMixin):
         vae_preparing: set[str] = set()
         vae_running: set[str] = set()
         output_transferring: set[str] = set()
+        registering: set[str] = set()
+        prepare_backpressure_logged: set[str] = set()
         prepared_since_compute = False
         wave_id = 0
 
         while self._running:
-            self._hungry_recv_rank0_reqs()
+            if disagg_prepared:
+                self._ddit_send_worker_credit(policy)
+                self._ddit_drain_disagg_prepared(
+                    pending_register=pending_register,
+                    registering=registering,
+                    full_ranks=full_ranks,
+                )
+            else:
+                self._hungry_recv_rank0_reqs()
             pending_queues = [
+                pending_register,
                 pending_init,
                 pending_migrate,
                 pending_finish,
@@ -1069,8 +1330,18 @@ class Scheduler(SchedulerDisaggMixin):
             )
 
             wave: CommandWave
-            if self.waiting_queue and (not compute_ready or not prepared_since_compute):
+            can_consider_prepare = (
+                not disagg_prepared
+                and self.waiting_queue
+                and (not compute_ready or not prepared_since_compute)
+            )
+            if can_consider_prepare and self._ddit_waiting_prepare_admitted(
+                policy, self.waiting_queue[0][1]
+            ):
                 identity, item = self.waiting_queue.popleft()
+                prepare_backpressure_logged.discard(
+                    str(getattr(item, "request_id", None) or id(item))
+                )
                 if isinstance(item, Req):
                     action = "full_forward" if item.is_warmup else "full_prepare"
                     wave = self._ddit_exclusive_wave(
@@ -1100,7 +1371,18 @@ class Scheduler(SchedulerDisaggMixin):
                         stage="control",
                     )
                     command_identity = identity
-            else:
+            elif can_consider_prepare:
+                blocked_item = self.waiting_queue[0][1]
+                blocked_request_id = str(
+                    getattr(blocked_item, "request_id", None) or id(blocked_item)
+                )
+                if blocked_request_id not in prepare_backpressure_logged:
+                    self._ddit_record_prepare_backpressure(
+                        wave_id=wave_id,
+                        item=blocked_item,
+                        reason="no_dit_vae_prepare_credit",
+                    )
+                    prepare_backpressure_logged.add(blocked_request_id)
                 self._ddit_enqueue_schedule_decisions(
                     policy=policy,
                     schedule_policy=schedule_policy,
@@ -1111,7 +1393,8 @@ class Scheduler(SchedulerDisaggMixin):
                     req_by_id=req_by_id,
                 )
                 blocked = (
-                    initializing
+                    registering
+                    | initializing
                     | migrating
                     | finishing
                     | vae_preparing
@@ -1123,6 +1406,44 @@ class Scheduler(SchedulerDisaggMixin):
                     world_size=world_size,
                     policy=policy,
                     running_order=running_order,
+                    pending_register=pending_register,
+                    pending_output_transfer=pending_output_transfer,
+                    pending_vae_run=pending_vae_run,
+                    pending_vae_prepare=pending_vae_prepare,
+                    pending_finish=pending_finish,
+                    pending_migrate=pending_migrate,
+                    pending_init=pending_init,
+                    blocked=blocked,
+                )
+                command_identity = None
+                if not wave.ops:
+                    wave = CommandWave(wave_id, ())
+                    time.sleep(0.01)
+            else:
+                self._ddit_enqueue_schedule_decisions(
+                    policy=policy,
+                    schedule_policy=schedule_policy,
+                    pending_init=pending_init,
+                    pending_migrate=pending_migrate,
+                    initializing=initializing,
+                    migrating=migrating,
+                    req_by_id=req_by_id,
+                )
+                blocked = (
+                    registering
+                    | initializing
+                    | migrating
+                    | finishing
+                    | vae_preparing
+                    | vae_running
+                    | output_transferring
+                )
+                wave = self._ddit_build_compute_wave(
+                    wave_id=wave_id,
+                    world_size=world_size,
+                    policy=policy,
+                    running_order=running_order,
+                    pending_register=pending_register,
                     pending_output_transfer=pending_output_transfer,
                     pending_vae_run=pending_vae_run,
                     pending_vae_prepare=pending_vae_prepare,
@@ -1141,7 +1462,13 @@ class Scheduler(SchedulerDisaggMixin):
                 wave_id += 1
                 has_compute_op = any(
                     op.action
-                    not in ("idle", "full_prepare", "full_forward", "control")
+                    not in (
+                        "idle",
+                        "full_prepare",
+                        "register_prepared",
+                        "full_forward",
+                        "control",
+                    )
                     for op in wave.ops
                 )
                 if has_compute_op:
@@ -1157,21 +1484,32 @@ class Scheduler(SchedulerDisaggMixin):
                         request_id = result["request_id"]
                         identities[request_id] = command_identity
                         req_by_id[request_id] = req
-                        state = DDiTRequestState(
+                        state = self._ddit_build_request_state(
                             request_id=request_id,
-                            resolution=resolve_resolution_key(req),
-                            total_steps=int(result["num_timesteps"]),
-                            arrival_time=(
-                                req.metrics.arrival_time_s
-                                if req.metrics and req.metrics.arrival_time_s
-                                else time.time()
-                            ),
-                            vae_k=int(getattr(self.server_args, "ddit_vae_gpus", 1)),
+                            req=req,
+                            num_timesteps=int(result["num_timesteps"]),
+                            world_size=world_size,
+                            schedule_policy=schedule_policy,
                         )
                         policy.add_request(state)
                         if isinstance(policy, FixedBaselineScheduler):
                             policy.mark_text_encoder_done(request_id)
                         prepared_since_compute = True
+                    elif action == "register_prepared":
+                        registering.discard(request_id)
+                        req = result["req"]
+                        request_id = result["request_id"]
+                        req_by_id[request_id] = req
+                        state = self._ddit_build_request_state(
+                            request_id=request_id,
+                            req=req,
+                            num_timesteps=int(result["num_timesteps"]),
+                            world_size=world_size,
+                            schedule_policy=schedule_policy,
+                        )
+                        policy.add_request(state)
+                        if isinstance(policy, FixedBaselineScheduler):
+                            policy.mark_text_encoder_done(request_id)
                     elif action == "full_forward":
                         req = op.payload["req"]
                         self._write_monolithic_profile_row(req, result)
@@ -1208,7 +1546,8 @@ class Scheduler(SchedulerDisaggMixin):
                         req = req_by_id[request_id]
                         req_state = policy.requests[request_id]
                         final_ranks = req_state.ranks
-                        record_lifecycle(self.server_args, req, "dit_end")
+                        if not self._ddit_is_warmup_req(req):
+                            record_lifecycle(self.server_args, req, "dit_end")
                         if getattr(policy, "vae_same_as_dit", False):
                             vae_ranks = final_ranks
                             req_state.phase = RequestPhase.VAE
@@ -1220,24 +1559,25 @@ class Scheduler(SchedulerDisaggMixin):
                                 final_dit_ranks=final_ranks,
                             )
                             policy.transition_to_vae(request_id, vae_ranks)
-                        record_rank_switch(
-                            self.server_args,
-                            req,
-                            stage="vae",
-                            step=req_state.cur_step,
-                            old_ranks=final_ranks,
-                            new_ranks=vae_ranks,
-                            reason=(
-                                f"{schedule_policy}_same_ranks"
-                                if getattr(policy, "vae_same_as_dit", False)
-                                else "dit_to_vae"
-                            ),
-                            policy=(
-                                schedule_policy
-                                if getattr(policy, "vae_same_as_dit", False)
-                                else "ddit_vae_gpus"
-                            ),
-                        )
+                        if not self._ddit_is_warmup_req(req):
+                            record_rank_switch(
+                                self.server_args,
+                                req,
+                                stage="vae",
+                                step=req_state.cur_step,
+                                old_ranks=final_ranks,
+                                new_ranks=vae_ranks,
+                                reason=(
+                                    f"{schedule_policy}_same_ranks"
+                                    if getattr(policy, "vae_same_as_dit", False)
+                                    else "dit_to_vae"
+                                ),
+                                policy=(
+                                    schedule_policy
+                                    if getattr(policy, "vae_same_as_dit", False)
+                                    else "ddit_vae_gpus"
+                                ),
+                            )
                         vae_preparing.add(request_id)
                         pending_vae_prepare.append(
                             DDiTOp(
@@ -1256,9 +1596,9 @@ class Scheduler(SchedulerDisaggMixin):
                         vae_preparing.discard(request_id)
                         req_state = policy.requests[request_id]
                         vae_running.add(request_id)
-                        record_lifecycle(
-                            self.server_args, req_by_id[request_id], "vae_start"
-                        )
+                        req = req_by_id[request_id]
+                        if not self._ddit_is_warmup_req(req):
+                            record_lifecycle(self.server_args, req, "vae_start")
                         pending_vae_run.append(
                             DDiTOp(
                                 action="vae_run",
@@ -1273,17 +1613,22 @@ class Scheduler(SchedulerDisaggMixin):
                         leader = op.ranks[0]
                         if leader == 0:
                             self._ddit_policy_complete(policy, request_id)
-                            record_lifecycle(
-                                self.server_args, req_by_id[request_id], "vae_end"
-                            )
+                            req = req_by_id[request_id]
+                            if not self._ddit_is_warmup_req(req):
+                                record_lifecycle(self.server_args, req, "vae_end")
                             self._write_monolithic_profile_row(
-                                req_by_id[request_id], result
+                                req, result
                             )
-                            self.return_result(
-                                result,
-                                identities.get(request_id),
-                                is_warmup=False,
-                            )
+                            if disagg_prepared:
+                                self._ddit_send_output_to_disagg_server(
+                                    request_id, result
+                                )
+                            else:
+                                self.return_result(
+                                    result,
+                                    identities.get(request_id),
+                                    is_warmup=False,
+                                )
                             identities.pop(request_id, None)
                             req_by_id.pop(request_id, None)
                         else:
@@ -1301,17 +1646,20 @@ class Scheduler(SchedulerDisaggMixin):
                     elif action == "output_transfer":
                         output_transferring.discard(request_id)
                         self._ddit_policy_complete(policy, request_id)
-                        record_lifecycle(
-                            self.server_args, req_by_id[request_id], "vae_end"
-                        )
+                        req = req_by_id[request_id]
+                        if not self._ddit_is_warmup_req(req):
+                            record_lifecycle(self.server_args, req, "vae_end")
                         self._write_monolithic_profile_row(
-                            req_by_id[request_id], result
+                            req, result
                         )
-                        self.return_result(
-                            result,
-                            identities.get(request_id),
-                            is_warmup=False,
-                        )
+                        if disagg_prepared:
+                            self._ddit_send_output_to_disagg_server(request_id, result)
+                        else:
+                            self.return_result(
+                                result,
+                                identities.get(request_id),
+                                is_warmup=False,
+                            )
                         identities.pop(request_id, None)
                         req_by_id.pop(request_id, None)
             except Exception as e:

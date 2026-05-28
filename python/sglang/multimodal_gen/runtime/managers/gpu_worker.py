@@ -282,6 +282,25 @@ class GPUWorker:
             "num_inference_steps": int(req.num_inference_steps),
         }
 
+    def register_hungry_prepared_request(self, req: Req) -> dict:
+        """Register a pre-DiT request state received from an encoder instance."""
+        assert self.pipeline is not None
+        start_time = time.monotonic()
+        _pre_dit_stages, _denoising_stage, post_dit_stages, _decoding_stage = (
+            self._hungry_stage_parts()
+        )
+        self._hungry_states[req.request_id] = {
+            "batch": req,
+            "start_time": start_time,
+            "post_dit_stages": post_dit_stages,
+            "denoising_state": None,
+        }
+        return {
+            "request_id": req.request_id,
+            "num_timesteps": int(len(req.timesteps)),
+            "num_inference_steps": int(req.num_inference_steps),
+        }
+
     def start_hungry_dit(
         self,
         request_id: str,

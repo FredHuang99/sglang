@@ -22,6 +22,7 @@ class TransferMsgType:
     DONE = "transfer_done"
     ALLOC_ACCEPTED = "transfer_alloc_accepted"
     ALLOC_REJECT = "transfer_alloc_reject"
+    CREDIT = "transfer_credit"
 
     # DiffusionServer → Instance
     ALLOC = "transfer_alloc"
@@ -199,6 +200,15 @@ class TransferRegisterMsg:
     # [{"slot_id": int, "offset": int, "size": int, "addr": int,
     #   "meta_offset": int, "meta_size": int, "meta_addr": int}]
     preallocated_slots: list = field(default_factory=list)
+
+
+@dataclass
+class TransferCreditMsg:
+    msg_type: str = TransferMsgType.CREDIT
+    role: str = ""
+    instance_id: int = 0
+    free_slots: int = 0
+    capacity_slots: int = 0
 
 
 def encode_transfer_msg(msg: Any) -> list[bytes]:

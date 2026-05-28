@@ -14,6 +14,7 @@ from enum import Enum
 from typing import Any
 
 from .config import (
+    DDiTSwitchEvent,
     is_power_of_two,
     parse_allowed_gpu_counts,
     parse_local_ranks,
@@ -42,6 +43,8 @@ class DDiTRequestState:
     cur_step: int = 0
     last_scheduled_step: int = 0
     vae_k: int = 1
+    initial_ranks: tuple[int, ...] = ()
+    switch_plan: tuple[DDiTSwitchEvent, ...] = ()
 
 
 @dataclass
@@ -66,6 +69,149 @@ class FixedBaselineSchedulerConfig:
     local_ranks: tuple[int, ...] = tuple(range(8))
     baseline_gpus: int = 1
     allowed_gpu_counts: tuple[int, ...] = (1, 2, 4, 8)
+
+
+@dataclass
+class ForcedSwitchSchedulerConfig:
+    local_ranks: tuple[int, ...] = tuple(range(8))
+    allowed_gpu_counts: tuple[int, ...] = (1, 2, 4, 8)
+
+
+class ForcedSwitchScheduler:
+    """Single-request correctness policy driven by per-request switch plans."""
+
+    vae_same_as_dit = False
+    policy_name = "forced_switch"
+
+    def __init__(self, config: ForcedSwitchSchedulerConfig | None = None):
+        self.config = config or ForcedSwitchSchedulerConfig()
+        self.requests: dict[str, DDiTRequestState] = {}
+        self.waiting: deque[str] = deque()
+        self.gpu_owner: dict[int, str | None] = {
+            rank: None for rank in self.config.local_ranks
+        }
+
+    def add_request(self, request: DDiTRequestState) -> None:
+        if request.request_id in self.requests:
+            raise ValueError(f"Duplicate DDiT request id: {request.request_id}")
+        if not request.initial_ranks:
+            request.initial_ranks = (self.config.local_ranks[0],)
+        request.phase = RequestPhase.WAITING
+        self.requests[request.request_id] = request
+        self.waiting.append(request.request_id)
+
+    def has_waiting_requests(self) -> bool:
+        return bool(self.waiting)
+
+    def prepare_credit(self, next_request: DDiTRequestState | None = None) -> int:
+        ranks = next_request.initial_ranks if next_request is not None else ()
+        if ranks:
+            return 1 if self._ranks_available(ranks, None) else 0
+        return 1 if bool(self._free_ranks()) else 0
+
+    def update_cur_step(self, request_id: str, cur_step: int) -> None:
+        self.requests[request_id].cur_step = int(cur_step)
+
+    def transition_to_vae(
+        self, request_id: str, vae_ranks: tuple[int, ...]
+    ) -> tuple[int, ...]:
+        req = self.requests[request_id]
+        vae_ranks = tuple(sorted(int(rank) for rank in vae_ranks))
+        self._assign(request_id, vae_ranks)
+        req.phase = RequestPhase.VAE
+        return vae_ranks
+
+    def complete_request(self, request_id: str) -> None:
+        req = self.requests[request_id]
+        for rank in req.ranks:
+            self.gpu_owner[rank] = None
+        req.ranks = ()
+        req.phase = RequestPhase.DONE
+
+    def _free_ranks(self) -> list[int]:
+        return [rank for rank, owner in self.gpu_owner.items() if owner is None]
+
+    def _ranks_available(
+        self, ranks: tuple[int, ...], request_id: str | None
+    ) -> bool:
+        for rank in ranks:
+            if rank not in self.gpu_owner:
+                return False
+            owner = self.gpu_owner.get(rank)
+            if owner not in (None, request_id):
+                return False
+        return True
+
+    def _assign(self, request_id: str, ranks: tuple[int, ...]) -> None:
+        req = self.requests[request_id]
+        old_ranks = set(req.ranks)
+        new_ranks = set(ranks)
+        for rank in old_ranks - new_ranks:
+            self.gpu_owner[rank] = None
+        for rank in new_ranks - old_ranks:
+            if self.gpu_owner[rank] not in (None, request_id):
+                raise RuntimeError(
+                    f"Rank {rank} is already owned by {self.gpu_owner[rank]}"
+                )
+            self.gpu_owner[rank] = request_id
+        for rank in new_ranks & old_ranks:
+            self.gpu_owner[rank] = request_id
+        req.ranks = tuple(sorted(ranks))
+        req.phase = RequestPhase.DIT
+        req.last_scheduled_step = req.cur_step
+
+    def _switch_after(self, req: DDiTRequestState) -> DDiTSwitchEvent | None:
+        for event in req.switch_plan:
+            if event.after_step == req.cur_step:
+                return event
+        return None
+
+    def schedule(self) -> list[dict[str, Any]]:
+        decisions: list[dict[str, Any]] = []
+
+        for req in self.requests.values():
+            if req.phase != RequestPhase.DIT:
+                continue
+            event = self._switch_after(req)
+            if event is None:
+                continue
+            new_ranks = tuple(sorted(event.ranks))
+            if new_ranks == req.ranks:
+                continue
+            if not self._ranks_available(new_ranks, req.request_id):
+                continue
+            old_ranks = req.ranks
+            self._assign(req.request_id, new_ranks)
+            decisions.append(
+                {
+                    "request_id": req.request_id,
+                    "stage": "dit",
+                    "old_ranks": old_ranks,
+                    "new_ranks": new_ranks,
+                    "reason": event.reason,
+                    "policy": "forced_switch",
+                }
+            )
+
+        while self.waiting:
+            request_id = self.waiting[0]
+            req = self.requests[request_id]
+            initial_ranks = tuple(sorted(req.initial_ranks))
+            if not self._ranks_available(initial_ranks, request_id):
+                break
+            self.waiting.popleft()
+            self._assign(request_id, initial_ranks)
+            decisions.append(
+                {
+                    "request_id": request_id,
+                    "stage": "dit",
+                    "old_ranks": (),
+                    "new_ranks": initial_ranks,
+                    "reason": "forced_switch",
+                    "policy": "forced_switch",
+                }
+            )
+        return decisions
 
 
 class FixedBaselineScheduler:
@@ -112,6 +258,15 @@ class FixedBaselineScheduler:
 
     def has_waiting_requests(self) -> bool:
         return bool(self.dit_waiting)
+
+    def prepare_credit(self, next_request: DDiTRequestState | None = None) -> int:
+        """Return whether another full-rank prepare may be admitted.
+
+        Fixed baseline does not benefit from preparing a backlog when the fixed
+        DiT/VAE rank group cannot be allocated, so expose a binary credit.
+        """
+        del next_request
+        return 1 if len(self._free_ranks()) >= self.config.baseline_gpus else 0
 
     def update_cur_step(self, request_id: str, cur_step: int) -> None:
         self.requests[request_id].cur_step = int(cur_step)
@@ -181,6 +336,16 @@ class HungryFirstScheduler:
 
     def has_waiting_requests(self) -> bool:
         return bool(self.waiting)
+
+    def prepare_credit(self, next_request: DDiTRequestState | None = None) -> int:
+        """Return a binary text-encoder admission credit for hungry scheduling."""
+        del next_request
+        free_count = len(self._free_ranks())
+        return (
+            1
+            if free_count > 0 and self._floor_allowed_power_of_two(free_count) > 0
+            else 0
+        )
 
     def complete_dit(
         self, request_id: str, *, vae_k: int | None = None
@@ -367,6 +532,11 @@ class ProfileBackedScheduler:
     def has_waiting_requests(self) -> bool:
         return bool(self.waiting)
 
+    def prepare_credit(self, next_request: DDiTRequestState | None = None) -> int:
+        """Return a binary admission credit for profile-backed policies."""
+        del next_request
+        return 1 if bool(self._free_ranks()) else 0
+
     def update_cur_step(self, request_id: str, cur_step: int) -> None:
         self.requests[request_id].cur_step = int(cur_step)
 
@@ -458,6 +628,19 @@ class ProfileBackedScheduler:
 class NaiveScheduler(ProfileBackedScheduler):
     policy_name = "naive"
 
+    def prepare_credit(self, next_request: DDiTRequestState | None = None) -> int:
+        if next_request is None:
+            return 1 if bool(self._free_ranks()) else 0
+        free = self._free_ranks()
+        target_k = self._opt_gpu_count(next_request.resolution)
+        if (
+            target_k in self.config.allowed_gpu_counts
+            and is_power_of_two(target_k)
+            and len(free) >= target_k
+        ):
+            return 1
+        return 0
+
     def schedule(self) -> list[dict[str, Any]]:
         decisions: list[dict[str, Any]] = []
         while self.waiting:
@@ -479,6 +662,10 @@ class NaiveScheduler(ProfileBackedScheduler):
 
 class NaiveGreedyScheduler(ProfileBackedScheduler):
     policy_name = "naive_greedy"
+
+    def prepare_credit(self, next_request: DDiTRequestState | None = None) -> int:
+        del next_request
+        return 1 if bool(self._free_ranks()) else 0
 
     def schedule(self) -> list[dict[str, Any]]:
         decisions: list[dict[str, Any]] = []
@@ -506,6 +693,13 @@ class WSJFScheduler(ProfileBackedScheduler):
 
     def has_waiting_requests(self) -> bool:
         return bool(self.waiting or self.window)
+
+    def prepare_credit(self, next_request: DDiTRequestState | None = None) -> int:
+        del next_request
+        if not self._free_ranks():
+            return 0
+        prepared_backlog = len(self.waiting) + len(self.window)
+        return max(0, self.config.window_size - prepared_backlog)
 
     def _fill_window(self) -> None:
         while self.waiting and len(self.window) < self.config.window_size:
@@ -627,6 +821,21 @@ def build_fixed_baseline_scheduler_config(
     return FixedBaselineSchedulerConfig(
         local_ranks=local_ranks,
         baseline_gpus=baseline_gpus,
+        allowed_gpu_counts=allowed_gpu_counts,
+    )
+
+
+def build_forced_switch_scheduler_config(
+    server_args: Any, world_size: int
+) -> ForcedSwitchSchedulerConfig:
+    local_ranks = parse_local_ranks(
+        getattr(server_args, "ddit_local_ranks", None), world_size
+    )
+    allowed_gpu_counts = parse_allowed_gpu_counts(
+        getattr(server_args, "ddit_allowed_gpu_counts", None), len(local_ranks)
+    )
+    return ForcedSwitchSchedulerConfig(
+        local_ranks=local_ranks,
         allowed_gpu_counts=allowed_gpu_counts,
     )
 

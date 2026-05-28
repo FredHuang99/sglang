@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     TransferAllocAcceptedMsg,
     TransferAllocRejectMsg,
+    TransferCreditMsg,
     TransferPushedMsg,
     TransferRegisterMsg,
     TransferStagedMsg,
@@ -43,6 +44,59 @@ class TestDiffusionServerInit(unittest.TestCase):
         self.assertEqual(server._encoder_free_slots, [3])
         self.assertEqual(server._denoiser_free_slots, [3])
         self.assertEqual(server._decoder_free_slots, [3])
+
+    def test_ddit_worker_credit_gates_encoder_dispatch(self):
+        server = DiffusionServer(
+            frontend_endpoint="tcp://127.0.0.1:19920",
+            encoder_work_endpoints=["tcp://127.0.0.1:19921"],
+            denoiser_work_endpoints=[],
+            decoder_work_endpoints=[],
+            encoder_result_endpoint="tcp://127.0.0.1:19924",
+            denoiser_result_endpoint="tcp://127.0.0.1:19925",
+            decoder_result_endpoint="tcp://127.0.0.1:19926",
+            ddit_worker_work_endpoints=["tcp://127.0.0.1:19927"],
+            ddit_worker_result_endpoint="tcp://127.0.0.1:19928",
+        )
+        self.addCleanup(server.stop)
+        server._encoder_pushes = [MagicMock()]
+        server._ddit_worker_pushes = [MagicMock()]
+
+        frontend = MagicMock()
+        frontend.recv_multipart.return_value = [
+            b"client",
+            b"",
+            pickle.dumps(SimpleNamespace(request_id="req-credit", metrics=None)),
+        ]
+
+        server._handle_client_request(frontend)
+        frontend2 = MagicMock()
+        frontend2.recv_multipart.return_value = [
+            b"client2",
+            b"",
+            pickle.dumps(SimpleNamespace(request_id="req-credit-2", metrics=None)),
+        ]
+        server._handle_client_request(frontend2)
+        server._drain_all_queues()
+
+        self.assertEqual(len(server._encoder_tta), 2)
+        server._encoder_pushes[0].send_multipart.assert_not_called()
+
+        server._handle_transfer_result(
+            encode_transfer_msg(
+                TransferCreditMsg(
+                    role=RoleType.DDIT_WORKER.value,
+                    instance_id=0,
+                    free_slots=1,
+                    capacity_slots=1,
+                )
+            ),
+            RoleType.DDIT_WORKER,
+        )
+        server._drain_all_queues()
+
+        self.assertEqual(len(server._encoder_tta), 1)
+        server._encoder_pushes[0].send_multipart.assert_called_once()
+        self.assertEqual(server._ddit_worker_free_slots, [0])
 
 
 class TestDiffusionServerClientRequests(unittest.TestCase):

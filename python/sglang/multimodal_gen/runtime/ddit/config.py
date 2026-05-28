@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -14,6 +15,23 @@ DDIT_SCHEDULE_POLICIES = (
     "wsjf",
     "wsjf_scale_up",
 )
+
+DDIT_SP_DEGREE_SHORTPATH = "shortpath"
+
+SHORTPATH_SP_DEGREE_TABLES: dict[str, dict[int, tuple[int, int]]] = {
+    "wan2.1-t2v-1.3b": {
+        1: (1, 1),
+        2: (2, 1),
+        4: (4, 1),
+        8: (2, 4),
+    },
+    "z-image": {
+        1: (1, 1),
+        2: (2, 1),
+        4: (2, 2),
+        8: (2, 4),
+    },
+}
 
 
 @dataclass(frozen=True)
@@ -235,6 +253,11 @@ def parse_sp_degree_map(value: Any) -> dict[int, tuple[int, int]]:
     """Parse '1=1x1,2=2x1,4=2x2' into {k: (ulysses, ring)}."""
     if value is None or value == "":
         return {}
+    if is_shortpath_sp_degree_map(value):
+        raise ValueError(
+            "--ddit-sp-degree-map shortpath must be resolved with "
+            "resolve_ddit_sp_degrees(server_args=...)."
+        )
     if isinstance(value, dict):
         parsed = {}
         for key, degree in value.items():
@@ -254,6 +277,55 @@ def parse_sp_degree_map(value: Any) -> dict[int, tuple[int, int]]:
     return parsed
 
 
+def is_shortpath_sp_degree_map(value: Any) -> bool:
+    return isinstance(value, str) and value.strip().lower() == DDIT_SP_DEGREE_SHORTPATH
+
+
+def normalize_shortpath_model_id(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    normalized = normalized.replace("\\", "/").rstrip("/")
+    basename = normalized.rsplit("/", 1)[-1]
+    joined = f"{normalized} {basename}"
+    if "wan" in joined and "2.1" in joined and "1.3" in joined:
+        return "wan2.1-t2v-1.3b"
+    if "z-image" in joined or "zimage" in joined:
+        return "z-image"
+    return basename or normalized
+
+
+def resolve_shortpath_model_id(server_args: Any) -> str:
+    explicit = getattr(server_args, "ddit_profile_model_id", None)
+    if explicit:
+        return normalize_shortpath_model_id(explicit)
+    model_id = getattr(server_args, "model_id", None)
+    if model_id:
+        return normalize_shortpath_model_id(model_id)
+    model_path = getattr(server_args, "model_path", None)
+    if model_path:
+        return normalize_shortpath_model_id(os.path.basename(str(model_path)))
+    return ""
+
+
+def resolve_shortpath_sp_degrees(
+    model_id: Any, rank_count: int
+) -> tuple[int, int]:
+    normalized_model_id = normalize_shortpath_model_id(model_id)
+    table = SHORTPATH_SP_DEGREE_TABLES.get(normalized_model_id)
+    if table is None:
+        supported = ", ".join(sorted(SHORTPATH_SP_DEGREE_TABLES))
+        raise ValueError(
+            "--ddit-sp-degree-map shortpath supports only "
+            f"{supported}; got model id {model_id!r}."
+        )
+    if rank_count not in table:
+        supported_counts = ", ".join(str(count) for count in sorted(table))
+        raise ValueError(
+            f"--ddit-sp-degree-map shortpath for {normalized_model_id} supports "
+            f"rank counts {{{supported_counts}}}; got {rank_count}."
+        )
+    return table[rank_count]
+
+
 def resolve_sp_degrees(rank_count: int, degree_map: Any = None) -> tuple[int, int]:
     parsed_map = parse_sp_degree_map(degree_map)
     ulysses, ring = parsed_map.get(rank_count, (rank_count, 1))
@@ -263,6 +335,24 @@ def resolve_sp_degrees(rank_count: int, degree_map: Any = None) -> tuple[int, in
             f"{ulysses}x{ring} != {rank_count}"
         )
     return ulysses, ring
+
+
+def resolve_ddit_sp_degrees(
+    rank_count: int,
+    degree_map: Any = None,
+    *,
+    server_args: Any = None,
+) -> tuple[int, int]:
+    if is_shortpath_sp_degree_map(degree_map):
+        if server_args is None:
+            raise ValueError(
+                "--ddit-sp-degree-map shortpath requires server_args for model-id "
+                "resolution."
+            )
+        return resolve_shortpath_sp_degrees(
+            resolve_shortpath_model_id(server_args), rank_count
+        )
+    return resolve_sp_degrees(rank_count, degree_map)
 
 
 def build_execution_plan(

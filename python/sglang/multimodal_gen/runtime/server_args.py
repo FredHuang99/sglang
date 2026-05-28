@@ -274,6 +274,7 @@ class ServerArgs:
     encoder_urls: str | None = None
     denoiser_urls: str | None = None
     decoder_urls: str | None = None
+    ddit_worker_urls: str | None = None
     # Per-role parallelism overrides (None = auto-derive from num_gpus)
     encoder_tp: int | None = None
     denoiser_tp: int | None = None
@@ -342,6 +343,13 @@ class ServerArgs:
                 "ulysses_degree": self.denoiser_ulysses,
                 "ring_degree": self.denoiser_ring,
             }
+        elif role_type == RoleType.DDIT_WORKER:
+            return {
+                "tp_size": self.denoiser_tp,
+                "sp_degree": self.denoiser_sp,
+                "ulysses_degree": self.denoiser_ulysses,
+                "ring_degree": self.denoiser_ring,
+            }
         elif role_type == RoleType.DECODER:
             return {**_none, "sp_degree": self.decoder_sp}
         return _none
@@ -351,6 +359,7 @@ class ServerArgs:
         RoleType.ENCODER: 1,
         RoleType.DENOISER: 2,
         RoleType.DECODER: 3,
+        RoleType.DDIT_WORKER: 4,
     }
 
     def derive_pool_result_endpoint(self) -> str:
@@ -453,9 +462,12 @@ class ServerArgs:
             return
         from sglang.multimodal_gen.runtime.ddit.config import (
             DDIT_SCHEDULE_POLICIES,
+            is_shortpath_sp_degree_map,
             parse_allowed_gpu_counts,
             parse_sp_degree_map,
             parse_switch_plan,
+            resolve_shortpath_model_id,
+            resolve_shortpath_sp_degrees,
         )
 
         allowed = parse_allowed_gpu_counts(self.ddit_allowed_gpu_counts, self.num_gpus)
@@ -502,18 +514,23 @@ class ServerArgs:
                 self.ddit_schedule_policy,
             )
         parse_switch_plan(self.ddit_switch_plan)
-        degree_map = parse_sp_degree_map(self.ddit_sp_degree_map)
-        for gpu_count, (ulysses, ring) in degree_map.items():
-            if gpu_count not in allowed:
-                raise ValueError(
-                    f"--ddit-sp-degree-map contains unsupported GPU count "
-                    f"{gpu_count}; allowed counts are {allowed}"
-                )
-            if ulysses * ring != gpu_count:
-                raise ValueError(
-                    f"--ddit-sp-degree-map entry {gpu_count}={ulysses}x{ring} "
-                    f"does not multiply to {gpu_count}"
-                )
+        if is_shortpath_sp_degree_map(self.ddit_sp_degree_map):
+            model_id = resolve_shortpath_model_id(self)
+            for gpu_count in allowed:
+                resolve_shortpath_sp_degrees(model_id, gpu_count)
+        else:
+            degree_map = parse_sp_degree_map(self.ddit_sp_degree_map)
+            for gpu_count, (ulysses, ring) in degree_map.items():
+                if gpu_count not in allowed:
+                    raise ValueError(
+                        f"--ddit-sp-degree-map contains unsupported GPU count "
+                        f"{gpu_count}; allowed counts are {allowed}"
+                    )
+                if ulysses * ring != gpu_count:
+                    raise ValueError(
+                        f"--ddit-sp-degree-map entry {gpu_count}={ulysses}x{ring} "
+                        f"does not multiply to {gpu_count}"
+                    )
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -936,9 +953,11 @@ class ServerArgs:
             "'encoder': run as encoder role instance. "
             "'denoising': run as denoiser role instance. "
             "'decoder': run as decoder role instance. "
+            "'ddit_worker': run as a two-stage DDiT DiT+VAE worker. "
             "'server': run as DiffusionServer head node (no GPU, routes requests). "
             "Role instances require --disagg-server-addr. "
-            "Server requires --encoder-urls, --denoiser-urls, --decoder-urls.",
+            "Server requires either --encoder-urls/--denoiser-urls/--decoder-urls "
+            "or --encoder-urls/--ddit-worker-urls.",
         )
         parser.add_argument(
             "--disagg-timeout",
@@ -1061,6 +1080,14 @@ class ServerArgs:
             default=None,
             help="Decoder instance work endpoints for DiffusionServer head mode. "
             "Semicolon-separated. Example: 'tcp://10.0.0.5:35000;tcp://10.0.0.6:35000'.",
+        )
+        parser.add_argument(
+            "--ddit-worker-urls",
+            type=str,
+            default=None,
+            help="DDiT DiT+VAE worker work endpoints for two-stage disaggregation. "
+            "Semicolon-separated. When set, DiffusionServer routes encoder outputs "
+            "directly to these workers and does not require denoiser/decoder URLs.",
         )
 
         # Per-role parallelism overrides
@@ -1216,7 +1243,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.ddit_sp_degree_map,
             help="Optional map from GPU count to Ulysses x Ring degrees, "
-            "e.g. '1=1x1,2=2x1,4=2x2,8=4x2'. Defaults to Ulysses-only.",
+            "e.g. '1=1x1,2=2x1,4=2x2,8=4x2'. The special value "
+            "'shortpath' selects built-in Wan2.1/Z-Image DDiT degree tables. "
+            "Defaults to Ulysses-only.",
         )
         parser.add_argument(
             "--ddit-prebuild-sp-groups",

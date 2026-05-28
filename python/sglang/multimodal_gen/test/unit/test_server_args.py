@@ -95,7 +95,12 @@ class TestPerRoleParallelism(unittest.TestCase):
         args = _from_dict_without_model_resolution({"model_path": "/fake"})
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
-        for role in [RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER]:
+        for role in [
+            RoleType.ENCODER,
+            RoleType.DENOISER,
+            RoleType.DECODER,
+            RoleType.DDIT_WORKER,
+        ]:
             par = args.get_role_parallelism(role)
             self.assertIsNone(par["tp_size"])
             self.assertIsNone(par["sp_degree"])
@@ -134,6 +139,28 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(par["sp_degree"], 8)
         self.assertEqual(par["ulysses_degree"], 4)
         self.assertEqual(par["ring_degree"], 2)
+
+    def test_ddit_worker_uses_denoiser_parallelism_overrides(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "denoiser_tp": 1,
+                "denoiser_sp": 8,
+                "denoiser_ulysses": 8,
+                "denoiser_ring": 1,
+            }
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        par = args.get_role_parallelism(RoleType.DDIT_WORKER)
+        self.assertEqual(par["tp_size"], 1)
+        self.assertEqual(par["sp_degree"], 8)
+        self.assertEqual(par["ulysses_degree"], 8)
+        self.assertEqual(par["ring_degree"], 1)
+        self.assertEqual(
+            args.DISAGG_RESULT_PORT_OFFSETS[RoleType.DDIT_WORKER],
+            4,
+        )
 
     def test_decoder_overrides(self):
         args = _from_dict_without_model_resolution(
@@ -318,6 +345,23 @@ class TestDisaggTimeoutArgs(unittest.TestCase):
 
         self.assertEqual(args.disagg_role, RoleType.DENOISER)
 
+    def test_ddit_worker_role_and_urls_parse(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            [
+                "--model-path",
+                "/fake",
+                "--disagg-role",
+                "ddit_worker",
+                "--ddit-worker-urls",
+                "tcp://127.0.0.1:49001",
+            ]
+        )
+
+        self.assertEqual(args.disagg_role, "ddit_worker")
+        self.assertEqual(args.ddit_worker_urls, "tcp://127.0.0.1:49001")
+
 
 class TestDisaggTransferBackendArgs(unittest.TestCase):
     def test_transfer_backend_defaults_to_auto(self):
@@ -336,6 +380,31 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
 
         args, _unknown = parser.parse_known_args(argv)
         self.assertEqual(args.disagg_transfer_backend, "mock")
+
+
+class TestDDiTServerArgs(unittest.TestCase):
+    def test_shortpath_sp_degree_map_is_validated_for_supported_model(self):
+        args = ServerArgs(
+            model_path="/models/Wan2.1-T2V-1.3B",
+            enable_ddit=True,
+            num_gpus=8,
+            ddit_sp_degree_map="shortpath",
+            ddit_profile_model_id="wan2.1-t2v-1.3b",
+        )
+
+        args._validate_ddit()
+
+    def test_shortpath_sp_degree_map_rejects_unsupported_model(self):
+        args = ServerArgs(
+            model_path="/models/unknown",
+            enable_ddit=True,
+            num_gpus=8,
+            ddit_sp_degree_map="shortpath",
+            ddit_profile_model_id="unknown",
+        )
+
+        with self.assertRaisesRegex(ValueError, "supports only"):
+            args._validate_ddit()
 
 
 if __name__ == "__main__":

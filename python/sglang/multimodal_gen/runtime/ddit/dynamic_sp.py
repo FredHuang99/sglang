@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
-from .config import parse_allowed_gpu_counts, parse_local_ranks, resolve_sp_degrees
+from .config import parse_allowed_gpu_counts, parse_local_ranks, resolve_ddit_sp_degrees
 
 
 @dataclass(frozen=True)
@@ -108,8 +108,10 @@ class DynamicSPGroupRegistry:
         if not dist.is_available() or not dist.is_initialized():
             return None
         ranks = tuple(sorted(int(rank) for rank in ranks))
-        ulysses_degree, ring_degree = resolve_sp_degrees(
-            len(ranks), getattr(self.server_args, "ddit_sp_degree_map", None)
+        ulysses_degree, ring_degree = resolve_ddit_sp_degrees(
+            len(ranks),
+            getattr(self.server_args, "ddit_sp_degree_map", None),
+            server_args=self.server_args,
         )
         spec = DynamicSPGroupSpec(
             ranks=ranks,

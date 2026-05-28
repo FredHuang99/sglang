@@ -452,7 +452,10 @@ class SchedulerDisaggMixin:
         for name in tensors:
             category = _DIST_REPLICATE
             if self.server_args.sp_degree > 1:
-                if self._disagg_role == RoleType.DENOISER and name in {
+                if self._disagg_role in (
+                    RoleType.DENOISER,
+                    RoleType.DDIT_WORKER,
+                ) and name in {
                     "latents",
                     "image_latent",
                 }:
@@ -475,7 +478,10 @@ class SchedulerDisaggMixin:
         req: Req,
         categories: dict[str, str],
     ) -> Req:
-        if self._disagg_role != RoleType.DENOISER or self.server_args.sp_degree <= 1:
+        if (
+            self._disagg_role not in (RoleType.DENOISER, RoleType.DDIT_WORKER)
+            or self.server_args.sp_degree <= 1
+        ):
             return req
 
         pre_sharded_fields: set[str] = set()
@@ -499,7 +505,7 @@ class SchedulerDisaggMixin:
         return req
 
     def _prepare_disagg_req_for_compute(self: Scheduler, req: Req) -> Req:
-        if self._disagg_role == RoleType.DENOISER:
+        if self._disagg_role in (RoleType.DENOISER, RoleType.DDIT_WORKER):
             scheduler_mod = self.worker.pipeline.get_module("scheduler")
             num_steps = getattr(req, "num_inference_steps", None)
             if scheduler_mod is not None and num_steps is not None:
@@ -534,7 +540,11 @@ class SchedulerDisaggMixin:
         return self._prepare_disagg_req_for_compute(req)
 
     def _role_has_inbound_transfer(self: Scheduler) -> bool:
-        return self._disagg_role in (RoleType.DENOISER, RoleType.DECODER)
+        return self._disagg_role in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+            RoleType.DDIT_WORKER,
+        )
 
     def _role_has_outbound_transfer(self: Scheduler) -> bool:
         return self._disagg_role in (RoleType.ENCODER, RoleType.DENOISER)
@@ -543,7 +553,11 @@ class SchedulerDisaggMixin:
         return self._disagg_role in (RoleType.ENCODER, RoleType.DENOISER)
 
     def _role_accepts_ready_failed(self: Scheduler) -> bool:
-        return self._disagg_role in (RoleType.DENOISER, RoleType.DECODER)
+        return self._disagg_role in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+            RoleType.DDIT_WORKER,
+        )
 
     def _prune_aborted_requests(self: Scheduler) -> None:
         aborted = getattr(self, "_aborted_request_ids", None)

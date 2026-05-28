@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Any
 
 import zmq
 
@@ -31,6 +32,7 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     encode_transfer_msg,
     is_transfer_message,
 )
+from sglang.multimodal_gen.runtime.ddit.logging import record_lifecycle
 from sglang.multimodal_gen.runtime.entrypoints.utils import GetDisaggStatsReq
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.request_profiling import (
@@ -120,6 +122,8 @@ class DiffusionServer:
         encoder_result_endpoint: str,
         denoiser_result_endpoint: str,
         decoder_result_endpoint: str,
+        ddit_worker_work_endpoints: list[str] | None = None,
+        ddit_worker_result_endpoint: str | None = None,
         dispatch_policy_name: str = "round_robin",
         timeout_s: float = 600.0,
         downstream_wait_timeout_s: float = 120.0,
@@ -128,26 +132,32 @@ class DiffusionServer:
         profile_enabled: bool = False,
         profile_output_dir: str | None = None,
         profile_run_id: str | None = None,
+        server_args: Any | None = None,
     ):
         self._frontend_endpoint = frontend_endpoint
         self._encoder_work_endpoints = encoder_work_endpoints
         self._denoiser_work_endpoints = denoiser_work_endpoints
         self._decoder_work_endpoints = decoder_work_endpoints
+        self._ddit_worker_work_endpoints = ddit_worker_work_endpoints or []
         self._encoder_result_endpoint = encoder_result_endpoint
         self._denoiser_result_endpoint = denoiser_result_endpoint
         self._decoder_result_endpoint = decoder_result_endpoint
+        self._ddit_worker_result_endpoint = ddit_worker_result_endpoint
 
         self._num_encoders = len(encoder_work_endpoints)
         self._num_denoisers = len(denoiser_work_endpoints)
         self._num_decoders = len(decoder_work_endpoints)
+        self._num_ddit_workers = len(self._ddit_worker_work_endpoints)
+        self._two_stage_ddit = self._num_ddit_workers > 0
         self._timeout_s = timeout_s
         self._downstream_wait_timeout_s = downstream_wait_timeout_s
+        self._server_args = server_args
 
         self._tracker = RequestTracker()
         self._dispatcher = PoolDispatcher(
             num_encoders=self._num_encoders,
-            num_denoisers=self._num_denoisers,
-            num_decoders=self._num_decoders,
+            num_denoisers=max(1, self._num_denoisers),
+            num_decoders=max(1, self._num_decoders),
             policy_name=dispatch_policy_name,
             max_slots_per_instance=max_slots_per_instance,
         )
@@ -168,17 +178,21 @@ class DiffusionServer:
         self._encoder_capacity_limits = [max_slots_per_instance] * self._num_encoders
         self._denoiser_capacity_limits = [max_slots_per_instance] * self._num_denoisers
         self._decoder_capacity_limits = [max_slots_per_instance] * self._num_decoders
+        self._ddit_worker_capacity_limits = [0] * self._num_ddit_workers
         self._encoder_free_slots = [max_slots_per_instance] * self._num_encoders
         self._denoiser_free_slots = [max_slots_per_instance] * self._num_denoisers
         self._decoder_free_slots = [max_slots_per_instance] * self._num_decoders
+        self._ddit_worker_free_slots = [0] * self._num_ddit_workers
         self._encoder_capacity_epochs = [0] * self._num_encoders
         self._denoiser_capacity_epochs = [0] * self._num_denoisers
         self._decoder_capacity_epochs = [0] * self._num_decoders
+        self._ddit_worker_capacity_epochs = [0] * self._num_ddit_workers
 
         # TTA queues per role type
         self._encoder_tta: deque[_EncoderTTAEntry] = deque()
         self._denoiser_tta: deque[_RoleTTAEntry] = deque()
         self._decoder_tta: deque[_RoleTTAEntry] = deque()
+        self._ddit_worker_tta: deque[_RoleTTAEntry] = deque()
 
         # Legacy/stat-only flag retained for compatibility. The current
         # disaggregation path always uses the transfer protocol.
@@ -198,6 +212,8 @@ class DiffusionServer:
         self._encoder_peers: dict[int, dict] = {}
         self._denoiser_peers: dict[int, dict] = {}
         self._decoder_peers: dict[int, dict] = {}
+        self._ddit_worker_peers: dict[int, dict] = {}
+        self._ddit_worker_admission_reservations: dict[str, int] = {}
 
     @staticmethod
     def _set_transfer_phase(
@@ -384,16 +400,18 @@ class DiffusionServer:
         self._thread.start()
         logger.info(
             "DiffusionServer started: frontend=%s, "
-            "%d encoder(s), %d denoiser(s), %d decoder(s), policy=%s, "
-            "capacity=(%d/%d/%d)",
+            "%d encoder(s), %d denoiser(s), %d decoder(s), %d ddit_worker(s), "
+            "policy=%s, capacity=(%d/%d/%d/%d)",
             self._frontend_endpoint,
             self._num_encoders,
             self._num_denoisers,
             self._num_decoders,
+            self._num_ddit_workers,
             type(self._dispatcher.encoder_policy).__name__,
             self._encoder_free_slots[0] if self._encoder_free_slots else 0,
             self._denoiser_free_slots[0] if self._denoiser_free_slots else 0,
             self._decoder_free_slots[0] if self._decoder_free_slots else 0,
+            self._ddit_worker_free_slots[0] if self._ddit_worker_free_slots else 0,
         )
 
     def stop(self) -> None:
@@ -441,6 +459,11 @@ class DiffusionServer:
             sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
             decoder_pushes.append(sock)
 
+        ddit_worker_pushes: list[zmq.Socket] = []
+        for i, ep in enumerate(self._ddit_worker_work_endpoints):
+            sock, _ = get_zmq_socket(self._context, zmq.PUSH, ep, bind=False)
+            ddit_worker_pushes.append(sock)
+
         encoder_result_pull, _ = get_zmq_socket(
             self._context, zmq.PULL, self._encoder_result_endpoint, bind=True
         )
@@ -450,23 +473,36 @@ class DiffusionServer:
         decoder_result_pull, _ = get_zmq_socket(
             self._context, zmq.PULL, self._decoder_result_endpoint, bind=True
         )
+        ddit_worker_result_pull = None
+        if self._ddit_worker_result_endpoint is not None:
+            ddit_worker_result_pull, _ = get_zmq_socket(
+                self._context,
+                zmq.PULL,
+                self._ddit_worker_result_endpoint,
+                bind=True,
+            )
 
         poller = zmq.Poller()
         poller.register(frontend, zmq.POLLIN)
         poller.register(encoder_result_pull, zmq.POLLIN)
         poller.register(denoiser_result_pull, zmq.POLLIN)
         poller.register(decoder_result_pull, zmq.POLLIN)
+        if ddit_worker_result_pull is not None:
+            poller.register(ddit_worker_result_pull, zmq.POLLIN)
 
         self._encoder_pushes = encoder_pushes
         self._denoiser_pushes = denoiser_pushes
         self._decoder_pushes = decoder_pushes
+        self._ddit_worker_pushes = ddit_worker_pushes
         self._frontend = frontend
 
         all_sockets = (
             [frontend, encoder_result_pull, denoiser_result_pull, decoder_result_pull]
+            + ([ddit_worker_result_pull] if ddit_worker_result_pull is not None else [])
             + encoder_pushes
             + denoiser_pushes
             + decoder_pushes
+            + ddit_worker_pushes
         )
 
         try:
@@ -486,6 +522,14 @@ class DiffusionServer:
 
                 if decoder_result_pull in events:
                     self._handle_role_result(decoder_result_pull, RoleType.DECODER)
+
+                if (
+                    ddit_worker_result_pull is not None
+                    and ddit_worker_result_pull in events
+                ):
+                    self._handle_role_result(
+                        ddit_worker_result_pull, RoleType.DDIT_WORKER
+                    )
 
                 self._drain_all_queues()
 
@@ -511,6 +555,8 @@ class DiffusionServer:
             self._handle_encoder_result_frames(frames)
         elif role == RoleType.DECODER:
             self._handle_decoder_result_frames(frames)
+        elif role == RoleType.DDIT_WORKER:
+            self._handle_ddit_worker_result_frames(frames)
         else:
             logger.warning(
                 "DiffusionServer: unexpected non-transfer frames from %s", role.value
@@ -592,6 +638,16 @@ class DiffusionServer:
             self._tracker.transition(request_id, RequestState.ENCODER_WAITING)
         except ValueError:
             pass
+        if self._server_args is not None and getattr(
+            self._server_args, "enable_ddit", False
+        ) and not getattr(req, "is_warmup", False):
+            record_lifecycle(
+                self._server_args,
+                req,
+                "add",
+                timestamp=request_arrival_time_s or time.time(),
+                status="queued",
+            )
         self._encoder_tta.append(
             _EncoderTTAEntry(
                 request_id=request_id,
@@ -693,6 +749,72 @@ class DiffusionServer:
         )
         self._tracker.remove(request_id)
 
+    def _handle_ddit_worker_result_frames(self, frames: list) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
+            OutputBatch,
+        )
+
+        request_id = self._extract_request_id(frames)
+        if request_id is None:
+            logger.warning("DiffusionServer: DDiT worker result missing request_id")
+            return
+        self._mark_profile_event(request_id, "completion_signal_time_s")
+        self._clear_ddit_worker_admission_reservation(
+            request_id,
+            restore_credit=False,
+        )
+
+        record = self._tracker.get(request_id)
+        p2p = self._transfer_state.get(request_id)
+        if p2p is not None:
+            self._recycle_prealloc_slot(p2p, RoleType.DDIT_WORKER)
+            self._release_receiver_slot_if_needed(p2p, record)
+            self._release_sender_slot_if_needed(p2p, record)
+        elif record and record.denoiser_instance is not None:
+            self._release_role_slot(RoleType.DDIT_WORKER, record.denoiser_instance)
+
+        tensor_fields, scalar_fields = unpack_tensors(frames, device="cpu")
+        output_batch = OutputBatch(
+            output=tensor_fields.get("output"),
+            audio=tensor_fields.get("audio"),
+            audio_sample_rate=scalar_fields.get("audio_sample_rate"),
+            error=scalar_fields.get("error"),
+        )
+
+        try:
+            if output_batch.error:
+                self._tracker.transition(
+                    request_id, RequestState.FAILED, error=output_batch.error
+                )
+            else:
+                self._tracker.transition(request_id, RequestState.DONE)
+        except ValueError:
+            pass
+
+        with self._lock:
+            client_identity = self._pending.pop(request_id, None)
+
+        if client_identity is not None:
+            self._mark_profile_event(request_id, "finish_time_s")
+            try:
+                self._frontend.send_multipart(
+                    [client_identity, b"", pickle.dumps(output_batch)]
+                )
+            except zmq.ZMQError as e:
+                logger.error(
+                    "DiffusionServer: failed to send DDiT result for %s: %s",
+                    request_id,
+                    e,
+                )
+
+        self._transfer_state.pop(request_id, None)
+        self._finalize_server_profile(
+            request_id,
+            status="failed" if output_batch.error else "completed",
+            error=output_batch.error,
+        )
+        self._tracker.remove(request_id)
+
     def _dispatch_to_encoder(
         self, request_id: str, payload: bytes, encoder_idx: int
     ) -> None:
@@ -719,8 +841,11 @@ class DiffusionServer:
 
     def _drain_all_queues(self) -> None:
         self._drain_encoder_tta()
-        self._drain_denoiser_tta()
-        self._drain_decoder_tta()
+        if self._two_stage_ddit:
+            self._drain_ddit_worker_tta()
+        else:
+            self._drain_denoiser_tta()
+            self._drain_decoder_tta()
 
     def _drain_encoder_tta(self) -> None:
         while self._encoder_tta:
@@ -729,7 +854,20 @@ class DiffusionServer:
             )
             if idx is None:
                 break
+            ddit_worker_idx = None
+            if self._two_stage_ddit:
+                ddit_worker_idx = self._select_downstream_instance_with_capacity(
+                    RoleType.DDIT_WORKER
+                )
+                if ddit_worker_idx is None:
+                    break
             entry = self._encoder_tta.popleft()
+            if ddit_worker_idx is not None:
+                self._ddit_worker_free_slots[ddit_worker_idx] -= 1
+                self._ddit_worker_admission_reservations[entry.request_id] = (
+                    ddit_worker_idx
+                )
+                self._bump_capacity_epoch(RoleType.DDIT_WORKER, ddit_worker_idx)
             self._dispatch_to_encoder(entry.request_id, entry.payload, idx)
 
     def _drain_denoiser_tta(self) -> None:
@@ -745,6 +883,35 @@ class DiffusionServer:
             RoleType.DECODER,
             self._transfer_dispatch_to_decoder,
         )
+
+    def _drain_ddit_worker_tta(self) -> None:
+        scan_count = len(self._ddit_worker_tta)
+        for _ in range(scan_count):
+            entry = self._ddit_worker_tta.popleft()
+            p2p = entry.transfer_state
+            reserved_idx = self._ddit_worker_admission_reservations.get(
+                entry.request_id
+            )
+            consume_slot = reserved_idx is None
+            if reserved_idx is None:
+                reserved_idx = self._select_downstream_instance_with_capacity(
+                    RoleType.DDIT_WORKER,
+                    p2p,
+                    allow_rejected_retry=(
+                        p2p is None or p2p.next_downstream_retry_at <= time.monotonic()
+                    ),
+                )
+            if reserved_idx is None:
+                self._ddit_worker_tta.append(entry)
+                continue
+            if p2p is not None:
+                p2p.downstream_tta_enqueued = False
+            self._transfer_dispatch_to_ddit_worker(
+                entry.request_id,
+                entry.transfer_state,
+                reserved_idx,
+                consume_slot=consume_slot,
+            )
 
     def _drain_role_tta(
         self,
@@ -875,6 +1042,9 @@ class DiffusionServer:
             self._decoder_tta = deque(
                 e for e in self._decoder_tta if e.request_id not in all_timed_out
             )
+            self._ddit_worker_tta = deque(
+                e for e in self._ddit_worker_tta if e.request_id not in all_timed_out
+            )
 
     def _free_slot_for_record(self, record) -> None:
         if (
@@ -891,7 +1061,12 @@ class DiffusionServer:
             )
             and record.denoiser_instance is not None
         ):
-            self._release_role_slot(RoleType.DENOISER, record.denoiser_instance)
+            role = (
+                RoleType.DDIT_WORKER
+                if self._two_stage_ddit
+                else RoleType.DENOISER
+            )
+            self._release_role_slot(role, record.denoiser_instance)
         if (
             record.state in (RequestState.DECODER_WAITING, RequestState.DECODER_RUNNING)
             and record.decoder_instance is not None
@@ -914,6 +1089,8 @@ class DiffusionServer:
             return self._denoiser_peers
         if role == RoleType.DECODER:
             return self._decoder_peers
+        if role == RoleType.DDIT_WORKER:
+            return self._ddit_worker_peers
         raise ValueError(f"Unsupported role for peer registry: {role}")
 
     def _role_pushes(self, role: RoleType) -> list[zmq.Socket]:
@@ -923,6 +1100,8 @@ class DiffusionServer:
             return self._denoiser_pushes
         if role == RoleType.DECODER:
             return self._decoder_pushes
+        if role == RoleType.DDIT_WORKER:
+            return self._ddit_worker_pushes
         raise ValueError(f"Unsupported role for push sockets: {role}")
 
     def _role_slot_arrays(self, role: RoleType) -> tuple[list[int], list[int]]:
@@ -932,6 +1111,8 @@ class DiffusionServer:
             return self._denoiser_free_slots, self._denoiser_capacity_limits
         if role == RoleType.DECODER:
             return self._decoder_free_slots, self._decoder_capacity_limits
+        if role == RoleType.DDIT_WORKER:
+            return self._ddit_worker_free_slots, self._ddit_worker_capacity_limits
         raise ValueError(f"Unsupported role for slot arrays: {role}")
 
     def _release_role_slot(
@@ -954,6 +1135,18 @@ class DiffusionServer:
         free_slots[instance_id] += 1
         if update_epoch:
             self._bump_capacity_epoch(role, instance_id)
+
+    def _clear_ddit_worker_admission_reservation(
+        self,
+        request_id: str,
+        *,
+        restore_credit: bool,
+    ) -> None:
+        worker_idx = self._ddit_worker_admission_reservations.pop(request_id, None)
+        if worker_idx is None:
+            return
+        if restore_credit:
+            self._release_role_slot(RoleType.DDIT_WORKER, worker_idx)
 
     def _apply_registered_capacity(
         self,
@@ -1000,6 +1193,10 @@ class DiffusionServer:
             self._denoiser_capacity_epochs[instance_id] += 1
         elif role == RoleType.DECODER and instance_id < len(self._decoder_capacity_epochs):
             self._decoder_capacity_epochs[instance_id] += 1
+        elif role == RoleType.DDIT_WORKER and instance_id < len(
+            self._ddit_worker_capacity_epochs
+        ):
+            self._ddit_worker_capacity_epochs[instance_id] += 1
 
     def _current_capacity_epoch(self, role: RoleType, instance_id: int) -> int:
         if role == RoleType.ENCODER and 0 <= instance_id < len(self._encoder_capacity_epochs):
@@ -1008,6 +1205,10 @@ class DiffusionServer:
             return self._denoiser_capacity_epochs[instance_id]
         if role == RoleType.DECODER and 0 <= instance_id < len(self._decoder_capacity_epochs):
             return self._decoder_capacity_epochs[instance_id]
+        if role == RoleType.DDIT_WORKER and 0 <= instance_id < len(
+            self._ddit_worker_capacity_epochs
+        ):
+            return self._ddit_worker_capacity_epochs[instance_id]
         return 0
 
     def _excluded_instances_for_request(
@@ -1018,6 +1219,22 @@ class DiffusionServer:
             if self._current_capacity_epoch(role, instance_id) == reject_epoch:
                 excluded.add(instance_id)
         return excluded
+
+    @staticmethod
+    def _select_ddit_worker_with_capacity(
+        free_slots: list[int],
+        excluded_instances: set[int] | None = None,
+    ) -> int | None:
+        excluded_instances = excluded_instances or set()
+        best_idx = None
+        best_free = 0
+        for idx, free in enumerate(free_slots):
+            if idx in excluded_instances or free <= 0:
+                continue
+            if best_idx is None or free > best_free:
+                best_idx = idx
+                best_free = free
+        return best_idx
 
     def _select_downstream_instance_with_capacity(
         self,
@@ -1042,6 +1259,9 @@ class DiffusionServer:
         elif role == RoleType.DECODER:
             free_slots = self._decoder_free_slots
             selector = self._dispatcher.select_decoder_with_capacity
+        elif role == RoleType.DDIT_WORKER:
+            free_slots = self._ddit_worker_free_slots
+            selector = self._select_ddit_worker_with_capacity
         else:
             return None
 
@@ -1186,6 +1406,16 @@ class DiffusionServer:
                 update_epoch=update_epoch,
             )
             p2p.sender_slot_released = True
+        elif (
+            p2p.sender_role == RoleType.DDIT_WORKER.value
+            and record.denoiser_instance is not None
+        ):
+            self._release_role_slot(
+                RoleType.DDIT_WORKER,
+                record.denoiser_instance,
+                update_epoch=update_epoch,
+            )
+            p2p.sender_slot_released = True
 
     def _release_receiver_slot_if_needed(
         self,
@@ -1203,6 +1433,16 @@ class DiffusionServer:
         ):
             self._release_role_slot(
                 RoleType.DENOISER,
+                record.denoiser_instance,
+                update_epoch=update_epoch,
+            )
+            p2p.receiver_slot_released = True
+        elif (
+            p2p.receiver_role == RoleType.DDIT_WORKER.value
+            and record.denoiser_instance is not None
+        ):
+            self._release_role_slot(
+                RoleType.DDIT_WORKER,
                 record.denoiser_instance,
                 update_epoch=update_epoch,
             )
@@ -1227,6 +1467,8 @@ class DiffusionServer:
 
         if msg_type == TransferMsgType.REGISTER:
             self._handle_transfer_register(msg)
+        elif msg_type == TransferMsgType.CREDIT:
+            self._handle_transfer_credit(msg)
         elif msg_type == TransferMsgType.STAGED:
             self._handle_transfer_staged(msg)
         elif msg_type == TransferMsgType.ALLOC_ACCEPTED:
@@ -1278,9 +1520,19 @@ class DiffusionServer:
         elif role == RoleType.DECODER:
             idx = info["instance_id"]
             self._decoder_peers[idx] = info
+        elif role == RoleType.DDIT_WORKER:
+            idx = info["instance_id"]
+            self._ddit_worker_peers[idx] = info
         else:
             idx = 0
         self._apply_registered_capacity(role, idx, info["capacity_slots"])
+        if role == RoleType.DDIT_WORKER and 0 <= idx < len(
+            self._ddit_worker_free_slots
+        ):
+            # DDiT worker capacity is driven by explicit scheduler credit, not
+            # by transfer-buffer slots. Keep it closed until the worker reports
+            # that DiT/VAE ranks can accept another prepared request.
+            self._ddit_worker_free_slots[idx] = 0
         logger.info(
             "DiffusionServer transfer: registered %s[%d] session=%s control=%s "
             "capacity=%d x %d bytes prealloc=%d",
@@ -1292,6 +1544,31 @@ class DiffusionServer:
             info["capacity_slot_size"],
             len(info["free_preallocated_slots"]),
         )
+
+    def _handle_transfer_credit(self, msg: dict) -> None:
+        try:
+            role = RoleType.from_string(msg.get("role", ""))
+        except ValueError:
+            return
+        if role != RoleType.DDIT_WORKER:
+            return
+        idx = int(msg.get("instance_id", 0))
+        if idx < 0 or idx >= len(self._ddit_worker_free_slots):
+            return
+        capacity = max(0, int(msg.get("capacity_slots", 0)))
+        free = max(0, int(msg.get("free_slots", 0)))
+        if capacity:
+            self._ddit_worker_capacity_limits[idx] = capacity
+        reserved = sum(
+            1
+            for reserved_idx in self._ddit_worker_admission_reservations.values()
+            if reserved_idx == idx
+        )
+        self._ddit_worker_free_slots[idx] = min(
+            max(0, free - reserved),
+            self._ddit_worker_capacity_limits[idx],
+        )
+        self._bump_capacity_epoch(RoleType.DDIT_WORKER, idx)
 
     def _handle_alloc_reject(self, msg: dict) -> None:
         request_id = msg.get("request_id", "")
@@ -1407,6 +1684,32 @@ class DiffusionServer:
             receiver_idx=decoder_idx,
         )
 
+    def _transfer_dispatch_to_ddit_worker(
+        self,
+        request_id: str,
+        p2p: _TransferRequestState,
+        worker_idx: int,
+        *,
+        consume_slot: bool = True,
+    ) -> None:
+        if consume_slot:
+            self._ddit_worker_free_slots[worker_idx] -= 1
+
+        try:
+            self._tracker.update_instances(
+                request_id,
+                denoiser_instance=worker_idx,
+            )
+        except ValueError:
+            pass
+
+        self._dispatch_transfer_alloc(
+            request_id=request_id,
+            p2p=p2p,
+            receiver_role=RoleType.DDIT_WORKER,
+            receiver_idx=worker_idx,
+        )
+
     def _transfer_return_to_client(self, request_id: str, result_frames: list) -> None:
         from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
             OutputBatch,
@@ -1507,6 +1810,10 @@ class DiffusionServer:
         )
 
         logger.error("DiffusionServer: %s - %s", request_id, error_msg)
+        self._clear_ddit_worker_admission_reservation(
+            request_id,
+            restore_credit=True,
+        )
 
         record = self._tracker.get(request_id)
         if record is not None:
@@ -1526,6 +1833,9 @@ class DiffusionServer:
         )
         self._decoder_tta = deque(
             entry for entry in self._decoder_tta if entry.request_id != request_id
+        )
+        self._ddit_worker_tta = deque(
+            entry for entry in self._ddit_worker_tta if entry.request_id != request_id
         )
 
         with self._lock:
@@ -1603,6 +1913,10 @@ class DiffusionServer:
         if role_enum == RoleType.DENOISER:
             self._enqueue_role_wait(
                 self._denoiser_tta, request_id, p2p, now=timestamp
+            )
+        elif role_enum == RoleType.DDIT_WORKER:
+            self._enqueue_role_wait(
+                self._ddit_worker_tta, request_id, p2p, now=timestamp
             )
         else:
             self._enqueue_role_wait(
@@ -1728,7 +2042,10 @@ class DiffusionServer:
             self._tracker.transition(request_id, RequestState.DENOISING_WAITING)
         except ValueError:
             pass
-        self._enqueue_role_wait(self._denoiser_tta, request_id, p2p)
+        if self._two_stage_ddit:
+            self._enqueue_role_wait(self._ddit_worker_tta, request_id, p2p)
+        else:
+            self._enqueue_role_wait(self._denoiser_tta, request_id, p2p)
 
     def _handle_transfer_pushed(self, msg: dict) -> None:
         request_id = msg["request_id"]
@@ -1816,15 +2133,28 @@ class DiffusionServer:
         self._release_sender_slot_if_needed(p2p, record)
         self._set_transfer_phase(p2p, TransferPhase.RUNNING_DOWNSTREAM)
         if record is None:
+            if p2p.receiver_role == RoleType.DDIT_WORKER.value:
+                self._clear_ddit_worker_admission_reservation(
+                    request_id,
+                    restore_credit=False,
+                )
             return
 
         try:
-            if p2p.receiver_role == RoleType.DENOISER.value:
+            if p2p.receiver_role in (
+                RoleType.DENOISER.value,
+                RoleType.DDIT_WORKER.value,
+            ):
                 self._tracker.transition(request_id, RequestState.DENOISING_RUNNING)
             elif p2p.receiver_role == RoleType.DECODER.value:
                 self._tracker.transition(request_id, RequestState.DECODER_RUNNING)
         except ValueError:
             pass
+        if p2p.receiver_role == RoleType.DDIT_WORKER.value:
+            self._clear_ddit_worker_admission_reservation(
+                request_id,
+                restore_credit=False,
+            )
 
     def _handle_transfer_done(self, msg: dict, role: RoleType) -> None:
         request_id = msg.get("request_id", "")
@@ -1978,6 +2308,30 @@ class DiffusionServer:
 
             self._transfer_state.pop(request_id, None)
 
+        elif role == RoleType.DDIT_WORKER:
+            record = self._tracker.get(request_id)
+            self._clear_ddit_worker_admission_reservation(
+                request_id,
+                restore_credit=False,
+            )
+            if p2p is not None:
+                self._recycle_prealloc_slot(p2p, RoleType.DDIT_WORKER)
+                self._release_receiver_slot_if_needed(p2p, record)
+                self._release_sender_slot_if_needed(p2p, record)
+            if error:
+                self._complete_terminal(
+                    request_id,
+                    RequestState.FAILED,
+                    f"DDiT worker error: {error}",
+                )
+            else:
+                result_frames = msg.get("result_frames")
+                if result_frames:
+                    self._transfer_return_to_client(request_id, result_frames)
+                else:
+                    self._transfer_return_to_client_from_msg(request_id, msg)
+            self._transfer_state.pop(request_id, None)
+
     def get_stats(self) -> dict:
         now = time.monotonic()
         transfer_details = []
@@ -2021,22 +2375,27 @@ class DiffusionServer:
             "num_encoders": self._num_encoders,
             "num_denoisers": self._num_denoisers,
             "num_decoders": self._num_decoders,
+            "num_ddit_workers": self._num_ddit_workers,
             "pending_requests": pending_count,
             "dispatch_policy": type(self._dispatcher.encoder_policy).__name__,
             "encoder_free_slots": list(self._encoder_free_slots),
             "denoiser_free_slots": list(self._denoiser_free_slots),
             "decoder_free_slots": list(self._decoder_free_slots),
+            "ddit_worker_free_slots": list(self._ddit_worker_free_slots),
             "encoder_capacity_limits": list(self._encoder_capacity_limits),
             "denoiser_capacity_limits": list(self._denoiser_capacity_limits),
             "decoder_capacity_limits": list(self._decoder_capacity_limits),
+            "ddit_worker_capacity_limits": list(self._ddit_worker_capacity_limits),
             "encoder_tta_depth": len(self._encoder_tta),
             "denoiser_tta_depth": len(self._denoiser_tta),
             "decoder_tta_depth": len(self._decoder_tta),
+            "ddit_worker_tta_depth": len(self._ddit_worker_tta),
             "transfer_active_transfers": len(self._transfer_state),
             "transfer_state_detail_limit": self._STATS_TRANSFER_DETAIL_LIMIT,
             "transfer_state_details": transfer_details,
             "encoder_peers": len(self._encoder_peers),
             "denoiser_peers": len(self._denoiser_peers),
             "decoder_peers": len(self._decoder_peers),
+            "ddit_worker_peers": len(self._ddit_worker_peers),
             "tracker": self._tracker.snapshot(),
         }

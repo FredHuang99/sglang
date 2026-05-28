@@ -16,6 +16,7 @@ class TestRoleType(unittest.TestCase):
         self.assertEqual(RoleType.from_string("encoder"), RoleType.ENCODER)
         self.assertEqual(RoleType.from_string("denoiser"), RoleType.DENOISER)
         self.assertEqual(RoleType.from_string("decoder"), RoleType.DECODER)
+        self.assertEqual(RoleType.from_string("ddit_worker"), RoleType.DDIT_WORKER)
         self.assertEqual(RoleType.from_string("ENCODER"), RoleType.ENCODER)
 
     def test_from_string_backward_compat(self):
@@ -32,6 +33,7 @@ class TestRoleType(unittest.TestCase):
         self.assertIn("denoiser", choices)
         self.assertIn("denoising", choices)
         self.assertIn("decoder", choices)
+        self.assertIn("ddit_worker", choices)
 
 
 class TestGetModuleRole(unittest.TestCase):
@@ -98,6 +100,10 @@ class TestFilterModulesForRole(unittest.TestCase):
     def test_decoder_keeps_vae_and_scheduler(self):
         result = filter_modules_for_role(self.WAN_MODULES, RoleType.DECODER)
         self.assertEqual(result, ["vae", "scheduler"])
+
+    def test_ddit_worker_keeps_dit_vae_and_scheduler(self):
+        result = filter_modules_for_role(self.WAN_MODULES, RoleType.DDIT_WORKER)
+        self.assertEqual(result, ["vae", "transformer", "scheduler"])
 
 
 class TestFilterModulesLTX2(unittest.TestCase):

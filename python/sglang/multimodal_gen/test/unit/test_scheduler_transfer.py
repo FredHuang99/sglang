@@ -1223,6 +1223,34 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
         scheduler._schedule_transfer_reconfigure.assert_called_once_with(1536, 384)
         self.assertNotIn("warmup-dec", scheduler._warmup_inbound_sizes)
 
+    def test_ddit_worker_warmup_register_schedules_reconfigure_from_inbound_sizes(self):
+        scheduler = _SchedulerHarness.make(RoleType.DDIT_WORKER)
+        scheduler._release_pending_receive = MagicMock()
+        scheduler._schedule_transfer_reconfigure = MagicMock()
+        scheduler._warmup_inbound_sizes["warmup-ddit"] = (4096, 512)
+        scheduler._compute_ready_queue.put(
+            _PendingInboundTransfer(
+                request_id="warmup-ddit",
+                role_name="DDIT_WORKER",
+                scalar_fields={"request_id": "warmup-ddit", "is_warmup": True},
+                tensors={"latents": torch.randn(1, 4, 4, 4)},
+                load_event=None,
+                prealloc_slot_id=7,
+            )
+        )
+        pending_register = deque()
+
+        handled = scheduler._ddit_drain_disagg_prepared(
+            pending_register=pending_register,
+            registering=set(),
+            full_ranks=(0,),
+        )
+
+        self.assertTrue(handled)
+        scheduler._schedule_transfer_reconfigure.assert_called_once_with(4096, 512)
+        self.assertNotIn("warmup-ddit", scheduler._warmup_inbound_sizes)
+        self.assertEqual(len(pending_register), 1)
+
 
 class TestSchedulerTensorDistribution(unittest.TestCase):
     def test_build_disagg_req_routes_sampling_fields_through_sampling_params(self):

@@ -76,14 +76,16 @@ def _wait_for_disagg_role_registration(
     expected_denoisers: int,
     expected_decoders: int,
     timeout_s: float,
+    expected_ddit_workers: int = 0,
     poll_interval_s: float = 0.1,
 ) -> None:
     logger.info(
         "Waiting for standalone role registration before startup calibration: "
-        "encoder=%d, denoiser=%d, decoder=%d",
+        "encoder=%d, denoiser=%d, decoder=%d, ddit_worker=%d",
         expected_encoders,
         expected_denoisers,
         expected_decoders,
+        expected_ddit_workers,
     )
     deadline = time.monotonic() + timeout_s
 
@@ -92,11 +94,13 @@ def _wait_for_disagg_role_registration(
         actual_encoders = int(stats.get("encoder_peers", 0))
         actual_denoisers = int(stats.get("denoiser_peers", 0))
         actual_decoders = int(stats.get("decoder_peers", 0))
+        actual_ddit_workers = int(stats.get("ddit_worker_peers", 0))
 
         if (
             actual_encoders == expected_encoders
             and actual_denoisers == expected_denoisers
             and actual_decoders == expected_decoders
+            and actual_ddit_workers == expected_ddit_workers
         ):
             logger.info(
                 "All standalone role instances registered; starting startup calibration"
@@ -110,7 +114,8 @@ def _wait_for_disagg_role_registration(
                 "calibration "
                 f"(encoder {actual_encoders}/{expected_encoders}, "
                 f"denoiser {actual_denoisers}/{expected_denoisers}, "
-                f"decoder {actual_decoders}/{expected_decoders})"
+                f"decoder {actual_decoders}/{expected_decoders}, "
+                f"ddit_worker {actual_ddit_workers}/{expected_ddit_workers})"
             )
 
         time.sleep(min(poll_interval_s, remaining))
@@ -616,6 +621,7 @@ def launch_pool_disagg_server(
             profile_enabled=server_args.profile_enabled,
             profile_output_dir=server_args.profile_output_dir,
             profile_run_id=server_args.profile_run_id,
+            server_args=server_args,
         )
         diffusion_server.start()
         _wait_for_disagg_role_registration(
@@ -710,42 +716,62 @@ def launch_disagg_server(server_args: ServerArgs):
     """
     configure_logger(server_args)
 
-    for name, val in [
-        ("--encoder-urls", server_args.encoder_urls),
-        ("--denoiser-urls", server_args.denoiser_urls),
-        ("--decoder-urls", server_args.decoder_urls),
-    ]:
-        if val is None:
-            raise ValueError(f"{name} is required for --disagg-role server")
+    if server_args.encoder_urls is None:
+        raise ValueError("--encoder-urls is required for --disagg-role server")
+    two_stage_ddit = bool(server_args.ddit_worker_urls)
+    if two_stage_ddit:
+        if server_args.denoiser_urls or server_args.decoder_urls:
+            logger.warning(
+                "--ddit-worker-urls is set; ignoring --denoiser-urls/--decoder-urls "
+                "for two-stage DDiT routing."
+            )
+    else:
+        for name, val in [
+            ("--denoiser-urls", server_args.denoiser_urls),
+            ("--decoder-urls", server_args.decoder_urls),
+        ]:
+            if val is None:
+                raise ValueError(f"{name} is required for --disagg-role server")
 
     host = server_args.host or "127.0.0.1"
     base_port = server_args.scheduler_port
 
     encoder_work_endpoints = parse_url_string(server_args.encoder_urls)
-    denoiser_work_endpoints = parse_url_string(server_args.denoiser_urls)
-    decoder_work_endpoints = parse_url_string(server_args.decoder_urls)
+    denoiser_work_endpoints = (
+        [] if two_stage_ddit else parse_url_string(server_args.denoiser_urls)
+    )
+    decoder_work_endpoints = (
+        [] if two_stage_ddit else parse_url_string(server_args.decoder_urls)
+    )
+    ddit_worker_work_endpoints = (
+        parse_url_string(server_args.ddit_worker_urls) if two_stage_ddit else []
+    )
 
     encoder_result_ep = f"tcp://{host}:{base_port + 1}"
     denoiser_result_ep = f"tcp://{host}:{base_port + 2}"
     decoder_result_ep = f"tcp://{host}:{base_port + 3}"
+    ddit_worker_result_ep = f"tcp://{host}:{base_port + 4}"
 
     frontend_endpoint = f"tcp://{host}:{base_port}"
 
     logger.info(
-        "Starting DiffusionServer: %d encoder(s), %d denoiser(s), %d decoder(s)",
+        "Starting DiffusionServer: %d encoder(s), %d denoiser(s), %d decoder(s), %d ddit_worker(s)",
         len(encoder_work_endpoints),
         len(denoiser_work_endpoints),
         len(decoder_work_endpoints),
+        len(ddit_worker_work_endpoints),
     )
     logger.info("  Frontend: %s", frontend_endpoint)
     logger.info("  Encoder work endpoints: %s", encoder_work_endpoints)
     logger.info("  Denoiser work endpoints: %s", denoiser_work_endpoints)
     logger.info("  Decoder work endpoints: %s", decoder_work_endpoints)
+    logger.info("  DDiT worker work endpoints: %s", ddit_worker_work_endpoints)
     logger.info(
-        "  Result endpoints: encoder=%s, denoiser=%s, decoder=%s",
+        "  Result endpoints: encoder=%s, denoiser=%s, decoder=%s, ddit_worker=%s",
         encoder_result_ep,
         denoiser_result_ep,
         decoder_result_ep,
+        ddit_worker_result_ep,
     )
 
     diffusion_server = DiffusionServer(
@@ -756,6 +782,10 @@ def launch_disagg_server(server_args: ServerArgs):
         encoder_result_endpoint=encoder_result_ep,
         denoiser_result_endpoint=denoiser_result_ep,
         decoder_result_endpoint=decoder_result_ep,
+        ddit_worker_work_endpoints=ddit_worker_work_endpoints,
+        ddit_worker_result_endpoint=(
+            ddit_worker_result_ep if ddit_worker_work_endpoints else None
+        ),
         dispatch_policy_name=server_args.disagg_dispatch_policy,
         timeout_s=float(server_args.disagg_timeout),
         downstream_wait_timeout_s=float(server_args.disagg_downstream_wait_timeout),
@@ -763,6 +793,7 @@ def launch_disagg_server(server_args: ServerArgs):
         profile_enabled=server_args.profile_enabled,
         profile_output_dir=server_args.profile_output_dir,
         profile_run_id=server_args.profile_run_id,
+        server_args=server_args,
     )
     try:
         diffusion_server.start()
@@ -771,6 +802,7 @@ def launch_disagg_server(server_args: ServerArgs):
             expected_encoders=len(encoder_work_endpoints),
             expected_denoisers=len(denoiser_work_endpoints),
             expected_decoders=len(decoder_work_endpoints),
+            expected_ddit_workers=len(ddit_worker_work_endpoints),
             timeout_s=float(server_args.disagg_timeout),
         )
         if server_args.warmup:
@@ -790,7 +822,7 @@ def launch_disagg_server(server_args: ServerArgs):
 
 
 def launch_disagg_role(server_args: ServerArgs):
-    """Launch a standalone disaggregated role instance (--disagg-role encoder/denoising/decoder).
+    """Launch a standalone disaggregated role instance.
 
     The instance:
     1. Binds its work PULL socket on tcp://0.0.0.0:{scheduler_port}
@@ -922,7 +954,12 @@ def dispatch_launch(server_args: ServerArgs):
         launch_server(server_args)
     elif role == RoleType.SERVER:
         launch_disagg_server(server_args)
-    elif role in (RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER):
+    elif role in (
+        RoleType.ENCODER,
+        RoleType.DENOISER,
+        RoleType.DECODER,
+        RoleType.DDIT_WORKER,
+    ):
         launch_disagg_role(server_args)
     else:
         raise ValueError(f"Unknown disagg_role: {role}")

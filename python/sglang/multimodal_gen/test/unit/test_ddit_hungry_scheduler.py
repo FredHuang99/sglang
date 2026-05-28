@@ -6,12 +6,21 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from sglang.multimodal_gen.runtime.ddit.config import resolve_vae_ranks
+from sglang.multimodal_gen.runtime.ddit.config import (
+    DDiTSwitchEvent,
+    parse_sp_degree_map,
+    resolve_ddit_sp_degrees,
+    resolve_shortpath_sp_degrees,
+    resolve_sp_degrees,
+    resolve_vae_ranks,
+)
 from sglang.multimodal_gen.runtime.ddit.concurrent import CommandWaveBuilder, DDiTOp
 from sglang.multimodal_gen.runtime.ddit.profile import ProfileStore
 from sglang.multimodal_gen.runtime.ddit.scheduler import (
     DDiTRequestState,
     DDiTSchedulerConfig,
+    ForcedSwitchScheduler,
+    ForcedSwitchSchedulerConfig,
     HungryFirstScheduler,
     NaiveGreedyScheduler,
     NaiveScheduler,
@@ -146,6 +155,79 @@ class TestDDiTHungryScheduler(unittest.TestCase):
 
         self.assertEqual(ranks, (2, 3))
 
+    def test_hungry_prepare_credit_requires_free_rank(self):
+        scheduler = HungryFirstScheduler(
+            DDiTSchedulerConfig(local_ranks=(0,), allowed_gpu_counts=(1,))
+        )
+        scheduler.add_request(
+            DDiTRequestState("req_busy", resolution="144p", total_steps=50)
+        )
+        scheduler.schedule()
+
+        self.assertEqual(scheduler.prepare_credit(), 0)
+
+    def test_forced_switch_scheduler_follows_request_switch_plan(self):
+        scheduler = ForcedSwitchScheduler(
+            ForcedSwitchSchedulerConfig(
+                local_ranks=tuple(range(4)),
+                allowed_gpu_counts=(1, 2, 4),
+            )
+        )
+        scheduler.add_request(
+            DDiTRequestState(
+                "req_forced",
+                resolution="720p",
+                total_steps=50,
+                initial_ranks=(0,),
+                switch_plan=(DDiTSwitchEvent(after_step=15, ranks=(0, 1)),),
+            )
+        )
+
+        first = scheduler.schedule()
+        self.assertEqual(first[0]["reason"], "forced_switch")
+        self.assertEqual(first[0]["new_ranks"], (0,))
+
+        scheduler.update_cur_step("req_forced", 15)
+        second = scheduler.schedule()
+
+        self.assertEqual(second[0]["old_ranks"], (0,))
+        self.assertEqual(second[0]["new_ranks"], (0, 1))
+        self.assertEqual(second[0]["reason"], "switch_plan")
+
+    def test_forced_switch_waits_when_target_rank_is_busy(self):
+        scheduler = ForcedSwitchScheduler(
+            ForcedSwitchSchedulerConfig(
+                local_ranks=tuple(range(4)),
+                allowed_gpu_counts=(1, 2, 4),
+            )
+        )
+        scheduler.add_request(
+            DDiTRequestState(
+                "req_a",
+                resolution="720p",
+                total_steps=50,
+                initial_ranks=(0,),
+                switch_plan=(DDiTSwitchEvent(after_step=15, ranks=(0, 1)),),
+            )
+        )
+        scheduler.add_request(
+            DDiTRequestState(
+                "req_b",
+                resolution="144p",
+                total_steps=50,
+                initial_ranks=(1,),
+            )
+        )
+        scheduler.schedule()
+        scheduler.update_cur_step("req_a", 15)
+
+        self.assertEqual(scheduler.schedule(), [])
+
+        scheduler.complete_request("req_b")
+        decision = scheduler.schedule()
+        self.assertEqual(decision[0]["request_id"], "req_a")
+        self.assertEqual(decision[0]["new_ranks"], (0, 1))
+
     def test_profile_path_overrides_default_hungry_tables(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(
@@ -189,6 +271,48 @@ class TestDDiTHungryScheduler(unittest.TestCase):
 
         self.assertEqual(scheduler.schedule(), [])
         self.assertEqual(list(scheduler.waiting), ["req_720", "req_144"])
+
+    def test_prepare_credit_matches_policy_admission(self):
+        naive = NaiveScheduler(
+            self._profile_config(
+                local_ranks=(0, 1, 2, 3),
+                allowed_gpu_counts=(1, 2, 4),
+            )
+        )
+        naive.config.profile.opt_gpus_num["720p"] = 8
+        self.assertEqual(
+            naive.prepare_credit(
+                DDiTRequestState("req_720", resolution="720p", total_steps=50)
+            ),
+            0,
+        )
+
+        greedy = NaiveGreedyScheduler(
+            self._profile_config(
+                local_ranks=(0, 1, 2, 3),
+                allowed_gpu_counts=(1, 2, 4),
+            )
+        )
+        self.assertEqual(
+            greedy.prepare_credit(
+                DDiTRequestState("req_720", resolution="720p", total_steps=50)
+            ),
+            1,
+        )
+
+    def test_wsjf_prepare_credit_respects_window_and_free_ranks(self):
+        scheduler = WSJFScheduler(self._profile_config(window_size=2))
+        scheduler.add_request(
+            DDiTRequestState("req_720", resolution="720p", total_steps=50)
+        )
+        scheduler.add_request(
+            DDiTRequestState("req_144", resolution="144p", total_steps=50)
+        )
+
+        self.assertEqual(scheduler.prepare_credit(), 0)
+
+        scheduler.schedule()
+        self.assertGreaterEqual(scheduler.prepare_credit(), 1)
 
     def test_naive_greedy_downgrades_to_nearest_power_of_two(self):
         scheduler = NaiveGreedyScheduler(
@@ -294,6 +418,60 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual(profile.model_id, "wan2.1-t2v-1.3b")
         self.assertEqual(profile.opt_gpus_num["720p"], 4)
         self.assertEqual(profile.per_step_time("unknown", 8), 1.0)
+
+    def test_shortpath_sp_degree_table_for_wan(self):
+        expected = {
+            1: (1, 1),
+            2: (2, 1),
+            4: (4, 1),
+            8: (2, 4),
+        }
+        for rank_count, degrees in expected.items():
+            self.assertEqual(
+                resolve_shortpath_sp_degrees("Wan2.1-T2V-1.3B", rank_count),
+                degrees,
+            )
+
+    def test_shortpath_sp_degree_table_for_z_image(self):
+        expected = {
+            1: (1, 1),
+            2: (2, 1),
+            4: (2, 2),
+            8: (2, 4),
+        }
+        for rank_count, degrees in expected.items():
+            self.assertEqual(
+                resolve_shortpath_sp_degrees("zimage", rank_count),
+                degrees,
+            )
+
+    def test_shortpath_requires_supported_model_and_rank_count(self):
+        with self.assertRaisesRegex(ValueError, "supports only"):
+            resolve_shortpath_sp_degrees("unknown-model", 4)
+        with self.assertRaisesRegex(ValueError, "rank counts"):
+            resolve_shortpath_sp_degrees("z-image", 16)
+
+    def test_ddit_sp_degree_shortpath_uses_server_args_model_id(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="shortpath",
+            ddit_profile_model_id="wan2.1-t2v-1.3b",
+            model_id=None,
+            model_path=None,
+        )
+
+        self.assertEqual(
+            resolve_ddit_sp_degrees(
+                8, server_args.ddit_sp_degree_map, server_args=server_args
+            ),
+            (2, 4),
+        )
+
+    def test_plain_sp_degree_map_behavior_is_unchanged(self):
+        degree_map = "1=1x1,2=2x1,4=2x2"
+
+        self.assertEqual(parse_sp_degree_map(degree_map)[4], (2, 2))
+        self.assertEqual(resolve_sp_degrees(4, degree_map), (2, 2))
+        self.assertEqual(resolve_sp_degrees(8, None), (8, 1))
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ class RoleType(str, Enum):
     ENCODER = "encoder"
     DENOISER = "denoiser"
     DECODER = "decoder"
+    DDIT_WORKER = "ddit_worker"
     SERVER = "server"  # Head node (no GPU, routes requests)
 
     @classmethod
@@ -91,6 +92,11 @@ def filter_modules_for_role(
         if module_role is None:
             filtered.append(name)
         elif module_role == role:
+            filtered.append(name)
+        elif role == RoleType.DDIT_WORKER and module_role in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+        ):
             filtered.append(name)
         elif name in extra_allowed_modules:
             filtered.append(name)
