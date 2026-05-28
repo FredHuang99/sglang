@@ -13,10 +13,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from .config import is_power_of_two
+from .config import is_power_of_two, select_preferred_rank_tuple
 
 
 class RequestPhase(str, Enum):
+    TEXT_ENCODER_PENDING = "text_encoder_pending"
+    DIT_WAITING = "dit_waiting"
     WAITING = "waiting"
     DIT = "dit"
     VAE = "vae"
@@ -53,6 +55,92 @@ class DDiTSchedulerConfig:
     allowed_gpu_counts: tuple[int, ...] = (1, 2, 4, 8)
 
 
+@dataclass
+class FixedBaselineSchedulerConfig:
+    local_ranks: tuple[int, ...] = tuple(range(8))
+    baseline_gpus: int = 1
+    allowed_gpu_counts: tuple[int, ...] = (1, 2, 4, 8)
+
+
+class FixedBaselineScheduler:
+    """Fixed-k DiT/VAE rank allocator with full-node text encoder semantics."""
+
+    def __init__(self, config: FixedBaselineSchedulerConfig | None = None):
+        self.config = config or FixedBaselineSchedulerConfig()
+        if self.config.baseline_gpus not in self.config.allowed_gpu_counts:
+            raise ValueError(
+                f"baseline_gpus must be one of {self.config.allowed_gpu_counts}, "
+                f"got {self.config.baseline_gpus}"
+            )
+        if not is_power_of_two(self.config.baseline_gpus):
+            raise ValueError(
+                f"baseline_gpus must be a power of two, got {self.config.baseline_gpus}"
+            )
+        if self.config.baseline_gpus > len(self.config.local_ranks):
+            raise ValueError(
+                f"baseline_gpus={self.config.baseline_gpus} exceeds local ranks "
+                f"{self.config.local_ranks}"
+            )
+
+        self.requests: dict[str, DDiTRequestState] = {}
+        self.text_encoder_queue: deque[str] = deque()
+        self.dit_waiting: deque[str] = deque()
+        self.gpu_owner: dict[int, str | None] = {
+            rank: None for rank in self.config.local_ranks
+        }
+
+    def add_request(self, request: DDiTRequestState) -> None:
+        if request.request_id in self.requests:
+            raise ValueError(f"Duplicate DDiT request id: {request.request_id}")
+        request.phase = RequestPhase.TEXT_ENCODER_PENDING
+        self.requests[request.request_id] = request
+        self.text_encoder_queue.append(request.request_id)
+
+    def mark_text_encoder_done(self, request_id: str) -> None:
+        req = self.requests[request_id]
+        req.phase = RequestPhase.DIT_WAITING
+        self.dit_waiting.append(request_id)
+
+    def complete_request(self, request_id: str) -> None:
+        req = self.requests[request_id]
+        for rank in req.ranks:
+            self.gpu_owner[rank] = None
+        req.ranks = ()
+        req.phase = RequestPhase.DONE
+
+    def _free_ranks(self) -> tuple[int, ...]:
+        return tuple(rank for rank, owner in self.gpu_owner.items() if owner is None)
+
+    def _assign(self, request_id: str, ranks: tuple[int, ...]) -> None:
+        req = self.requests[request_id]
+        for rank in ranks:
+            if self.gpu_owner[rank] is not None:
+                raise RuntimeError(f"Rank {rank} is already owned")
+            self.gpu_owner[rank] = request_id
+        req.ranks = tuple(sorted(ranks))
+        req.phase = RequestPhase.DIT
+
+    def schedule(self) -> list[dict[str, Any]]:
+        decisions: list[dict[str, Any]] = []
+        while self.dit_waiting:
+            free = self._free_ranks()
+            if len(free) < self.config.baseline_gpus:
+                break
+            request_id = self.dit_waiting.popleft()
+            ranks = select_preferred_rank_tuple(free, self.config.baseline_gpus)
+            self._assign(request_id, ranks)
+            decisions.append(
+                {
+                    "request_id": request_id,
+                    "stage": "baseline",
+                    "old_ranks": (),
+                    "new_ranks": ranks,
+                    "reason": "fixed_baseline",
+                }
+            )
+        return decisions
+
+
 class HungryFirstScheduler:
     """Resource policy matching the FlexDiT hungry-first behavior."""
 
@@ -73,7 +161,9 @@ class HungryFirstScheduler:
     def update_cur_step(self, request_id: str, cur_step: int) -> None:
         self.requests[request_id].cur_step = int(cur_step)
 
-    def complete_dit(self, request_id: str, *, vae_k: int | None = None) -> tuple[int, ...]:
+    def complete_dit(
+        self, request_id: str, *, vae_k: int | None = None
+    ) -> tuple[int, ...]:
         req = self.requests[request_id]
         req.phase = RequestPhase.VAE
         if vae_k is not None:
@@ -95,6 +185,14 @@ class HungryFirstScheduler:
     def _free_ranks(self) -> list[int]:
         return [rank for rank, owner in self.gpu_owner.items() if owner is None]
 
+    def _take_preferred_free_ranks(
+        self, free: list[int], count: int
+    ) -> tuple[tuple[int, ...], list[int]]:
+        selected = select_preferred_rank_tuple(tuple(free), count)
+        selected_set = set(selected)
+        remaining = [rank for rank in free if rank not in selected_set]
+        return selected, remaining
+
     def _assign(self, request_id: str, ranks: tuple[int, ...]) -> None:
         req = self.requests[request_id]
         old_ranks = set(req.ranks)
@@ -103,7 +201,9 @@ class HungryFirstScheduler:
             self.gpu_owner[rank] = None
         for rank in new_ranks - old_ranks:
             if self.gpu_owner[rank] not in (None, request_id):
-                raise RuntimeError(f"Rank {rank} is already owned by {self.gpu_owner[rank]}")
+                raise RuntimeError(
+                    f"Rank {rank} is already owned by {self.gpu_owner[rank]}"
+                )
             self.gpu_owner[rank] = request_id
         req.ranks = tuple(sorted(ranks))
         req.phase = RequestPhase.DIT
@@ -150,12 +250,14 @@ class HungryFirstScheduler:
             _neg_score, request_id = heapq.heappop(hungry_heap)
             req = self.requests[request_id]
             opt_k = self._opt_gpu_count(req.resolution)
-            target_k = self._floor_allowed_power_of_two(min(opt_k, len(req.ranks) + len(free)))
+            target_k = self._floor_allowed_power_of_two(
+                min(opt_k, len(req.ranks) + len(free))
+            )
             if target_k <= len(req.ranks):
                 continue
             add_count = target_k - len(req.ranks)
-            new_ranks = tuple(sorted(req.ranks + tuple(free[:add_count])))
-            free = free[add_count:]
+            selected, free = self._take_preferred_free_ranks(free, add_count)
+            new_ranks = tuple(sorted(req.ranks + selected))
             old_ranks = req.ranks
             self._assign(request_id, new_ranks)
             decisions.append(
@@ -176,8 +278,7 @@ class HungryFirstScheduler:
             if target_k <= 0:
                 break
             self.waiting.popleft()
-            new_ranks = tuple(sorted(free[:target_k]))
-            free = free[target_k:]
+            new_ranks, free = self._take_preferred_free_ranks(free, target_k)
             self._assign(request_id, new_ranks)
             decisions.append(
                 {

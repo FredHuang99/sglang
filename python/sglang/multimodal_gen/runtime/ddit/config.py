@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+DDIT_SCHEDULE_POLICIES = ("forced_switch", "hungry_first", "fixed_baseline")
+
 
 @dataclass(frozen=True)
 class DDiTSwitchEvent:
@@ -21,10 +23,12 @@ class DDiTExecutionPlan:
 
     initial_ranks: tuple[int, ...]
     switches: tuple[DDiTSwitchEvent, ...]
+    policy: str = "forced_switch"
+    force_dynamic: bool = False
 
     @property
     def enabled(self) -> bool:
-        return bool(self.switches)
+        return self.force_dynamic or bool(self.switches)
 
     def switch_after(self, completed_step: int) -> DDiTSwitchEvent | None:
         for event in self.switches:
@@ -53,6 +57,19 @@ def _unique_sorted_ranks(ranks: list[int] | tuple[int, ...]) -> tuple[int, ...]:
 
 def is_power_of_two(value: int) -> bool:
     return value > 0 and (value & (value - 1)) == 0
+
+
+def resolve_schedule_policy(server_args: Any) -> str:
+    policy = str(
+        getattr(server_args, "ddit_schedule_policy", "forced_switch")
+        or "forced_switch"
+    )
+    if policy not in DDIT_SCHEDULE_POLICIES:
+        raise ValueError(
+            f"Unsupported DDiT schedule policy {policy!r}; "
+            f"expected one of {DDIT_SCHEDULE_POLICIES}"
+        )
+    return policy
 
 
 def parse_rank_list(value: Any) -> tuple[int, ...]:
@@ -144,6 +161,27 @@ def _first_n_ranks(count: int, world_size: int) -> tuple[int, ...]:
     return tuple(range(count))
 
 
+def select_preferred_rank_tuple(
+    free_ranks: tuple[int, ...] | list[int],
+    count: int,
+) -> tuple[int, ...]:
+    """Select k ranks, preferring a contiguous block but allowing gaps."""
+    count = int(count)
+    if count <= 0:
+        raise ValueError(f"Rank count must be positive, got {count}")
+
+    ranks = tuple(sorted({int(rank) for rank in free_ranks}))
+    if len(ranks) < count:
+        raise ValueError(f"Need {count} free ranks, got {list(ranks)}")
+
+    rank_set = set(ranks)
+    for start in ranks:
+        candidate = tuple(range(start, start + count))
+        if all(rank in rank_set for rank in candidate):
+            return candidate
+    return ranks[:count]
+
+
 def validate_node_local_power_of_two(
     ranks: tuple[int, ...],
     *,
@@ -225,6 +263,7 @@ def build_execution_plan(
     *,
     world_size: int,
 ) -> DDiTExecutionPlan:
+    policy = resolve_schedule_policy(server_args)
     allowed = parse_allowed_gpu_counts(
         getattr(server_args, "ddit_allowed_gpu_counts", None), world_size
     )
@@ -232,19 +271,40 @@ def build_execution_plan(
         getattr(server_args, "ddit_local_ranks", None), world_size
     )
     local_ranks = set(local_rank_tuple)
-    initial_ranks = parse_rank_list(_as_extra_value(batch, "ddit_initial_ranks"))
-    if not initial_ranks:
-        initial_ranks = parse_rank_list(getattr(server_args, "ddit_initial_ranks", None))
-    if not initial_ranks:
-        count = max(
-            1,
-            min(int(getattr(server_args, "ddit_initial_gpus", 1)), len(local_rank_tuple)),
+    if policy == "fixed_baseline":
+        initial_ranks = parse_rank_list(
+            _as_extra_value(batch, "ddit_baseline_ranks")
+            or _as_extra_value(batch, "ddit_fixed_ranks")
+            or _as_extra_value(batch, "ddit_dit_ranks")
         )
-        initial_ranks = tuple(local_rank_tuple[:count])
+        if not initial_ranks:
+            baseline_gpus = int(getattr(server_args, "ddit_baseline_gpus", 1))
+            baseline_gpus = max(1, min(baseline_gpus, len(local_rank_tuple)))
+            initial_ranks = select_preferred_rank_tuple(local_rank_tuple, baseline_gpus)
+    else:
+        initial_ranks = parse_rank_list(_as_extra_value(batch, "ddit_initial_ranks"))
+        if not initial_ranks:
+            initial_ranks = parse_rank_list(
+                getattr(server_args, "ddit_initial_ranks", None)
+            )
+        if not initial_ranks:
+            count = max(
+                1,
+                min(
+                    int(getattr(server_args, "ddit_initial_gpus", 1)),
+                    len(local_rank_tuple),
+                ),
+            )
+            initial_ranks = tuple(local_rank_tuple[:count])
 
-    switch_plan = parse_switch_plan(_as_extra_value(batch, "ddit_switch_plan"))
-    if not switch_plan:
-        switch_plan = parse_switch_plan(getattr(server_args, "ddit_switch_plan", None))
+    if policy == "fixed_baseline":
+        switch_plan = ()
+    else:
+        switch_plan = parse_switch_plan(_as_extra_value(batch, "ddit_switch_plan"))
+        if not switch_plan:
+            switch_plan = parse_switch_plan(
+                getattr(server_args, "ddit_switch_plan", None)
+            )
 
     validate_node_local_power_of_two(
         initial_ranks, local_world_size=world_size, allowed_gpu_counts=allowed
@@ -263,7 +323,12 @@ def build_execution_plan(
                 f"DDiT switch ranks {event.ranks} must stay within local ranks "
                 f"{tuple(sorted(local_ranks))}"
             )
-    return DDiTExecutionPlan(initial_ranks=initial_ranks, switches=switch_plan)
+    return DDiTExecutionPlan(
+        initial_ranks=initial_ranks,
+        switches=switch_plan,
+        policy=policy,
+        force_dynamic=policy == "fixed_baseline",
+    )
 
 
 def resolve_vae_ranks(
@@ -273,12 +338,35 @@ def resolve_vae_ranks(
     world_size: int,
     final_dit_ranks: tuple[int, ...] | None = None,
 ) -> tuple[int, ...]:
+    policy = resolve_schedule_policy(server_args)
+    if policy == "fixed_baseline" and final_dit_ranks:
+        ranks = tuple(sorted(final_dit_ranks))
+        allowed = parse_allowed_gpu_counts(
+            getattr(server_args, "ddit_allowed_gpu_counts", None), world_size
+        )
+        local_rank_tuple = parse_local_ranks(
+            getattr(server_args, "ddit_local_ranks", None), world_size
+        )
+        validate_node_local_power_of_two(
+            ranks, local_world_size=world_size, allowed_gpu_counts=allowed
+        )
+        if not set(ranks).issubset(set(local_rank_tuple)):
+            raise ValueError(
+                f"DDiT fixed-baseline VAE ranks {ranks} must stay within local ranks "
+                f"{tuple(sorted(local_rank_tuple))}"
+            )
+        return ranks
+
     explicit_ranks = parse_rank_list(_as_extra_value(batch, "ddit_vae_ranks"))
     if explicit_ranks:
         return explicit_ranks
 
     request_k = _as_extra_value(batch, "ddit_vae_k")
-    vae_k = int(request_k if request_k is not None else getattr(server_args, "ddit_vae_gpus", 1))
+    vae_k = int(
+        request_k
+        if request_k is not None
+        else getattr(server_args, "ddit_vae_gpus", 1)
+    )
     local_rank_tuple = parse_local_ranks(
         getattr(server_args, "ddit_local_ranks", None), world_size
     )

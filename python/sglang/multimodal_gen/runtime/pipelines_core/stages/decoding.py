@@ -10,7 +10,10 @@ import weakref
 import torch
 import torch.distributed as dist
 
-from sglang.multimodal_gen.runtime.ddit.config import resolve_vae_ranks
+from sglang.multimodal_gen.runtime.ddit.config import (
+    resolve_schedule_policy,
+    resolve_vae_ranks,
+)
 from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
     current_rank_in,
     use_dynamic_sp_group,
@@ -217,6 +220,15 @@ class DecodingStage(PipelineStage):
         )
         batch.extra["ddit_vae_ranks"] = list(vae_ranks)
         record_lifecycle(server_args, batch, "vae_start")
+        schedule_policy = resolve_schedule_policy(server_args)
+        switch_reason = (
+            "fixed_baseline_same_ranks"
+            if schedule_policy == "fixed_baseline"
+            else "dit_to_vae"
+        )
+        switch_policy = (
+            "fixed_baseline" if schedule_policy == "fixed_baseline" else "ddit_vae_gpus"
+        )
         record_rank_switch(
             server_args,
             batch,
@@ -224,8 +236,8 @@ class DecodingStage(PipelineStage):
             step=getattr(batch, "step_index", None),
             old_ranks=final_dit_ranks,
             new_ranks=vae_ranks,
-            reason="dit_to_vae",
-            policy="ddit_vae_gpus",
+            reason=switch_reason,
+            policy=switch_policy,
         )
 
         frames = None

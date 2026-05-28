@@ -294,6 +294,10 @@ class ServerArgs:
     ddit_advertised_host: str | None = None
     ddit_local_ranks: str | None = None
     ddit_allowed_gpu_counts: str = "1,2,4,8"
+    ddit_schedule_policy: Literal["forced_switch", "hungry_first", "fixed_baseline"] = (
+        "forced_switch"
+    )
+    ddit_baseline_gpus: int = 1
     ddit_initial_gpus: int = 1
     ddit_initial_ranks: str | None = None
     ddit_switch_plan: str | None = None
@@ -440,12 +444,23 @@ class ServerArgs:
         if not self.enable_ddit:
             return
         from sglang.multimodal_gen.runtime.ddit.config import (
+            DDIT_SCHEDULE_POLICIES,
             parse_allowed_gpu_counts,
             parse_sp_degree_map,
             parse_switch_plan,
         )
 
         allowed = parse_allowed_gpu_counts(self.ddit_allowed_gpu_counts, self.num_gpus)
+        if self.ddit_schedule_policy not in DDIT_SCHEDULE_POLICIES:
+            raise ValueError(
+                f"--ddit-schedule-policy must be one of {DDIT_SCHEDULE_POLICIES}, "
+                f"got {self.ddit_schedule_policy}"
+            )
+        if self.ddit_baseline_gpus not in allowed:
+            raise ValueError(
+                f"--ddit-baseline-gpus must be one of {allowed}, "
+                f"got {self.ddit_baseline_gpus}"
+            )
         if self.ddit_vae_gpus not in allowed:
             raise ValueError(
                 f"--ddit-vae-gpus must be one of {allowed}, got {self.ddit_vae_gpus}"
@@ -453,6 +468,16 @@ class ServerArgs:
         if self.ddit_initial_gpus not in allowed:
             raise ValueError(
                 f"--ddit-initial-gpus must be one of {allowed}, got {self.ddit_initial_gpus}"
+            )
+        if (
+            self.ddit_schedule_policy == "fixed_baseline"
+            and self.ddit_vae_gpus != self.ddit_baseline_gpus
+        ):
+            logger.warning(
+                "--ddit-vae-gpus=%s is ignored by fixed_baseline; DiT and VAE "
+                "use the same %s ranks.",
+                self.ddit_vae_gpus,
+                self.ddit_baseline_gpus,
             )
         parse_switch_plan(self.ddit_switch_plan)
         degree_map = parse_sp_degree_map(self.ddit_sp_degree_map)
@@ -1113,6 +1138,21 @@ class ServerArgs:
             type=str,
             default=ServerArgs.ddit_allowed_gpu_counts,
             help="Comma-separated power-of-two GPU counts allowed for DDiT SP groups.",
+        )
+        parser.add_argument(
+            "--ddit-schedule-policy",
+            type=str,
+            choices=("forced_switch", "hungry_first", "fixed_baseline"),
+            default=ServerArgs.ddit_schedule_policy,
+            help="DDiT scheduling policy. fixed_baseline keeps text encoder on the "
+            "full-node TP group and runs DiT/VAE on a fixed k-rank subgroup.",
+        )
+        parser.add_argument(
+            "--ddit-baseline-gpus",
+            type=int,
+            default=ServerArgs.ddit_baseline_gpus,
+            help="Fixed number of GPUs used by DiT/VAE when "
+            "--ddit-schedule-policy=fixed_baseline.",
         )
         parser.add_argument(
             "--ddit-initial-gpus",

@@ -1125,7 +1125,20 @@ class DenoisingStage(PipelineStage):
         )
         active_ranks = plan.initial_ranks
         batch.extra["ddit_initial_ranks"] = list(active_ranks)
+        if plan.policy == "fixed_baseline":
+            batch.extra["ddit_baseline_ranks"] = list(active_ranks)
         record_lifecycle(server_args, batch, "dit_start")
+        if plan.policy == "fixed_baseline":
+            record_rank_switch(
+                server_args,
+                batch,
+                stage="baseline",
+                step=None,
+                old_ranks=(),
+                new_ranks=active_ranks,
+                reason="fixed_baseline",
+                policy="fixed_baseline",
+            )
         prepared_vars, latents = self._prepare_ddit_segment(
             batch=batch,
             server_args=server_args,

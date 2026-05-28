@@ -1,264 +1,234 @@
 # SGLang Diffusion DDiT 代码 Cookbook
 
-本文档解释本次 DDiT/FlexDiT 风格开发涉及的核心文件、类、函数和工作流。
+本文档解释本次 DDiT/FlexDiT 开发涉及的核心文件、类、函数和 workflow。正文用中文说明，源码符号保持英文。
 
-## 1. 总体流程
+## 1. 总体 Workflow
 
 ```mermaid
 flowchart TD
-  A["HTTP / client request"] --> B["SamplingParams / Req"]
-  B --> C["Scheduler logs add_time"]
-  C --> D["Text encoding + latent/timestep preparation"]
-  D --> E["DDiT denoising loop"]
-  E --> F{"switch after step?"}
-  F -- yes --> G["gather canonical latent + broadcast"]
-  G --> H["switch dynamic SP group"]
-  H --> E
-  F -- no --> E
-  E --> I["DiT end: final latent broadcast"]
-  I --> J["VAE rank selection"]
-  J --> K["dynamic SP VAE decode"]
-  K --> L["Output + lifecycle CSV"]
+  A["HTTP / client request"] --> B["SamplingParams -> Req"]
+  B --> C["Scheduler record add_time"]
+  C --> D["Text encoder on full-node TP group"]
+  D --> E["Canonical text output in Req state"]
+  E --> F["Latent/timestep preparation"]
+  F --> G{"DDiT policy"}
+  G -->|forced_switch| H["DiT dynamic SP with step switches"]
+  G -->|fixed_baseline| I["DiT fixed k-rank SP group"]
+  H --> J["Canonical final latent broadcast"]
+  I --> J
+  J --> K["VAE rank selection"]
+  K --> L["Dynamic SP VAE decode"]
+  L --> M["Output + lifecycle CSV"]
 ```
 
 核心原则：
 
-- text encoder 和 latent/timestep preparation 不在扩容时重跑。
-- DiT 扩容只发生在 denoising step 边界。
-- 扩容时使用当前 latent 的 gather/broadcast，不重新采样初始 noise。
-- VAE 默认 1 卡，但支持请求级或服务级 k 卡。
+- text encoder 参数 shard 到本节点全机 TP group，因此 text encoder 永远使用全机 ranks。
+- DiT/VAE 参数 replicated 到每个 rank，因此 DiT/VAE 可以切到 selected dynamic SP ranks。
+- DDiT 扩缩容只发生在 denoising step 边界。
+- fixed baseline 中，`k` 只表示 DiT/VAE 固定卡数，不影响 text encoder。
 
-## 2. 新增 DDiT 模块
+## 2. `runtime/ddit/config.py`
 
-### `runtime/ddit/config.py`
-
-负责解析和校验 DDiT 配置。
+职责：解析 DDiT 参数，生成每个请求的执行计划。
 
 关键类型：
 
 ```python
 @dataclass(frozen=True)
-class DDiTSwitchEvent:
-    after_step: int
-    ranks: tuple[int, ...]
-    reason: str = "switch_plan"
-
-@dataclass(frozen=True)
 class DDiTExecutionPlan:
     initial_ranks: tuple[int, ...]
     switches: tuple[DDiTSwitchEvent, ...]
+    policy: str = "forced_switch"
+    force_dynamic: bool = False
 ```
 
 关键函数：
 
-- `parse_switch_plan`：支持 `15:1->2;30:2->4` 和 `15:0,1;30:0,1,2,3`。
-- `build_execution_plan`：合并请求级和服务级配置，生成 DiT 初始 ranks 和 step switch events。
-- `resolve_vae_ranks`：根据 `ddit_vae_ranks > ddit_vae_k > --ddit-vae-gpus` 选择 VAE ranks。
-- `resolve_resolution_key`：优先使用请求里的 resolution key，否则从 height/width 推断。
+- `resolve_schedule_policy`：校验并返回 `forced_switch`、`hungry_first` 或 `fixed_baseline`。
+- `select_preferred_rank_tuple`：从 free ranks 中选 k 个 ranks，优先连续 block，否则稳定选择 sorted free ranks 的前 k 个。
+- `build_execution_plan`：生成 DiT ranks 和 step switch events。
+- `resolve_vae_ranks`：非 fixed-baseline 下按 `ddit_vae_ranks > ddit_vae_k > --ddit-vae-gpus` 选择 VAE ranks；fixed-baseline 下直接复用 final DiT ranks。
 
-### `runtime/ddit/dynamic_sp.py`
+fixed-baseline 特殊逻辑：
 
-负责动态 SP process group。
+```python
+if policy == "fixed_baseline":
+    initial_ranks = parse_rank_list(batch.extra.get("ddit_baseline_ranks"))
+    if not initial_ranks:
+        initial_ranks = select_preferred_rank_tuple(local_rank_tuple, baseline_gpus)
+    switch_plan = ()
+```
+
+这保证 `ddit_initial_gpus` 和 `ddit_switch_plan` 不会干扰 fixed baseline。
+
+## 3. `runtime/ddit/scheduler.py`
+
+职责：提供可单元测试的调度策略。
+
+`HungryFirstScheduler`：
+
+- 维护 waiting/running requests 和 rank ownership。
+- running DiT 请求根据 starvation score 排序。
+- waiting 请求优先尝试 opt GPU 数，资源不足时选小于等于 free 数的最大 power-of-two。
+- rank 选择复用 `select_preferred_rank_tuple`，因此不再要求连续 ranks。
+
+`FixedBaselineScheduler`：
+
+```python
+class FixedBaselineScheduler:
+    def add_request(self, request): ...
+    def mark_text_encoder_done(self, request_id): ...
+    def schedule(self) -> list[dict[str, Any]]: ...
+    def complete_request(self, request_id): ...
+```
+
+主体逻辑：
+
+- 请求先进入 `TEXT_ENCODER_PENDING`，表示它还需要全机 TP text encoder。
+- text encoder 完成后进入 `DIT_WAITING`。
+- `schedule()` 只根据 DiT/VAE free ranks 分配 `baseline_gpus` 张卡。
+- DiT/VAE 使用同一组 ranks，直到请求结束才释放。
+- 分配时优先连续 ranks，例如 `[0,1,2,3]`；没有连续 block 时允许 `[0,2,5,7]` 这类非连续组合。
+
+## 4. `runtime/ddit/dynamic_sp.py`
+
+职责：缓存 dynamic sequence-parallel process groups。
 
 关键类：
 
 ```python
 class DynamicSPGroupRegistry:
-    def get(self, ranks: tuple[int, ...]) -> SequenceParallelGroupCoordinator | None:
-        ...
-
-    def prebuild(self) -> None:
-        ...
-
-    @contextlib.contextmanager
-    def use(self, ranks: tuple[int, ...]) -> Iterator[None]:
-        ...
+    def get(self, ranks: tuple[int, ...]): ...
+    def prebuild(self): ...
+    def use(self, ranks: tuple[int, ...]): ...
 ```
 
 主体逻辑：
 
-- 按 active rank tuple 缓存 `SequenceParallelGroupCoordinator`。
-- 对 active ranks 使用配置的 Ulysses/Ring degree。
-- 对 inactive ranks 建 singleton group，让所有进程都能进入同一个上下文逻辑。
-- context 内临时替换全局 `_SP` 和 `PROCESS_GROUP.ULYSSES_PG/RING_PG`。
+- key 是 sorted rank tuple 加 Ulysses/Ring degree。
+- 支持 arbitrary same-node power-of-two rank tuple，不要求 ranks 连续。
+- active ranks 使用配置的 Ulysses/Ring degree。
+- inactive ranks 建 singleton groups，使所有进程都可以进入相同 control flow。
+- `use_dynamic_sp_group(server_args, ranks)` 临时替换全局 SP context。
 
-### `runtime/ddit/logging.py`
-
-负责实验日志。
-
-输出：
-
-- `ddit_lifecycle.csv`：一行一个请求，记录 add/DiT/VAE 时间戳。
-- `ddit_lifecycle.csv` 最后三行：`p50/p90/p99` lifespan time，即 `vae_end_time - add_time`。
-- `ddit_rank_switch.jsonl`：一行一个 rank switch 事件。
-
-关键函数：
-
-- `record_lifecycle(server_args, batch, event)`
-- `record_rank_switch(server_args, batch, stage, step, old_ranks, new_ranks, ...)`
-
-### `runtime/ddit/scheduler.py`
-
-实现可单测的 hungry-first policy。
-
-关键类：
-
-```python
-class HungryFirstScheduler:
-    def add_request(...)
-    def update_cur_step(...)
-    def schedule(...)
-    def complete_dit(...)
-    def complete_vae(...)
-```
-
-调度逻辑：
-
-- waiting 请求按 FIFO 入队。
-- running DiT 请求根据饥饿度排序。
-- 饥饿度为：`(cur_step - last_scheduled_step) * (t(current_k) - t(opt_k))`。
-- hungry 请求先扩容，最多到 opt GPU 数。
-- DiT 结束后按 `vae_k` 保留 VAE ranks，VAE 结束后释放全部 ranks。
-
-## 3. Denoising 接入
+## 5. Denoising 接入
 
 文件：`runtime/pipelines_core/stages/denoising.py`
 
-新增主体函数：
+关键函数：
 
-- `_run_single_denoising_step`：把原来 forward loop 中单步 DiT 逻辑抽出来，普通路径和 DDiT 路径共用。
-- `_forward_ddit`：执行 step-wise rank switching。
-- `_canonicalize_ddit_latents`：在 switch 点把 active SP shard gather 成 canonical latent，再 broadcast 到所有 ranks。
-- `_prepare_ddit_segment`：在新的 dynamic SP group 下准备当前 segment 的 denoising invariant state。
+- `_forward_ddit`：执行 dynamic SP denoising。
+- `_prepare_ddit_segment`：在当前 active ranks 下准备 denoising invariant state。
+- `_canonicalize_ddit_latents`：把 active SP shard gather 成 canonical latent，再 broadcast 给全 ranks。
 
-DDiT denoising 的关键流程：
+fixed-baseline 行为：
+
+- `build_execution_plan` 返回 `force_dynamic=True`，所以即使没有 switch plan 也会进入 `_forward_ddit`。
+- `record_rank_switch(... stage="baseline", step=None, reason="fixed_baseline")` 记录固定 rank assignment。
+- DiT 所有 steps 都在同一个 active ranks tuple 中执行。
 
 ```mermaid
 sequenceDiagram
   participant R as all ranks
-  participant A as active ranks
-  participant L as leader rank
-  R->>R: build DDiTExecutionPlan
-  R->>A: use_dynamic_sp_group(initial_ranks)
-  A->>A: run denoising step
-  A->>L: gather latent if sharded
-  L->>R: broadcast canonical latent
-  R->>R: switch to new active ranks
-  A->>A: continue next steps
+  participant A as selected DiT ranks
+  R->>R: text encoder full-node TP already completed
+  R->>R: build fixed-baseline execution plan
+  R->>A: use_dynamic_sp_group(selected_ranks)
+  A->>A: run all denoising steps
+  A->>R: canonical latent broadcast
 ```
 
-Wan DiT 修正：
-
-文件：`runtime/models/dits/wanvideo.py`
-
-原来 Wan 在初始化时缓存 `self.sp_size`。DDiT 扩容后这个值会过期，所以 forward 内改为每次读取：
-
-```python
-sp_size = get_sp_world_size()
-sequence_shard_enabled = forward_batch.enable_sequence_shard and sp_size > 1
-```
-
-## 4. VAE 接入
+## 6. VAE 接入
 
 文件：`runtime/pipelines_core/stages/decoding.py`
 
-新增主体函数：
+关键函数：
 
-- `_forward_ddit_vae`：根据 `resolve_vae_ranks` 选择 VAE ranks，在 dynamic SP context 中 decode。
-- `_broadcast_ddit_tensor`：如果 VAE leader 不是 rank0，也把 decoded tensor broadcast 回所有 ranks，保证 rank0 可以返回结果。
+- `_forward_ddit_vae`：选择 VAE ranks 并在 dynamic SP context 中 decode。
+- `_broadcast_ddit_tensor`：把 VAE leader 上的 decoded frames broadcast 回全 ranks，保证 rank0 能返回结果。
 
-VAE rank 选择优先级：
+fixed-baseline 行为：
 
-```mermaid
-flowchart LR
-  A["request ddit_vae_ranks"] -->|highest| D["VAE ranks"]
-  B["request ddit_vae_k"] --> D
-  C["server --ddit-vae-gpus"] -->|default 1| D
-```
+- `resolve_vae_ranks` 直接返回 `ddit_final_dit_ranks`。
+- 请求级 `ddit_vae_k`、`ddit_vae_ranks` 和服务级 `--ddit-vae-gpus` 不改变 ranks。
+- rank switch JSONL 会记录 `reason="fixed_baseline_same_ranks"`，用于说明 VAE 复用 DiT ranks。
 
-## 5. 请求与服务参数
-
-### 服务级参数
+## 7. Server Args
 
 文件：`runtime/server_args.py`
 
-新增：
+新增/相关参数：
 
 - `--enable-ddit`
-- `--ddit-node-id`
-- `--ddit-advertised-host`
-- `--ddit-local-ranks`
-- `--ddit-allowed-gpu-counts`
+- `--ddit-schedule-policy forced_switch|hungry_first|fixed_baseline`
+- `--ddit-baseline-gpus`
 - `--ddit-initial-gpus`
 - `--ddit-initial-ranks`
 - `--ddit-switch-plan`
 - `--ddit-vae-gpus`
+- `--ddit-local-ranks`
+- `--ddit-allowed-gpu-counts`
 - `--ddit-sp-degree-map`
 - `--ddit-prebuild-sp-groups`
 - `--ddit-log-dir`
-- `--ddit-profile-path`
-- `--ddit-debug-cpu-backup`
 
-### 请求级参数
+参数关系：
 
-文件：`configs/sample/sampling_params.py`
+- forced-switch：`ddit_initial_gpus` / `ddit_initial_ranks` 决定 DiT 起始 ranks。
+- fixed-baseline：`ddit_baseline_gpus` 决定 DiT/VAE 固定 ranks；`ddit_initial_gpus` 不生效。
+- fixed-baseline：VAE 复用 DiT ranks，`ddit_vae_gpus` 只会产生 warning，不改变行为。
 
-新增：
+## 8. Mixed Workload Client
 
-- `resolution_key`
-- `ddit_resolution_key`
-- `ddit_initial_ranks`
-- `ddit_switch_plan`
-- `ddit_vae_k`
-- `ddit_vae_ranks`
+文件：`examples/multimodal_gen/ddit_mixed_workload_client.py`
 
-OpenAI video endpoint 也支持这些字段，并支持 client 指定 `request_id`。
+关键函数：
 
-## 6. 实验脚本
+- `counts_from_ratios`：按比例生成数量，最后一类补齐总数。
+- `build_workload`：生成请求 payload，并写入 `resolution_key` / `ddit_resolution_key`。
+- `detect_project_root`：从脚本路径向上查找项目根目录。
+- `resolve_project_image_path`：解析 `--image-path`，默认使用 `<project_root>/examples/assets/example_image.png`。
 
-### `examples/multimodal_gen/ddit_forced_switch_wan.py`
+图片路径优先级：
 
-用途：单请求正确性实验。
+```mermaid
+flowchart LR
+  A["--image-path absolute"] --> D["final image_path"]
+  B["--image-path relative"] --> C["resolve against project root"]
+  C --> D
+  E["no --image-path"] --> F["project_root/examples/assets/example_image.png"]
+  F --> D
+```
 
-默认行为：
+## 9. 日志
 
-- `num_inference_steps=50`
-- `initial_ranks=0`
-- `switch_plan=15:1->2;30:2->4;45:4->8`
-- `ddit_vae_k=1`
+文件：`runtime/ddit/logging.py`
 
-### `examples/multimodal_gen/ddit_mixed_workload_client.py`
+生命周期 CSV：
 
-用途：mixed workload E2E 压测。
+- 文件名：`ddit_lifecycle.csv`
+- 一行一个请求。
+- 最后三行自动写入 `p50/p90/p99` lifespan time。
 
-主体逻辑：
+rank switch JSONL：
 
-- 根据 `num_requests`、`resolutions`、`ratios` 生成请求数量。
-- 最后一类分辨率补齐总数。
-- shuffle 后按 `rate` 发送。
-- `rate=burst` 时不 sleep。
+- 文件名：`ddit_rank_switch.jsonl`
+- forced-switch 记录 DiT step 扩容和 VAE ranks。
+- fixed-baseline 记录 baseline rank assignment，以及 VAE 复用 DiT ranks。
 
-## 7. 当前边界与多机后续
+## 10. 当前边界与后续
 
-当前代码完成：
+已经实现：
 
-- 单机 dynamic SP group。
-- 请求级 forced switch。
-- VAE k 卡选择与日志。
-- hungry-first policy 的独立实现和单测。
-- 非 `127.0.0.1` 的 advertised host 参数。
-- 本节点 rank 约束。
+- fixed-baseline 参数语义。
+- text encoder 全机 TP、DiT/VAE 固定 k-rank dynamic SP 的 pipeline 路径。
+- arbitrary non-contiguous same-node dynamic SP group 支持。
+- fixed-baseline rank allocator 单测。
+- mixed workload client project-root image path 修复。
 
-后续多机需要：
+仍需后续实现：
 
-- worker 注册协议。
-- 节点级资源池和节点选择策略。
-- 跨节点故障恢复。
-- 多机启动脚本和日志聚合。
-- 多机 E2E 验收。
-
-明确不做：
-
-- 跨节点 SP。
-- 跨节点 latent migration。
-- 同一请求跨节点 VAE。
+- phase-aware worker-pool serving loop，让不同请求的 DiT/VAE subgroup 真正并发。
+- text encoder full-node TP rendezvous 与 running DiT step-boundary rendezvous 的统一调度。
+- 多节点 worker 注册、节点级资源池和跨节点日志汇总。

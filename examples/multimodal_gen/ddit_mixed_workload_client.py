@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 DEFAULT_SIZE_MAP = {
@@ -17,6 +19,51 @@ DEFAULT_SIZE_MAP = {
     "720p": "1280x720",
     "1080p": "1920x1080",
 }
+DEFAULT_IMAGE_RELATIVE_PATH = os.path.join("examples", "assets", "example_image.png")
+
+
+def detect_project_root(project_root: str | None = None) -> Path:
+    if project_root:
+        return Path(project_root).expanduser().resolve()
+
+    script_path = Path(__file__).resolve()
+    for candidate in (script_path.parent, *script_path.parents):
+        has_default_image = (candidate / DEFAULT_IMAGE_RELATIVE_PATH).exists()
+        has_repo_marker = (candidate / "python" / "sglang").exists() or (
+            candidate / ".git"
+        ).exists()
+        if has_default_image and has_repo_marker:
+            return candidate
+    raise FileNotFoundError(
+        "Could not detect project root containing "
+        f"{DEFAULT_IMAGE_RELATIVE_PATH!r}. Pass --project-root explicitly."
+    )
+
+
+def resolve_project_image_path(
+    image_path: str | None = None,
+    *,
+    project_root: str | None = None,
+) -> str | None:
+    if image_path == "":
+        return None
+
+    root = detect_project_root(project_root)
+    path = (
+        root / DEFAULT_IMAGE_RELATIVE_PATH
+        if image_path is None
+        else Path(image_path).expanduser()
+    )
+    if not path.is_absolute():
+        path = root / path
+    path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"Input image path does not exist: {path}")
+    return str(path)
+
+
+def default_project_image_path() -> str:
+    return str(detect_project_root() / DEFAULT_IMAGE_RELATIVE_PATH)
 
 
 @dataclass(frozen=True)
@@ -79,6 +126,7 @@ def build_workload(
     seed: int,
     prompt: str,
     size_map: dict[str, str],
+    image_path: str | None = None,
     extra_payload: dict[str, Any] | None = None,
 ) -> list[WorkloadRequest]:
     if len(resolutions) != len(ratios):
@@ -99,6 +147,9 @@ def build_workload(
                 "resolution_key": resolution,
                 "ddit_resolution_key": resolution,
             }
+            if image_path:
+                payload["image_path"] = image_path
+                payload["input_reference"] = image_path
             if extra_payload:
                 payload.update(extra_payload)
             requests_to_send.append(
@@ -158,18 +209,40 @@ def main() -> None:
     parser.add_argument("--server-url", default="http://127.0.0.1:30000")
     parser.add_argument("--num-requests", type=int, required=True)
     parser.add_argument("--resolutions", required=True, help="Comma-separated labels.")
-    parser.add_argument("--ratios", required=True, help="Comma-separated floats summing to 1.")
+    parser.add_argument(
+        "--ratios", required=True, help="Comma-separated floats summing to 1."
+    )
     parser.add_argument("--rate", default="1", help="Requests per second or 'burst'.")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--prompt", default="A cinematic video of a small robot walking through a city.")
+    parser.add_argument(
+        "--prompt",
+        default="A cinematic video of a small robot walking through a city.",
+    )
+    parser.add_argument(
+        "--image-path",
+        default=None,
+        help="Input image path for TI2V models. Relative paths are resolved "
+        "against --project-root. Defaults to examples/assets/example_image.png.",
+    )
+    parser.add_argument(
+        "--project-root",
+        default=None,
+        help="Project root used to resolve default and relative image paths. "
+        "Auto-detected from this script when omitted.",
+    )
     parser.add_argument("--size-map-json", default=None)
-    parser.add_argument("--extra-json", default=None, help="Extra JSON payload merged into every request.")
+    parser.add_argument(
+        "--extra-json", default=None, help="Extra JSON payload merged into every request."
+    )
     parser.add_argument("--timeout", type=float, default=30.0)
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
     resolutions = parse_csv(args.resolutions)
     ratios = parse_ratios(args.ratios)
+    image_path = resolve_project_image_path(
+        args.image_path, project_root=args.project_root
+    )
     workload = build_workload(
         num_requests=args.num_requests,
         resolutions=resolutions,
@@ -177,6 +250,7 @@ def main() -> None:
         seed=args.seed,
         prompt=args.prompt,
         size_map=load_size_map(args.size_map_json),
+        image_path=image_path,
         extra_payload=json.loads(args.extra_json) if args.extra_json else None,
     )
     if args.dry_run:
