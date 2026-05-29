@@ -4,7 +4,9 @@ import json
 import os
 import tempfile
 import unittest
+from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.multimodal_gen.runtime.ddit.config import (
     DDiTSwitchEvent,
@@ -15,6 +17,10 @@ from sglang.multimodal_gen.runtime.ddit.config import (
     resolve_vae_ranks,
 )
 from sglang.multimodal_gen.runtime.ddit.concurrent import CommandWaveBuilder, DDiTOp
+from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
+    DynamicSPGroupRegistry,
+    get_dynamic_sp_registry,
+)
 from sglang.multimodal_gen.runtime.ddit.profile import ProfileStore
 from sglang.multimodal_gen.runtime.ddit.scheduler import (
     DDiTRequestState,
@@ -30,6 +36,7 @@ from sglang.multimodal_gen.runtime.ddit.scheduler import (
     WSJFScaleUpScheduler,
     build_hungry_scheduler_config,
 )
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 
 
 class TestDDiTHungryScheduler(unittest.TestCase):
@@ -193,6 +200,102 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual(second[0]["old_ranks"], (0,))
         self.assertEqual(second[0]["new_ranks"], (0, 1))
         self.assertEqual(second[0]["reason"], "switch_plan")
+
+    def test_dynamic_sp_registry_has_and_ensure_are_cache_aware(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1,2=2x1",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        registry = DynamicSPGroupRegistry(server_args)
+        spec = registry.resolve_spec((1, 0))
+
+        self.assertEqual(spec.ranks, (0, 1))
+        self.assertEqual((spec.ulysses_degree, spec.ring_degree), (2, 1))
+        self.assertFalse(registry.has((0, 1)))
+
+        built_group = object()
+        with patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_available",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_initialized",
+            return_value=True,
+        ), patch.object(
+            registry, "_build", return_value=built_group
+        ) as build:
+            first = registry.ensure((1, 0))
+            second = registry.ensure((0, 1))
+
+        self.assertTrue(first.created)
+        self.assertIs(first.group, built_group)
+        self.assertTrue(registry.has((0, 1)))
+        self.assertFalse(second.created)
+        self.assertIs(second.group, built_group)
+        build.assert_called_once_with(spec)
+
+    def test_scheduler_skips_dynamic_sp_ensure_wave_on_cache_hit(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        registry = get_dynamic_sp_registry(server_args)
+        spec = registry.resolve_spec((0,))
+        registry._cache[spec] = object()
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = server_args
+
+        pending_dynamic_sp = deque()
+        ensured_dynamic_sp = set()
+        ensuring_dynamic_sp = set()
+        scheduler._ddit_queue_dynamic_sp_ensure(
+            pending_dynamic_sp=pending_dynamic_sp,
+            ensured_dynamic_sp=ensured_dynamic_sp,
+            ensuring_dynamic_sp=ensuring_dynamic_sp,
+            full_ranks=tuple(range(4)),
+            target_ranks=(0,),
+            request_id="req",
+            reason="dit_init",
+        )
+
+        self.assertEqual(list(pending_dynamic_sp), [])
+        self.assertEqual(ensured_dynamic_sp, {(0,)})
+        self.assertEqual(ensuring_dynamic_sp, set())
+
+    def test_scheduler_queues_full_rank_dynamic_sp_ensure_on_cache_miss(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1,2=2x1",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = server_args
+
+        pending_dynamic_sp = deque()
+        ensured_dynamic_sp = set()
+        ensuring_dynamic_sp = set()
+        scheduler._ddit_queue_dynamic_sp_ensure(
+            pending_dynamic_sp=pending_dynamic_sp,
+            ensured_dynamic_sp=ensured_dynamic_sp,
+            ensuring_dynamic_sp=ensuring_dynamic_sp,
+            full_ranks=tuple(range(4)),
+            target_ranks=(1, 0),
+            request_id="req",
+            reason="dit_migrate",
+        )
+
+        self.assertEqual(len(pending_dynamic_sp), 1)
+        op = pending_dynamic_sp[0]
+        self.assertEqual(op.action, "ensure_dynamic_sp")
+        self.assertEqual(op.ranks, tuple(range(4)))
+        self.assertEqual(op.payload["target_ranks"], (0, 1))
+        self.assertEqual(op.payload["log_reason"], "dit_migrate")
+        self.assertEqual(ensured_dynamic_sp, set())
+        self.assertEqual(ensuring_dynamic_sp, {(0, 1)})
 
     def test_forced_switch_waits_when_target_rank_is_busy(self):
         scheduler = ForcedSwitchScheduler(

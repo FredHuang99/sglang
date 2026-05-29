@@ -30,6 +30,13 @@ class DynamicSPGroupSpec:
     ring_degree: int
 
 
+@dataclass(frozen=True)
+class DynamicSPEnsureResult:
+    spec: DynamicSPGroupSpec
+    group: SequenceParallelGroupCoordinator | None
+    created: bool
+
+
 def _rank_groups_covering_world(active_ranks: tuple[int, ...]) -> list[list[int]]:
     world_size = dist.get_world_size()
     active = set(active_ranks)
@@ -67,6 +74,37 @@ class DynamicSPGroupRegistry:
     def __init__(self, server_args: Any):
         self.server_args = server_args
         self._cache: dict[DynamicSPGroupSpec, SequenceParallelGroupCoordinator] = {}
+
+    @property
+    def cache_size(self) -> int:
+        return len(self._cache)
+
+    def resolve_spec(self, ranks: tuple[int, ...]) -> DynamicSPGroupSpec:
+        ranks = tuple(sorted(int(rank) for rank in ranks))
+        ulysses_degree, ring_degree = resolve_ddit_sp_degrees(
+            len(ranks),
+            getattr(self.server_args, "ddit_sp_degree_map", None),
+            server_args=self.server_args,
+        )
+        return DynamicSPGroupSpec(
+            ranks=ranks,
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+        )
+
+    def has(self, ranks: tuple[int, ...]) -> bool:
+        return self.resolve_spec(ranks) in self._cache
+
+    def ensure(self, ranks: tuple[int, ...]) -> DynamicSPEnsureResult:
+        spec = self.resolve_spec(ranks)
+        if not dist.is_available() or not dist.is_initialized():
+            return DynamicSPEnsureResult(spec=spec, group=None, created=False)
+        group = self._cache.get(spec)
+        if group is not None:
+            return DynamicSPEnsureResult(spec=spec, group=group, created=False)
+        group = self._build(spec)
+        self._cache[spec] = group
+        return DynamicSPEnsureResult(spec=spec, group=group, created=True)
 
     def _build(self, spec: DynamicSPGroupSpec) -> SequenceParallelGroupCoordinator:
         backend = current_platform.get_torch_distributed_backend_str()
@@ -109,22 +147,7 @@ class DynamicSPGroupRegistry:
         )
 
     def get(self, ranks: tuple[int, ...]) -> SequenceParallelGroupCoordinator | None:
-        if not dist.is_available() or not dist.is_initialized():
-            return None
-        ranks = tuple(sorted(int(rank) for rank in ranks))
-        ulysses_degree, ring_degree = resolve_ddit_sp_degrees(
-            len(ranks),
-            getattr(self.server_args, "ddit_sp_degree_map", None),
-            server_args=self.server_args,
-        )
-        spec = DynamicSPGroupSpec(
-            ranks=ranks,
-            ulysses_degree=ulysses_degree,
-            ring_degree=ring_degree,
-        )
-        if spec not in self._cache:
-            self._cache[spec] = self._build(spec)
-        return self._cache[spec]
+        return self.ensure(ranks).group
 
     def prebuild(self) -> None:
         if not dist.is_available() or not dist.is_initialized():
@@ -177,7 +200,13 @@ class DynamicSPGroupRegistry:
             logger.info("DDiT dynamic SP prebuild entering final barrier")
         dist.barrier()
         if rank == 0:
-            logger.info("DDiT dynamic SP prebuild done")
+            logger.info(
+                "DDiT dynamic SP prebuild done: cache_size=%s, "
+                "total_rank_tuples=%s, allowed_counts=%s",
+                self.cache_size,
+                total_groups,
+                counts,
+            )
 
     @contextlib.contextmanager
     def use(self, ranks: tuple[int, ...]) -> Iterator[None]:
@@ -236,19 +265,30 @@ def _ddit_role_value(server_args: Any) -> str:
 
 def should_prebuild_dynamic_sp_groups(server_args: Any) -> bool:
     if not getattr(server_args, "enable_ddit", False):
+        _log_prebuild_skip(server_args, "enable_ddit=false")
         return False
     if not getattr(server_args, "ddit_prebuild_sp_groups", True):
+        _log_prebuild_skip(server_args, "disabled_by_arg")
         return False
 
     role_value = _ddit_role_value(server_args)
     if role_value in {"encoder", "server"}:
-        logger.info(
-            "Skipping DDiT dynamic SP prebuild for role=%s; dynamic SP is only "
-            "needed by DiT/VAE compute roles.",
-            role_value,
-        )
+        _log_prebuild_skip(server_args, f"role={role_value}")
         return False
     return True
+
+
+def _log_prebuild_skip(server_args: Any, reason: str) -> None:
+    if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        return
+    logger.info(
+        "Skipping DDiT dynamic SP prebuild: reason=%s, role=%s, "
+        "enable_ddit=%s, ddit_prebuild_sp_groups=%s",
+        reason,
+        _ddit_role_value(server_args),
+        getattr(server_args, "enable_ddit", False),
+        getattr(server_args, "ddit_prebuild_sp_groups", True),
+    )
 
 
 def current_rank_in(ranks: tuple[int, ...]) -> bool:

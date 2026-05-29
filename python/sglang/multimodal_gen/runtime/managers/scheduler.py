@@ -28,6 +28,7 @@ from sglang.multimodal_gen.runtime.ddit.concurrent import (
     CommandWaveBuilder,
     DDiTOp,
 )
+from sglang.multimodal_gen.runtime.ddit.dynamic_sp import get_dynamic_sp_registry
 from sglang.multimodal_gen.runtime.ddit.logging import record_lifecycle
 from sglang.multimodal_gen.runtime.ddit.logging import record_op_trace_rows
 from sglang.multimodal_gen.runtime.ddit.logging import record_rank_switch
@@ -578,6 +579,26 @@ class Scheduler(SchedulerDisaggMixin):
             if self.gpu_id == 0:
                 result["req"] = req
             return result
+        if action == "ensure_dynamic_sp":
+            target_ranks = tuple(command.get("target_ranks") or command["ranks"])
+            result = get_dynamic_sp_registry(self.server_args).ensure(target_ranks)
+            if self.gpu_id == 0:
+                logger.info(
+                    "DDiT worker: ensured dynamic SP group for ranks=%s "
+                    "(cache_hit=%s, created=%s, degree_pair=%sx%s, reason=%s)",
+                    result.spec.ranks,
+                    not result.created,
+                    result.created,
+                    result.spec.ulysses_degree,
+                    result.spec.ring_degree,
+                    command.get("log_reason", ""),
+                )
+            return {
+                "target_ranks": result.spec.ranks,
+                "created": result.created,
+                "ulysses_degree": result.spec.ulysses_degree,
+                "ring_degree": result.spec.ring_degree,
+            }
         if action == "full_forward":
             return self.worker.execute_forward([command["req"]])
         if action == "control":
@@ -993,16 +1014,70 @@ class Scheduler(SchedulerDisaggMixin):
             scalar_fields["error"] = output_batch.error
         send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
 
+    def _ddit_queue_dynamic_sp_ensure(
+        self,
+        *,
+        pending_dynamic_sp: deque[DDiTOp],
+        ensured_dynamic_sp: set[tuple[int, ...]],
+        ensuring_dynamic_sp: set[tuple[int, ...]],
+        full_ranks: tuple[int, ...],
+        target_ranks: tuple[int, ...],
+        request_id: str | None,
+        reason: str,
+    ) -> None:
+        target_ranks = tuple(sorted(int(rank) for rank in target_ranks))
+        registry = get_dynamic_sp_registry(self.server_args)
+        spec = registry.resolve_spec(target_ranks)
+        if target_ranks in ensured_dynamic_sp or target_ranks in ensuring_dynamic_sp:
+            return
+        if registry.has(target_ranks):
+            ensured_dynamic_sp.add(target_ranks)
+            logger.info(
+                "DDiT worker: dynamic SP cache hit for ranks=%s "
+                "(degree_pair=%sx%s, reason=%s); skipping ensure wave",
+                spec.ranks,
+                spec.ulysses_degree,
+                spec.ring_degree,
+                reason,
+            )
+            return
+        pending_dynamic_sp.append(
+            DDiTOp(
+                action="ensure_dynamic_sp",
+                request_id=request_id,
+                ranks=full_ranks,
+                stage="ddit_sp",
+                payload={
+                    "target_ranks": spec.ranks,
+                    "log_reason": reason,
+                },
+                op_id=f"ensure_dynamic_sp:{','.join(str(r) for r in target_ranks)}",
+            )
+        )
+        ensuring_dynamic_sp.add(target_ranks)
+        logger.info(
+            "DDiT worker: dynamic SP cache miss for ranks=%s "
+            "(degree_pair=%sx%s, reason=%s); queued full-rank ensure",
+            spec.ranks,
+            spec.ulysses_degree,
+            spec.ring_degree,
+            reason,
+        )
+
     def _ddit_enqueue_schedule_decisions(
         self,
         *,
         policy: Any,
         schedule_policy: str,
+        pending_dynamic_sp: deque[DDiTOp],
         pending_init: deque[DDiTOp],
         pending_migrate: deque[DDiTOp],
         initializing: set[str],
         migrating: set[str],
         req_by_id: dict[str, Req],
+        ensured_dynamic_sp: set[tuple[int, ...]],
+        ensuring_dynamic_sp: set[tuple[int, ...]],
+        full_ranks: tuple[int, ...],
     ) -> None:
         for decision in policy.schedule():
             request_id = decision["request_id"]
@@ -1024,6 +1099,15 @@ class Scheduler(SchedulerDisaggMixin):
                         reason=str(decision.get("reason", schedule_policy)),
                         policy=str(decision.get("policy", schedule_policy)),
                     )
+                self._ddit_queue_dynamic_sp_ensure(
+                    pending_dynamic_sp=pending_dynamic_sp,
+                    ensured_dynamic_sp=ensured_dynamic_sp,
+                    ensuring_dynamic_sp=ensuring_dynamic_sp,
+                    full_ranks=full_ranks,
+                    target_ranks=new_ranks,
+                    request_id=request_id,
+                    reason="dit_migrate",
+                )
                 pending_migrate.append(
                     DDiTOp(
                         action="dit_migrate",
@@ -1059,6 +1143,15 @@ class Scheduler(SchedulerDisaggMixin):
                     reason=log_reason,
                     policy=log_policy,
                 )
+            self._ddit_queue_dynamic_sp_ensure(
+                pending_dynamic_sp=pending_dynamic_sp,
+                ensured_dynamic_sp=ensured_dynamic_sp,
+                ensuring_dynamic_sp=ensuring_dynamic_sp,
+                full_ranks=full_ranks,
+                target_ranks=ranks,
+                request_id=request_id,
+                reason="dit_init",
+            )
             pending_init.append(
                 DDiTOp(
                     action="dit_init",
@@ -1123,6 +1216,7 @@ class Scheduler(SchedulerDisaggMixin):
         policy: Any,
         running_order: deque[str],
         pending_register: deque[DDiTOp],
+        pending_dynamic_sp: deque[DDiTOp],
         pending_output_transfer: deque[DDiTOp],
         pending_vae_run: deque[DDiTOp],
         pending_vae_prepare: deque[DDiTOp],
@@ -1133,6 +1227,7 @@ class Scheduler(SchedulerDisaggMixin):
     ) -> CommandWave:
         builder = CommandWaveBuilder(wave_id, world_size)
         for queue in (
+            pending_dynamic_sp,
             pending_register,
             pending_output_transfer,
             pending_vae_run,
@@ -1310,6 +1405,7 @@ class Scheduler(SchedulerDisaggMixin):
         running_order: deque[str] = deque()
         pending_init: deque[DDiTOp] = deque()
         pending_register: deque[DDiTOp] = deque()
+        pending_dynamic_sp: deque[DDiTOp] = deque()
         pending_migrate: deque[DDiTOp] = deque()
         pending_finish: deque[DDiTOp] = deque()
         pending_vae_prepare: deque[DDiTOp] = deque()
@@ -1322,6 +1418,8 @@ class Scheduler(SchedulerDisaggMixin):
         vae_running: set[str] = set()
         output_transferring: set[str] = set()
         registering: set[str] = set()
+        ensured_dynamic_sp: set[tuple[int, ...]] = set()
+        ensuring_dynamic_sp: set[tuple[int, ...]] = set()
         prepare_backpressure_logged: set[str] = set()
         prepared_since_compute = False
         wave_id = 0
@@ -1338,6 +1436,7 @@ class Scheduler(SchedulerDisaggMixin):
                 self._hungry_recv_rank0_reqs()
             pending_queues = [
                 pending_register,
+                pending_dynamic_sp,
                 pending_init,
                 pending_migrate,
                 pending_finish,
@@ -1408,11 +1507,15 @@ class Scheduler(SchedulerDisaggMixin):
                 self._ddit_enqueue_schedule_decisions(
                     policy=policy,
                     schedule_policy=schedule_policy,
+                    pending_dynamic_sp=pending_dynamic_sp,
                     pending_init=pending_init,
                     pending_migrate=pending_migrate,
                     initializing=initializing,
                     migrating=migrating,
                     req_by_id=req_by_id,
+                    ensured_dynamic_sp=ensured_dynamic_sp,
+                    ensuring_dynamic_sp=ensuring_dynamic_sp,
+                    full_ranks=full_ranks,
                 )
                 blocked = (
                     registering
@@ -1429,6 +1532,7 @@ class Scheduler(SchedulerDisaggMixin):
                     policy=policy,
                     running_order=running_order,
                     pending_register=pending_register,
+                    pending_dynamic_sp=pending_dynamic_sp,
                     pending_output_transfer=pending_output_transfer,
                     pending_vae_run=pending_vae_run,
                     pending_vae_prepare=pending_vae_prepare,
@@ -1445,11 +1549,15 @@ class Scheduler(SchedulerDisaggMixin):
                 self._ddit_enqueue_schedule_decisions(
                     policy=policy,
                     schedule_policy=schedule_policy,
+                    pending_dynamic_sp=pending_dynamic_sp,
                     pending_init=pending_init,
                     pending_migrate=pending_migrate,
                     initializing=initializing,
                     migrating=migrating,
                     req_by_id=req_by_id,
+                    ensured_dynamic_sp=ensured_dynamic_sp,
+                    ensuring_dynamic_sp=ensuring_dynamic_sp,
+                    full_ranks=full_ranks,
                 )
                 blocked = (
                     registering
@@ -1466,6 +1574,7 @@ class Scheduler(SchedulerDisaggMixin):
                     policy=policy,
                     running_order=running_order,
                     pending_register=pending_register,
+                    pending_dynamic_sp=pending_dynamic_sp,
                     pending_output_transfer=pending_output_transfer,
                     pending_vae_run=pending_vae_run,
                     pending_vae_prepare=pending_vae_prepare,
@@ -1488,6 +1597,7 @@ class Scheduler(SchedulerDisaggMixin):
                         "idle",
                         "full_prepare",
                         "register_prepared",
+                        "ensure_dynamic_sp",
                         "full_forward",
                         "control",
                     )
@@ -1540,6 +1650,18 @@ class Scheduler(SchedulerDisaggMixin):
                             state.total_steps,
                             schedule_policy,
                         )
+                    elif action == "ensure_dynamic_sp":
+                        target_ranks = tuple(
+                            int(rank)
+                            for rank in (
+                                result.get("target_ranks")
+                                if isinstance(result, dict)
+                                else op.payload.get("target_ranks", ())
+                            )
+                        )
+                        if target_ranks:
+                            ensuring_dynamic_sp.discard(target_ranks)
+                            ensured_dynamic_sp.add(target_ranks)
                     elif action == "full_forward":
                         req = op.payload["req"]
                         self._write_monolithic_profile_row(req, result)
