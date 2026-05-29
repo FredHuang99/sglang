@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.buffer import (
     TransferMetaBuffer,
     TransferTensorBuffer,
 )
+from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
+    unpack_tensors,
+)
 from sglang.multimodal_gen.runtime.disaggregation.transport.engine import (
     MockTransferEngine,
 )
@@ -1223,10 +1226,13 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
         scheduler._schedule_transfer_reconfigure.assert_called_once_with(1536, 384)
         self.assertNotIn("warmup-dec", scheduler._warmup_inbound_sizes)
 
-    def test_ddit_worker_warmup_register_schedules_reconfigure_from_inbound_sizes(self):
+    def test_ddit_worker_warmup_ack_schedules_reconfigure_from_inbound_sizes(self):
         scheduler = _SchedulerHarness.make(RoleType.DDIT_WORKER)
         scheduler._release_pending_receive = MagicMock()
         scheduler._schedule_transfer_reconfigure = MagicMock()
+        scheduler._maybe_apply_pending_transfer_reconfigure = MagicMock(
+            return_value=True
+        )
         scheduler._warmup_inbound_sizes["warmup-ddit"] = (4096, 512)
         scheduler._compute_ready_queue.put(
             _PendingInboundTransfer(
@@ -1248,8 +1254,14 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
 
         self.assertTrue(handled)
         scheduler._schedule_transfer_reconfigure.assert_called_once_with(4096, 512)
+        scheduler._maybe_apply_pending_transfer_reconfigure.assert_called_once()
         self.assertNotIn("warmup-ddit", scheduler._warmup_inbound_sizes)
-        self.assertEqual(len(pending_register), 1)
+        self.assertEqual(len(pending_register), 0)
+        scheduler._pool_result_push.send_multipart.assert_called_once()
+        sent_frames = scheduler._pool_result_push.send_multipart.call_args[0][0]
+        tensor_fields, scalar_fields = unpack_tensors(sent_frames, device="cpu")
+        self.assertEqual(tensor_fields, {})
+        self.assertEqual(scalar_fields["request_id"], "warmup-ddit")
 
 
 class TestSchedulerTensorDistribution(unittest.TestCase):

@@ -936,6 +936,21 @@ class Scheduler(SchedulerDisaggMixin):
                     inbound_sizes[0],
                     inbound_sizes[1],
                 )
+                reconfigured = self._maybe_apply_pending_transfer_reconfigure()
+                logger.info(
+                    "DDiT worker warmup calibration completed for %s "
+                    "(inbound_data=%d bytes, inbound_meta=%d bytes, "
+                    "reconfigured=%s); returning startup ACK",
+                    item.request_id,
+                    int(inbound_sizes[0]),
+                    int(inbound_sizes[1]),
+                    reconfigured,
+                )
+                self._ddit_send_output_to_disagg_server(
+                    item.request_id, OutputBatch()
+                )
+                handled = True
+                continue
             pending_register.append(
                 DDiTOp(
                     action="register_prepared",
