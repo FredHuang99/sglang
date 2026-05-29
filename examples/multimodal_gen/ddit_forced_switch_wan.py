@@ -21,7 +21,7 @@ def main() -> None:
     parser.add_argument("--ddit-vae-k", type=int, default=1)
     parser.add_argument("--ddit-vae-ranks", default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--timeout", type=float, default=3600)
     args = parser.parse_args()
 
     payload = {

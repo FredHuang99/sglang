@@ -24,6 +24,16 @@
 
 `536870912` 是 512MiB configured lower bound。启动后的 disagg calibration warmup 会测量实际 prepared payload，并按 `round_allocation_size(measured_payload_bytes) * disagg_max_slots_per_instance * redundancy` 自动放大实际 transfer buffer。mixed workload 如果包含比 720p 更大的请求，应把 `--disagg-warmup-resolutions` 设成 workload 中最大 payload 的尺寸。
 
+## Mixed Workload Client Semantics
+
+`examples\multimodal_gen\ddit_mixed_workload_client.py` 是异步提交请求的 E2E client。它的 `--rate` 表示 request arrival rate，而不是 response completion rate：
+
+- `--rate burst`：连续提交全部请求，不等待前一个请求完成。
+- `--rate 2`：每 0.5 秒提交一个新请求，不受已有请求是否完成影响。
+- client 会在全部请求提交后继续等待 HTTP responses，避免连接提前断开。
+- queue latency、DiT latency、VAE latency、E2E latency 以 server 端 `ddit_lifecycle.csv` 为准；client 输出只用于确认 HTTP 状态和辅助排错。
+- `--max-inflight` 默认等于 `--num-requests`，不会限制实验并发；只有需要限制客户端侧 HTTP 连接数时才显式设置。
+
 ## Forced Switch Correctness
 
 用途：单请求全路径正确性验证。默认 50 denoising steps，在 completed step 15/30/45 后触发 `1->2->4->8` 的 DiT SP 扩容，VAE 默认 1 卡。
@@ -151,6 +161,22 @@ python examples\multimodal_gen\ddit_mixed_workload_client.py `
   --rate burst `
   --seed 42
 ```
+
+如果要让 hungry_first 的 VAE 固定 1 卡，可在 client 侧加：
+
+```powershell
+  --ddit-vae-k 1
+```
+
+如果要让 Wan2.1 T2V 1.3B 按 profile 中的 `opt_vae_k` 为每个 resolution 设置 VAE GPU 数，可加：
+
+```powershell
+  --ddit-vae-k profile `
+  --ddit-profile-path examples\multimodal_gen\ddit_profile_data.json `
+  --ddit-profile-model-id wan2.1-t2v-1.3b
+```
+
+`examples\multimodal_gen\ddit_profile_data.json` 中 Wan 的默认表为 `{"144p":1,"360p":4,"480p":8,"720p":8}`。z-image 没有 `opt_vae_k` 时会 fallback 到 `1`。
 
 验收点：rank switch 中出现 `reason="waiting_queue"`、`reason="hungry_first"`、`reason="dit_to_vae"`；op trace 中同一 `wave_id` 可出现不同 request 的 rank-disjoint `dit_step`。
 
@@ -465,9 +491,13 @@ Op trace JSONL：`<LOG_DIR>\ddit_op_trace.jsonl`
 | mixed client `--resolutions` | 分辨率标签列表，例如 `144p,360p,720p`。 |
 | mixed client `--ratios` | 各分辨率比例，float 列表且总和为 1，例如 `0.5,0.25,0.25`。 |
 | mixed client `--rate` | 请求发送速率；可为数值 requests/s，也可为 `burst`。 |
+| mixed client `--max-inflight` | client 侧最大并发 HTTP 请求数；默认等于 `--num-requests`，因此不会把 E2E 到达流串行化。 |
 | mixed client `--seed` | workload shuffle 和 request id 生成的随机种子。 |
 | mixed client `--image-path` | TI2V / image 模型输入图片路径；相对路径按 project root 解析。 |
 | mixed client `--project-root` | 显式指定项目根目录；未传时脚本从自身位置自动探测。 |
 | mixed client `--size-map-json` | 覆盖 resolution 到 size 的映射 JSON，例如 `{"720p":"1280x720"}`。 |
+| mixed client `--ddit-vae-k` | 可选 per-request VAE GPU 数；支持整数 `1/2/4/8`、JSON map 如 `{"144p":1,"720p":8}`，或 `profile`/`auto` 从 profile 的 `opt_vae_k` 读取。主要用于 `hungry_first`；same-ranks 策略会被服务端忽略。 |
+| mixed client `--ddit-profile-path` | mixed client 读取 `--ddit-vae-k profile` 时使用的 profile JSON；可复用 server 的 DDiT profile。相对路径按 project root 解析。 |
+| mixed client `--ddit-profile-model-id` | mixed client 从 multi-model profile 读取 `opt_vae_k` 时选择的 model id，例如 `wan2.1-t2v-1.3b` 或 `z-image`。 |
 | mixed client `--extra-json` | 合并到每个 request payload 的额外 JSON 字段。 |
 | mixed client `--dry-run` | 只打印将要发送的 payload，不实际请求 server。 |

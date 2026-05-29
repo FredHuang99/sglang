@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -128,6 +129,57 @@ class TestMixedWorkloadClient(CustomTestCase):
         )
         self.assertEqual([item.resolution for item in workload_a], [item.resolution for item in workload_b])
         self.assertEqual(len(workload_a), 6)
+
+    def test_build_workload_can_inject_ddit_vae_k(self):
+        client = _load_client_module()
+        workload = client.build_workload(
+            num_requests=2,
+            resolutions=["144p", "720p"],
+            ratios=[0.5, 0.5],
+            seed=7,
+            prompt="test",
+            size_map={"144p": "256x144", "720p": "1280x720"},
+            ddit_vae_k_resolver=client.build_vae_k_resolver('{"144p":1,"720p":8}'),
+        )
+        by_resolution = {
+            item.resolution: item.payload["ddit_vae_k"] for item in workload
+        }
+
+        self.assertEqual(by_resolution, {"144p": 1, "720p": 8})
+
+    def test_send_workload_burst_does_not_wait_for_each_response(self):
+        client = _load_client_module()
+        workload = [
+            client.WorkloadRequest(
+                f"req_{idx}", "144p", {"request_id": f"req_{idx}"}
+            )
+            for idx in range(3)
+        ]
+
+        class FakeResponse:
+            status_code = 200
+            text = "{}"
+
+            def json(self):
+                return {}
+
+        def fake_post(_endpoint, *, json, timeout):
+            del json, timeout
+            time.sleep(0.1)
+            return FakeResponse()
+
+        start = time.perf_counter()
+        responses = client.send_workload(
+            server_url="http://127.0.0.1:30000",
+            workload=workload,
+            rate=None,
+            timeout=10,
+            max_inflight=3,
+            post_fn=fake_post,
+        )
+
+        self.assertLess(time.perf_counter() - start, 0.25)
+        self.assertEqual(len(responses), 3)
 
 
 class TestLifecycleCsvLogger(CustomTestCase):

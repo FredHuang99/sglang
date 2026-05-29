@@ -253,7 +253,7 @@ class ServerArgs:
     # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 3600  # seconds, timeout for pending disagg requests
-    disagg_downstream_wait_timeout: int = 1800  # seconds, wait for downstream slot
+    disagg_downstream_wait_timeout: int = 3600  # seconds, wait for downstream slot
     disagg_dispatch_policy: str = "round_robin"  # "round_robin" or "max_free_slots"
     disagg_mode: bool = False  # True when running as a disaggregated instance
     disagg_instance_id: int = 0  # Stable per-role instance ID inside a pool

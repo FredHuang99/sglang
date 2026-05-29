@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 import os
 import random
@@ -13,13 +14,15 @@ from typing import Any
 
 DEFAULT_SIZE_MAP = {
     "144p": "256x144",
-    "240p": "426x240",
-    "360p": "640x360",
-    "480p": "854x480",
+    "240p": "432x240",
+    "360p": "640x352",
+    "480p": "832x480",
     "720p": "1280x720",
-    "1080p": "1920x1080",
+    "1k": "1024x576",
+    "2k": "2048x1152"
 }
 DEFAULT_IMAGE_RELATIVE_PATH = os.path.join("examples", "assets", "example_image.png")
+ALLOWED_DDIT_VAE_K = (1, 2, 4, 8)
 
 
 def detect_project_root(project_root: str | None = None) -> Path:
@@ -118,6 +121,90 @@ def load_size_map(raw: str | None) -> dict[str, str]:
     return merged
 
 
+def normalize_profile_model_id(value: str) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "-")
+    if "wan" in normalized and "2.1" in normalized and "1.3" in normalized:
+        return "wan2.1-t2v-1.3b"
+    if "z-image" in normalized or "zimage" in normalized:
+        return "z-image"
+    return normalized
+
+
+def _validate_vae_k(value: Any) -> int:
+    vae_k = int(value)
+    if vae_k not in ALLOWED_DDIT_VAE_K:
+        raise ValueError(
+            f"DDiT VAE k must be one of {ALLOWED_DDIT_VAE_K}, got {vae_k}"
+        )
+    return vae_k
+
+
+def load_profile_model_payload(
+    profile_path: str,
+    profile_model_id: str | None,
+    *,
+    project_root: str | None = None,
+) -> dict[str, Any]:
+    path = Path(profile_path).expanduser()
+    if not path.is_absolute():
+        path = detect_project_root(project_root) / path
+    path = path.resolve()
+    if not path.exists():
+        raise FileNotFoundError(f"DDiT profile path does not exist: {path}")
+    with path.open(encoding="utf-8") as f:
+        payload = json.load(f)
+    if "models" not in payload:
+        return payload
+    if not profile_model_id:
+        raise ValueError(
+            "--ddit-profile-model-id is required when --ddit-vae-k profile "
+            "uses a multi-model profile."
+        )
+    models = payload.get("models") or {}
+    normalized = normalize_profile_model_id(profile_model_id)
+    if profile_model_id in models:
+        return models[profile_model_id]
+    if normalized in models:
+        return models[normalized]
+    raise ValueError(
+        f"Model id {profile_model_id!r} was not found in DDiT profile {path}"
+    )
+
+
+def build_vae_k_resolver(
+    raw_vae_k: str | None,
+    *,
+    profile_path: str | None = None,
+    profile_model_id: str | None = None,
+    project_root: str | None = None,
+):
+    if raw_vae_k is None or raw_vae_k == "":
+        return None
+    raw = str(raw_vae_k).strip()
+    if raw.lower() in ("profile", "auto"):
+        if not profile_path:
+            raise ValueError("--ddit-profile-path is required for --ddit-vae-k profile")
+        payload = load_profile_model_payload(
+            profile_path, profile_model_id, project_root=project_root
+        )
+        table = {
+            str(resolution): _validate_vae_k(value)
+            for resolution, value in (payload.get("opt_vae_k") or {}).items()
+        }
+        return lambda resolution: table.get(str(resolution), 1)
+    if raw.startswith("{"):
+        table_payload = json.loads(raw)
+        if not isinstance(table_payload, dict):
+            raise ValueError("--ddit-vae-k JSON value must be an object")
+        table = {
+            str(resolution): _validate_vae_k(value)
+            for resolution, value in table_payload.items()
+        }
+        return lambda resolution: table.get(str(resolution), 1)
+    constant = _validate_vae_k(raw)
+    return lambda _resolution: constant
+
+
 def build_workload(
     *,
     num_requests: int,
@@ -128,6 +215,7 @@ def build_workload(
     size_map: dict[str, str],
     image_path: str | None = None,
     extra_payload: dict[str, Any] | None = None,
+    ddit_vae_k_resolver: Any | None = None,
 ) -> list[WorkloadRequest]:
     if len(resolutions) != len(ratios):
         raise ValueError(
@@ -150,6 +238,10 @@ def build_workload(
             if image_path:
                 payload["image_path"] = image_path
                 payload["input_reference"] = image_path
+            if ddit_vae_k_resolver is not None:
+                payload["ddit_vae_k"] = _validate_vae_k(
+                    ddit_vae_k_resolver(resolution)
+                )
             if extra_payload:
                 payload.update(extra_payload)
             requests_to_send.append(
@@ -179,29 +271,95 @@ def send_workload(
     workload: list[WorkloadRequest],
     rate: float | None,
     timeout: float,
+    max_inflight: int | None = None,
+    post_fn: Any | None = None,
 ) -> list[dict[str, Any]]:
-    import requests
-
     endpoint = server_url.rstrip("/") + "/v1/videos"
     sleep_s = None if rate is None else 1.0 / rate
-    responses = []
-    for item in workload:
+    if not workload:
+        return []
+    inflight_limit = len(workload) if max_inflight is None else int(max_inflight)
+    if inflight_limit <= 0:
+        raise ValueError("--max-inflight must be positive when set")
+    inflight_limit = min(inflight_limit, len(workload))
+    if post_fn is None:
+        import requests
+
+        post = requests.post
+    else:
+        post = post_fn
+    responses: list[dict[str, Any] | None] = [None] * len(workload)
+    futures: dict[Future[dict[str, Any]], int] = {}
+
+    def post_one(item: WorkloadRequest, submit_time: float) -> dict[str, Any]:
         start = time.time()
-        response = requests.post(endpoint, json=item.payload, timeout=timeout)
-        record = {
+        record: dict[str, Any] = {
             "client_request_id": item.request_id,
             "resolution": item.resolution,
-            "status_code": response.status_code,
-            "elapsed_s": time.time() - start,
+            "client_submit_time": submit_time,
+            "client_request_start_time": start,
         }
         try:
-            record["response"] = response.json()
-        except Exception:
-            record["response_text"] = response.text
-        responses.append(record)
-        if sleep_s is not None:
-            time.sleep(sleep_s)
-    return responses
+            response = post(endpoint, json=item.payload, timeout=timeout)
+            end = time.time()
+            record.update(
+                {
+                    "status_code": response.status_code,
+                    "client_response_time": end,
+                    "client_elapsed_s": end - submit_time,
+                    "client_http_elapsed_s": end - start,
+                }
+            )
+            try:
+                record["response"] = response.json()
+            except Exception:
+                record["response_text"] = response.text
+        except Exception as exc:
+            end = time.time()
+            record.update(
+                {
+                    "client_response_time": end,
+                    "client_elapsed_s": end - submit_time,
+                    "client_http_elapsed_s": end - start,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+            )
+        return record
+
+    def collect_done(done: set[Future[dict[str, Any]]]) -> None:
+        for future in done:
+            idx = futures.pop(future)
+            try:
+                responses[idx] = future.result()
+            except Exception as exc:
+                item = workload[idx]
+                now = time.time()
+                responses[idx] = {
+                    "client_request_id": item.request_id,
+                    "resolution": item.resolution,
+                    "client_response_time": now,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                }
+
+    with ThreadPoolExecutor(max_workers=inflight_limit) as executor:
+        for idx, item in enumerate(workload):
+            while len(futures) >= inflight_limit:
+                done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+                collect_done(done)
+
+            submit_time = time.time()
+            future = executor.submit(post_one, item, submit_time)
+            futures[future] = idx
+            if sleep_s is not None and idx + 1 < len(workload):
+                time.sleep(sleep_s)
+
+        while futures:
+            done, _pending = wait(futures, return_when=FIRST_COMPLETED)
+            collect_done(done)
+
+    return [record for record in responses if record is not None]
 
 
 def main() -> None:
@@ -232,9 +390,35 @@ def main() -> None:
     )
     parser.add_argument("--size-map-json", default=None)
     parser.add_argument(
+        "--ddit-vae-k",
+        default=None,
+        help=(
+            "Optional per-request DDiT VAE GPU count. Accepts an integer "
+            "1/2/4/8, a JSON map such as '{\"144p\":1,\"720p\":8}', or "
+            "'profile'/'auto' to read opt_vae_k from --ddit-profile-path."
+        ),
+    )
+    parser.add_argument(
+        "--ddit-profile-path",
+        default=None,
+        help="Profile JSON path used when --ddit-vae-k is profile/auto.",
+    )
+    parser.add_argument(
+        "--ddit-profile-model-id",
+        default=None,
+        help="Model id used to select a model from a multi-model DDiT profile.",
+    )
+    parser.add_argument(
         "--extra-json", default=None, help="Extra JSON payload merged into every request."
     )
-    parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--timeout", type=float, default=3600)
+    parser.add_argument(
+        "--max-inflight",
+        type=int,
+        default=None,
+        help="Maximum client-side concurrent HTTP requests. Defaults to "
+        "--num-requests so the arrival stream is not serialized by the client.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -252,6 +436,12 @@ def main() -> None:
         size_map=load_size_map(args.size_map_json),
         image_path=image_path,
         extra_payload=json.loads(args.extra_json) if args.extra_json else None,
+        ddit_vae_k_resolver=build_vae_k_resolver(
+            args.ddit_vae_k,
+            profile_path=args.ddit_profile_path,
+            profile_model_id=args.ddit_profile_model_id,
+            project_root=args.project_root,
+        ),
     )
     if args.dry_run:
         print(json.dumps([item.payload for item in workload], indent=2))
@@ -261,6 +451,7 @@ def main() -> None:
         workload=workload,
         rate=parse_rate(args.rate),
         timeout=args.timeout,
+        max_inflight=args.max_inflight,
     )
     print(json.dumps(responses, indent=2))
 

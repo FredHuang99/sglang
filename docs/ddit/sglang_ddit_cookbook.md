@@ -162,6 +162,8 @@ DiT 完成后先在 final DiT ranks 上执行 `DIT_FINISH`，得到 canonical fi
 - 若 VAE ranks 与 final DiT ranks 不同，`VAE_PREPARE` 分发 final latent 到 VAE ranks。
 - 若 VAE leader 不是 rank0，runtime 追加 `OUTPUT_TRANSFER`，把 output tensor P2P 交给 rank0。
 
+Mixed workload client 可以把 per-request `ddit_vae_k` 穿透到 payload。`--ddit-vae-k 1` 表示所有 request 固定 1 卡 VAE；`--ddit-vae-k '{"144p":1,"720p":8}'` 表示按 resolution 查 inline map；`--ddit-vae-k profile` 会从 `--ddit-profile-path` 中当前 model 的 `opt_vae_k` 读取，例如 Wan2.1 T2V 1.3B 可用 `144p=1, 360p=4, 480p=8, 720p=8`。如果 profile 没有 `opt_vae_k`，例如 z-image 当前默认 profile，client fallback 到 `ddit_vae_k=1`。这些字段只会影响支持 DiT/VAE rank separation 的 `hungry_first` / forced path；same-ranks 策略即使收到 request-level VAE k，也仍然保持 VAE ranks 等于 DiT ranks。
+
 ## 9. True Concurrent Runtime
 
 `CommandWaveBuilder` 保证同一 wave 内的 ops rank-disjoint：
@@ -185,6 +187,8 @@ sequenceDiagram
 Text encoder 不参与这种长期并发 ownership；它在 encoder instance 中 full-rank TP 执行。真正多请求多 rank 并发只发生在 ddit_worker 的 DiT/VAE 阶段。
 
 `ddit_op_trace.jsonl` 是验收主证据：同一 `wave_id` 内不同 request 的 `dit_step` / `vae_run` 时间区间应重叠，且 ranks 不重叠。
+
+Mixed workload client 也必须保持异步到达语义。`ddit_mixed_workload_client.py` 的发送线程按 `--rate` submit HTTP request，不等待前一个 response 返回；全部 request submit 完以后才统一收集 responses。这样 `burst` 和固定 rate workload 不会被客户端串行化，server 端 `ddit_lifecycle.csv` 记录的 add/dit/vae/end timestamp 才能反映真实排队和并发调度。
 
 ## 10. Scheduling Policies
 
