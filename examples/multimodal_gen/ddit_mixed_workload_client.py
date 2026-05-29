@@ -23,6 +23,7 @@ DEFAULT_SIZE_MAP = {
 }
 DEFAULT_IMAGE_RELATIVE_PATH = os.path.join("examples", "assets", "example_image.png")
 ALLOWED_DDIT_VAE_K = (1, 2, 4, 8)
+INPUT_REFERENCE_MODES = ("auto", "none", "image")
 
 
 def detect_project_root(project_root: str | None = None) -> Path:
@@ -130,6 +131,59 @@ def normalize_profile_model_id(value: str) -> str:
     return normalized
 
 
+def infer_input_reference_required(model_id: str | None) -> bool | None:
+    """Infer whether a workload should send input_reference from model naming."""
+    if not model_id:
+        return None
+    normalized = normalize_profile_model_id(model_id)
+    raw = str(model_id or "").strip().lower().replace("_", "-")
+    joined = f"{raw} {normalized}"
+    if "ti2v" in joined or "i2v" in joined or "i2i" in joined:
+        return True
+    if normalized == "z-image" or "t2i" in joined or "t2v" in joined:
+        return False
+    return None
+
+
+def resolve_input_reference_path(
+    *,
+    image_path: str | None,
+    mode: str,
+    model_id: str | None,
+    project_root: str | None = None,
+) -> str | None:
+    mode = str(mode or "auto").lower()
+    if mode not in INPUT_REFERENCE_MODES:
+        raise ValueError(
+            f"--input-reference-mode must be one of {INPUT_REFERENCE_MODES}, "
+            f"got {mode!r}"
+        )
+    if mode == "none":
+        return None
+    if mode == "image":
+        resolved = resolve_project_image_path(image_path, project_root=project_root)
+        if resolved is None:
+            raise ValueError(
+                "--input-reference-mode image requires a non-empty --image-path"
+            )
+        return resolved
+
+    inferred = infer_input_reference_required(model_id)
+    if inferred is False:
+        return None
+    if inferred is True:
+        resolved = resolve_project_image_path(image_path, project_root=project_root)
+        if resolved is None:
+            raise ValueError(
+                f"Model {model_id!r} appears to require input_reference, "
+                "but --image-path disabled it."
+            )
+        return resolved
+    if image_path in (None, ""):
+        return None
+    return resolve_project_image_path(image_path, project_root=project_root)
+
+
 def _validate_vae_k(value: Any) -> int:
     vae_k = int(value)
     if vae_k not in ALLOWED_DDIT_VAE_K:
@@ -214,6 +268,7 @@ def build_workload(
     prompt: str,
     size_map: dict[str, str],
     image_path: str | None = None,
+    include_input_reference: bool = False,
     extra_payload: dict[str, Any] | None = None,
     ddit_vae_k_resolver: Any | None = None,
 ) -> list[WorkloadRequest]:
@@ -235,8 +290,7 @@ def build_workload(
                 "resolution_key": resolution,
                 "ddit_resolution_key": resolution,
             }
-            if image_path:
-                payload["image_path"] = image_path
+            if include_input_reference and image_path:
                 payload["input_reference"] = image_path
             if ddit_vae_k_resolver is not None:
                 payload["ddit_vae_k"] = _validate_vae_k(
@@ -379,8 +433,27 @@ def main() -> None:
     parser.add_argument(
         "--image-path",
         default=None,
-        help="Input image path for TI2V models. Relative paths are resolved "
-        "against --project-root. Defaults to examples/assets/example_image.png.",
+        help="Input image path for image-conditioned models. Relative paths are "
+        "resolved against --project-root. In auto mode this defaults to "
+        "examples/assets/example_image.png only for I2V/TI2V model ids.",
+    )
+    parser.add_argument(
+        "--input-reference-mode",
+        choices=INPUT_REFERENCE_MODES,
+        default="auto",
+        help=(
+            "Controls whether requests include input_reference: auto infers from "
+            "--input-model-id/--ddit-profile-model-id, none disables it, image "
+            "forces it."
+        ),
+    )
+    parser.add_argument(
+        "--input-model-id",
+        default=None,
+        help=(
+            "Optional model id used only for input_reference auto inference. "
+            "Defaults to --ddit-profile-model-id when omitted."
+        ),
     )
     parser.add_argument(
         "--project-root",
@@ -424,8 +497,12 @@ def main() -> None:
 
     resolutions = parse_csv(args.resolutions)
     ratios = parse_ratios(args.ratios)
-    image_path = resolve_project_image_path(
-        args.image_path, project_root=args.project_root
+    input_model_id = args.input_model_id or args.ddit_profile_model_id
+    image_path = resolve_input_reference_path(
+        image_path=args.image_path,
+        mode=args.input_reference_mode,
+        model_id=input_model_id,
+        project_root=args.project_root,
     )
     workload = build_workload(
         num_requests=args.num_requests,
@@ -435,6 +512,7 @@ def main() -> None:
         prompt=args.prompt,
         size_map=load_size_map(args.size_map_json),
         image_path=image_path,
+        include_input_reference=image_path is not None,
         extra_payload=json.loads(args.extra_json) if args.extra_json else None,
         ddit_vae_k_resolver=build_vae_k_resolver(
             args.ddit_vae_k,

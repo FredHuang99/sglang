@@ -49,6 +49,65 @@ class TestDDiTMixedWorkloadClient(unittest.TestCase):
             self.module.resolve_project_image_path("", project_root=str(self.root_dir))
         )
 
+    def test_auto_input_reference_skips_text_only_models(self):
+        for model_id in ("Z-Image", "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"):
+            resolved = self.module.resolve_input_reference_path(
+                image_path=None,
+                mode="auto",
+                model_id=model_id,
+                project_root=str(self.root_dir),
+            )
+            self.assertIsNone(resolved)
+
+        workload = self.module.build_workload(
+            num_requests=1,
+            resolutions=["720p"],
+            ratios=[1.0],
+            seed=1,
+            prompt="test",
+            size_map={"720p": "1280x720"},
+            image_path=None,
+            include_input_reference=False,
+        )
+
+        self.assertNotIn("input_reference", workload[0].payload)
+        self.assertNotIn("image_path", workload[0].payload)
+
+    def test_auto_input_reference_uses_default_image_for_ti2v_models(self):
+        resolved = self.module.resolve_input_reference_path(
+            image_path=None,
+            mode="auto",
+            model_id="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+            project_root=str(self.root_dir),
+        )
+        self.assertEqual(
+            Path(resolved),
+            self.root_dir / "examples" / "assets" / "example_image.png",
+        )
+
+        workload = self.module.build_workload(
+            num_requests=1,
+            resolutions=["720p"],
+            ratios=[1.0],
+            seed=1,
+            prompt="test",
+            size_map={"720p": "1280x720"},
+            image_path=resolved,
+            include_input_reference=True,
+        )
+
+        self.assertEqual(workload[0].payload["input_reference"], resolved)
+        self.assertNotIn("image_path", workload[0].payload)
+
+    def test_forced_image_mode_rejects_empty_image_path(self):
+        with self.assertRaisesRegex(ValueError, "requires a non-empty --image-path"):
+            self.module.resolve_input_reference_path(
+                image_path="",
+                mode="image",
+                model_id="z-image",
+                project_root=str(self.root_dir),
+            )
+
     def test_constant_ddit_vae_k_is_added_to_each_payload(self):
         workload = self.module.build_workload(
             num_requests=2,
