@@ -2,6 +2,7 @@
 
 import argparse
 import importlib.util
+from unittest.mock import patch
 import unittest
 from pathlib import Path
 
@@ -186,6 +187,37 @@ class TestWanLaunchScripts(unittest.TestCase):
         kwargs = self.ddit_disagg_module._common_kwargs(args)
 
         self.assertEqual(kwargs["ddit_sp_degree_map"], "shortpath")
+
+    def test_ddit_disagg_role_processes_are_not_daemonic(self):
+        args = self.ddit_disagg_module.build_parser().parse_args(
+            ["--model-path", "wan"]
+        )
+        fake_processes = []
+
+        class FakeProcess:
+            def __init__(self, *unused_args, **kwargs):
+                del unused_args
+                self.kwargs = kwargs
+                fake_processes.append(self)
+
+            def start(self):
+                raise RuntimeError("stop before launching roles")
+
+        fake_parser = argparse.Namespace(parse_args=lambda: args)
+        with patch.object(
+            self.ddit_disagg_module.mp,
+            "get_context",
+            return_value=argparse.Namespace(Process=FakeProcess),
+        ), patch.object(
+            self.ddit_disagg_module, "build_parser", return_value=fake_parser
+        ), patch.object(self.ddit_disagg_module, "launch_disagg_server"):
+            with self.assertRaisesRegex(RuntimeError, "stop before launching roles"):
+                self.ddit_disagg_module.main()
+
+        self.assertTrue(fake_processes)
+        self.assertTrue(
+            all(process.kwargs.get("daemon") is False for process in fake_processes)
+        )
 
 
 if __name__ == "__main__":

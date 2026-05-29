@@ -268,13 +268,13 @@ def main() -> None:
             target=launch_disagg_role,
             args=(encoder_args,),
             name="sglang-ddit-encoder-instance",
-            daemon=True,
+            daemon=False,
         ),
         ctx.Process(
             target=launch_disagg_role,
             args=(ddit_worker_args,),
             name="sglang-ddit-worker-instance",
-            daemon=True,
+            daemon=False,
         ),
     ]
 
