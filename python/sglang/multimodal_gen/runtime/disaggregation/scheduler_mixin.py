@@ -459,10 +459,17 @@ class SchedulerDisaggMixin:
         for name in tensors:
             category = _DIST_REPLICATE
             if self.server_args.sp_degree > 1:
-                if self._disagg_role in (
-                    RoleType.DENOISER,
-                    RoleType.DDIT_WORKER,
-                ) and name in {
+                if self._disagg_role == RoleType.DDIT_WORKER and name in {
+                    "latents",
+                    "image_latent",
+                }:
+                    # DDiT switches sequence-parallel ranks dynamically.  Keep
+                    # inbound latents full so the dynamic SP group can shard
+                    # them for the current active rank tuple; static startup-SP
+                    # pre-sharding would be interpreted as already sharded for
+                    # every later dynamic group.
+                    category = _DIST_MODEL_MANAGED
+                elif self._disagg_role == RoleType.DENOISER and name in {
                     "latents",
                     "image_latent",
                 }:

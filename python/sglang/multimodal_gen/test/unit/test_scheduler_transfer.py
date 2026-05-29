@@ -1347,6 +1347,26 @@ class TestSchedulerTensorDistribution(unittest.TestCase):
         self.assertFalse(hasattr(req, "_disagg_pre_sharded_fields"))
         scheduler.server_args.pipeline_config.shard_latents_for_sp.assert_not_called()
 
+    def test_ddit_worker_keeps_full_latents_for_dynamic_sp(self):
+        scheduler = _SchedulerHarness.make(RoleType.DDIT_WORKER)
+        scheduler.server_args.sp_degree = 8
+        scheduler.server_args.pipeline_config = SimpleNamespace(
+            shard_latents_for_sp=MagicMock()
+        )
+        scheduler._broadcast_tensor_payload_to_all_ranks = MagicMock(
+            side_effect=lambda payload: payload
+        )
+
+        latents = torch.randn(1, 4, 1, 90, 160)
+        req = scheduler._build_disagg_compute_req(
+            {"request_id": "req-ddit-dynamic-sp"},
+            {"latents": latents},
+        )
+
+        self.assertTrue(torch.equal(req.latents, latents))
+        self.assertFalse(hasattr(req, "_disagg_pre_sharded_fields"))
+        scheduler.server_args.pipeline_config.shard_latents_for_sp.assert_not_called()
+
     def test_decoder_parallel_decode_keeps_full_latents(self):
         scheduler = _SchedulerHarness.make(RoleType.DECODER)
         scheduler.server_args.sp_degree = 2
