@@ -1003,8 +1003,22 @@ class DenoisingStage(PipelineStage):
         timestep_index: int,
         t_host: torch.Tensor,
         timesteps_cpu: torch.Tensor,
+        profile_timings: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         """Run one denoising step using already prepared invariant state."""
+        profile_last = time.perf_counter()
+        profile_device = get_local_torch_device()
+
+        def mark_profile(name: str) -> None:
+            nonlocal profile_last
+            if profile_timings is None:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(profile_device)
+            now = time.perf_counter()
+            profile_timings[name] = (now - profile_last) * 1000.0
+            profile_last = now
+
         target_dtype = prepared_vars["target_dtype"]
         timesteps = prepared_vars["timesteps"]
         boundary_timestep = prepared_vars["boundary_timestep"]
@@ -1020,6 +1034,7 @@ class DenoisingStage(PipelineStage):
             server_args=server_args,
             batch=batch,
         )
+        mark_profile("select_model_ms")
 
         latent_model_input = latents.to(target_dtype)
         if batch.image_latent is not None:
@@ -1042,6 +1057,13 @@ class DenoisingStage(PipelineStage):
         latent_model_input = self.scheduler.scale_model_input(
             latent_model_input, t_device
         )
+        if profile_timings is not None:
+            profile_timings["latent_shape"] = tuple(int(dim) for dim in latents.shape)
+            profile_timings["model_input_shape"] = tuple(
+                int(dim) for dim in latent_model_input.shape
+            )
+            profile_timings["target_dtype"] = str(target_dtype)
+        mark_profile("input_prepare_ms")
 
         attn_metadata = self._build_attn_metadata(
             timestep_index,
@@ -1050,6 +1072,7 @@ class DenoisingStage(PipelineStage):
             timestep_value=t_int,
             timesteps=timesteps_cpu,
         )
+        mark_profile("attn_metadata_ms")
         noise_pred = self._predict_noise_with_cfg(
             current_model=current_model,
             latent_model_input=latent_model_input,
@@ -1066,6 +1089,7 @@ class DenoisingStage(PipelineStage):
             guidance=prepared_vars["guidance"],
             latents=latents,
         )
+        mark_profile("predict_noise_ms")
 
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
@@ -1077,10 +1101,13 @@ class DenoisingStage(PipelineStage):
             **prepared_vars["extra_step_kwargs"],
             return_dict=False,
         )[0]
+        mark_profile("scheduler_step_ms")
 
-        return self.post_forward_for_ti2v_task(
+        latents = self.post_forward_for_ti2v_task(
             batch, server_args, reserved_frames_mask, latents, z
         )
+        mark_profile("post_forward_ms")
+        return latents
 
     def _canonicalize_ddit_latents(
         self,
@@ -1177,6 +1204,7 @@ class DenoisingStage(PipelineStage):
             "trajectory_timesteps": [],
             "trajectory_latents": [],
             "denoising_start_time": time.time(),
+            "profile_next_step": True,
         }
 
     def ddit_hungry_step(
@@ -1223,10 +1251,15 @@ class DenoisingStage(PipelineStage):
             state["active_ranks"] = target_ranks
             state["prepared_vars"] = prepared_vars
             state["latents"] = latents
+            state["profile_next_step"] = True
 
         prepared_vars = state["prepared_vars"]
         timesteps_cpu = state["timesteps_cpu"]
         t_host = timesteps_cpu[step_index]
+        profile_timings: dict[str, Any] | None = (
+            {} if state.pop("profile_next_step", False) else None
+        )
+        profile_wall_start = time.perf_counter() if profile_timings is not None else 0.0
         with torch.autocast(
             device_type=current_platform.device_type,
             dtype=prepared_vars["target_dtype"],
@@ -1248,6 +1281,7 @@ class DenoisingStage(PipelineStage):
                             timestep_index=step_index,
                             t_host=t_host,
                             timesteps_cpu=timesteps_cpu,
+                            profile_timings=profile_timings,
                         )
 
         completed_step = step_index + 1
@@ -1258,6 +1292,20 @@ class DenoisingStage(PipelineStage):
             state["trajectory_latents"].append(state["latents"])
         if not batch.is_warmup and current_rank_in(tuple(state["active_ranks"])):
             self.step_profile()
+        if profile_timings is not None and current_rank_in(tuple(state["active_ranks"])):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(get_local_torch_device())
+            total_ms = (time.perf_counter() - profile_wall_start) * 1000.0
+            logger.info(
+                "DDiT step profile: request=%s rank=%s step=%s ranks=%s "
+                "total_ms=%.2f timings=%s",
+                batch.request_id,
+                get_world_group().rank,
+                step_index,
+                tuple(state["active_ranks"]),
+                total_ms,
+                profile_timings,
+            )
         return {"done": completed_step >= num_timesteps, "cur_step": completed_step}
 
     def ddit_hungry_migrate(
@@ -1334,6 +1382,7 @@ class DenoisingStage(PipelineStage):
             "trajectory_timesteps": trajectory_timesteps,
             "trajectory_latents": trajectory_latents,
             "denoising_start_time": denoising_start_time,
+            "profile_next_step": True,
         }
 
     def ddit_hungry_finish(
