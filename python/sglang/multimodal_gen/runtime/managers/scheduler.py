@@ -1486,7 +1486,25 @@ class Scheduler(SchedulerDisaggMixin):
                 old_ranks = tuple(decision["old_ranks"])
                 new_ranks = tuple(decision["new_ranks"])
                 step = int(policy.requests[request_id].cur_step)
+                total_steps = int(policy.requests[request_id].total_steps)
+                remaining_steps = max(0, total_steps - step)
                 req = req_by_id[request_id]
+                if remaining_steps <= 1 or new_ranks == old_ranks:
+                    if hasattr(policy, "_assign"):
+                        policy._assign(request_id, old_ranks)
+                    logger.warning(
+                        "DDiT worker: skipped late DiT migrate for %s at "
+                        "step=%d/%d (old_ranks=%s, requested_new_ranks=%s, "
+                        "reason=%s, policy=%s)",
+                        request_id,
+                        step,
+                        total_steps,
+                        old_ranks,
+                        new_ranks,
+                        decision.get("reason", schedule_policy),
+                        decision.get("policy", schedule_policy),
+                    )
+                    continue
                 if not self._ddit_is_warmup_req(req):
                     record_rank_switch(
                         self.server_args,
@@ -1613,6 +1631,8 @@ class Scheduler(SchedulerDisaggMixin):
         policy: Any,
         running_order: deque[str],
         blocked: set[str],
+        pending_finish: deque[DDiTOp],
+        finishing: set[str],
     ) -> None:
         for _ in range(len(running_order)):
             request_id = running_order.popleft()
@@ -1623,7 +1643,25 @@ class Scheduler(SchedulerDisaggMixin):
                 running_order.append(request_id)
                 continue
             if req_state.cur_step >= req_state.total_steps:
-                running_order.append(request_id)
+                if request_id not in finishing:
+                    finishing.add(request_id)
+                    pending_finish.append(
+                        DDiTOp(
+                            action="dit_finish",
+                            request_id=request_id,
+                            ranks=req_state.ranks,
+                            stage="dit",
+                            step=req_state.cur_step,
+                        )
+                    )
+                    logger.warning(
+                        "DDiT worker: enqueued fallback DiT finish for %s at "
+                        "step=%d/%d after request reached total_steps without "
+                        "a pending finish op",
+                        request_id,
+                        req_state.cur_step,
+                        req_state.total_steps,
+                    )
                 continue
             op = DDiTOp(
                 action="dit_step",
@@ -1653,6 +1691,7 @@ class Scheduler(SchedulerDisaggMixin):
         pending_migrate: deque[DDiTOp],
         pending_init: deque[DDiTOp],
         blocked: set[str],
+        finishing: set[str],
     ) -> CommandWave:
         builder = CommandWaveBuilder(wave_id, world_size)
         for queue in (
@@ -1671,6 +1710,8 @@ class Scheduler(SchedulerDisaggMixin):
             policy=policy,
             running_order=running_order,
             blocked=blocked,
+            pending_finish=pending_finish,
+            finishing=finishing,
         )
         return builder.build()
 
@@ -1974,6 +2015,7 @@ class Scheduler(SchedulerDisaggMixin):
                     pending_migrate=pending_migrate,
                     pending_init=pending_init,
                     blocked=blocked,
+                    finishing=finishing,
                 )
                 command_identity = None
                 if not wave.ops:
@@ -2018,6 +2060,7 @@ class Scheduler(SchedulerDisaggMixin):
                     pending_migrate=pending_migrate,
                     pending_init=pending_init,
                     blocked=blocked,
+                    finishing=finishing,
                 )
                 command_identity = None
                 if not wave.ops:

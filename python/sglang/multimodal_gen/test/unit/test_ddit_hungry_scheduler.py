@@ -503,6 +503,45 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual([row["request_id"] for row in lifecycle_rows], ["req"])
         self.assertEqual(summary_rows[0], {"metric": "p50", "value": "2.500000"})
 
+    def test_lifecycle_logger_merges_interprocess_writes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lifecycle_path = os.path.join(tmpdir, "ddit_lifecycle.csv")
+            summary_path = os.path.join(tmpdir, "ddit_lifecycle_summary.csv")
+            server_logger = LifecycleCsvLogger(lifecycle_path, summary_path)
+            worker_logger = LifecycleCsvLogger(lifecycle_path, summary_path)
+
+            server_logger.record(
+                request_id="req",
+                resolution="720p",
+                event="add",
+                timestamp=10.0,
+                status="queued",
+            )
+            worker_logger.record(
+                request_id="req",
+                resolution="720p",
+                event="dit_start",
+                timestamp=10.5,
+            )
+            worker_logger.record(
+                request_id="req",
+                resolution="720p",
+                event="vae_end",
+                timestamp=12.5,
+            )
+
+            with open(lifecycle_path, newline="", encoding="utf-8") as f:
+                lifecycle_rows = list(csv.DictReader(f))
+            with open(summary_path, newline="", encoding="utf-8") as f:
+                summary_rows = list(csv.DictReader(f))
+
+        self.assertEqual(len(lifecycle_rows), 1)
+        self.assertEqual(lifecycle_rows[0]["add_time"], "10.000000")
+        self.assertEqual(lifecycle_rows[0]["dit_start_time"], "10.500000")
+        self.assertEqual(lifecycle_rows[0]["vae_end_time"], "12.500000")
+        self.assertEqual(lifecycle_rows[0]["status"], "completed")
+        self.assertEqual(summary_rows[0], {"metric": "p50", "value": "2.500000"})
+
     def test_lifecycle_logger_writes_mixed_resolution_slo_attainment(self):
         profile = DDiTProfile.from_payload(
             "z-image",
@@ -1215,6 +1254,86 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual(second[0]["request_id"], "req_720")
         self.assertEqual(second[0]["reason"], "wsjf_scale_up")
         self.assertEqual(second[0]["old_ranks"], (0, 1, 2, 3))
+
+    def test_hungry_first_does_not_scale_up_on_final_remaining_step(self):
+        scheduler = HungryFirstScheduler(
+            DDiTSchedulerConfig(
+                local_ranks=(0, 1, 2, 3),
+                allowed_gpu_counts=(1, 2, 4),
+                opt_gpus_num={"720p": 4},
+                dit_step_times={"720p": {1: 10.0, 2: 5.0, 4: 1.0}},
+            )
+        )
+        req = DDiTRequestState(
+            "req",
+            resolution="720p",
+            total_steps=50,
+            phase=RequestPhase.DIT,
+            ranks=(0,),
+            cur_step=49,
+            last_scheduled_step=0,
+        )
+        scheduler.requests["req"] = req
+        scheduler.gpu_owner[0] = "req"
+
+        self.assertEqual(scheduler.schedule(), [])
+        self.assertEqual(scheduler.requests["req"].ranks, (0,))
+
+    def test_wsjf_scale_up_does_not_scale_up_on_final_remaining_step(self):
+        scheduler = WSJFScaleUpScheduler(
+            self._profile_config(local_ranks=(0, 1, 2, 3))
+        )
+        scheduler.config.profile.opt_gpus_num["720p"] = 4
+        scheduler.config.profile.dit_step_times["720p"][1] = 10.0
+        scheduler.config.profile.dit_step_times["720p"][4] = 1.0
+        req = DDiTRequestState(
+            "req",
+            resolution="720p",
+            total_steps=50,
+            phase=RequestPhase.DIT,
+            ranks=(0,),
+            cur_step=49,
+            last_scheduled_step=0,
+        )
+        scheduler.requests["req"] = req
+        scheduler.gpu_owner[0] = "req"
+
+        self.assertEqual(scheduler.schedule(), [])
+        self.assertEqual(scheduler.requests["req"].ranks, (0,))
+
+    def test_ddit_add_step_ops_enqueues_finish_when_step_already_complete(self):
+        scheduler = object.__new__(Scheduler)
+        policy = SimpleNamespace(
+            requests={
+                "req": DDiTRequestState(
+                    "req",
+                    resolution="720p",
+                    total_steps=50,
+                    phase=RequestPhase.DIT,
+                    ranks=(0,),
+                    cur_step=50,
+                )
+            }
+        )
+        running_order = deque(["req"])
+        pending_finish = deque()
+        finishing = set()
+        builder = CommandWaveBuilder(wave_id=1, world_size=2)
+
+        scheduler._ddit_add_step_ops(
+            builder=builder,
+            policy=policy,
+            running_order=running_order,
+            blocked=set(),
+            pending_finish=pending_finish,
+            finishing=finishing,
+        )
+
+        self.assertEqual(list(running_order), [])
+        self.assertEqual(finishing, {"req"})
+        self.assertEqual(len(pending_finish), 1)
+        self.assertEqual(pending_finish[0].action, "dit_finish")
+        self.assertEqual(pending_finish[0].step, 50)
 
     def test_profile_backed_policies_release_same_vae_ranks(self):
         for scheduler_cls in (

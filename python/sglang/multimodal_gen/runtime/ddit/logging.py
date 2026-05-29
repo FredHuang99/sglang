@@ -8,7 +8,9 @@ import os
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any
 
 import torch.distributed as dist
@@ -31,6 +33,23 @@ LIFECYCLE_SUMMARY_COLUMNS = ["metric", "value"]
 SUMMARY_ROW_NAMES = ("p50", "p90", "p99", "slo10", "slo5")
 
 
+class _LifecycleStatusPriority(IntEnum):
+    EMPTY = 0
+    QUEUED = 1
+    RUNNING = 2
+    COMPLETED = 3
+    FAILED = 4
+
+
+_STATUS_PRIORITY = {
+    "": _LifecycleStatusPriority.EMPTY,
+    "queued": _LifecycleStatusPriority.QUEUED,
+    "running": _LifecycleStatusPriority.RUNNING,
+    "completed": _LifecycleStatusPriority.COMPLETED,
+    "failed": _LifecycleStatusPriority.FAILED,
+}
+
+
 def _is_rank_zero() -> bool:
     return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
 
@@ -45,6 +64,120 @@ def _percentile_nearest_rank(values: list[float], percentile: float) -> float | 
     ordered = sorted(values)
     rank = max(1, int((percentile / 100.0) * len(ordered) + 0.999999999))
     return ordered[min(rank, len(ordered)) - 1]
+
+
+@contextmanager
+def _interprocess_file_lock(path: str):
+    lock_path = f"{path}.lock"
+    lock_dir = os.path.dirname(lock_path)
+    if lock_dir:
+        os.makedirs(lock_dir, exist_ok=True)
+    with open(lock_path, "a+b") as lock_file:
+        lock_file.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _empty_lifecycle_row(request_id: str) -> dict[str, Any]:
+    return {
+        "request_id": request_id,
+        "resolution": "",
+        "add_time": "",
+        "dit_start_time": "",
+        "dit_end_time": "",
+        "vae_start_time": "",
+        "vae_end_time": "",
+        "status": "",
+        "error": "",
+    }
+
+
+def _merge_timestamp(
+    existing: Any,
+    incoming: Any,
+    *,
+    prefer: str,
+) -> str:
+    existing_s = str(existing or "")
+    incoming_s = str(incoming or "")
+    if not existing_s:
+        return incoming_s
+    if not incoming_s:
+        return existing_s
+    try:
+        existing_f = float(existing_s)
+        incoming_f = float(incoming_s)
+    except (TypeError, ValueError):
+        return incoming_s or existing_s
+    selected = (
+        min(existing_f, incoming_f)
+        if prefer == "earliest"
+        else max(existing_f, incoming_f)
+    )
+    return f"{selected:.6f}"
+
+
+def _merge_status(existing: Any, incoming: Any) -> str:
+    existing_s = str(existing or "")
+    incoming_s = str(incoming or "")
+    if _STATUS_PRIORITY.get(
+        incoming_s, _LifecycleStatusPriority.EMPTY
+    ) >= _STATUS_PRIORITY.get(
+        existing_s,
+        _LifecycleStatusPriority.EMPTY,
+    ):
+        return incoming_s
+    return existing_s
+
+
+def _merge_lifecycle_rows(
+    existing_rows: dict[str, dict[str, Any]],
+    incoming_rows: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {
+        request_id: {
+            column: row.get(column, "") for column in LIFECYCLE_COLUMNS
+        }
+        for request_id, row in existing_rows.items()
+    }
+    for request_id, incoming in incoming_rows.items():
+        row = merged.setdefault(request_id, _empty_lifecycle_row(request_id))
+        row["request_id"] = request_id
+        incoming_resolution = str(incoming.get("resolution") or "")
+        if incoming_resolution and not str(row.get("resolution") or ""):
+            row["resolution"] = incoming_resolution
+        elif incoming_resolution and str(row.get("resolution") or "") == "unknown":
+            row["resolution"] = incoming_resolution
+        for column in ("add_time", "dit_start_time", "vae_start_time"):
+            row[column] = _merge_timestamp(
+                row.get(column), incoming.get(column), prefer="earliest"
+            )
+        for column in ("dit_end_time", "vae_end_time"):
+            row[column] = _merge_timestamp(
+                row.get(column), incoming.get(column), prefer="latest"
+            )
+        row["status"] = _merge_status(row.get("status"), incoming.get("status"))
+        incoming_error = str(incoming.get("error") or "")
+        if incoming_error:
+            row["error"] = incoming_error
+        elif not row.get("error"):
+            row["error"] = ""
+    return merged
 
 
 @dataclass
@@ -70,19 +203,26 @@ class LifecycleCsvLogger:
         self.profile = profile
         self._lock = threading.Lock()
         self._rows: dict[str, dict[str, Any]] = {}
-        os.makedirs(os.path.dirname(path), exist_ok=True)
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         self._load()
 
     def _load(self) -> None:
+        self._rows = self._read_rows_from_disk()
+
+    def _read_rows_from_disk(self) -> dict[str, dict[str, Any]]:
+        rows: dict[str, dict[str, Any]] = {}
         if not os.path.exists(self.path):
-            return
+            return rows
         with open(self.path, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
                 request_id = row.get("request_id")
                 if request_id in SUMMARY_ROW_NAMES:
                     continue
                 if request_id:
-                    self._rows[request_id] = dict(row)
+                    rows[request_id] = dict(row)
+        return rows
 
     def record(
         self,
@@ -132,31 +272,37 @@ class LifecycleCsvLogger:
             self._flush_locked()
 
     def _flush_locked(self) -> None:
-        directory = os.path.dirname(self.path)
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=".ddit_lifecycle_", suffix=".csv", dir=directory
-        )
-        os.close(fd)
-        try:
-            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=LIFECYCLE_COLUMNS)
-                writer.writeheader()
-                for request_id in sorted(self._rows):
-                    writer.writerow(
-                        {
-                            column: self._rows[request_id].get(column, "")
-                            for column in LIFECYCLE_COLUMNS
-                        }
-                    )
-            os.replace(tmp_path, self.path)
-            self._flush_summary_locked()
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        with _interprocess_file_lock(self.path):
+            self._rows = _merge_lifecycle_rows(
+                self._read_rows_from_disk(), self._rows
+            )
+            directory = os.path.dirname(self.path) or "."
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=".ddit_lifecycle_", suffix=".csv", dir=directory
+            )
+            os.close(fd)
+            try:
+                with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=LIFECYCLE_COLUMNS)
+                    writer.writeheader()
+                    for request_id in sorted(self._rows):
+                        writer.writerow(
+                            {
+                                column: self._rows[request_id].get(column, "")
+                                for column in LIFECYCLE_COLUMNS
+                            }
+                        )
+                os.replace(tmp_path, self.path)
+                self._flush_summary_locked()
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
 
     def _flush_summary_locked(self) -> None:
         summary_path = self.summary_path
-        directory = os.path.dirname(summary_path)
+        directory = os.path.dirname(summary_path) or "."
+        if directory != ".":
+            os.makedirs(directory, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(
             prefix=".ddit_lifecycle_summary_", suffix=".csv", dir=directory
         )

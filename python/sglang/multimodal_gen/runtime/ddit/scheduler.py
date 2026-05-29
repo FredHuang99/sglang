@@ -429,6 +429,9 @@ class HungryFirstScheduler:
         return max(allowed) if allowed else 1
 
     def _starvation_score(self, req: DDiTRequestState) -> float:
+        remaining_steps = max(0, int(req.total_steps) - int(req.cur_step))
+        if remaining_steps <= 1:
+            return 0.0
         current_k = max(1, len(req.ranks))
         opt_k = self._opt_gpu_count(req.resolution)
         if current_k >= opt_k:
@@ -614,6 +617,9 @@ class ProfileBackedScheduler:
         )
 
     def _starvation_score(self, req: DDiTRequestState) -> float:
+        remaining_steps = max(0, int(req.total_steps) - int(req.cur_step))
+        if remaining_steps <= 1:
+            return 0.0
         current_k = max(1, len(req.ranks))
         opt_k = self._opt_gpu_count(req.resolution)
         if current_k >= opt_k:
