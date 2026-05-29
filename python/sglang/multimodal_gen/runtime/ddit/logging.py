@@ -26,6 +26,7 @@ LIFECYCLE_COLUMNS = [
     "status",
     "error",
 ]
+LIFECYCLE_SUMMARY_COLUMNS = ["metric", "value"]
 SUMMARY_ROW_NAMES = ("p50", "p90", "p99")
 
 
@@ -49,6 +50,7 @@ def _percentile_nearest_rank(values: list[float], percentile: float) -> float | 
 class DDiTLogPaths:
     log_dir: str
     lifecycle_csv: str
+    lifecycle_summary_csv: str
     rank_switch_jsonl: str
     op_trace_jsonl: str
 
@@ -56,8 +58,9 @@ class DDiTLogPaths:
 class LifecycleCsvLogger:
     """One-row-per-request lifecycle CSV logger."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, summary_path: str | None = None):
         self.path = path
+        self.summary_path = summary_path or self._default_summary_path(path)
         self._lock = threading.Lock()
         self._rows: dict[str, dict[str, Any]] = {}
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -138,12 +141,34 @@ class LifecycleCsvLogger:
                             for column in LIFECYCLE_COLUMNS
                         }
                     )
-                for name, value in self._lifespan_summary_rows():
-                    f.write(f"{name},{value:.6f}\n")
             os.replace(tmp_path, self.path)
+            self._flush_summary_locked()
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+
+    def _flush_summary_locked(self) -> None:
+        summary_path = self.summary_path
+        directory = os.path.dirname(summary_path)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".ddit_lifecycle_summary_", suffix=".csv", dir=directory
+        )
+        os.close(fd)
+        try:
+            with open(tmp_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=LIFECYCLE_SUMMARY_COLUMNS)
+                writer.writeheader()
+                for name, value in self._lifespan_summary_rows():
+                    writer.writerow({"metric": name, "value": f"{value:.6f}"})
+            os.replace(tmp_path, summary_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    @staticmethod
+    def _default_summary_path(path: str) -> str:
+        root, ext = os.path.splitext(path)
+        return f"{root}_summary{ext or '.csv'}"
 
     def _lifespan_summary_rows(self) -> list[tuple[str, float]]:
         lifespans = []
@@ -231,11 +256,13 @@ def resolve_log_paths(server_args: Any) -> DDiTLogPaths:
         getattr(server_args, "output_path", None) or "outputs", "ddit_logs"
     )
     lifecycle_csv = os.path.join(log_dir, "ddit_lifecycle.csv")
+    lifecycle_summary_csv = os.path.join(log_dir, "ddit_lifecycle_summary.csv")
     rank_switch_jsonl = os.path.join(log_dir, "ddit_rank_switch.jsonl")
     op_trace_jsonl = os.path.join(log_dir, "ddit_op_trace.jsonl")
     return DDiTLogPaths(
         log_dir=log_dir,
         lifecycle_csv=lifecycle_csv,
+        lifecycle_summary_csv=lifecycle_summary_csv,
         rank_switch_jsonl=rank_switch_jsonl,
         op_trace_jsonl=op_trace_jsonl,
     )
@@ -248,7 +275,7 @@ def get_loggers(
     cached = _LOGGER_CACHE.get(paths.log_dir)
     if cached is not None:
         return cached
-    lifecycle = LifecycleCsvLogger(paths.lifecycle_csv)
+    lifecycle = LifecycleCsvLogger(paths.lifecycle_csv, paths.lifecycle_summary_csv)
     switches = RankSwitchJsonlLogger(paths.rank_switch_jsonl)
     op_trace = OpTraceJsonlLogger(paths.op_trace_jsonl)
     _LOGGER_CACHE[paths.log_dir] = (lifecycle, switches, op_trace)

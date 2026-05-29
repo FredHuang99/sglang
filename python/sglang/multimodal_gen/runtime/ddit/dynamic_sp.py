@@ -569,9 +569,10 @@ class DynamicSPGroupRegistry:
                 getattr(self.server_args, "ddit_dynamic_sp_prebuild_mode", "auto")
                 or "auto"
             ).lower() == "all":
-                logger.warning(
-                    "DDiT dynamic SP prebuild mode=all is for debugging only; "
-                    "it may create many NCCL communicators and exhaust resources."
+                logger.info(
+                    "DDiT dynamic SP prebuild mode=all will prebuild all exact "
+                    "rank specs for the allowed GPU counts; startup time and NCCL "
+                    "communicator resource use are expected to increase."
                 )
             rank_tuples_for_log: Any = rank_tuples
             if len(rank_tuples) > 16:
@@ -590,6 +591,13 @@ class DynamicSPGroupRegistry:
                 getattr(self.server_args, "ddit_dynamic_sp_prebuild_mode", "auto"),
             )
 
+        started = time.perf_counter()
+        total_created_process_groups = 0
+        total_reused_process_groups = 0
+        total_new_group_ms = 0.0
+        total_collective_touch_ms = 0.0
+        singleton_specs = 0
+        full_rank_specs = 0
         for idx, ranks in enumerate(rank_tuples, start=1):
             should_log_progress = (
                 total_groups <= 16 or idx == 1 or idx == total_groups or idx % 10 == 0
@@ -601,7 +609,15 @@ class DynamicSPGroupRegistry:
                     total_groups,
                     ranks,
                 )
-            self.get(tuple(ranks))
+            result = self.ensure(tuple(ranks))
+            total_created_process_groups += result.stats.created_process_groups
+            total_reused_process_groups += result.stats.reused_process_groups
+            total_new_group_ms += result.stats.new_group_ms
+            total_collective_touch_ms += result.stats.collective_touch_ms
+            if len(ranks) == 1:
+                singleton_specs += 1
+            if len(ranks) == world_size:
+                full_rank_specs += 1
 
         if total_groups == 0 and rank == 0:
             logger.warning(
@@ -617,11 +633,21 @@ class DynamicSPGroupRegistry:
             logger.info(
                 "DDiT dynamic SP prebuild done: cache_size=%s, "
                 "process_group_cache_size=%s, total_rank_tuples=%s, "
-                "allowed_counts=%s",
+                "allowed_counts=%s, elapsed_s=%.2f, singleton_specs=%s, "
+                "full_rank_specs=%s, created_process_groups=%s, "
+                "reused_process_groups=%s, new_group_ms=%.2f, "
+                "collective_touch_ms=%.2f",
                 self.cache_size,
                 len(self._device_pg_cache),
                 total_groups,
                 counts,
+                time.perf_counter() - started,
+                singleton_specs,
+                full_rank_specs,
+                total_created_process_groups,
+                total_reused_process_groups,
+                total_new_group_ms,
+                total_collective_touch_ms,
             )
 
     @contextlib.contextmanager

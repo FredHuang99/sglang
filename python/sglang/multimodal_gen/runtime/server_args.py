@@ -624,6 +624,10 @@ class ServerArgs:
             )
 
     def _adjust_offload(self):
+        if self.enable_ddit:
+            self._adjust_ddit_non_offload()
+            return
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info("Enabling all offloading for GPU with low device memory")

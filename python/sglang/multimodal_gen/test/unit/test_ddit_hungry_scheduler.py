@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import csv
 import json
 import os
 import tempfile
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
     _prebuild_rank_tuples,
     get_dynamic_sp_registry,
 )
+from sglang.multimodal_gen.runtime.ddit.logging import LifecycleCsvLogger
 from sglang.multimodal_gen.runtime.ddit.profile import ProfileStore
 from sglang.multimodal_gen.runtime.ddit.scheduler import (
     DDiTRequestState,
@@ -470,6 +472,33 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertIn((0, 7), rank_tuples)
         self.assertNotIn((0, 7), activation_tuples)
         self.assertIn(tuple(range(8)), activation_tuples)
+
+    def test_lifecycle_logger_writes_summary_to_separate_csv(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lifecycle_path = os.path.join(tmpdir, "ddit_lifecycle.csv")
+            summary_path = os.path.join(tmpdir, "ddit_lifecycle_summary.csv")
+            logger = LifecycleCsvLogger(lifecycle_path, summary_path)
+
+            logger.record(
+                request_id="req",
+                resolution="720p",
+                event="add",
+                timestamp=10.0,
+            )
+            logger.record(
+                request_id="req",
+                resolution="720p",
+                event="vae_end",
+                timestamp=12.5,
+            )
+
+            with open(lifecycle_path, newline="", encoding="utf-8") as f:
+                lifecycle_rows = list(csv.DictReader(f))
+            with open(summary_path, newline="", encoding="utf-8") as f:
+                summary_rows = list(csv.DictReader(f))
+
+        self.assertEqual([row["request_id"] for row in lifecycle_rows], ["req"])
+        self.assertEqual(summary_rows[0], {"metric": "p50", "value": "2.500000"})
 
     def test_dynamic_sp_forced_switch_plan_without_plan_stays_bounded(self):
         server_args = SimpleNamespace(

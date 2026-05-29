@@ -1769,6 +1769,7 @@ class Scheduler(SchedulerDisaggMixin):
         ensuring_dynamic_sp: set[tuple[int, ...]] = set()
         activated_dynamic_sp: set[tuple[Any, ...]] = set()
         activating_dynamic_sp: set[tuple[Any, ...]] = set()
+        warmup_activation_summary: dict[str, dict[str, Any]] = {}
         prepare_backpressure_logged: set[str] = set()
         prepared_since_compute = False
         wave_id = 0
@@ -2081,6 +2082,54 @@ class Scheduler(SchedulerDisaggMixin):
                         if activation_key:
                             activating_dynamic_sp.discard(activation_key)
                             activated_dynamic_sp.add(activation_key)
+                        if isinstance(result, dict) and str(request_id).startswith(
+                            "warmup-"
+                        ):
+                            summary = warmup_activation_summary.setdefault(
+                                str(request_id),
+                                {
+                                    "count": 0,
+                                    "force_count": 0,
+                                    "cache_hits": 0,
+                                    "activation_ms_total": 0.0,
+                                    "model_forward_warmup_ms_total": 0.0,
+                                    "activation_keys": set(),
+                                },
+                            )
+                            summary["count"] += 1
+                            summary["force_count"] += int(
+                                bool(result.get("force_activation"))
+                            )
+                            summary["cache_hits"] += int(
+                                bool(result.get("activation_cache_hit"))
+                            )
+                            summary["activation_ms_total"] += float(
+                                result.get("activation_ms") or 0.0
+                            )
+                            summary["model_forward_warmup_ms_total"] += float(
+                                result.get("model_forward_warmup_ms") or 0.0
+                            )
+                            if activation_key:
+                                summary["activation_keys"].add(activation_key)
+                    elif action == "warmup_ack":
+                        summary = warmup_activation_summary.pop(
+                            str(request_id), None
+                        )
+                        if summary is not None and self.gpu_id == 0:
+                            logger.info(
+                                "DDiT worker: startup warmup dynamic SP activation "
+                                "done for %s (activation_ops=%s, force_ops=%s, "
+                                "cache_hits=%s, unique_coarse_keys=%s, "
+                                "activation_ms_total=%.2f, "
+                                "model_forward_warmup_ms_total=%.2f)",
+                                request_id,
+                                summary["count"],
+                                summary["force_count"],
+                                summary["cache_hits"],
+                                len(summary["activation_keys"]),
+                                summary["activation_ms_total"],
+                                summary["model_forward_warmup_ms_total"],
+                            )
                     elif action == "full_forward":
                         req = op.payload["req"]
                         self._write_monolithic_profile_row(req, result)
