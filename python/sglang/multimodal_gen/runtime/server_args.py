@@ -311,6 +311,9 @@ class ServerArgs:
     ddit_vae_gpus: int = 1
     ddit_sp_degree_map: str | None = None
     ddit_prebuild_sp_groups: bool = True
+    ddit_dynamic_sp_prebuild_mode: Literal[
+        "off", "auto", "plan", "canonical", "all"
+    ] = "auto"
     ddit_log_dir: str | None = None
     ddit_profile_path: str | None = None
     ddit_profile_model_id: str | None = None
@@ -475,6 +478,18 @@ class ServerArgs:
             raise ValueError(
                 f"--ddit-schedule-policy must be one of {DDIT_SCHEDULE_POLICIES}, "
                 f"got {self.ddit_schedule_policy}"
+            )
+        if self.ddit_dynamic_sp_prebuild_mode not in (
+            "off",
+            "auto",
+            "plan",
+            "canonical",
+            "all",
+        ):
+            raise ValueError(
+                "--ddit-dynamic-sp-prebuild-mode must be one of "
+                "{off,auto,plan,canonical,all}, got "
+                f"{self.ddit_dynamic_sp_prebuild_mode!r}"
             )
         if self.ddit_baseline_gpus not in allowed:
             raise ValueError(
@@ -1252,6 +1267,16 @@ class ServerArgs:
             action=StoreBoolean,
             default=ServerArgs.ddit_prebuild_sp_groups,
             help="Prebuild cached DDiT SP groups at worker startup.",
+        )
+        parser.add_argument(
+            "--ddit-dynamic-sp-prebuild-mode",
+            choices=("off", "auto", "plan", "canonical", "all"),
+            default=ServerArgs.ddit_dynamic_sp_prebuild_mode,
+            help=(
+                "Dynamic SP prebuild candidate policy. 'auto' prebuilds the "
+                "forced-switch plan or bounded canonical E2E candidates; "
+                "'all' is debug-only and may create many NCCL communicators."
+            ),
         )
         parser.add_argument(
             "--ddit-log-dir",

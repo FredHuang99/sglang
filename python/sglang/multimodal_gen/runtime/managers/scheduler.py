@@ -594,19 +594,29 @@ class Scheduler(SchedulerDisaggMixin):
             if self.gpu_id == 0:
                 logger.info(
                     "DDiT worker: ensured dynamic SP group for ranks=%s "
-                    "(cache_hit=%s, created=%s, degree_pair=%sx%s, reason=%s)",
+                    "(cache_hit=%s, created=%s, degree_pair=%sx%s, reason=%s, "
+                    "created_process_groups=%s, reused_process_groups=%s, "
+                    "build_ms=%.2f, new_group_ms=%.2f)",
                     result.spec.ranks,
                     not result.created,
                     result.created,
                     result.spec.ulysses_degree,
                     result.spec.ring_degree,
                     command.get("log_reason", ""),
+                    result.stats.created_process_groups,
+                    result.stats.reused_process_groups,
+                    result.stats.build_ms,
+                    result.stats.new_group_ms,
                 )
             return {
                 "target_ranks": result.spec.ranks,
                 "created": result.created,
                 "ulysses_degree": result.spec.ulysses_degree,
                 "ring_degree": result.spec.ring_degree,
+                "created_process_groups": result.stats.created_process_groups,
+                "reused_process_groups": result.stats.reused_process_groups,
+                "build_ms": result.stats.build_ms,
+                "new_group_ms": result.stats.new_group_ms,
             }
         if action == "full_forward":
             return self.worker.execute_forward([command["req"]])

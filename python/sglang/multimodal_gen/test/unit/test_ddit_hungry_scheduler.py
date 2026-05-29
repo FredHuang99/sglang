@@ -18,7 +18,10 @@ from sglang.multimodal_gen.runtime.ddit.config import (
 )
 from sglang.multimodal_gen.runtime.ddit.concurrent import CommandWaveBuilder, DDiTOp
 from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
+    DynamicSPBuildStats,
     DynamicSPGroupRegistry,
+    LightweightDynamicSPCoordinator,
+    _prebuild_rank_tuples,
     get_dynamic_sp_registry,
 )
 from sglang.multimodal_gen.runtime.ddit.profile import ProfileStore
@@ -224,7 +227,9 @@ class TestDDiTHungryScheduler(unittest.TestCase):
             "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_initialized",
             return_value=True,
         ), patch.object(
-            registry, "_build", return_value=built_group
+            registry,
+            "_build",
+            return_value=(built_group, DynamicSPBuildStats(created_process_groups=1)),
         ) as build:
             first = registry.ensure((1, 0))
             second = registry.ensure((0, 1))
@@ -235,6 +240,172 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertFalse(second.created)
         self.assertIs(second.group, built_group)
         build.assert_called_once_with(spec)
+
+    def test_dynamic_sp_singleton_build_uses_lightweight_local_bypass(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        registry = DynamicSPGroupRegistry(server_args)
+
+        with patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_available",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_initialized",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.get_rank",
+            return_value=0,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.new_group"
+        ) as new_group, patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.get_world_group",
+            return_value=SimpleNamespace(local_rank=0),
+        ):
+            result = registry.ensure((0,))
+
+        self.assertTrue(result.created)
+        self.assertIsInstance(result.group, LightweightDynamicSPCoordinator)
+        self.assertEqual(result.group.world_size, 1)
+        self.assertIsNone(result.group.device_group)
+        self.assertEqual(result.stats.created_process_groups, 0)
+        new_group.assert_not_called()
+
+    def test_dynamic_sp_process_group_cache_deduplicates_repeated_ranks(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1,2=2x1",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        registry = DynamicSPGroupRegistry(server_args)
+        calls = []
+
+        def fake_new_group(**kwargs):
+            calls.append(tuple(kwargs["ranks"]))
+            return object()
+
+        with patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_available",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_initialized",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.get_rank",
+            return_value=0,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.new_group",
+            side_effect=fake_new_group,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.get_world_group",
+            return_value=SimpleNamespace(local_rank=0),
+        ):
+            result = registry.ensure((0, 1))
+
+        self.assertTrue(result.created)
+        self.assertEqual(calls, [(0, 1)])
+        self.assertEqual(result.stats.created_process_groups, 1)
+        self.assertEqual(result.stats.reused_process_groups, 1)
+
+    def test_dynamic_sp_full_static_group_is_reused_without_ensure_wave(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1,2=2x1",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        registry = DynamicSPGroupRegistry(server_args)
+        static_group = SimpleNamespace(
+            ranks=[0, 1],
+            ulysses_world_size=2,
+            ring_world_size=1,
+        )
+
+        with patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_available",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_initialized",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.distributed.parallel_state.get_sp_group",
+            return_value=static_group,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.new_group"
+        ) as new_group:
+            self.assertTrue(registry.has((0, 1)))
+            result = registry.ensure((0, 1))
+
+        self.assertFalse(result.created)
+        self.assertIs(result.group, static_group)
+        new_group.assert_not_called()
+
+    def test_dynamic_sp_prebuild_uses_bounded_forced_switch_rank_tuples(self):
+        server_args = SimpleNamespace(
+            ddit_local_ranks=None,
+            ddit_allowed_gpu_counts="1,2,4,8",
+            ddit_initial_gpus=1,
+            ddit_initial_ranks=None,
+            ddit_switch_plan="15:1->2;30:2->4;45:4->8",
+            ddit_vae_gpus=1,
+            ddit_vae_ranks=None,
+            ddit_baseline_gpus=None,
+            ddit_baseline_ranks=None,
+            ddit_schedule_policy="forced_switch",
+            ddit_dynamic_sp_prebuild_mode="auto",
+        )
+
+        self.assertEqual(
+            _prebuild_rank_tuples(server_args, world_size=8),
+            ((0,), (0, 1), (0, 1, 2, 3), tuple(range(8))),
+        )
+
+    def test_dynamic_sp_forced_switch_auto_prebuild_skips_canonical_extras(self):
+        server_args = SimpleNamespace(
+            ddit_local_ranks="0,1,2,3,4,5,6,7",
+            ddit_allowed_gpu_counts="1,2,4,8",
+            ddit_initial_gpus=1,
+            ddit_initial_ranks="2",
+            ddit_switch_plan="10:2,3",
+            ddit_vae_gpus=1,
+            ddit_vae_ranks="6",
+            ddit_baseline_gpus=None,
+            ddit_baseline_ranks=None,
+            ddit_schedule_policy="forced_switch",
+            ddit_dynamic_sp_prebuild_mode="auto",
+        )
+
+        self.assertEqual(
+            _prebuild_rank_tuples(server_args, world_size=8),
+            ((2,), (6,), (2, 3)),
+        )
+
+    def test_dynamic_sp_prebuild_keeps_explicit_non_prefix_rank_tuples(self):
+        server_args = SimpleNamespace(
+            ddit_local_ranks="0,1,2,3,4,5,6,7",
+            ddit_allowed_gpu_counts="1,2,4,8",
+            ddit_initial_gpus=1,
+            ddit_initial_ranks="2",
+            ddit_switch_plan="10:2,3;20:1,3,5,7",
+            ddit_vae_gpus=1,
+            ddit_vae_ranks="6",
+            ddit_baseline_gpus=None,
+            ddit_baseline_ranks=None,
+            ddit_schedule_policy="hungry_first",
+            ddit_dynamic_sp_prebuild_mode="auto",
+        )
+
+        rank_tuples = _prebuild_rank_tuples(server_args, world_size=8)
+
+        self.assertIn((2,), rank_tuples)
+        self.assertIn((2, 3), rank_tuples)
+        self.assertIn((1, 3, 5, 7), rank_tuples)
+        self.assertIn((6,), rank_tuples)
+        self.assertLess(len(rank_tuples), 107)
 
     def test_scheduler_skips_dynamic_sp_ensure_wave_on_cache_hit(self):
         server_args = SimpleNamespace(

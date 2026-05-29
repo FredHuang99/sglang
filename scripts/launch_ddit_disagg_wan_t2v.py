@@ -62,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ddit-profile-model-id", default=None)
     parser.add_argument("--ddit-sp-degree-map", default=None)
     parser.add_argument(
+        "--ddit-dynamic-sp-prebuild-mode",
+        choices=("off", "auto", "plan", "canonical", "all"),
+        default="auto",
+        help=(
+            "Dynamic SP prebuild candidate policy. 'all' is debug-only and "
+            "may create many NCCL communicators."
+        ),
+    )
+    parser.add_argument(
         "--ddit-prebuild-sp-groups",
         type=_parse_bool,
         default=None,
@@ -169,6 +178,7 @@ def _common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "ddit_window_size": args.ddit_window_size,
         "ddit_allowed_gpu_counts": args.ddit_allowed_gpu_counts,
         "ddit_prebuild_sp_groups": _resolve_ddit_prebuild_sp_groups(args),
+        "ddit_dynamic_sp_prebuild_mode": args.ddit_dynamic_sp_prebuild_mode,
         "ddit_log_dir": args.ddit_log_dir,
         "ddit_profile_path": args.ddit_profile_path,
         "ddit_profile_model_id": args.ddit_profile_model_id or args.model_id,
