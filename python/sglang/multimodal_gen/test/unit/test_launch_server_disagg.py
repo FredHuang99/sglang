@@ -148,6 +148,16 @@ class _FakeSpawnContext:
     def Process(self, target, args, name, daemon):
         rank = args[1]
         spec = self.process_specs.get(rank, {})
+        self.events.append(
+            (
+                "process_args",
+                rank,
+                isinstance(args[5], list),
+                len(args[5]) if isinstance(args[5], list) else None,
+                isinstance(args[6], list),
+                len(args[6]) if isinstance(args[6], list) else None,
+            )
+        )
         return _FakeProcess(
             self.events,
             rank,
@@ -578,6 +588,26 @@ class TestDisaggWorkerLaunchOrdering(unittest.TestCase):
 
         worker_ids = [event[2] for event in events if event[0] == "start"]
         self.assertEqual(worker_ids, [0, 1, 6, 7])
+
+    def test_worker_group_passes_rank0_pipe_lists_and_slave_pipe_handles(self):
+        events = []
+        pool_ctx = _FakeSpawnContext(events)
+
+        _spawn_disagg_worker_group(
+            pool_ctx=pool_ctx,
+            worker_ids=[0, 1, 2, 3],
+            role_args=_make_fake_role_args(
+                disagg_role_device="cuda",
+                num_gpus=4,
+            ),
+            process_name_builder=lambda rank_idx: f"ddit-r{rank_idx}",
+            group_label="Pool ddit_worker[0]",
+        )
+
+        process_args = [event for event in events if event[0] == "process_args"]
+        self.assertEqual(process_args[0][1:], (0, True, 3, True, 3))
+        for event in process_args[1:]:
+            self.assertEqual(event[2:], (False, None, False, None))
 
     def test_worker_group_cleanup_terminates_started_processes_on_ready_failure(self):
         events = []

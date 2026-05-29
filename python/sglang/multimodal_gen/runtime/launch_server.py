@@ -188,6 +188,11 @@ def _spawn_disagg_worker_group(
     processes: list[mp.Process] = []
     ready_readers: list[tuple[int, mp.connection.Connection]] = []
     ready_writers: list[mp.connection.Connection] = []
+    task_pipes_to_slaves_w: list[mp.connection.Connection] = []
+    task_pipes_to_slaves_r: list[mp.connection.Connection] = []
+    result_pipes_from_slaves_w: list[mp.connection.Connection] = []
+    result_pipes_from_slaves_r: list[mp.connection.Connection] = []
+
     role_device = (
         role_args.resolved_role_device()
         if hasattr(role_args, "resolved_role_device")
@@ -204,9 +209,34 @@ def _spawn_disagg_worker_group(
             ready_readers.append((rank_idx, reader))
             ready_writers.append(writer)
 
+        for _ in range(max(0, len(worker_ids) - 1)):
+            reader, writer = pool_ctx.Pipe(duplex=False)
+            task_pipes_to_slaves_r.append(reader)
+            task_pipes_to_slaves_w.append(writer)
+            reader, writer = pool_ctx.Pipe(duplex=False)
+            result_pipes_from_slaves_r.append(reader)
+            result_pipes_from_slaves_w.append(writer)
+
+        for rank_idx, worker_id in enumerate(worker_ids):
+            writer = ready_writers[rank_idx]
+            if rank_idx == 0:
+                task_pipes = task_pipes_to_slaves_w
+                result_pipes = result_pipes_from_slaves_r
+            else:
+                task_pipes = task_pipes_to_slaves_r[rank_idx - 1]
+                result_pipes = result_pipes_from_slaves_w[rank_idx - 1]
+
             process = pool_ctx.Process(
                 target=_run_disagg_role_process,
-                args=(worker_id, rank_idx, rank_idx, role_args, writer, [], []),
+                args=(
+                    worker_id,
+                    rank_idx,
+                    rank_idx,
+                    role_args,
+                    writer,
+                    task_pipes,
+                    result_pipes,
+                ),
                 name=process_name_builder(rank_idx),
                 daemon=True,
             )
@@ -230,6 +260,14 @@ def _spawn_disagg_worker_group(
 
         for writer in ready_writers:
             writer.close()
+        for pipe in task_pipes_to_slaves_w:
+            pipe.close()
+        for pipe in task_pipes_to_slaves_r:
+            pipe.close()
+        for pipe in result_pipes_from_slaves_w:
+            pipe.close()
+        for pipe in result_pipes_from_slaves_r:
+            pipe.close()
 
         for rank_idx, reader in ready_readers:
             try:
@@ -269,6 +307,16 @@ def _spawn_disagg_worker_group(
         for _, reader in ready_readers:
             try:
                 reader.close()
+            except Exception:
+                pass
+        for pipe in (
+            task_pipes_to_slaves_w
+            + task_pipes_to_slaves_r
+            + result_pipes_from_slaves_w
+            + result_pipes_from_slaves_r
+        ):
+            try:
+                pipe.close()
             except Exception:
                 pass
 
