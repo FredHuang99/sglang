@@ -1082,7 +1082,7 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
             "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferTensorBuffer",
         ) as buffer_cls, patch(
             "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.TransferMetaBuffer"
-        ), patch(
+        ) as meta_buffer_cls, patch(
             "sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin.DiffusionTransferManager",
             return_value=fake_manager,
         ):
@@ -1098,6 +1098,10 @@ class TestSchedulerWarmupCalibration(unittest.TestCase):
         self.assertEqual(buffer_kwargs["role_name"], RoleType.ENCODER.value)
         self.assertFalse(buffer_kwargs["pin_memory"])
         self.assertFalse(buffer_kwargs["pin_memory_strict"])
+        meta_buffer_cls.assert_called_once()
+        meta_kwargs = meta_buffer_cls.call_args.kwargs
+        self.assertEqual(meta_kwargs["slot_count"], 32)
+        self.assertEqual(meta_kwargs["slot_size"], 64 * 1024)
         sent_frames = scheduler._pool_result_push.send_multipart.call_args[0][0]
         register_msg = decode_transfer_msg(sent_frames)
         self.assertEqual(register_msg["capacity_slot_size"], expected_slot_size)

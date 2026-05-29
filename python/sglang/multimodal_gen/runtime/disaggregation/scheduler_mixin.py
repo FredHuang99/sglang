@@ -79,6 +79,7 @@ logger = init_logger(__name__)
 
 _ENCODER_IDLE_BROADCAST_INTERVAL_S = 0.01
 _SKIP_BROADCAST_MSG = ("skip",)
+_MIN_TRANSFER_META_SLOT_SIZE = 64 * 1024
 
 
 @dataclasses.dataclass
@@ -797,7 +798,10 @@ class SchedulerDisaggMixin:
             pin_memory=transfer_pin_memory,
             pin_memory_strict=transfer_pin_memory_strict,
         )
-        meta_slot_size = measured_meta_bytes or (64 * 1024)
+        meta_slot_size = max(
+            _MIN_TRANSFER_META_SLOT_SIZE,
+            int(measured_meta_bytes or 0),
+        )
         meta_buffer = TransferMetaBuffer(
             slot_count=max_slots,
             slot_size=meta_slot_size,
