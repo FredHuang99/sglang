@@ -152,6 +152,10 @@ def _resolve_disagg_max_slots(args: argparse.Namespace) -> int:
 def _resolve_ddit_prebuild_sp_groups(args: argparse.Namespace) -> bool:
     if args.ddit_prebuild_sp_groups is not None:
         return bool(args.ddit_prebuild_sp_groups)
+    if args.ddit_dynamic_sp_prebuild_mode == "off":
+        return False
+    if args.ddit_dynamic_sp_prebuild_mode in {"all", "canonical", "plan"}:
+        return True
     return args.ddit_schedule_policy != "forced_switch"
 
 
@@ -172,6 +176,12 @@ def _common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "warmup": args.disagg_warmup,
         "warmup_resolutions": _parse_csv(args.disagg_warmup_resolutions),
         "warmup_steps": args.disagg_warmup_steps,
+        "dit_cpu_offload": False,
+        "dit_layerwise_offload": False,
+        "text_encoder_cpu_offload": False,
+        "image_encoder_cpu_offload": False,
+        "vae_cpu_offload": False,
+        "pin_cpu_memory": False,
         "enable_ddit": True,
         "ddit_schedule_policy": args.ddit_schedule_policy,
         "ddit_baseline_gpus": args.ddit_baseline_gpus,

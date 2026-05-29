@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
     DynamicSPBuildStats,
     DynamicSPGroupRegistry,
     LightweightDynamicSPCoordinator,
+    _activation_rank_tuples,
     _prebuild_rank_tuples,
     get_dynamic_sp_registry,
 )
@@ -344,6 +345,48 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertIs(result.group, static_group)
         new_group.assert_not_called()
 
+    def test_dynamic_sp_full_world_active_pg_reuses_world_group(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="8=2x4",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        registry = DynamicSPGroupRegistry(server_args)
+        world_pg = object()
+        calls = []
+
+        def fake_new_group(**kwargs):
+            calls.append(tuple(kwargs["ranks"]))
+            return object()
+
+        with patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_available",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.is_initialized",
+            return_value=True,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.get_rank",
+            return_value=0,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.get_world_size",
+            return_value=8,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.dist.new_group",
+            side_effect=fake_new_group,
+        ), patch(
+            "sglang.multimodal_gen.runtime.ddit.dynamic_sp.get_world_group",
+            return_value=SimpleNamespace(local_rank=0, device_group=world_pg),
+        ):
+            result = registry.ensure(tuple(range(8)))
+
+        self.assertTrue(result.created)
+        self.assertNotIn(tuple(range(8)), calls)
+        self.assertIn((0, 1), calls)
+        self.assertIn((0, 2, 4, 6), calls)
+        self.assertIs(registry._device_pg_cache[tuple(range(8))], world_pg)
+
     def test_dynamic_sp_prebuild_uses_bounded_forced_switch_rank_tuples(self):
         server_args = SimpleNamespace(
             ddit_local_ranks=None,
@@ -403,6 +446,30 @@ class TestDDiTHungryScheduler(unittest.TestCase):
             _prebuild_rank_tuples(server_args, world_size=8),
             ((0,), (0, 1), (0, 1, 2, 3), tuple(range(8))),
         )
+
+    def test_dynamic_sp_all_prebuilds_all_specs_but_bounded_activation_coverage(self):
+        server_args = SimpleNamespace(
+            ddit_local_ranks="0,1,2,3,4,5,6,7",
+            ddit_allowed_gpu_counts="1,2,4,8",
+            ddit_initial_gpus=1,
+            ddit_initial_ranks=None,
+            ddit_switch_plan=None,
+            ddit_vae_gpus=1,
+            ddit_vae_ranks=None,
+            ddit_baseline_gpus=None,
+            ddit_baseline_ranks=None,
+            ddit_schedule_policy="hungry_first",
+            ddit_dynamic_sp_prebuild_mode="all",
+        )
+
+        rank_tuples = _prebuild_rank_tuples(server_args, world_size=8)
+        activation_tuples = _activation_rank_tuples(server_args, world_size=8)
+
+        self.assertEqual(len(rank_tuples), 107)
+        self.assertEqual(len(activation_tuples), 15)
+        self.assertIn((0, 7), rank_tuples)
+        self.assertNotIn((0, 7), activation_tuples)
+        self.assertIn(tuple(range(8)), activation_tuples)
 
     def test_dynamic_sp_forced_switch_plan_without_plan_stays_bounded(self):
         server_args = SimpleNamespace(
@@ -561,12 +628,12 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual(
             [op.action for op in ops],
             [
-                "activate_dynamic_sp",
+                "ensure_dynamic_sp",
+                "ensure_dynamic_sp",
                 "ensure_dynamic_sp",
                 "activate_dynamic_sp",
-                "ensure_dynamic_sp",
                 "activate_dynamic_sp",
-                "ensure_dynamic_sp",
+                "activate_dynamic_sp",
                 "activate_dynamic_sp",
             ],
         )
@@ -598,6 +665,65 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         )
         self.assertEqual(len(activating_dynamic_sp), 4)
 
+    def test_scheduler_warmup_all_queues_all_pg_specs_and_coverage_activation(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1,2=2x1,4=2x2,8=2x4",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+            ddit_local_ranks="0,1,2,3,4,5,6,7",
+            ddit_allowed_gpu_counts="1,2,4,8",
+            ddit_initial_gpus=1,
+            ddit_initial_ranks=None,
+            ddit_switch_plan=None,
+            ddit_vae_gpus=1,
+            ddit_vae_ranks=None,
+            ddit_baseline_gpus=None,
+            ddit_baseline_ranks=None,
+            ddit_schedule_policy="hungry_first",
+            ddit_dynamic_sp_prebuild_mode="all",
+        )
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = server_args
+        state = DDiTRequestState(
+            "warmup-1",
+            resolution="720p",
+            total_steps=1,
+            initial_ranks=(0,),
+        )
+        req = SimpleNamespace(
+            extra={"cache_dit_num_inference_steps": 50},
+            height=720,
+            width=1280,
+            num_frames=1,
+            num_inference_steps=1,
+            raw_latent_shape=None,
+            latents=SimpleNamespace(shape=(1, 16, 1, 90, 160), dtype="bf16"),
+            image_latent=None,
+            do_classifier_free_guidance=True,
+            is_warmup=True,
+        )
+        pending_dynamic_sp = deque()
+        scheduler._ddit_queue_request_plan_dynamic_sp_ensures(
+            req=req,
+            world_size=8,
+            state=state,
+            pending_dynamic_sp=pending_dynamic_sp,
+            ensured_dynamic_sp=set(),
+            ensuring_dynamic_sp=set(),
+            activated_dynamic_sp=set(),
+            activating_dynamic_sp=set(),
+            full_ranks=tuple(range(8)),
+        )
+
+        ops = list(pending_dynamic_sp)
+        self.assertEqual(
+            len([op for op in ops if op.action == "ensure_dynamic_sp"]), 107
+        )
+        activations = [op for op in ops if op.action == "activate_dynamic_sp"]
+        self.assertEqual(len(activations), 15)
+        self.assertTrue(all(op.payload["force_activation"] for op in activations))
+
     def test_scheduler_dynamic_sp_activation_key_uses_static_request_shape(self):
         server_args = SimpleNamespace(
             ddit_sp_degree_map="1=1x1,2=2x1,4=2x2,8=2x4",
@@ -627,9 +753,46 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         different_ranks = scheduler._ddit_activation_key(
             req=req, target_ranks=tuple(range(8))
         )
+        same_count_different_ranks = scheduler._ddit_activation_key(
+            req=req, target_ranks=(2, 3, 4, 5)
+        )
+        warmup_req = SimpleNamespace(
+            extra={"cache_dit_num_inference_steps": 50},
+            height=720,
+            width=1280,
+            num_frames=1,
+            num_inference_steps=1,
+            raw_latent_shape=None,
+            latents=SimpleNamespace(shape=(1, 16, 1, 90, 160), dtype="bf16"),
+            image_latent=None,
+            prompt_embeds=SimpleNamespace(shape=(1, 16, 4096)),
+            negative_prompt_embeds=SimpleNamespace(shape=(1, 16, 4096)),
+            do_classifier_free_guidance=True,
+        )
+        real_req = SimpleNamespace(
+            extra={},
+            height=720,
+            width=1280,
+            num_frames=1,
+            num_inference_steps=50,
+            raw_latent_shape=None,
+            latents=SimpleNamespace(shape=(1, 16, 1, 90, 160), dtype="bf16"),
+            image_latent=None,
+            prompt_embeds=SimpleNamespace(shape=(1, 256, 4096)),
+            negative_prompt_embeds=SimpleNamespace(shape=(1, 256, 4096)),
+            do_classifier_free_guidance=True,
+        )
+        warmup_key = scheduler._ddit_activation_key(
+            req=warmup_req, target_ranks=(0, 1, 2, 3)
+        )
+        real_key = scheduler._ddit_activation_key(
+            req=real_req, target_ranks=(0, 1, 2, 3)
+        )
 
         self.assertEqual(first, second)
+        self.assertEqual(first, same_count_different_ranks)
         self.assertNotEqual(first, different_ranks)
+        self.assertEqual(warmup_key, real_key)
 
     def test_disagg_ddit_register_prepared_returns_raw_outputs(self):
         scheduler = object.__new__(Scheduler)

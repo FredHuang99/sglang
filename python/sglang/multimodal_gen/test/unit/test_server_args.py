@@ -383,6 +383,27 @@ class TestDisaggTransferBackendArgs(unittest.TestCase):
 
 
 class TestDDiTServerArgs(unittest.TestCase):
+    def test_ddit_forces_non_offload_execution(self):
+        args = _from_dict_without_model_resolution(
+            {
+                "model_path": "/fake",
+                "enable_ddit": True,
+                "dit_cpu_offload": True,
+                "dit_layerwise_offload": True,
+                "text_encoder_cpu_offload": True,
+                "image_encoder_cpu_offload": True,
+                "vae_cpu_offload": True,
+                "pin_cpu_memory": True,
+            }
+        )
+
+        self.assertFalse(args.dit_cpu_offload)
+        self.assertFalse(args.dit_layerwise_offload)
+        self.assertFalse(args.text_encoder_cpu_offload)
+        self.assertFalse(args.image_encoder_cpu_offload)
+        self.assertFalse(args.vae_cpu_offload)
+        self.assertFalse(args.pin_cpu_memory)
+
     def test_shortpath_sp_degree_map_is_validated_for_supported_model(self):
         args = ServerArgs(
             model_path="/models/Wan2.1-T2V-1.3B",

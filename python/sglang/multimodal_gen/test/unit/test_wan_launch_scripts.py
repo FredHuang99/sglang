@@ -233,6 +233,27 @@ class TestWanLaunchScripts(unittest.TestCase):
 
         self.assertTrue(kwargs["ddit_prebuild_sp_groups"])
 
+    def test_ddit_disagg_launcher_all_mode_enables_prebuild_and_non_offload(self):
+        args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "forced_switch",
+                "--ddit-dynamic-sp-prebuild-mode",
+                "all",
+            ]
+        )
+        kwargs = self.ddit_disagg_module._common_kwargs(args)
+
+        self.assertTrue(kwargs["ddit_prebuild_sp_groups"])
+        self.assertFalse(kwargs["dit_cpu_offload"])
+        self.assertFalse(kwargs["dit_layerwise_offload"])
+        self.assertFalse(kwargs["text_encoder_cpu_offload"])
+        self.assertFalse(kwargs["image_encoder_cpu_offload"])
+        self.assertFalse(kwargs["vae_cpu_offload"])
+        self.assertFalse(kwargs["pin_cpu_memory"])
+
     def test_ddit_disagg_launcher_rewrites_role_result_base_after_head_port_adjustment(
         self,
     ):

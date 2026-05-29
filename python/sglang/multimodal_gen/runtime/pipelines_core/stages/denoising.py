@@ -1416,11 +1416,12 @@ class DenoisingStage(PipelineStage):
         active_ranks: tuple[int, ...],
         activation_key: tuple[Any, ...],
         begin_index: int = 0,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Run a disposable forward to activate kernels/collectives for a rank set."""
         active_ranks = tuple(active_ranks)
         activation_key = tuple(activation_key)
-        if activation_key in self._ddit_activation_cache:
+        if activation_key in self._ddit_activation_cache and not force:
             return {
                 "cache_hit": True,
                 "activation_ms": 0.0,

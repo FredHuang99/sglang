@@ -43,6 +43,7 @@ class DynamicSPBuildStats:
     reused_process_groups: int = 0
     build_ms: float = 0.0
     new_group_ms: float = 0.0
+    collective_touch_ms: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -171,6 +172,51 @@ def prebuild_rank_tuples_for_server(
     server_args: Any, world_size: int
 ) -> tuple[tuple[int, ...], ...]:
     return _prebuild_rank_tuples(server_args, world_size)
+
+
+def _coverage_rank_tuples(
+    local_ranks: tuple[int, ...], allowed_counts: tuple[int, ...]
+) -> tuple[tuple[int, ...], ...]:
+    rank_tuples: list[tuple[int, ...]] = []
+    for count in sorted(set(allowed_counts)):
+        if count <= 0 or count > len(local_ranks):
+            continue
+        if count == 1:
+            rank_tuples.extend((rank,) for rank in local_ranks)
+            continue
+        for start in range(0, len(local_ranks), count):
+            ranks = local_ranks[start : start + count]
+            if len(ranks) == count:
+                rank_tuples.append(tuple(ranks))
+    return tuple(sorted(set(rank_tuples), key=lambda ranks: (len(ranks), ranks)))
+
+
+def _activation_rank_tuples(
+    server_args: Any, world_size: int
+) -> tuple[tuple[int, ...], ...]:
+    local_ranks = parse_local_ranks(
+        getattr(server_args, "ddit_local_ranks", None), world_size
+    )
+    allowed_counts = parse_allowed_gpu_counts(
+        getattr(server_args, "ddit_allowed_gpu_counts", None), len(local_ranks)
+    )
+    mode = str(
+        getattr(server_args, "ddit_dynamic_sp_prebuild_mode", "auto") or "auto"
+    ).lower()
+    if mode == "off":
+        return ()
+    if mode == "plan":
+        return _prebuild_rank_tuples(server_args, world_size)
+    coverage = _coverage_rank_tuples(local_ranks, allowed_counts)
+    if mode in {"auto", "canonical", "all"}:
+        return coverage
+    return _prebuild_rank_tuples(server_args, world_size)
+
+
+def activation_rank_tuples_for_server(
+    server_args: Any, world_size: int
+) -> tuple[tuple[int, ...], ...]:
+    return _activation_rank_tuples(server_args, world_size)
 
 
 class LightweightDynamicSPCoordinator:
@@ -362,6 +408,7 @@ class DynamicSPGroupRegistry:
             reused_process_groups=stats.reused_process_groups,
             build_ms=(time.perf_counter() - started) * 1000.0,
             new_group_ms=stats.new_group_ms,
+            collective_touch_ms=stats.collective_touch_ms,
         )
         self._cache[spec] = group
         return DynamicSPEnsureResult(spec=spec, group=group, created=True, stats=stats)
@@ -437,6 +484,12 @@ class DynamicSPGroupRegistry:
             cached = self._device_pg_cache[ranks]
             stats.reused_process_groups += 1
             return cached
+        if ranks == tuple(range(dist.get_world_size())):
+            world_pg = get_world_group().device_group
+            if world_pg is not None:
+                self._device_pg_cache[ranks] = world_pg
+                stats.reused_process_groups += 1
+                return world_pg
 
         kwargs = {"ranks": list(ranks), "backend": backend}
         kwargs.update(_new_group_optional_kwargs())
@@ -444,8 +497,28 @@ class DynamicSPGroupRegistry:
         pg = dist.new_group(**kwargs)
         stats.new_group_ms += (time.perf_counter() - started) * 1000.0
         stats.created_process_groups += 1
+        stats.collective_touch_ms += self._touch_device_pg(ranks, pg)
         self._device_pg_cache[ranks] = pg
         return pg
+
+    def _touch_device_pg(self, ranks: tuple[int, ...], pg: Any) -> float:
+        if not (
+            current_platform.is_cuda_alike()
+            and torch.cuda.is_available()
+            and current_platform.get_torch_distributed_backend_str() == "nccl"
+        ):
+            return 0.0
+        rank = dist.get_rank()
+        started = time.perf_counter()
+        if rank in ranks:
+            device = current_platform.get_local_torch_device()
+            tensor = torch.ones((1,), device=device, dtype=torch.float32)
+            dist.all_reduce(tensor, group=pg)
+            torch.cuda.synchronize(device)
+        # Non-members wait here so the next full-rank new_group is not started
+        # while member ranks are still touching this subgroup communicator.
+        dist.barrier()
+        return (time.perf_counter() - started) * 1000.0
 
     def _static_sp_group_for_spec(self, spec: DynamicSPGroupSpec) -> Any | None:
         if not dist.is_available() or not dist.is_initialized():
@@ -500,22 +573,28 @@ class DynamicSPGroupRegistry:
                     "DDiT dynamic SP prebuild mode=all is for debugging only; "
                     "it may create many NCCL communicators and exhaust resources."
                 )
+            rank_tuples_for_log: Any = rank_tuples
+            if len(rank_tuples) > 16:
+                rank_tuples_for_log = "omitted"
             logger.info(
                 "DDiT dynamic SP prebuild start: role=%s, world_size=%s, "
-                "local_ranks=%s, counts=%s, total_rank_tuples=%s, "
+                "local_ranks=%s, counts=%s, rank_specs=%s, "
                 "rank_tuples=%s, degree_map=%s, mode=%s",
                 _ddit_role_value(self.server_args),
                 world_size,
                 local_ranks,
                 counts,
                 total_groups,
-                rank_tuples,
+                rank_tuples_for_log,
                 getattr(self.server_args, "ddit_sp_degree_map", None),
                 getattr(self.server_args, "ddit_dynamic_sp_prebuild_mode", "auto"),
             )
 
         for idx, ranks in enumerate(rank_tuples, start=1):
-            if rank == 0:
+            should_log_progress = (
+                total_groups <= 16 or idx == 1 or idx == total_groups or idx % 10 == 0
+            )
+            if rank == 0 and should_log_progress:
                 logger.info(
                     "DDiT dynamic SP prebuild progress: %s/%s ranks=%s",
                     idx,

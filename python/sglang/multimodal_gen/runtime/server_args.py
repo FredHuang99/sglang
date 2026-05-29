@@ -425,6 +425,7 @@ class ServerArgs:
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         self._adjust_disagg_parallelism_aliases()
+        self._adjust_ddit_non_offload()
         self._adjust_offload()
         self._adjust_path()
         self._adjust_quant_config()
@@ -434,6 +435,7 @@ class ServerArgs:
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
+        self._adjust_ddit_non_offload()
         self._adjust_autocast()
         self.adjust_pipeline_config()
 
@@ -451,6 +453,30 @@ class ServerArgs:
                 "decoder/VAE parallel decode. Please use decoder_sp instead."
             )
             self.decoder_sp = self.decoder_tp
+
+    def _adjust_ddit_non_offload(self):
+        if not self.enable_ddit:
+            return
+        forced_false_fields = (
+            "dit_cpu_offload",
+            "dit_layerwise_offload",
+            "text_encoder_cpu_offload",
+            "image_encoder_cpu_offload",
+            "vae_cpu_offload",
+            "pin_cpu_memory",
+        )
+        changed = [
+            field_name
+            for field_name in forced_false_fields
+            if getattr(self, field_name) is not False
+        ]
+        if changed:
+            logger.warning(
+                "DDiT mode forces non-offload execution; setting %s to False.",
+                ", ".join(changed),
+            )
+        for field_name in forced_false_fields:
+            setattr(self, field_name, False)
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""

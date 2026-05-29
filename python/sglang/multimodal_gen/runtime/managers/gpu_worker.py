@@ -396,6 +396,7 @@ class GPUWorker:
         activation_key: tuple,
         *,
         begin_index: int = 0,
+        force: bool = False,
     ) -> dict:
         _pre, denoising_stage, _post, _decode = self._hungry_stage_parts()
         state = self._hungry_states[request_id]
@@ -405,12 +406,16 @@ class GPUWorker:
             active_ranks=tuple(ranks),
             activation_key=tuple(activation_key),
             begin_index=begin_index,
+            force=force,
         )
         return {
             "request_id": request_id,
             "ranks": tuple(ranks),
             **result,
         }
+
+    def drop_hungry_request(self, request_id: str) -> None:
+        self._hungry_states.pop(request_id, None)
 
     def finish_hungry_dit(
         self,
