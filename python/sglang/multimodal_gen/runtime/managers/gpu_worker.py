@@ -389,6 +389,29 @@ class GPUWorker:
             state["denoising_state"] = None
         return {"request_id": request_id, "ranks": tuple(new_ranks)}
 
+    def activate_hungry_dit(
+        self,
+        request_id: str,
+        ranks: tuple[int, ...],
+        activation_key: tuple,
+        *,
+        begin_index: int = 0,
+    ) -> dict:
+        _pre, denoising_stage, _post, _decode = self._hungry_stage_parts()
+        state = self._hungry_states[request_id]
+        result = denoising_stage.ddit_hungry_activate(
+            batch=state["batch"],
+            server_args=self.server_args,
+            active_ranks=tuple(ranks),
+            activation_key=tuple(activation_key),
+            begin_index=begin_index,
+        )
+        return {
+            "request_id": request_id,
+            "ranks": tuple(ranks),
+            **result,
+        }
+
     def finish_hungry_dit(
         self,
         request_id: str,

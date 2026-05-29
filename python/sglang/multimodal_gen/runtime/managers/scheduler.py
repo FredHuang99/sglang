@@ -28,7 +28,10 @@ from sglang.multimodal_gen.runtime.ddit.concurrent import (
     CommandWaveBuilder,
     DDiTOp,
 )
-from sglang.multimodal_gen.runtime.ddit.dynamic_sp import get_dynamic_sp_registry
+from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
+    get_dynamic_sp_registry,
+    prebuild_rank_tuples_for_server,
+)
 from sglang.multimodal_gen.runtime.ddit.logging import record_lifecycle
 from sglang.multimodal_gen.runtime.ddit.logging import record_op_trace_rows
 from sglang.multimodal_gen.runtime.ddit.logging import record_rank_switch
@@ -591,7 +594,7 @@ class Scheduler(SchedulerDisaggMixin):
         if action == "ensure_dynamic_sp":
             target_ranks = tuple(command.get("target_ranks") or command["ranks"])
             result = get_dynamic_sp_registry(self.server_args).ensure(target_ranks)
-            if self.gpu_id == 0:
+            if self.gpu_id == min(tuple(command["ranks"])):
                 logger.info(
                     "DDiT worker: ensured dynamic SP group for ranks=%s "
                     "(cache_hit=%s, created=%s, degree_pair=%sx%s, reason=%s, "
@@ -616,7 +619,40 @@ class Scheduler(SchedulerDisaggMixin):
                 "created_process_groups": result.stats.created_process_groups,
                 "reused_process_groups": result.stats.reused_process_groups,
                 "build_ms": result.stats.build_ms,
+                "pg_build_ms": result.stats.build_ms,
                 "new_group_ms": result.stats.new_group_ms,
+            }
+        if action == "activate_dynamic_sp":
+            started = time.perf_counter()
+            result = self.worker.activate_hungry_dit(
+                command["request_id"],
+                tuple(command["ranks"]),
+                tuple(command.get("activation_key") or ()),
+                begin_index=int(command.get("begin_index") or 0),
+            )
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            activation_ms = float(result.get("activation_ms", elapsed_ms))
+            if self.gpu_id == min(tuple(command["ranks"])):
+                logger.info(
+                    "DDiT worker: activated dynamic SP group for ranks=%s "
+                    "(cache_hit=%s, activation_ms=%.2f, reason=%s)",
+                    tuple(command["ranks"]),
+                    bool(result.get("cache_hit")),
+                    activation_ms,
+                    command.get("log_reason", ""),
+                )
+            timings = result.get("timings") or {}
+            return {
+                "request_id": command["request_id"],
+                "target_ranks": tuple(command["ranks"]),
+                "activation_key": tuple(command.get("activation_key") or ()),
+                "activation_cache_hit": bool(result.get("cache_hit")),
+                "activation_ms": activation_ms,
+                "collective_warmup_ms": 0.0,
+                "model_forward_warmup_ms": float(
+                    timings.get("predict_noise_ms", 0.0)
+                ),
+                "activation_timings": timings,
             }
         if action == "full_forward":
             return self.worker.execute_forward([command["req"]])
@@ -697,6 +733,21 @@ class Scheduler(SchedulerDisaggMixin):
             "status": status,
             "error": error,
         }
+        if isinstance(result, dict):
+            for key in (
+                "activation_ms",
+                "activation_cache_hit",
+                "model_forward_warmup_ms",
+                "collective_warmup_ms",
+                "pg_build_ms",
+                "build_ms",
+                "new_group_ms",
+                "activation_timings",
+                "created_process_groups",
+                "reused_process_groups",
+            ):
+                if key in result:
+                    trace[key] = result[key]
         return {
             "rank": self.gpu_id,
             "status": status,
@@ -1127,19 +1178,109 @@ class Scheduler(SchedulerDisaggMixin):
             reason,
         )
 
+    def _ddit_activation_key(
+        self, *, req: Req, target_ranks: tuple[int, ...]
+    ) -> tuple[Any, ...]:
+        registry = get_dynamic_sp_registry(self.server_args)
+        spec = registry.resolve_spec(target_ranks)
+
+        def shape_signature(value: Any) -> tuple[Any, ...]:
+            shape = getattr(value, "shape", None)
+            if shape is not None:
+                return tuple(int(dim) for dim in shape)
+            if isinstance(value, (list, tuple)):
+                return tuple(shape_signature(item) for item in value)
+            return ()
+
+        latents = getattr(req, "latents", None)
+        latent_shape = shape_signature(latents)
+        latent_dtype = str(getattr(latents, "dtype", "unknown"))
+        image_latent = getattr(req, "image_latent", None)
+        image_shape = shape_signature(image_latent)
+        prompt_embeds = getattr(req, "prompt_embeds", None)
+        prompt_shape = shape_signature(prompt_embeds)
+        neg_prompt_embeds = getattr(req, "negative_prompt_embeds", None)
+        neg_prompt_shape = shape_signature(neg_prompt_embeds)
+        return (
+            spec.ranks,
+            spec.ulysses_degree,
+            spec.ring_degree,
+            resolve_resolution_key(req),
+            latent_shape,
+            image_shape,
+            prompt_shape,
+            neg_prompt_shape,
+            latent_dtype,
+            bool(getattr(req, "do_classifier_free_guidance", False)),
+            str(getattr(self.server_args, "ddit_profile_model_id", None) or ""),
+            str(getattr(self.server_args, "model_id", None) or ""),
+            str(getattr(self.server_args, "ddit_sp_degree_map", None) or ""),
+        )
+
+    def _ddit_queue_dynamic_sp_activation(
+        self,
+        *,
+        pending_dynamic_sp: deque[DDiTOp],
+        activated_dynamic_sp: set[tuple[Any, ...]],
+        activating_dynamic_sp: set[tuple[Any, ...]],
+        target_ranks: tuple[int, ...],
+        request_id: str,
+        req: Req,
+        reason: str,
+        begin_index: int = 0,
+    ) -> None:
+        target_ranks = tuple(sorted(int(rank) for rank in target_ranks))
+        activation_key = self._ddit_activation_key(req=req, target_ranks=target_ranks)
+        if (
+            activation_key in activated_dynamic_sp
+            or activation_key in activating_dynamic_sp
+        ):
+            return
+        pending_dynamic_sp.append(
+            DDiTOp(
+                action="activate_dynamic_sp",
+                request_id=request_id,
+                ranks=target_ranks,
+                stage="ddit_sp",
+                step=begin_index,
+                payload={
+                    "activation_key": activation_key,
+                    "begin_index": begin_index,
+                    "log_reason": reason,
+                },
+                op_id=f"activate_dynamic_sp:{','.join(str(r) for r in target_ranks)}",
+            )
+        )
+        activating_dynamic_sp.add(activation_key)
+        logger.info(
+            "DDiT worker: queued dynamic SP activation for ranks=%s "
+            "(reason=%s, begin_index=%s)",
+            target_ranks,
+            reason,
+            begin_index,
+        )
+
     def _ddit_queue_request_plan_dynamic_sp_ensures(
         self,
         *,
+        req: Req,
+        world_size: int,
         state: DDiTRequestState,
         pending_dynamic_sp: deque[DDiTOp],
         ensured_dynamic_sp: set[tuple[int, ...]],
         ensuring_dynamic_sp: set[tuple[int, ...]],
+        activated_dynamic_sp: set[tuple[Any, ...]],
+        activating_dynamic_sp: set[tuple[Any, ...]],
         full_ranks: tuple[int, ...],
     ) -> None:
         plan_ranks: list[tuple[int, ...]] = []
         if state.initial_ranks:
             plan_ranks.append(tuple(state.initial_ranks))
         plan_ranks.extend(tuple(event.ranks) for event in state.switch_plan)
+        if self._ddit_is_warmup_req(req):
+            plan_ranks.extend(
+                prebuild_rank_tuples_for_server(self.server_args, world_size)
+            )
         if not plan_ranks:
             return
 
@@ -1152,6 +1293,16 @@ class Scheduler(SchedulerDisaggMixin):
                 target_ranks=ranks,
                 request_id=state.request_id,
                 reason="request_plan",
+            )
+            self._ddit_queue_dynamic_sp_activation(
+                pending_dynamic_sp=pending_dynamic_sp,
+                activated_dynamic_sp=activated_dynamic_sp,
+                activating_dynamic_sp=activating_dynamic_sp,
+                target_ranks=ranks,
+                request_id=state.request_id,
+                req=req,
+                reason="request_plan",
+                begin_index=0,
             )
 
     def _ddit_enqueue_schedule_decisions(
@@ -1167,6 +1318,8 @@ class Scheduler(SchedulerDisaggMixin):
         req_by_id: dict[str, Req],
         ensured_dynamic_sp: set[tuple[int, ...]],
         ensuring_dynamic_sp: set[tuple[int, ...]],
+        activated_dynamic_sp: set[tuple[Any, ...]],
+        activating_dynamic_sp: set[tuple[Any, ...]],
         full_ranks: tuple[int, ...],
     ) -> None:
         for decision in policy.schedule():
@@ -1207,6 +1360,16 @@ class Scheduler(SchedulerDisaggMixin):
                     target_ranks=new_ranks,
                     request_id=request_id,
                     reason="dit_migrate",
+                )
+                self._ddit_queue_dynamic_sp_activation(
+                    pending_dynamic_sp=pending_dynamic_sp,
+                    activated_dynamic_sp=activated_dynamic_sp,
+                    activating_dynamic_sp=activating_dynamic_sp,
+                    target_ranks=new_ranks,
+                    request_id=request_id,
+                    req=req,
+                    reason="dit_migrate",
+                    begin_index=step,
                 )
                 pending_migrate.append(
                     DDiTOp(
@@ -1251,6 +1414,16 @@ class Scheduler(SchedulerDisaggMixin):
                 target_ranks=ranks,
                 request_id=request_id,
                 reason="dit_init",
+            )
+            self._ddit_queue_dynamic_sp_activation(
+                pending_dynamic_sp=pending_dynamic_sp,
+                activated_dynamic_sp=activated_dynamic_sp,
+                activating_dynamic_sp=activating_dynamic_sp,
+                target_ranks=ranks,
+                request_id=request_id,
+                req=req,
+                reason="dit_init",
+                begin_index=0,
             )
             pending_init.append(
                 DDiTOp(
@@ -1520,6 +1693,8 @@ class Scheduler(SchedulerDisaggMixin):
         registering: set[str] = set()
         ensured_dynamic_sp: set[tuple[int, ...]] = set()
         ensuring_dynamic_sp: set[tuple[int, ...]] = set()
+        activated_dynamic_sp: set[tuple[Any, ...]] = set()
+        activating_dynamic_sp: set[tuple[Any, ...]] = set()
         prepare_backpressure_logged: set[str] = set()
         prepared_since_compute = False
         wave_id = 0
@@ -1615,6 +1790,8 @@ class Scheduler(SchedulerDisaggMixin):
                     req_by_id=req_by_id,
                     ensured_dynamic_sp=ensured_dynamic_sp,
                     ensuring_dynamic_sp=ensuring_dynamic_sp,
+                    activated_dynamic_sp=activated_dynamic_sp,
+                    activating_dynamic_sp=activating_dynamic_sp,
                     full_ranks=full_ranks,
                 )
                 blocked = (
@@ -1657,6 +1834,8 @@ class Scheduler(SchedulerDisaggMixin):
                     req_by_id=req_by_id,
                     ensured_dynamic_sp=ensured_dynamic_sp,
                     ensuring_dynamic_sp=ensuring_dynamic_sp,
+                    activated_dynamic_sp=activated_dynamic_sp,
+                    activating_dynamic_sp=activating_dynamic_sp,
                     full_ranks=full_ranks,
                 )
                 blocked = (
@@ -1698,6 +1877,7 @@ class Scheduler(SchedulerDisaggMixin):
                         "full_prepare",
                         "register_prepared",
                         "ensure_dynamic_sp",
+                        "activate_dynamic_sp",
                         "full_forward",
                         "control",
                     )
@@ -1733,10 +1913,14 @@ class Scheduler(SchedulerDisaggMixin):
                             schedule_policy=schedule_policy,
                         )
                         self._ddit_queue_request_plan_dynamic_sp_ensures(
+                            req=req,
+                            world_size=world_size,
                             state=state,
                             pending_dynamic_sp=pending_dynamic_sp,
                             ensured_dynamic_sp=ensured_dynamic_sp,
                             ensuring_dynamic_sp=ensuring_dynamic_sp,
+                            activated_dynamic_sp=activated_dynamic_sp,
+                            activating_dynamic_sp=activating_dynamic_sp,
                             full_ranks=full_ranks,
                         )
                         prepared_since_compute = True
@@ -1762,10 +1946,14 @@ class Scheduler(SchedulerDisaggMixin):
                             schedule_policy=schedule_policy,
                         )
                         self._ddit_queue_request_plan_dynamic_sp_ensures(
+                            req=req,
+                            world_size=world_size,
                             state=state,
                             pending_dynamic_sp=pending_dynamic_sp,
                             ensured_dynamic_sp=ensured_dynamic_sp,
                             ensuring_dynamic_sp=ensuring_dynamic_sp,
+                            activated_dynamic_sp=activated_dynamic_sp,
+                            activating_dynamic_sp=activating_dynamic_sp,
                             full_ranks=full_ranks,
                         )
                     elif action == "ensure_dynamic_sp":
@@ -1780,6 +1968,15 @@ class Scheduler(SchedulerDisaggMixin):
                         if target_ranks:
                             ensuring_dynamic_sp.discard(target_ranks)
                             ensured_dynamic_sp.add(target_ranks)
+                    elif action == "activate_dynamic_sp":
+                        activation_key = tuple(
+                            result.get("activation_key")
+                            if isinstance(result, dict)
+                            else op.payload.get("activation_key", ())
+                        )
+                        if activation_key:
+                            activating_dynamic_sp.discard(activation_key)
+                            activated_dynamic_sp.add(activation_key)
                     elif action == "full_forward":
                         req = op.payload["req"]
                         self._write_monolithic_profile_row(req, result)

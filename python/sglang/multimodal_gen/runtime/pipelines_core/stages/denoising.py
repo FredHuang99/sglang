@@ -149,6 +149,7 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+        self._ddit_activation_cache: set[tuple[Any, ...]] = set()
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -1089,6 +1090,7 @@ class DenoisingStage(PipelineStage):
             server_args=server_args,
             guidance=prepared_vars["guidance"],
             latents=latents,
+            profile_timings=profile_timings,
         )
         mark_profile("predict_noise_ms")
 
@@ -1398,6 +1400,89 @@ class DenoisingStage(PipelineStage):
             "denoising_start_time": denoising_start_time,
             "profile_next_step": True,
         }
+
+    def ddit_hungry_activate(
+        self,
+        *,
+        batch: Req,
+        server_args: ServerArgs,
+        active_ranks: tuple[int, ...],
+        activation_key: tuple[Any, ...],
+        begin_index: int = 0,
+    ) -> dict[str, Any]:
+        """Run a disposable forward to activate kernels/collectives for a rank set."""
+        active_ranks = tuple(active_ranks)
+        activation_key = tuple(activation_key)
+        if activation_key in self._ddit_activation_cache:
+            return {
+                "cache_hit": True,
+                "activation_ms": 0.0,
+                "timings": {},
+            }
+
+        saved_latents = batch.latents
+        saved_step_index = getattr(batch, "step_index", None)
+        saved_noise_pred = getattr(batch, "noise_pred", None)
+        saved_is_cfg_negative = getattr(batch, "is_cfg_negative", False)
+        had_did_sp_shard = hasattr(batch, "did_sp_shard_latents")
+        saved_did_sp_shard = getattr(batch, "did_sp_shard_latents", False)
+
+        started = time.perf_counter()
+        profile_timings: dict[str, Any] = {}
+        try:
+            prepared_vars, latents = self._prepare_ddit_segment(
+                batch=batch,
+                server_args=server_args,
+                active_ranks=active_ranks,
+                begin_index=begin_index,
+            )
+            timesteps_cpu = prepared_vars["timesteps"].cpu()
+            if timesteps_cpu.numel() == 0:
+                self._ddit_activation_cache.add(activation_key)
+                return {
+                    "cache_hit": False,
+                    "activation_ms": (time.perf_counter() - started) * 1000.0,
+                    "timings": profile_timings,
+                }
+            timestep_index = min(
+                max(int(begin_index), 0), int(timesteps_cpu.shape[0]) - 1
+            )
+            t_host = timesteps_cpu[timestep_index]
+            activation_latents = latents.detach().clone()
+            with torch.no_grad():
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=prepared_vars["target_dtype"],
+                    enabled=prepared_vars["autocast_enabled"],
+                ):
+                    with use_dynamic_sp_group(server_args, active_ranks):
+                        self._run_single_denoising_step(
+                            batch=batch,
+                            server_args=server_args,
+                            prepared_vars=prepared_vars,
+                            latents=activation_latents,
+                            timestep_index=timestep_index,
+                            t_host=t_host,
+                            timesteps_cpu=timesteps_cpu,
+                            profile_timings=profile_timings,
+                        )
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(get_local_torch_device())
+            self._ddit_activation_cache.add(activation_key)
+            return {
+                "cache_hit": False,
+                "activation_ms": (time.perf_counter() - started) * 1000.0,
+                "timings": profile_timings,
+            }
+        finally:
+            batch.latents = saved_latents
+            batch.step_index = saved_step_index
+            batch.noise_pred = saved_noise_pred
+            batch.is_cfg_negative = saved_is_cfg_negative
+            if had_did_sp_shard:
+                batch.did_sp_shard_latents = saved_did_sp_shard
+            elif hasattr(batch, "did_sp_shard_latents"):
+                delattr(batch, "did_sp_shard_latents")
 
     def ddit_hungry_finish(
         self,
@@ -1909,6 +1994,7 @@ class DenoisingStage(PipelineStage):
         server_args,
         guidance,
         latents,
+        profile_timings: dict[str, Any] | None = None,
     ):
         """
         Predict the noise residual with classifier-free guidance.
@@ -1932,6 +2018,18 @@ class DenoisingStage(PipelineStage):
         noise_pred_cond: torch.Tensor | None = None
         noise_pred_uncond: torch.Tensor | None = None
         cfg_rank = get_classifier_free_guidance_rank()
+        profile_last = time.perf_counter()
+
+        def mark_profile(name: str) -> None:
+            nonlocal profile_last
+            if profile_timings is None:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(get_local_torch_device())
+            now = time.perf_counter()
+            profile_timings[name] = (now - profile_last) * 1000.0
+            profile_last = now
+
         # positive pass
         if not (server_args.enable_cfg_parallel and cfg_rank != 0):
             batch.is_cfg_negative = False
@@ -1953,6 +2051,7 @@ class DenoisingStage(PipelineStage):
                 noise_pred_cond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_cond, latents
                 )
+        mark_profile("predict_noise_cond_ms")
         if not batch.do_classifier_free_guidance:
             # If CFG is disabled, we are done. Return the conditional prediction.
             return noise_pred_cond
@@ -1977,6 +2076,7 @@ class DenoisingStage(PipelineStage):
                 noise_pred_uncond = server_args.pipeline_config.slice_noise_pred(
                     noise_pred_uncond, latents
                 )
+        mark_profile("predict_noise_uncond_ms")
 
         # Combine predictions
         if server_args.enable_cfg_parallel:

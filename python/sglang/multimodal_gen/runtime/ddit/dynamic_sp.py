@@ -141,7 +141,8 @@ def _prebuild_rank_tuples(
             baseline_count = max(1, min(int(baseline_gpus), len(local_ranks)))
             add_candidate(local_ranks[:baseline_count])
 
-    for event in parse_switch_plan(getattr(server_args, "ddit_switch_plan", None)):
+    switch_plan = parse_switch_plan(getattr(server_args, "ddit_switch_plan", None))
+    for event in switch_plan:
         add_candidate(event.ranks)
 
     vae_ranks = parse_rank_list(getattr(server_args, "ddit_vae_ranks", None))
@@ -155,13 +156,21 @@ def _prebuild_rank_tuples(
 
     # Keep auto prebuild bounded. Forced-switch correctness usually knows its
     # explicit plan up front; E2E policies need only canonical startup coverage.
-    if mode == "canonical" or (
-        mode == "auto" and schedule_policy != "forced_switch"
-    ):
+    needs_canonical_defaults = mode == "canonical" or (
+        mode == "auto"
+        and (schedule_policy != "forced_switch" or not switch_plan)
+    )
+    if needs_canonical_defaults:
         for count in sorted(allowed_counts):
             add_candidate(local_ranks[:count])
 
     return tuple(sorted(set(rank_tuples), key=lambda ranks: (len(ranks), ranks)))
+
+
+def prebuild_rank_tuples_for_server(
+    server_args: Any, world_size: int
+) -> tuple[tuple[int, ...], ...]:
+    return _prebuild_rank_tuples(server_args, world_size)
 
 
 class LightweightDynamicSPCoordinator:
@@ -472,6 +481,17 @@ class DynamicSPGroupRegistry:
         rank_tuples = _prebuild_rank_tuples(self.server_args, world_size)
         total_groups = len(rank_tuples)
         if rank == 0:
+            mode = str(
+                getattr(self.server_args, "ddit_dynamic_sp_prebuild_mode", "auto")
+                or "auto"
+            ).lower()
+            if mode == "plan" and not parse_switch_plan(
+                getattr(self.server_args, "ddit_switch_plan", None)
+            ):
+                logger.warning(
+                    "DDiT dynamic SP prebuild mode=plan has no server-level "
+                    "ddit_switch_plan; request-level plans will be built lazily"
+                )
             if str(
                 getattr(self.server_args, "ddit_dynamic_sp_prebuild_mode", "auto")
                 or "auto"

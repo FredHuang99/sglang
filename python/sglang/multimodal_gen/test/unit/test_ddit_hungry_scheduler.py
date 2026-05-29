@@ -384,6 +384,43 @@ class TestDDiTHungryScheduler(unittest.TestCase):
             ((2,), (6,), (2, 3)),
         )
 
+    def test_dynamic_sp_forced_switch_auto_without_plan_prebuilds_canonical(self):
+        server_args = SimpleNamespace(
+            ddit_local_ranks="0,1,2,3,4,5,6,7",
+            ddit_allowed_gpu_counts="1,2,4,8",
+            ddit_initial_gpus=1,
+            ddit_initial_ranks=None,
+            ddit_switch_plan=None,
+            ddit_vae_gpus=1,
+            ddit_vae_ranks=None,
+            ddit_baseline_gpus=None,
+            ddit_baseline_ranks=None,
+            ddit_schedule_policy="forced_switch",
+            ddit_dynamic_sp_prebuild_mode="auto",
+        )
+
+        self.assertEqual(
+            _prebuild_rank_tuples(server_args, world_size=8),
+            ((0,), (0, 1), (0, 1, 2, 3), tuple(range(8))),
+        )
+
+    def test_dynamic_sp_forced_switch_plan_without_plan_stays_bounded(self):
+        server_args = SimpleNamespace(
+            ddit_local_ranks="0,1,2,3,4,5,6,7",
+            ddit_allowed_gpu_counts="1,2,4,8",
+            ddit_initial_gpus=1,
+            ddit_initial_ranks=None,
+            ddit_switch_plan=None,
+            ddit_vae_gpus=1,
+            ddit_vae_ranks=None,
+            ddit_baseline_gpus=None,
+            ddit_baseline_ranks=None,
+            ddit_schedule_policy="forced_switch",
+            ddit_dynamic_sp_prebuild_mode="plan",
+        )
+
+        self.assertEqual(_prebuild_rank_tuples(server_args, world_size=8), ((0,),))
+
     def test_dynamic_sp_prebuild_keeps_explicit_non_prefix_rank_tuples(self):
         server_args = SimpleNamespace(
             ddit_local_ranks="0,1,2,3,4,5,6,7",
@@ -496,27 +533,70 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         pending_dynamic_sp = deque()
         ensured_dynamic_sp = set()
         ensuring_dynamic_sp = set()
+        activated_dynamic_sp = set()
+        activating_dynamic_sp = set()
+        req = SimpleNamespace(
+            extra={},
+            height=720,
+            width=1280,
+            latents=SimpleNamespace(shape=(1, 16, 1, 90, 160), dtype="bf16"),
+            image_latent=None,
+            do_classifier_free_guidance=True,
+            is_warmup=False,
+        )
         scheduler._ddit_queue_request_plan_dynamic_sp_ensures(
+            req=req,
+            world_size=8,
             state=state,
             pending_dynamic_sp=pending_dynamic_sp,
             ensured_dynamic_sp=ensured_dynamic_sp,
             ensuring_dynamic_sp=ensuring_dynamic_sp,
+            activated_dynamic_sp=activated_dynamic_sp,
+            activating_dynamic_sp=activating_dynamic_sp,
             full_ranks=tuple(range(8)),
         )
 
         self.assertEqual(ensured_dynamic_sp, {(0,)})
+        ops = list(pending_dynamic_sp)
         self.assertEqual(
-            [op.payload["target_ranks"] for op in pending_dynamic_sp],
+            [op.action for op in ops],
+            [
+                "activate_dynamic_sp",
+                "ensure_dynamic_sp",
+                "activate_dynamic_sp",
+                "ensure_dynamic_sp",
+                "activate_dynamic_sp",
+                "ensure_dynamic_sp",
+                "activate_dynamic_sp",
+            ],
+        )
+        self.assertEqual(
+            [
+                op.payload.get("target_ranks", op.ranks)
+                for op in ops
+                if op.action == "ensure_dynamic_sp"
+            ],
             [(0, 1), (0, 1, 2, 3), tuple(range(8))],
         )
-        self.assertTrue(all(op.ranks == tuple(range(8)) for op in pending_dynamic_sp))
+        self.assertEqual(
+            [op.ranks for op in ops if op.action == "activate_dynamic_sp"],
+            [(0,), (0, 1), (0, 1, 2, 3), tuple(range(8))],
+        )
         self.assertTrue(
-            all(op.payload["log_reason"] == "request_plan" for op in pending_dynamic_sp)
+            all(
+                op.ranks == tuple(range(8))
+                for op in ops
+                if op.action == "ensure_dynamic_sp"
+            )
+        )
+        self.assertTrue(
+            all(op.payload["log_reason"] == "request_plan" for op in ops)
         )
         self.assertEqual(
             ensuring_dynamic_sp,
             {(0, 1), (0, 1, 2, 3), tuple(range(8))},
         )
+        self.assertEqual(len(activating_dynamic_sp), 4)
 
     def test_disagg_ddit_register_prepared_returns_raw_outputs(self):
         scheduler = object.__new__(Scheduler)
