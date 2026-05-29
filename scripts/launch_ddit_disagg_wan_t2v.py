@@ -264,47 +264,68 @@ def _tcp_endpoint(host: str, port: int) -> str:
     return f"tcp://{host}:{port}"
 
 
+def _assert_no_disagg_port_collisions(
+    head_args: ServerArgs,
+    encoder_args: ServerArgs,
+    ddit_worker_args: ServerArgs,
+) -> None:
+    port_labels = [
+        (head_args.scheduler_port, "head frontend"),
+        (head_args.scheduler_port + 1, "encoder result"),
+        (head_args.scheduler_port + 2, "denoiser result"),
+        (head_args.scheduler_port + 3, "decoder result"),
+        (head_args.scheduler_port + 4, "ddit_worker result"),
+        (encoder_args.scheduler_port, "encoder work"),
+        (encoder_args.scheduler_port + 1, "encoder control"),
+        (ddit_worker_args.scheduler_port, "ddit_worker work"),
+        (ddit_worker_args.scheduler_port + 1, "ddit_worker control"),
+    ]
+    seen: dict[int, str] = {}
+    collisions: list[str] = []
+    for port, label in port_labels:
+        previous = seen.get(port)
+        if previous is not None:
+            collisions.append(f"{port}: {previous} vs {label}")
+        else:
+            seen[port] = label
+    if collisions:
+        raise ValueError(
+            "DDiT disagg port collision detected after ServerArgs port settling: "
+            + "; ".join(collisions)
+        )
+
+
 def _resolve_launch_args(
     args: argparse.Namespace, gpu_ids: list[int]
 ) -> tuple[ServerArgs, ServerArgs, ServerArgs]:
-    provisional_head_endpoint = _tcp_endpoint(args.host, args.scheduler_port)
-    encoder_work_port = args.scheduler_port + 10
-    ddit_worker_work_port = args.scheduler_port + 20
-
-    encoder_args = _make_encoder_args(
-        args,
-        gpu_ids=gpu_ids,
-        head_endpoint=provisional_head_endpoint,
-        work_port=encoder_work_port,
-    )
-    ddit_worker_args = _make_ddit_worker_args(
-        args,
-        gpu_ids=gpu_ids,
-        head_endpoint=provisional_head_endpoint,
-        work_port=ddit_worker_work_port,
-    )
+    provisional_encoder_work_port = args.scheduler_port + 10
+    provisional_ddit_worker_work_port = args.scheduler_port + 20
     head_args = _make_head_args(
         args,
-        encoder_work_endpoint=_tcp_endpoint(args.host, encoder_args.scheduler_port),
+        encoder_work_endpoint=_tcp_endpoint(args.host, provisional_encoder_work_port),
         ddit_worker_work_endpoint=_tcp_endpoint(
-            args.host, ddit_worker_args.scheduler_port
+            args.host, provisional_ddit_worker_work_port
         ),
     )
 
     actual_head_endpoint = _tcp_endpoint(head_args.host, head_args.scheduler_port)
-    if actual_head_endpoint != provisional_head_endpoint:
-        encoder_args = _make_encoder_args(
-            args,
-            gpu_ids=gpu_ids,
-            head_endpoint=actual_head_endpoint,
-            work_port=encoder_args.scheduler_port,
-        )
-        ddit_worker_args = _make_ddit_worker_args(
-            args,
-            gpu_ids=gpu_ids,
-            head_endpoint=actual_head_endpoint,
-            work_port=ddit_worker_args.scheduler_port,
-        )
+    encoder_args = _make_encoder_args(
+        args,
+        gpu_ids=gpu_ids,
+        head_endpoint=actual_head_endpoint,
+        work_port=head_args.scheduler_port + 10,
+    )
+    ddit_worker_args = _make_ddit_worker_args(
+        args,
+        gpu_ids=gpu_ids,
+        head_endpoint=actual_head_endpoint,
+        work_port=head_args.scheduler_port + 20,
+    )
+    head_args.encoder_urls = _tcp_endpoint(args.host, encoder_args.scheduler_port)
+    head_args.ddit_worker_urls = _tcp_endpoint(
+        args.host, ddit_worker_args.scheduler_port
+    )
+    _assert_no_disagg_port_collisions(head_args, encoder_args, ddit_worker_args)
 
     return encoder_args, ddit_worker_args, head_args
 
