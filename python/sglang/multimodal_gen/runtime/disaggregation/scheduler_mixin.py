@@ -160,6 +160,12 @@ _EXCLUDE_FIELDS = frozenset(
 
 _SAMPLING_PARAMS_FIELDS = [
     "request_id",
+    "resolution_key",
+    "ddit_resolution_key",
+    "ddit_initial_ranks",
+    "ddit_switch_plan",
+    "ddit_vae_k",
+    "ddit_vae_ranks",
     "guidance_scale",
     "guidance_scale_2",
     "height",
@@ -1151,7 +1157,7 @@ class SchedulerDisaggMixin:
                 getattr(peer_info, "receiver_control_endpoint"),
                 ready_msg,
             )
-            logger.info(
+            logger.debug(
                 "Transfer %s: sent READY to %s[%s] for %s "
                 "(data=%d bytes, meta=%d bytes, src_session=%s, dst_session=%s)",
                 self._disagg_role.value.upper(),
@@ -1203,7 +1209,7 @@ class SchedulerDisaggMixin:
                 )
             )
         )
-        logger.info(
+        logger.debug(
             "Transfer %s: reported PUSHED success to DiffusionServer for %s "
             "(receiver=%s[%s])",
             self._disagg_role.value.upper(),
@@ -1284,7 +1290,7 @@ class SchedulerDisaggMixin:
         """Start receiver-side H2D/load and stash loaded tensors for later distribution."""
         request_id = msg["request_id"]
         role_name = self._disagg_role.value.upper()
-        logger.info(
+        logger.debug(
             "Transfer %s: received READY for %s "
             "(data=%d bytes, meta=%d bytes, src_session=%s, dst_session=%s)",
             role_name,
@@ -1355,7 +1361,7 @@ class SchedulerDisaggMixin:
             error = f"failed to load transfer after READY: {last_error}"
             self._fail_inbound_transfer(request_id, error, prealloc_slot_id)
             return None
-        logger.info(
+        logger.debug(
             "Transfer %s: loaded transfer payload for %s "
             "(tensor_fields=%s, scalar_fields=%d)",
             role_name,
@@ -1580,7 +1586,7 @@ class SchedulerDisaggMixin:
                 staged_for_decoder=staged_for_decoder,
             )
         )
-        logger.info(
+        logger.debug(
             "Transfer %s: queued outbound %s for %s "
             "(data=%d bytes, meta=%d bytes, has_event=%s)",
             self._disagg_role.value.upper(),
@@ -1710,7 +1716,7 @@ class SchedulerDisaggMixin:
             return False
 
         self._send_ready_queue.append(item)
-        logger.info(
+        logger.debug(
             "Transfer %s: outbound %s ready for server notification for %s",
             self._disagg_role.value.upper(),
             item.msg_type,
@@ -1761,7 +1767,7 @@ class SchedulerDisaggMixin:
             )
 
         self._pool_result_push.send_multipart(encode_transfer_msg(msg))
-        logger.info(
+        logger.debug(
             "Transfer %s: sent %s notification to DiffusionServer for %s "
             "(data=%d bytes, meta=%d bytes, session=%s)",
             self._disagg_role.value.upper(),
@@ -2159,7 +2165,7 @@ class SchedulerDisaggMixin:
         current_session_id = (
             self._transfer_manager.session_id if self._transfer_manager is not None else ""
         )
-        logger.info(
+        logger.debug(
             "Transfer %s: received ALLOC for %s "
             "(data=%d bytes, meta=%d bytes, source_role=%s[%s], source_control=%s)",
             self._disagg_role.value.upper(),
@@ -2385,7 +2391,7 @@ class SchedulerDisaggMixin:
                 source_control_endpoint,
                 peer_msg,
             )
-            logger.info(
+            logger.debug(
                 "Transfer %s: sent PEER_INFO to upstream for %s "
                 "(data=%d bytes, meta=%d bytes, source_control=%s)",
                 self._disagg_role.value.upper(),
@@ -2426,7 +2432,7 @@ class SchedulerDisaggMixin:
                 )
             )
         )
-        logger.info(
+        logger.debug(
             "Transfer %s: accepted ALLOC for %s "
             "(data_slot=%d bytes, meta_slot=%d bytes, session=%s)",
             self._disagg_role.value.upper(),
@@ -2763,7 +2769,7 @@ class SchedulerDisaggMixin:
             if isinstance(req_result, Req) and self._pool_result_push is not None:
                 if self._transfer_manager is not None:
                     tensor_fields, scalar_fields = extract_transfer_fields(req_result)
-                    logger.info(
+                    logger.debug(
                         "Transfer ENCODER: staging prepared payload for %s "
                         "(tensor_fields=%s, scalar_fields=%d, estimated_data=%d bytes)",
                         request_id,

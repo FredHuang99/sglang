@@ -915,7 +915,7 @@ class DiffusionServer:
                 continue
             if p2p is not None:
                 p2p.downstream_tta_enqueued = False
-            logger.info(
+            logger.debug(
                 "DiffusionServer transfer: dispatching %s to ddit_worker[%d] "
                 "(consume_slot=%s, reserved=%s)",
                 entry.request_id,
@@ -1396,7 +1396,7 @@ class DiffusionServer:
         self._role_pushes(receiver_role)[receiver_idx].send_multipart(
             encode_transfer_msg(alloc_msg)
         )
-        logger.info(
+        logger.debug(
             "DiffusionServer transfer: sent ALLOC for %s to %s[%d] "
             "(data=%d bytes, meta=%d bytes, receiver_session=%s)",
             request_id,
@@ -1989,7 +1989,7 @@ class DiffusionServer:
             p2p.prealloc_slot_id = msg.get("prealloc_slot_id")
 
         p2p.alloc_accepted = True
-        logger.info(
+        logger.debug(
             "DiffusionServer transfer: ALLOC accepted for %s by %s[%s] "
             "(data_slot=%d bytes, meta_slot=%d bytes)",
             request_id,
@@ -2068,7 +2068,7 @@ class DiffusionServer:
             downstream_wait_since=time.monotonic(),
         )
         self._transfer_state[request_id] = p2p
-        logger.info(
+        logger.debug(
             "DiffusionServer transfer: received encoder STAGED for %s "
             "(data=%d bytes, meta=%d bytes, session=%s)",
             request_id,
@@ -2088,7 +2088,7 @@ class DiffusionServer:
             pass
         if self._two_stage_ddit:
             self._enqueue_role_wait(self._ddit_worker_tta, request_id, p2p)
-            logger.info(
+            logger.debug(
                 "DiffusionServer transfer: queued %s for ddit_worker handoff "
                 "(queue_depth=%d)",
                 request_id,
@@ -2182,7 +2182,7 @@ class DiffusionServer:
 
         self._release_sender_slot_if_needed(p2p, record)
         self._set_transfer_phase(p2p, TransferPhase.RUNNING_DOWNSTREAM)
-        logger.info(
+        logger.debug(
             "DiffusionServer transfer: PUSHED success for %s; downstream %s[%d] "
             "is running",
             request_id,

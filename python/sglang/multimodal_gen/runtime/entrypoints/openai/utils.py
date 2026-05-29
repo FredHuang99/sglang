@@ -295,7 +295,7 @@ async def process_generation_batch(
     log_batch_completion(logger, 1, total_time)
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
-        logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
+        logger.debug(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
 
     return save_file_path_list, result
 

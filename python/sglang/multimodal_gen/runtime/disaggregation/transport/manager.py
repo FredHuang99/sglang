@@ -829,7 +829,7 @@ class DiffusionTransferManager:
         peer_info.state = "worker_queued"
         queue_idx = self._select_send_queue_idx(peer_info)
         self._send_queues[queue_idx].put(request_id)
-        logger.info(
+        logger.debug(
             "TransferManager: enqueued peer send for %s to %s[%s] "
             "(queue=%d, data=%d bytes, meta=%d bytes)",
             request_id,
@@ -885,7 +885,7 @@ class DiffusionTransferManager:
                 state="waiting_stage",
             )
             self._pending_peer_sends[request_id] = pending
-            logger.info(
+            logger.debug(
                 "TransferManager: received PEER_INFO for %s from %s[%s] "
                 "(data=%d bytes, meta=%d bytes, dest_session=%s)",
                 request_id,
@@ -1086,7 +1086,7 @@ class DiffusionTransferManager:
             self._send_queues[retry_queue_idx].put(request_id)
             return
 
-        logger.info(
+        logger.debug(
             "TransferManager: send completion for %s success=%s retryable=%s "
             "error=%s",
             request_id,

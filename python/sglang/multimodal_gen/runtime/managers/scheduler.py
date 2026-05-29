@@ -723,17 +723,13 @@ class Scheduler(SchedulerDisaggMixin):
             str(result["command"].get("request_id") or "").startswith("warmup-")
             for result in non_idle_results
         )
-        if not warmup_only_wave:
-            record_op_trace_rows(
-                self.server_args,
-                [
-                    result["trace"]
-                    for result in results
-                    if not str(result["trace"].get("request_id") or "").startswith(
-                        "warmup-"
-                    )
-                ],
-            )
+        trace_rows = [
+            result["trace"]
+            for result in non_idle_results
+            if not str(result["trace"].get("request_id") or "").startswith("warmup-")
+        ]
+        if trace_rows and not warmup_only_wave:
+            record_op_trace_rows(self.server_args, trace_rows)
         failed = [result for result in results if result["status"] != "ok"]
         if failed:
             raise RuntimeError(failed[0]["error"])
@@ -792,6 +788,48 @@ class Scheduler(SchedulerDisaggMixin):
             policy.update_cur_step(request_id, cur_step)
         else:
             policy.requests[request_id].cur_step = int(cur_step)
+
+    def _ddit_log_registered_request_state(
+        self,
+        *,
+        source: str,
+        req: Req,
+        state: DDiTRequestState,
+        schedule_policy: str,
+    ) -> None:
+        switch_plan = [
+            {
+                "after_step": int(event.after_step),
+                "ranks": list(event.ranks),
+                "reason": event.reason,
+            }
+            for event in state.switch_plan
+        ]
+        extra = getattr(req, "extra", {}) or {}
+        logger.info(
+            "DDiT worker: registered %s request %s "
+            "(resolution=%s, steps=%d, policy=%s, initial_ranks=%s, "
+            "switch_plan=%s, vae_k=%s, vae_ranks=%s)",
+            source,
+            state.request_id,
+            state.resolution,
+            state.total_steps,
+            schedule_policy,
+            state.initial_ranks,
+            switch_plan,
+            extra.get("ddit_vae_k"),
+            extra.get("ddit_vae_ranks"),
+        )
+        if schedule_policy == "forced_switch" and not state.switch_plan:
+            logger.warning(
+                "DDiT worker: forced_switch request %s has empty switch_plan "
+                "(req_extra_keys=%s, req_extra_ddit_switch_plan=%r, "
+                "server_ddit_switch_plan=%r)",
+                state.request_id,
+                sorted(extra.keys()),
+                extra.get("ddit_switch_plan"),
+                getattr(self.server_args, "ddit_switch_plan", None),
+            )
 
     @staticmethod
     def _ddit_is_warmup_req(req: Req | None) -> bool:
@@ -1047,7 +1085,7 @@ class Scheduler(SchedulerDisaggMixin):
             return
         if registry.has(target_ranks):
             ensured_dynamic_sp.add(target_ranks)
-            logger.info(
+            logger.debug(
                 "DDiT worker: dynamic SP cache hit for ranks=%s "
                 "(degree_pair=%sx%s, reason=%s); skipping ensure wave",
                 spec.ranks,
@@ -1114,6 +1152,16 @@ class Scheduler(SchedulerDisaggMixin):
                         reason=str(decision.get("reason", schedule_policy)),
                         policy=str(decision.get("policy", schedule_policy)),
                     )
+                logger.info(
+                    "DDiT worker: scheduled DiT migrate for %s at step=%d "
+                    "(old_ranks=%s, new_ranks=%s, reason=%s, policy=%s)",
+                    request_id,
+                    step,
+                    old_ranks,
+                    new_ranks,
+                    decision.get("reason", schedule_policy),
+                    decision.get("policy", schedule_policy),
+                )
                 self._ddit_queue_dynamic_sp_ensure(
                     pending_dynamic_sp=pending_dynamic_sp,
                     ensured_dynamic_sp=ensured_dynamic_sp,
@@ -1641,6 +1689,12 @@ class Scheduler(SchedulerDisaggMixin):
                         policy.add_request(state)
                         if isinstance(policy, FixedBaselineScheduler):
                             policy.mark_text_encoder_done(request_id)
+                        self._ddit_log_registered_request_state(
+                            source="local",
+                            req=req,
+                            state=state,
+                            schedule_policy=schedule_policy,
+                        )
                         prepared_since_compute = True
                     elif action == "register_prepared":
                         registering.discard(request_id)
@@ -1657,13 +1711,11 @@ class Scheduler(SchedulerDisaggMixin):
                         policy.add_request(state)
                         if isinstance(policy, FixedBaselineScheduler):
                             policy.mark_text_encoder_done(request_id)
-                        logger.info(
-                            "DDiT worker: registered prepared request %s "
-                            "(resolution=%s, steps=%d, policy=%s)",
-                            request_id,
-                            state.resolution,
-                            state.total_steps,
-                            schedule_policy,
+                        self._ddit_log_registered_request_state(
+                            source="prepared",
+                            req=req,
+                            state=state,
+                            schedule_policy=schedule_policy,
                         )
                     elif action == "ensure_dynamic_sp":
                         target_ranks = tuple(

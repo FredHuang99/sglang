@@ -216,7 +216,7 @@ class StageProfiler:
             msg = f"[{self.stage_name}] started..."
             if self.logger.isEnabledFor(logging.DEBUG):
                 msg += f" ({round(current_platform.get_available_gpu_memory(), 2)} GB left)"
-            self.logger.info(msg)
+            self.logger.debug(msg)
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
             if (
@@ -252,7 +252,7 @@ class StageProfiler:
             return False
 
         if self.log_stage_start_end:
-            self.logger.info(
+            self.logger.debug(
                 f"[{self.stage_name}] finished in {execution_time_s:.4f} seconds",
             )
 

@@ -539,7 +539,7 @@ class GPUWorker:
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
-        logger.info(
+        logger.debug(
             f"Peak GPU memory: {peak_reserved_gb:.2f} GB, "
             f"Peak allocated: {peak_allocated_gb:.2f} GB, "
             f"Memory pool overhead: {pool_overhead_gb:.2f} GB ({pool_overhead_gb / peak_reserved_gb * 100:.1f}%), "
