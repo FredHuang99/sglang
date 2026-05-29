@@ -827,7 +827,18 @@ class DiffusionTransferManager:
             )
             return
         peer_info.state = "worker_queued"
-        self._send_queues[self._select_send_queue_idx(peer_info)].put(request_id)
+        queue_idx = self._select_send_queue_idx(peer_info)
+        self._send_queues[queue_idx].put(request_id)
+        logger.info(
+            "TransferManager: enqueued peer send for %s to %s[%s] "
+            "(queue=%d, data=%d bytes, meta=%d bytes)",
+            request_id,
+            peer_info.receiver_role,
+            peer_info.receiver_instance,
+            queue_idx,
+            peer_info.transfer_size,
+            peer_info.meta_transfer_size,
+        )
 
     def _register_peer_send(self, msg: dict) -> None:
         request_id = msg.get("request_id", "")
@@ -874,6 +885,16 @@ class DiffusionTransferManager:
                 state="waiting_stage",
             )
             self._pending_peer_sends[request_id] = pending
+            logger.info(
+                "TransferManager: received PEER_INFO for %s from %s[%s] "
+                "(data=%d bytes, meta=%d bytes, dest_session=%s)",
+                request_id,
+                pending.receiver_role,
+                pending.receiver_instance,
+                pending.transfer_size,
+                pending.meta_transfer_size,
+                pending.dest_session_id,
+            )
             self._maybe_enqueue_send_locked(request_id)
 
     def _submit_send_task(self, request_id: str, queue_idx: int | None = None) -> None:
@@ -1065,6 +1086,14 @@ class DiffusionTransferManager:
             self._send_queues[retry_queue_idx].put(request_id)
             return
 
+        logger.info(
+            "TransferManager: send completion for %s success=%s retryable=%s "
+            "error=%s",
+            request_id,
+            completion.success,
+            completion.retryable,
+            completion.error_msg or "",
+        )
         if self._on_send_completion is not None and peer_info is not None:
             self._on_send_completion(
                 request_id,

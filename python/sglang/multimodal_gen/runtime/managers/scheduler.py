@@ -964,6 +964,13 @@ class Scheduler(SchedulerDisaggMixin):
                 )
             )
             registering.add(item.request_id)
+            logger.info(
+                "DDiT worker: queued prepared request %s for policy registration "
+                "(tensor_fields=%s, scalar_fields=%d)",
+                item.request_id,
+                sorted(item.tensors.keys()),
+                len(item.scalar_fields),
+            )
             handled = True
         return handled
 
@@ -1525,6 +1532,14 @@ class Scheduler(SchedulerDisaggMixin):
                         policy.add_request(state)
                         if isinstance(policy, FixedBaselineScheduler):
                             policy.mark_text_encoder_done(request_id)
+                        logger.info(
+                            "DDiT worker: registered prepared request %s "
+                            "(resolution=%s, steps=%d, policy=%s)",
+                            request_id,
+                            state.resolution,
+                            state.total_steps,
+                            schedule_policy,
+                        )
                     elif action == "full_forward":
                         req = op.payload["req"]
                         self._write_monolithic_profile_row(req, result)

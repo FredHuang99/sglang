@@ -868,6 +868,13 @@ class DiffusionServer:
                     ddit_worker_idx
                 )
                 self._bump_capacity_epoch(RoleType.DDIT_WORKER, ddit_worker_idx)
+                logger.info(
+                    "DiffusionServer DDiT admission: reserved ddit_worker[%d] "
+                    "for %s before encoder dispatch (free_after=%d)",
+                    ddit_worker_idx,
+                    entry.request_id,
+                    self._ddit_worker_free_slots[ddit_worker_idx],
+                )
             self._dispatch_to_encoder(entry.request_id, entry.payload, idx)
 
     def _drain_denoiser_tta(self) -> None:
@@ -906,6 +913,14 @@ class DiffusionServer:
                 continue
             if p2p is not None:
                 p2p.downstream_tta_enqueued = False
+            logger.info(
+                "DiffusionServer transfer: dispatching %s to ddit_worker[%d] "
+                "(consume_slot=%s, reserved=%s)",
+                entry.request_id,
+                reserved_idx,
+                consume_slot,
+                entry.request_id in self._ddit_worker_admission_reservations,
+            )
             self._transfer_dispatch_to_ddit_worker(
                 entry.request_id,
                 entry.transfer_state,
@@ -1378,6 +1393,16 @@ class DiffusionServer:
 
         self._role_pushes(receiver_role)[receiver_idx].send_multipart(
             encode_transfer_msg(alloc_msg)
+        )
+        logger.info(
+            "DiffusionServer transfer: sent ALLOC for %s to %s[%d] "
+            "(data=%d bytes, meta=%d bytes, receiver_session=%s)",
+            request_id,
+            receiver_role.value,
+            receiver_idx,
+            p2p.data_size,
+            p2p.meta_size,
+            p2p.receiver_session_id,
         )
         self._set_transfer_phase(p2p, TransferPhase.WAITING_ALLOC_RESULT)
 
@@ -1962,6 +1987,15 @@ class DiffusionServer:
             p2p.prealloc_slot_id = msg.get("prealloc_slot_id")
 
         p2p.alloc_accepted = True
+        logger.info(
+            "DiffusionServer transfer: ALLOC accepted for %s by %s[%s] "
+            "(data_slot=%d bytes, meta_slot=%d bytes)",
+            request_id,
+            receiver_role,
+            receiver_instance,
+            p2p.receiver_slot_size,
+            p2p.receiver_meta_slot_size,
+        )
         p2p.downstream_wait_since = None
         p2p.rejected_instances.clear()
         p2p.downstream_retry_attempts = 0
@@ -2032,6 +2066,14 @@ class DiffusionServer:
             downstream_wait_since=time.monotonic(),
         )
         self._transfer_state[request_id] = p2p
+        logger.info(
+            "DiffusionServer transfer: received encoder STAGED for %s "
+            "(data=%d bytes, meta=%d bytes, session=%s)",
+            request_id,
+            p2p.data_size,
+            p2p.meta_size,
+            staged_session_id,
+        )
 
         try:
             self._tracker.transition(request_id, RequestState.ENCODER_DONE)
@@ -2044,6 +2086,12 @@ class DiffusionServer:
             pass
         if self._two_stage_ddit:
             self._enqueue_role_wait(self._ddit_worker_tta, request_id, p2p)
+            logger.info(
+                "DiffusionServer transfer: queued %s for ddit_worker handoff "
+                "(queue_depth=%d)",
+                request_id,
+                len(self._ddit_worker_tta),
+            )
         else:
             self._enqueue_role_wait(self._denoiser_tta, request_id, p2p)
 
@@ -2132,6 +2180,13 @@ class DiffusionServer:
 
         self._release_sender_slot_if_needed(p2p, record)
         self._set_transfer_phase(p2p, TransferPhase.RUNNING_DOWNSTREAM)
+        logger.info(
+            "DiffusionServer transfer: PUSHED success for %s; downstream %s[%d] "
+            "is running",
+            request_id,
+            p2p.receiver_role,
+            p2p.receiver_instance,
+        )
         if record is None:
             if p2p.receiver_role == RoleType.DDIT_WORKER.value:
                 self._clear_ddit_worker_admission_reservation(

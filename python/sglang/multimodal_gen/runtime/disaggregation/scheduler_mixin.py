@@ -1151,6 +1151,18 @@ class SchedulerDisaggMixin:
                 getattr(peer_info, "receiver_control_endpoint"),
                 ready_msg,
             )
+            logger.info(
+                "Transfer %s: sent READY to %s[%s] for %s "
+                "(data=%d bytes, meta=%d bytes, src_session=%s, dst_session=%s)",
+                self._disagg_role.value.upper(),
+                receiver_role,
+                receiver_instance,
+                request_id,
+                int(getattr(peer_info, "transfer_size", 0) or 0),
+                int(getattr(peer_info, "meta_transfer_size", 0) or 0),
+                source_session_id,
+                dest_session_id,
+            )
         except Exception:
             logger.exception(
                 "Transfer %s: failed to notify downstream ready for %s",
@@ -1190,6 +1202,14 @@ class SchedulerDisaggMixin:
                     receiver_instance=receiver_instance,
                 )
             )
+        )
+        logger.info(
+            "Transfer %s: reported PUSHED success to DiffusionServer for %s "
+            "(receiver=%s[%s])",
+            self._disagg_role.value.upper(),
+            request_id,
+            receiver_role,
+            receiver_instance,
         )
         self._profile_role_finalize(
             request_id,
@@ -1264,6 +1284,16 @@ class SchedulerDisaggMixin:
         """Start receiver-side H2D/load and stash loaded tensors for later distribution."""
         request_id = msg["request_id"]
         role_name = self._disagg_role.value.upper()
+        logger.info(
+            "Transfer %s: received READY for %s "
+            "(data=%d bytes, meta=%d bytes, src_session=%s, dst_session=%s)",
+            role_name,
+            request_id,
+            int(msg.get("data_size", 0) or 0),
+            int(msg.get("meta_size", 0) or 0),
+            msg.get("source_session_id", ""),
+            msg.get("dest_session_id", ""),
+        )
 
         if self._disagg_metrics:
             self._disagg_metrics.record_request_start(request_id)
@@ -1325,6 +1355,14 @@ class SchedulerDisaggMixin:
             error = f"failed to load transfer after READY: {last_error}"
             self._fail_inbound_transfer(request_id, error, prealloc_slot_id)
             return None
+        logger.info(
+            "Transfer %s: loaded transfer payload for %s "
+            "(tensor_fields=%s, scalar_fields=%d)",
+            role_name,
+            request_id,
+            sorted(tensors.keys()),
+            len(scalar_fields),
+        )
 
         if scalar_fields.get("is_warmup"):
             transfer_bytes = estimate_transfer_bytes(tensors)
@@ -1542,6 +1580,16 @@ class SchedulerDisaggMixin:
                 staged_for_decoder=staged_for_decoder,
             )
         )
+        logger.info(
+            "Transfer %s: queued outbound %s for %s "
+            "(data=%d bytes, meta=%d bytes, has_event=%s)",
+            self._disagg_role.value.upper(),
+            msg_type,
+            request_id,
+            int(getattr(staged, "transfer_size", 0) or 0),
+            int(getattr(staged, "meta_size", 0) or 0),
+            stage_event is not None,
+        )
 
     def _has_pending_outbound_staging_retry(self: Scheduler) -> bool:
         return bool(self._outbound_staging_retry_queue)
@@ -1662,6 +1710,12 @@ class SchedulerDisaggMixin:
             return False
 
         self._send_ready_queue.append(item)
+        logger.info(
+            "Transfer %s: outbound %s ready for server notification for %s",
+            self._disagg_role.value.upper(),
+            item.msg_type,
+            item.request_id,
+        )
         return True
 
     def _process_send_ready_queue_once(self: Scheduler) -> bool:
@@ -1707,6 +1761,16 @@ class SchedulerDisaggMixin:
             )
 
         self._pool_result_push.send_multipart(encode_transfer_msg(msg))
+        logger.info(
+            "Transfer %s: sent %s notification to DiffusionServer for %s "
+            "(data=%d bytes, meta=%d bytes, session=%s)",
+            self._disagg_role.value.upper(),
+            item.msg_type,
+            item.request_id,
+            int(getattr(staged, "transfer_size", 0) or 0),
+            int(getattr(staged, "meta_size", 0) or 0),
+            self._transfer_manager.session_id,
+        )
         return True
 
     # ------------------------------------------------------------------
@@ -2095,6 +2159,17 @@ class SchedulerDisaggMixin:
         current_session_id = (
             self._transfer_manager.session_id if self._transfer_manager is not None else ""
         )
+        logger.info(
+            "Transfer %s: received ALLOC for %s "
+            "(data=%d bytes, meta=%d bytes, source_role=%s[%s], source_control=%s)",
+            self._disagg_role.value.upper(),
+            request_id,
+            data_size,
+            meta_size,
+            msg.get("source_role", ""),
+            msg.get("source_instance", -1),
+            msg.get("source_control_endpoint", ""),
+        )
 
         def release_pending() -> None:
             if self._transfer_manager is not None:
@@ -2310,6 +2385,15 @@ class SchedulerDisaggMixin:
                 source_control_endpoint,
                 peer_msg,
             )
+            logger.info(
+                "Transfer %s: sent PEER_INFO to upstream for %s "
+                "(data=%d bytes, meta=%d bytes, source_control=%s)",
+                self._disagg_role.value.upper(),
+                request_id,
+                data_size,
+                meta_size,
+                source_control_endpoint,
+            )
         except Exception:
             logger.exception(
                 "Transfer %s: failed to send peer info to upstream for %s",
@@ -2341,6 +2425,15 @@ class SchedulerDisaggMixin:
                     prealloc_slot_id=prealloc_slot_id,
                 )
             )
+        )
+        logger.info(
+            "Transfer %s: accepted ALLOC for %s "
+            "(data_slot=%d bytes, meta_slot=%d bytes, session=%s)",
+            self._disagg_role.value.upper(),
+            request_id,
+            pending.slot.size if pending.slot is not None else 0,
+            pending.meta_slot.size,
+            current_session_id,
         )
         self._profile_role_update(
             request_id,
@@ -2670,6 +2763,14 @@ class SchedulerDisaggMixin:
             if isinstance(req_result, Req) and self._pool_result_push is not None:
                 if self._transfer_manager is not None:
                     tensor_fields, scalar_fields = extract_transfer_fields(req_result)
+                    logger.info(
+                        "Transfer ENCODER: staging prepared payload for %s "
+                        "(tensor_fields=%s, scalar_fields=%d, estimated_data=%d bytes)",
+                        request_id,
+                        sorted(tensor_fields.keys()),
+                        len(scalar_fields),
+                        estimate_transfer_bytes(tensor_fields),
+                    )
                     staged, stage_event = self._transfer_manager.stage_tensors_async(
                         request_id=request_id,
                         tensor_fields=tensor_fields,
