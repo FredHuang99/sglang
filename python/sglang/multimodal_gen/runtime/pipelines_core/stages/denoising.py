@@ -1006,6 +1006,7 @@ class DenoisingStage(PipelineStage):
         t_host: torch.Tensor,
         timesteps_cpu: torch.Tensor,
         profile_timings: dict[str, Any] | None = None,
+        skip_scheduler_step: bool = False,
     ) -> torch.Tensor:
         """Run one denoising step using already prepared invariant state."""
         profile_last = time.perf_counter()
@@ -1093,6 +1094,12 @@ class DenoisingStage(PipelineStage):
             profile_timings=profile_timings,
         )
         mark_profile("predict_noise_ms")
+
+        if skip_scheduler_step:
+            if profile_timings is not None:
+                profile_timings["scheduler_step_ms"] = 0.0
+                profile_timings["post_forward_ms"] = 0.0
+            return latents
 
         if server_args.comfyui_mode:
             batch.noise_pred = noise_pred
@@ -1465,6 +1472,7 @@ class DenoisingStage(PipelineStage):
                             t_host=t_host,
                             timesteps_cpu=timesteps_cpu,
                             profile_timings=profile_timings,
+                            skip_scheduler_step=True,
                         )
             if torch.cuda.is_available():
                 torch.cuda.synchronize(get_local_torch_device())

@@ -1192,26 +1192,39 @@ class Scheduler(SchedulerDisaggMixin):
                 return tuple(shape_signature(item) for item in value)
             return ()
 
-        latents = getattr(req, "latents", None)
-        latent_shape = shape_signature(latents)
-        latent_dtype = str(getattr(latents, "dtype", "unknown"))
-        image_latent = getattr(req, "image_latent", None)
-        image_shape = shape_signature(image_latent)
-        prompt_embeds = getattr(req, "prompt_embeds", None)
-        prompt_shape = shape_signature(prompt_embeds)
-        neg_prompt_embeds = getattr(req, "negative_prompt_embeds", None)
-        neg_prompt_shape = shape_signature(neg_prompt_embeds)
+        extra = getattr(req, "extra", None)
+        if not isinstance(extra, dict):
+            extra = {}
+            try:
+                req.extra = extra
+            except Exception:
+                pass
+        static_signature = extra.get("ddit_activation_static_signature")
+        if static_signature is None:
+            latents = getattr(req, "latents", None)
+            image_latent = getattr(req, "image_latent", None)
+            prompt_embeds = getattr(req, "prompt_embeds", None)
+            neg_prompt_embeds = getattr(req, "negative_prompt_embeds", None)
+            static_signature = (
+                getattr(req, "height", None),
+                getattr(req, "width", None),
+                getattr(req, "num_frames", None),
+                getattr(req, "num_inference_steps", None),
+                shape_signature(getattr(req, "raw_latent_shape", None)),
+                shape_signature(latents),
+                shape_signature(image_latent),
+                shape_signature(prompt_embeds),
+                shape_signature(neg_prompt_embeds),
+                str(getattr(latents, "dtype", "unknown")),
+                bool(getattr(req, "do_classifier_free_guidance", False)),
+            )
+            extra["ddit_activation_static_signature"] = static_signature
         return (
             spec.ranks,
             spec.ulysses_degree,
             spec.ring_degree,
             resolve_resolution_key(req),
-            latent_shape,
-            image_shape,
-            prompt_shape,
-            neg_prompt_shape,
-            latent_dtype,
-            bool(getattr(req, "do_classifier_free_guidance", False)),
+            tuple(static_signature),
             str(getattr(self.server_args, "ddit_profile_model_id", None) or ""),
             str(getattr(self.server_args, "model_id", None) or ""),
             str(getattr(self.server_args, "ddit_sp_degree_map", None) or ""),

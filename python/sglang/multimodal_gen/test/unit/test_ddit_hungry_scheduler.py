@@ -598,6 +598,39 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         )
         self.assertEqual(len(activating_dynamic_sp), 4)
 
+    def test_scheduler_dynamic_sp_activation_key_uses_static_request_shape(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1,2=2x1,4=2x2,8=2x4",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = server_args
+        req = SimpleNamespace(
+            extra={},
+            height=720,
+            width=1280,
+            num_frames=1,
+            num_inference_steps=50,
+            raw_latent_shape=None,
+            latents=SimpleNamespace(shape=(1, 16, 1, 90, 160), dtype="bf16"),
+            image_latent=None,
+            prompt_embeds=SimpleNamespace(shape=(1, 128, 4096)),
+            negative_prompt_embeds=SimpleNamespace(shape=(1, 128, 4096)),
+            do_classifier_free_guidance=True,
+        )
+
+        first = scheduler._ddit_activation_key(req=req, target_ranks=(0, 1, 2, 3))
+        req.latents = SimpleNamespace(shape=(1, 16, 1, 40, 90), dtype="bf16")
+        second = scheduler._ddit_activation_key(req=req, target_ranks=(0, 1, 2, 3))
+        different_ranks = scheduler._ddit_activation_key(
+            req=req, target_ranks=tuple(range(8))
+        )
+
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, different_ranks)
+
     def test_disagg_ddit_register_prepared_returns_raw_outputs(self):
         scheduler = object.__new__(Scheduler)
         scheduler.server_args = SimpleNamespace(disagg_role="ddit_worker")
