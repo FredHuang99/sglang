@@ -250,6 +250,55 @@ def _make_head_args(
     return ServerArgs.from_kwargs(**kwargs)
 
 
+def _tcp_endpoint(host: str, port: int) -> str:
+    return f"tcp://{host}:{port}"
+
+
+def _resolve_launch_args(
+    args: argparse.Namespace, gpu_ids: list[int]
+) -> tuple[ServerArgs, ServerArgs, ServerArgs]:
+    provisional_head_endpoint = _tcp_endpoint(args.host, args.scheduler_port)
+    encoder_work_port = args.scheduler_port + 10
+    ddit_worker_work_port = args.scheduler_port + 20
+
+    encoder_args = _make_encoder_args(
+        args,
+        gpu_ids=gpu_ids,
+        head_endpoint=provisional_head_endpoint,
+        work_port=encoder_work_port,
+    )
+    ddit_worker_args = _make_ddit_worker_args(
+        args,
+        gpu_ids=gpu_ids,
+        head_endpoint=provisional_head_endpoint,
+        work_port=ddit_worker_work_port,
+    )
+    head_args = _make_head_args(
+        args,
+        encoder_work_endpoint=_tcp_endpoint(args.host, encoder_args.scheduler_port),
+        ddit_worker_work_endpoint=_tcp_endpoint(
+            args.host, ddit_worker_args.scheduler_port
+        ),
+    )
+
+    actual_head_endpoint = _tcp_endpoint(head_args.host, head_args.scheduler_port)
+    if actual_head_endpoint != provisional_head_endpoint:
+        encoder_args = _make_encoder_args(
+            args,
+            gpu_ids=gpu_ids,
+            head_endpoint=actual_head_endpoint,
+            work_port=encoder_args.scheduler_port,
+        )
+        ddit_worker_args = _make_ddit_worker_args(
+            args,
+            gpu_ids=gpu_ids,
+            head_endpoint=actual_head_endpoint,
+            work_port=ddit_worker_args.scheduler_port,
+        )
+
+    return encoder_args, ddit_worker_args, head_args
+
+
 def _terminate(processes: list[mp.Process], timeout_s: float = 5.0) -> None:
     for process in processes:
         if process.is_alive():
@@ -263,29 +312,7 @@ def _terminate(processes: list[mp.Process], timeout_s: float = 5.0) -> None:
 def main() -> None:
     args = build_parser().parse_args()
     gpu_ids = _parse_gpu_ids(args.gpu_ids, args.num_gpus)
-    head_endpoint = f"tcp://{args.host}:{args.scheduler_port}"
-    encoder_work_port = args.scheduler_port + 10
-    ddit_worker_work_port = args.scheduler_port + 20
-    encoder_work_endpoint = f"tcp://{args.host}:{encoder_work_port}"
-    ddit_worker_work_endpoint = f"tcp://{args.host}:{ddit_worker_work_port}"
-
-    encoder_args = _make_encoder_args(
-        args,
-        gpu_ids=gpu_ids,
-        head_endpoint=head_endpoint,
-        work_port=encoder_work_port,
-    )
-    ddit_worker_args = _make_ddit_worker_args(
-        args,
-        gpu_ids=gpu_ids,
-        head_endpoint=head_endpoint,
-        work_port=ddit_worker_work_port,
-    )
-    head_args = _make_head_args(
-        args,
-        encoder_work_endpoint=encoder_work_endpoint,
-        ddit_worker_work_endpoint=ddit_worker_work_endpoint,
-    )
+    encoder_args, ddit_worker_args, head_args = _resolve_launch_args(args, gpu_ids)
 
     ctx = mp.get_context("spawn")
     processes = [

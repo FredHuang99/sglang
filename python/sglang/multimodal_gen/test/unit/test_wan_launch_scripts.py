@@ -5,6 +5,7 @@ import importlib.util
 from unittest.mock import patch
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_script_module(script_name: str):
@@ -231,6 +232,50 @@ class TestWanLaunchScripts(unittest.TestCase):
         kwargs = self.ddit_disagg_module._common_kwargs(args)
 
         self.assertTrue(kwargs["ddit_prebuild_sp_groups"])
+
+    def test_ddit_disagg_launcher_rewrites_role_result_base_after_head_port_adjustment(
+        self,
+    ):
+        args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--host",
+                "127.0.0.1",
+                "--scheduler-port",
+                "5555",
+                "--num-gpus",
+                "2",
+            ]
+        )
+
+        def fake_from_kwargs(**kwargs):
+            role = kwargs.get("disagg_role")
+            if getattr(role, "value", role) == "server":
+                kwargs = dict(kwargs)
+                kwargs["scheduler_port"] = 7777
+            return SimpleNamespace(**kwargs)
+
+        with patch.object(
+            self.ddit_disagg_module.ServerArgs,
+            "from_kwargs",
+            side_effect=fake_from_kwargs,
+        ):
+            encoder_args, ddit_worker_args, head_args = (
+                self.ddit_disagg_module._resolve_launch_args(args, [0, 1])
+            )
+
+        self.assertEqual(head_args.scheduler_port, 7777)
+        self.assertEqual(encoder_args.disagg_server_addr, "tcp://127.0.0.1:7777")
+        self.assertEqual(ddit_worker_args.disagg_server_addr, "tcp://127.0.0.1:7777")
+        self.assertEqual(
+            head_args.encoder_urls,
+            f"tcp://127.0.0.1:{encoder_args.scheduler_port}",
+        )
+        self.assertEqual(
+            head_args.ddit_worker_urls,
+            f"tcp://127.0.0.1:{ddit_worker_args.scheduler_port}",
+        )
 
     def test_ddit_disagg_role_processes_are_not_daemonic(self):
         args = self.ddit_disagg_module.build_parser().parse_args(
