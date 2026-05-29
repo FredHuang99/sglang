@@ -575,6 +575,15 @@ class Scheduler(SchedulerDisaggMixin):
                 command["scalar_fields"],
                 command.get("tensors"),
             )
+            disagg_role = getattr(self.server_args, "disagg_role", "")
+            if (
+                disagg_role == RoleType.DDIT_WORKER
+                or str(disagg_role) == RoleType.DDIT_WORKER.value
+            ):
+                # The original frontend request owns output persistence.  The
+                # ddit_worker only returns decoded tensors to DiffusionServer.
+                req.save_output = False
+                req.return_file_paths_only = False
             result = self.worker.register_hungry_prepared_request(req)
             if self.gpu_id == 0:
                 result["req"] = req
@@ -1012,6 +1021,12 @@ class Scheduler(SchedulerDisaggMixin):
             scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
         if output_batch.error is not None:
             scalar_fields["error"] = output_batch.error
+        if output_batch.output_file_paths:
+            output_file_paths = [
+                str(path) for path in output_batch.output_file_paths if path
+            ]
+            if output_file_paths:
+                scalar_fields["output_file_paths"] = output_file_paths
         send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
 
     def _ddit_queue_dynamic_sp_ensure(

@@ -37,6 +37,7 @@ from sglang.multimodal_gen.runtime.ddit.scheduler import (
     build_hungry_scheduler_config,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 
 
 class TestDDiTHungryScheduler(unittest.TestCase):
@@ -296,6 +297,51 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual(op.payload["log_reason"], "dit_migrate")
         self.assertEqual(ensured_dynamic_sp, set())
         self.assertEqual(ensuring_dynamic_sp, {(0, 1)})
+
+    def test_disagg_ddit_register_prepared_returns_raw_outputs(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = SimpleNamespace(disagg_role="ddit_worker")
+        scheduler.gpu_id = 0
+        seen = {}
+
+        def register(req):
+            seen["save_output"] = req.save_output
+            seen["return_file_paths_only"] = req.return_file_paths_only
+            return {"request_id": req.request_id, "num_timesteps": 1}
+
+        scheduler.worker = SimpleNamespace(register_hungry_prepared_request=register)
+
+        result = scheduler._ddit_run_rank_command(
+            {
+                "action": "register_prepared",
+                "scalar_fields": {
+                    "request_id": "req",
+                    "save_output": True,
+                    "return_file_paths_only": True,
+                },
+                "tensors": {},
+            }
+        )
+
+        self.assertEqual(result["request_id"], "req")
+        self.assertFalse(seen["save_output"])
+        self.assertFalse(seen["return_file_paths_only"])
+
+    def test_ddit_result_forwarding_preserves_output_file_paths(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler._pool_result_push = object()
+        output_batch = OutputBatch(output_file_paths=["/tmp/out.png", None])
+
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.scheduler.send_tensors"
+        ) as send_tensors:
+            scheduler._ddit_send_output_to_disagg_server("req", output_batch)
+
+        send_tensors.assert_called_once()
+        _socket, tensor_fields, scalar_fields = send_tensors.call_args.args
+        self.assertEqual(tensor_fields, {})
+        self.assertEqual(scalar_fields["request_id"], "req")
+        self.assertEqual(scalar_fields["output_file_paths"], ["/tmp/out.png"])
 
     def test_forced_switch_waits_when_target_rank_is_busy(self):
         scheduler = ForcedSwitchScheduler(

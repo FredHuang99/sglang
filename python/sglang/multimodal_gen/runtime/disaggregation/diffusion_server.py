@@ -699,6 +699,7 @@ class DiffusionServer:
             audio=tensor_fields.get("audio"),
             audio_sample_rate=scalar_fields.get("audio_sample_rate"),
             error=scalar_fields.get("error"),
+            output_file_paths=scalar_fields.get("output_file_paths"),
         )
 
         try:
@@ -779,6 +780,7 @@ class DiffusionServer:
             audio=tensor_fields.get("audio"),
             audio_sample_rate=scalar_fields.get("audio_sample_rate"),
             error=scalar_fields.get("error"),
+            output_file_paths=scalar_fields.get("output_file_paths"),
         )
 
         try:
