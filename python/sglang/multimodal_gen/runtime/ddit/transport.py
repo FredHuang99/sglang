@@ -28,11 +28,14 @@ def _device() -> torch.device:
     return get_local_torch_device()
 
 
-def send_tensor_p2p(tensor: torch.Tensor, dst: int) -> None:
-    """Send a tensor to another rank without involving the world collective."""
-    if not dist.is_available() or not dist.is_initialized():
+def _run_p2p_ops(ops: list[dist.P2POp]) -> None:
+    if not ops:
         return
-    tensor = tensor.detach().contiguous().to(_device())
+    for work in dist.batch_isend_irecv(ops):
+        work.wait()
+
+
+def _tensor_meta(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.dtype not in _DTYPE_TO_CODE:
         raise TypeError(f"Unsupported DDiT P2P tensor dtype: {tensor.dtype}")
     shape = tuple(int(dim) for dim in tensor.shape)
@@ -45,16 +48,35 @@ def send_tensor_p2p(tensor: torch.Tensor, dst: int) -> None:
         meta[2 : 2 + len(shape)] = torch.tensor(
             shape, dtype=torch.int64, device=_device()
         )
-    dist.send(meta, dst=dst, group=get_world_group().device_group)
-    dist.send(tensor, dst=dst, group=get_world_group().device_group)
+    return meta
+
+
+def send_tensor_p2p_many(tensor: torch.Tensor, dsts: tuple[int, ...]) -> None:
+    """Send one tensor to multiple ranks with batched NCCL P2P ops."""
+    if not dist.is_available() or not dist.is_initialized():
+        return
+    dsts = tuple(int(dst) for dst in dsts)
+    if not dsts:
+        return
+    group = get_world_group().device_group
+    tensor = tensor.detach().contiguous().to(_device())
+    meta = _tensor_meta(tensor)
+    _run_p2p_ops([dist.P2POp(dist.isend, meta, dst, group) for dst in dsts])
+    _run_p2p_ops([dist.P2POp(dist.isend, tensor, dst, group) for dst in dsts])
+
+
+def send_tensor_p2p(tensor: torch.Tensor, dst: int) -> None:
+    """Send a tensor to another rank without involving the world collective."""
+    send_tensor_p2p_many(tensor, (dst,))
 
 
 def recv_tensor_p2p(src: int) -> torch.Tensor:
     """Receive a tensor sent by send_tensor_p2p."""
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("recv_tensor_p2p requires torch.distributed")
+    group = get_world_group().device_group
     meta = torch.empty(_MAX_TENSOR_DIMS + 2, dtype=torch.int64, device=_device())
-    dist.recv(meta, src=src, group=get_world_group().device_group)
+    _run_p2p_ops([dist.P2POp(dist.irecv, meta, src, group)])
     ndim = int(meta[0].item())
     dtype_code = int(meta[1].item())
     dtype = _CODE_TO_DTYPE.get(dtype_code)
@@ -62,5 +84,5 @@ def recv_tensor_p2p(src: int) -> torch.Tensor:
         raise TypeError(f"Unsupported DDiT P2P tensor dtype code: {dtype_code}")
     shape = tuple(int(dim.item()) for dim in meta[2 : 2 + ndim])
     tensor = torch.empty(shape, dtype=dtype, device=_device())
-    dist.recv(tensor, src=src, group=get_world_group().device_group)
+    _run_p2p_ops([dist.P2POp(dist.irecv, tensor, src, group)])
     return tensor

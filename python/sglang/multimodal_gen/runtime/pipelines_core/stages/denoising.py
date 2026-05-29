@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.ddit.logging import (
 from sglang.multimodal_gen.runtime.ddit.transport import (
     recv_tensor_p2p,
     send_tensor_p2p,
+    send_tensor_p2p_many,
 )
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
@@ -1120,6 +1121,13 @@ class DenoisingStage(PipelineStage):
         with use_dynamic_sp_group(self.server_args, active_ranks):
             if current_rank_in(active_ranks):
                 latents, _ = self._postprocess_sp_latents(batch, latents, None)
+                restore_layout = getattr(
+                    self.server_args.pipeline_config,
+                    "restore_latents_after_sp_gather",
+                    None,
+                )
+                if callable(restore_layout):
+                    latents = restore_layout(latents, batch)
                 batch.did_sp_shard_latents = False
 
         src_rank = active_ranks[0]
@@ -1140,6 +1148,13 @@ class DenoisingStage(PipelineStage):
         """Gather active SP shards without broadcasting outside active ranks."""
         with use_dynamic_sp_group(self.server_args, active_ranks):
             latents, _ = self._postprocess_sp_latents(batch, latents, None)
+            restore_layout = getattr(
+                self.server_args.pipeline_config,
+                "restore_latents_after_sp_gather",
+                None,
+            )
+            if callable(restore_layout):
+                latents = restore_layout(latents, batch)
             batch.did_sp_shard_latents = False
         batch.latents = latents.contiguous()
         batch.did_sp_shard_latents = False
@@ -1334,9 +1349,8 @@ class DenoisingStage(PipelineStage):
                 active_ranks=old_ranks,
             )
             if rank == old_leader:
-                for dst in new_ranks:
-                    if dst not in old_ranks:
-                        send_tensor_p2p(latents, dst=dst)
+                dsts = tuple(dst for dst in new_ranks if dst not in old_ranks)
+                send_tensor_p2p_many(latents, dsts)
 
         if rank in new_ranks and rank not in old_ranks:
             latents = recv_tensor_p2p(src=old_leader)

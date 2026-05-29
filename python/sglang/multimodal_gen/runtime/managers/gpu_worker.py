@@ -33,6 +33,7 @@ from sglang.multimodal_gen.runtime.ddit.dynamic_sp import prebuild_dynamic_sp_gr
 from sglang.multimodal_gen.runtime.ddit.transport import (
     recv_tensor_p2p,
     send_tensor_p2p,
+    send_tensor_p2p_many,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
@@ -421,9 +422,8 @@ class GPUWorker:
         src = final_dit_ranks[0]
         rank = get_world_group().rank
         if rank == src:
-            for dst in vae_ranks:
-                if dst not in final_dit_ranks:
-                    send_tensor_p2p(batch.latents, dst=dst)
+            dsts = tuple(dst for dst in vae_ranks if dst not in final_dit_ranks)
+            send_tensor_p2p_many(batch.latents, dsts)
         if rank in vae_ranks and rank not in final_dit_ranks:
             batch.latents = recv_tensor_p2p(src=src)
             batch.did_sp_shard_latents = False

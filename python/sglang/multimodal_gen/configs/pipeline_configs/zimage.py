@@ -203,13 +203,25 @@ class ZImagePipelineConfig(ImagePipelineConfig):
             return latents
         return sequence_model_parallel_all_gather(latents, dim=3)
 
-    def post_denoising_loop(self, latents, batch):
-        # Restore swapped H/W and crop padded spatial dims before final reshape.
+    def restore_latents_after_sp_gather(self, latents, batch):
         if latents.dim() == 5 and getattr(batch, "_zimage_sp_swap_hw", False):
             latents = latents.transpose(3, 4).contiguous()
+            batch._zimage_sp_swap_hw = False
         raw_latent_shape = getattr(batch, "raw_latent_shape", None)
         if raw_latent_shape is not None and latents.dim() == 5:
-            latents = latents[:, :, :, : raw_latent_shape[3], : raw_latent_shape[4]]
+            latents = latents[
+                :,
+                :,
+                : raw_latent_shape[2],
+                : raw_latent_shape[3],
+                : raw_latent_shape[4],
+            ]
+        return latents
+
+    def post_denoising_loop(self, latents, batch):
+        # Restore swapped H/W and crop padded spatial dims before final reshape.
+        latents = self.restore_latents_after_sp_gather(latents, batch)
+        raw_latent_shape = getattr(batch, "raw_latent_shape", None)
 
         bs, channels, num_frames, height, width = latents.shape
         if raw_latent_shape is not None and num_frames > raw_latent_shape[2]:
