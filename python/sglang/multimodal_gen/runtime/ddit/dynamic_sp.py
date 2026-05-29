@@ -579,8 +579,9 @@ def _new_group_optional_kwargs() -> dict[str, Any]:
     except (TypeError, ValueError):
         parameters = {}
     kwargs: dict[str, Any] = {}
-    if "use_local_synchronization" in parameters:
-        kwargs["use_local_synchronization"] = True
+    # Dynamic DDiT builds subset groups through a full-rank ordered ensure wave.
+    # Keep global synchronization semantics so non-member ranks participate in
+    # the same new_group ordering; local synchronization can deadlock here.
     if (
         "device_id" in parameters
         and current_platform.is_cuda_alike()

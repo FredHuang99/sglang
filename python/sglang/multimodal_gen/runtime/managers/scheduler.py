@@ -1127,6 +1127,33 @@ class Scheduler(SchedulerDisaggMixin):
             reason,
         )
 
+    def _ddit_queue_request_plan_dynamic_sp_ensures(
+        self,
+        *,
+        state: DDiTRequestState,
+        pending_dynamic_sp: deque[DDiTOp],
+        ensured_dynamic_sp: set[tuple[int, ...]],
+        ensuring_dynamic_sp: set[tuple[int, ...]],
+        full_ranks: tuple[int, ...],
+    ) -> None:
+        plan_ranks: list[tuple[int, ...]] = []
+        if state.initial_ranks:
+            plan_ranks.append(tuple(state.initial_ranks))
+        plan_ranks.extend(tuple(event.ranks) for event in state.switch_plan)
+        if not plan_ranks:
+            return
+
+        for ranks in sorted(set(plan_ranks), key=lambda value: (len(value), value)):
+            self._ddit_queue_dynamic_sp_ensure(
+                pending_dynamic_sp=pending_dynamic_sp,
+                ensured_dynamic_sp=ensured_dynamic_sp,
+                ensuring_dynamic_sp=ensuring_dynamic_sp,
+                full_ranks=full_ranks,
+                target_ranks=ranks,
+                request_id=state.request_id,
+                reason="request_plan",
+            )
+
     def _ddit_enqueue_schedule_decisions(
         self,
         *,
@@ -1705,6 +1732,13 @@ class Scheduler(SchedulerDisaggMixin):
                             state=state,
                             schedule_policy=schedule_policy,
                         )
+                        self._ddit_queue_request_plan_dynamic_sp_ensures(
+                            state=state,
+                            pending_dynamic_sp=pending_dynamic_sp,
+                            ensured_dynamic_sp=ensured_dynamic_sp,
+                            ensuring_dynamic_sp=ensuring_dynamic_sp,
+                            full_ranks=full_ranks,
+                        )
                         prepared_since_compute = True
                     elif action == "register_prepared":
                         registering.discard(request_id)
@@ -1726,6 +1760,13 @@ class Scheduler(SchedulerDisaggMixin):
                             req=req,
                             state=state,
                             schedule_policy=schedule_policy,
+                        )
+                        self._ddit_queue_request_plan_dynamic_sp_ensures(
+                            state=state,
+                            pending_dynamic_sp=pending_dynamic_sp,
+                            ensured_dynamic_sp=ensured_dynamic_sp,
+                            ensuring_dynamic_sp=ensuring_dynamic_sp,
+                            full_ranks=full_ranks,
                         )
                     elif action == "ensure_dynamic_sp":
                         target_ranks = tuple(

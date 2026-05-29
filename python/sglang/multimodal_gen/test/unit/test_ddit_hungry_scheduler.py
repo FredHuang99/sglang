@@ -469,6 +469,55 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual(ensured_dynamic_sp, set())
         self.assertEqual(ensuring_dynamic_sp, {(0, 1)})
 
+    def test_scheduler_queues_request_switch_plan_dynamic_sp_ensures(self):
+        server_args = SimpleNamespace(
+            ddit_sp_degree_map="1=1x1,2=2x1,4=2x2,8=2x4",
+            ddit_profile_model_id="z-image",
+            model_id="z-image",
+            model_path="z-image",
+        )
+        registry = get_dynamic_sp_registry(server_args)
+        initial_spec = registry.resolve_spec((0,))
+        registry._cache[initial_spec] = object()
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = server_args
+        state = DDiTRequestState(
+            "req",
+            resolution="720p",
+            total_steps=50,
+            initial_ranks=(0,),
+            switch_plan=(
+                DDiTSwitchEvent(after_step=15, ranks=(0, 1)),
+                DDiTSwitchEvent(after_step=30, ranks=(0, 1, 2, 3)),
+                DDiTSwitchEvent(after_step=45, ranks=tuple(range(8))),
+            ),
+        )
+
+        pending_dynamic_sp = deque()
+        ensured_dynamic_sp = set()
+        ensuring_dynamic_sp = set()
+        scheduler._ddit_queue_request_plan_dynamic_sp_ensures(
+            state=state,
+            pending_dynamic_sp=pending_dynamic_sp,
+            ensured_dynamic_sp=ensured_dynamic_sp,
+            ensuring_dynamic_sp=ensuring_dynamic_sp,
+            full_ranks=tuple(range(8)),
+        )
+
+        self.assertEqual(ensured_dynamic_sp, {(0,)})
+        self.assertEqual(
+            [op.payload["target_ranks"] for op in pending_dynamic_sp],
+            [(0, 1), (0, 1, 2, 3), tuple(range(8))],
+        )
+        self.assertTrue(all(op.ranks == tuple(range(8)) for op in pending_dynamic_sp))
+        self.assertTrue(
+            all(op.payload["log_reason"] == "request_plan" for op in pending_dynamic_sp)
+        )
+        self.assertEqual(
+            ensuring_dynamic_sp,
+            {(0, 1), (0, 1, 2, 3), tuple(range(8))},
+        )
+
     def test_disagg_ddit_register_prepared_returns_raw_outputs(self):
         scheduler = object.__new__(Scheduler)
         scheduler.server_args = SimpleNamespace(disagg_role="ddit_worker")
