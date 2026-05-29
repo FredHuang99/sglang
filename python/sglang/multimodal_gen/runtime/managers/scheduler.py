@@ -594,10 +594,12 @@ class Scheduler(SchedulerDisaggMixin):
             if self.gpu_id == 0:
                 logger.info(
                     "DDiT worker: ensured dynamic SP group for ranks=%s "
-                    "(cache_hit=%s, created=%s, degree_pair=%sx%s, reason=%s)",
+                    "(cache_hit=%s, created=%s, warmup_ms=%.2f, "
+                    "degree_pair=%sx%s, reason=%s)",
                     result.spec.ranks,
                     not result.created,
                     result.created,
+                    result.warmup_ms,
                     result.spec.ulysses_degree,
                     result.spec.ring_degree,
                     command.get("log_reason", ""),
@@ -605,6 +607,7 @@ class Scheduler(SchedulerDisaggMixin):
             return {
                 "target_ranks": result.spec.ranks,
                 "created": result.created,
+                "warmup_ms": result.warmup_ms,
                 "ulysses_degree": result.spec.ulysses_degree,
                 "ring_degree": result.spec.ring_degree,
             }

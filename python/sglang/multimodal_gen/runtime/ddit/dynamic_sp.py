@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import math
+import time
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -35,6 +36,7 @@ class DynamicSPEnsureResult:
     spec: DynamicSPGroupSpec
     group: SequenceParallelGroupCoordinator | None
     created: bool
+    warmup_ms: float = 0.0
 
 
 def _rank_groups_covering_world(active_ranks: tuple[int, ...]) -> list[list[int]]:
@@ -103,8 +105,11 @@ class DynamicSPGroupRegistry:
         if group is not None:
             return DynamicSPEnsureResult(spec=spec, group=group, created=False)
         group = self._build(spec)
+        warmup_ms = self._warmup_group(spec, group)
         self._cache[spec] = group
-        return DynamicSPEnsureResult(spec=spec, group=group, created=True)
+        return DynamicSPEnsureResult(
+            spec=spec, group=group, created=True, warmup_ms=warmup_ms
+        )
 
     def _build(self, spec: DynamicSPGroupSpec) -> SequenceParallelGroupCoordinator:
         backend = current_platform.get_torch_distributed_backend_str()
@@ -145,6 +150,69 @@ class DynamicSPGroupRegistry:
             ulysses_group=ulysses_pg,
             ring_group=ring_pg,
         )
+
+    def _warmup_group(
+        self,
+        spec: DynamicSPGroupSpec,
+        group: SequenceParallelGroupCoordinator,
+    ) -> float:
+        """Eagerly initialize communicators used by the first dynamic-SP step."""
+        if not dist.is_available() or not dist.is_initialized():
+            return 0.0
+        wall_start = time.perf_counter()
+        device = group.device
+        try:
+            if group.ulysses_world_size > 1:
+                token = torch.empty(
+                    group.ulysses_world_size,
+                    dtype=torch.float32,
+                    device=device,
+                )
+                output = torch.empty_like(token)
+                dist.all_to_all_single(output, token, group=group.ulysses_group)
+
+            if group.ring_world_size > 1:
+                token = torch.ones(1, dtype=torch.float32, device=device)
+                dist.all_reduce(token, group=group.ring_group)
+                self._warmup_ring_p2p(group, token)
+
+            if group.world_size > 1:
+                token = torch.ones(1, dtype=torch.float32, device=device)
+                dist.all_reduce(token, group=group.device_group)
+        except Exception:
+            logger.warning(
+                "DDiT dynamic SP warmup failed for ranks=%s degree_pair=%sx%s",
+                spec.ranks,
+                spec.ulysses_degree,
+                spec.ring_degree,
+                exc_info=True,
+            )
+            raise
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device)
+        return (time.perf_counter() - wall_start) * 1000.0
+
+    def _warmup_ring_p2p(
+        self,
+        group: SequenceParallelGroupCoordinator,
+        token: torch.Tensor,
+    ) -> None:
+        ring_world_size = group.ring_world_size
+        if ring_world_size <= 1:
+            return
+        ring_rank = group.ring_rank
+        ring_ranks = dist.get_process_group_ranks(group.ring_group)
+        next_rank = ring_ranks[(ring_rank + 1) % ring_world_size]
+        prev_rank = ring_ranks[(ring_rank - 1) % ring_world_size]
+        recv = torch.empty_like(token)
+        ops = [
+            dist.P2POp(dist.irecv, recv, prev_rank, group.ring_group),
+            dist.P2POp(dist.isend, token, next_rank, group.ring_group),
+        ]
+        reqs = dist.batch_isend_irecv(ops)
+        for req in reqs:
+            req.wait()
 
     def get(self, ranks: tuple[int, ...]) -> SequenceParallelGroupCoordinator | None:
         return self.ensure(ranks).group

@@ -225,16 +225,21 @@ class TestDDiTHungryScheduler(unittest.TestCase):
             return_value=True,
         ), patch.object(
             registry, "_build", return_value=built_group
-        ) as build:
+        ) as build, patch.object(
+            registry, "_warmup_group", return_value=12.5
+        ) as warmup:
             first = registry.ensure((1, 0))
             second = registry.ensure((0, 1))
 
         self.assertTrue(first.created)
         self.assertIs(first.group, built_group)
+        self.assertEqual(first.warmup_ms, 12.5)
         self.assertTrue(registry.has((0, 1)))
         self.assertFalse(second.created)
         self.assertIs(second.group, built_group)
+        self.assertEqual(second.warmup_ms, 0.0)
         build.assert_called_once_with(spec)
+        warmup.assert_called_once_with(spec, built_group)
 
     def test_scheduler_skips_dynamic_sp_ensure_wave_on_cache_hit(self):
         server_args = SimpleNamespace(
