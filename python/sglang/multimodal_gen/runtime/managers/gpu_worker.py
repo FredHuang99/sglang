@@ -118,6 +118,18 @@ class GPUWorker:
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(self.rank)
         os.environ["WORLD_SIZE"] = str(self.server_args.num_gpus)
+        role = getattr(self.server_args, "disagg_role", "scheduler")
+        role_name = getattr(role, "value", role)
+        logger.info(
+            "Worker %s role=%s: starting distributed init on local_rank=%s, "
+            "world_size=%s, master=%s:%s",
+            self.rank,
+            role_name,
+            self.local_rank,
+            self.server_args.num_gpus,
+            master_addr,
+            self.master_port,
+        )
         # initialize the distributed environment
         maybe_init_distributed_environment_and_model_parallel(
             tp_size=self.server_args.tp_size,
@@ -129,11 +141,19 @@ class GPUWorker:
             distributed_init_method=NetworkAddress(master_addr, self.master_port).to_tcp(),
             dist_timeout=self.server_args.dist_timeout,
         )
+        logger.info(
+            "Worker %s role=%s: distributed init done; checking dynamic SP prebuild",
+            self.rank,
+            role_name,
+        )
         prebuild_dynamic_sp_groups(self.server_args)
+        logger.info(
+            "Worker %s role=%s: dynamic SP prebuild check done; building pipeline",
+            self.rank,
+            role_name,
+        )
 
         # set proc title
-        role = getattr(self.server_args, "disagg_role", "scheduler")
-        role_name = getattr(role, "value", role)
         title_prefix = f"sgl_diffusion::{role_name}_scheduler"
         if model_parallel_is_initialized():
             suffix = ""
@@ -154,6 +174,7 @@ class GPUWorker:
             setproctitle(f"{title_prefix}_{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
+        logger.info("Worker %s role=%s: pipeline build done", self.rank, role_name)
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting

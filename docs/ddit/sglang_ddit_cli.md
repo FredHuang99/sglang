@@ -453,7 +453,7 @@ Op trace JSONL：`<LOG_DIR>\ddit_op_trace.jsonl`
 | `--ddit-local-ranks` | 当前节点可用于 DiT/VAE 的 rank 列表；不传时使用当前 instance 的所有 local ranks。 |
 | `--ddit-node-id` | 当前节点 id，写入 rank switch 日志；单机默认 `node0`。 |
 | `--ddit-sp-degree-map` | 为不同 GPU 数配置 Ulysses/Ring degree，例如 `1=1x1,2=2x1,4=2x2,8=4x2`；也可设为 `shortpath`，对 `wan2.1-t2v-1.3b` 使用 `1x1/2x1/4x1/2x4`，对 `z-image` 使用 `1x1/2x1/2x2/2x4`。 |
-| `--ddit-prebuild-sp-groups` | 是否启动时预建 dynamic SP process groups。 |
+| `--ddit-prebuild-sp-groups` | 是否启动时预建 dynamic SP process groups；launcher 中 `forced_switch` 默认 `false`，E2E 策略默认 `true`，encoder/server role 总是跳过。 |
 | `--ddit-debug-cpu-backup` | debug 开关；开启后额外保留 CPU 侧状态备份，用于排查 latent/state 迁移。 |
 | `--disagg-role ddit_worker` | 启动 two-instance DDiT 的 DiT+VAE worker role；该 role 不加载 text/image encoder。 |
 | `--ddit-worker-urls` | DiffusionServer/head 连接 DDiT worker pool 的 work endpoint 列表。 |
@@ -468,6 +468,7 @@ Op trace JSONL：`<LOG_DIR>\ddit_op_trace.jsonl`
 | `scripts\launch_ddit_disagg_wan_t2v.py --ddit-worker-ulysses` | ddit_worker full Ulysses degree；不传时等于 worker SP degree。 |
 | `scripts\launch_ddit_disagg_wan_t2v.py --ddit-worker-ring` | ddit_worker full Ring degree；默认 `1`。 |
 | `scripts\launch_ddit_disagg_wan_t2v.py --ddit-sp-degree-map` | 透传到 DDiT dynamic SP resolver；Wan/Z-image 实验推荐 `shortpath`。 |
+| `scripts\launch_ddit_disagg_wan_t2v.py --ddit-prebuild-sp-groups` | 是否在 ddit_worker/monolithic compute role 启动时预建 dynamic SP process groups；launcher 中 `forced_switch` 默认 `false`，E2E 策略默认 `true`。encoder/server role 会自动跳过该 prebuild。 |
 | `scripts\launch_ddit_disagg_wan_t2v.py --disagg-max-slots-per-instance` | 每个 encoder/ddit_worker instance 的 prepared payload admission slots；forced/fixed/naive/greedy/hungry 推荐 `1`，WSJF/Scale-Up 推荐等于 window size。 |
 | `scripts\launch_ddit_disagg_wan_t2v.py --disagg-transfer-backend` | encoder 到 ddit_worker 的 transfer backend，默认 `auto`。 |
 | `scripts\launch_ddit_disagg_wan_t2v.py --disagg-transfer-pool-size` | transfer data buffer configured lower bound，单位 bytes；模板用 `536870912`。 |

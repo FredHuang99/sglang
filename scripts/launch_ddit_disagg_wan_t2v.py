@@ -27,6 +27,15 @@ DDIT_POLICIES = (
 )
 
 
+def _parse_bool(value: str) -> bool:
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean value, got {value!r}.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-path", required=True)
@@ -52,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ddit-profile-path", default=None)
     parser.add_argument("--ddit-profile-model-id", default=None)
     parser.add_argument("--ddit-sp-degree-map", default=None)
+    parser.add_argument(
+        "--ddit-prebuild-sp-groups",
+        type=_parse_bool,
+        default=None,
+        help=(
+            "Whether to prebuild DDiT dynamic SP groups. Defaults to false for "
+            "forced_switch correctness and true for E2E scheduling policies."
+        ),
+    )
     parser.add_argument("--ddit-allowed-gpu-counts", default="1,2,4,8")
     parser.add_argument("--ddit-log-dir", default=None)
     parser.add_argument("--disagg-transfer-backend", default="auto")
@@ -122,6 +140,12 @@ def _resolve_disagg_max_slots(args: argparse.Namespace) -> int:
     return 1
 
 
+def _resolve_ddit_prebuild_sp_groups(args: argparse.Namespace) -> bool:
+    if args.ddit_prebuild_sp_groups is not None:
+        return bool(args.ddit_prebuild_sp_groups)
+    return args.ddit_schedule_policy != "forced_switch"
+
+
 def _common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
     max_slots = _resolve_disagg_max_slots(args)
     kwargs: dict[str, Any] = {
@@ -144,6 +168,7 @@ def _common_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         "ddit_baseline_gpus": args.ddit_baseline_gpus,
         "ddit_window_size": args.ddit_window_size,
         "ddit_allowed_gpu_counts": args.ddit_allowed_gpu_counts,
+        "ddit_prebuild_sp_groups": _resolve_ddit_prebuild_sp_groups(args),
         "ddit_log_dir": args.ddit_log_dir,
         "ddit_profile_path": args.ddit_profile_path,
         "ddit_profile_model_id": args.ddit_profile_model_id or args.model_id,

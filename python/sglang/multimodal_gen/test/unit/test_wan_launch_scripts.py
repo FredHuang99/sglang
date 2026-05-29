@@ -188,6 +188,50 @@ class TestWanLaunchScripts(unittest.TestCase):
 
         self.assertEqual(kwargs["ddit_sp_degree_map"], "shortpath")
 
+    def test_ddit_disagg_launcher_defaults_prebuild_by_policy(self):
+        forced_args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "forced_switch",
+            ]
+        )
+        hungry_args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "hungry_first",
+            ]
+        )
+
+        self.assertFalse(
+            self.ddit_disagg_module._common_kwargs(forced_args)[
+                "ddit_prebuild_sp_groups"
+            ]
+        )
+        self.assertTrue(
+            self.ddit_disagg_module._common_kwargs(hungry_args)[
+                "ddit_prebuild_sp_groups"
+            ]
+        )
+
+    def test_ddit_disagg_launcher_accepts_explicit_prebuild_override(self):
+        args = self.ddit_disagg_module.build_parser().parse_args(
+            [
+                "--model-path",
+                "wan",
+                "--ddit-schedule-policy",
+                "forced_switch",
+                "--ddit-prebuild-sp-groups",
+                "true",
+            ]
+        )
+        kwargs = self.ddit_disagg_module._common_kwargs(args)
+
+        self.assertTrue(kwargs["ddit_prebuild_sp_groups"])
+
     def test_ddit_disagg_role_processes_are_not_daemonic(self):
         args = self.ddit_disagg_module.build_parser().parse_args(
             ["--model-path", "wan"]

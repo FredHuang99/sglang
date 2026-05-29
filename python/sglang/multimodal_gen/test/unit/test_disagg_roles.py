@@ -2,7 +2,11 @@
 """Unit tests for disaggregation role-based module filtering."""
 
 import unittest
+from types import SimpleNamespace
 
+from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
+    should_prebuild_dynamic_sp_groups,
+)
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
@@ -135,6 +139,36 @@ class TestFilterModulesLTX2(unittest.TestCase):
             extra_allowed_modules={"vae", "audio_vae"},
         )
         self.assertEqual(result, ["transformer", "scheduler", "vae", "audio_vae"])
+
+
+class TestDDiTDynamicSPPrebuildAdmission(unittest.TestCase):
+    def _args(self, role: RoleType, *, enable_ddit: bool = True):
+        return SimpleNamespace(
+            enable_ddit=enable_ddit,
+            ddit_prebuild_sp_groups=True,
+            disagg_role=role,
+        )
+
+    def test_encoder_and_server_skip_dynamic_sp_prebuild(self):
+        self.assertFalse(
+            should_prebuild_dynamic_sp_groups(self._args(RoleType.ENCODER))
+        )
+        self.assertFalse(should_prebuild_dynamic_sp_groups(self._args(RoleType.SERVER)))
+
+    def test_compute_roles_keep_dynamic_sp_prebuild(self):
+        self.assertTrue(
+            should_prebuild_dynamic_sp_groups(self._args(RoleType.DDIT_WORKER))
+        )
+        self.assertTrue(
+            should_prebuild_dynamic_sp_groups(self._args(RoleType.MONOLITHIC))
+        )
+
+    def test_disabled_ddit_skips_dynamic_sp_prebuild(self):
+        self.assertFalse(
+            should_prebuild_dynamic_sp_groups(
+                self._args(RoleType.DDIT_WORKER, enable_ddit=False)
+            )
+        )
 
 
 if __name__ == "__main__":

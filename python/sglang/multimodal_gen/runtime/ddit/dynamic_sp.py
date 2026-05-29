@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import math
 from dataclasses import dataclass
 from typing import Any, Iterator
 
@@ -15,8 +16,11 @@ from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_world_group
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from .config import parse_allowed_gpu_counts, parse_local_ranks, resolve_ddit_sp_degrees
+
+logger = init_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -126,16 +130,54 @@ class DynamicSPGroupRegistry:
         if not dist.is_available() or not dist.is_initialized():
             return
         world_size = dist.get_world_size()
+        rank = dist.get_rank()
         local_ranks = parse_local_ranks(
             getattr(self.server_args, "ddit_local_ranks", None), world_size
         )
         counts = parse_allowed_gpu_counts(
             getattr(self.server_args, "ddit_allowed_gpu_counts", None), len(local_ranks)
         )
+        total_groups = sum(math.comb(len(local_ranks), count) for count in counts)
+        built_groups = 0
+        if rank == 0:
+            logger.info(
+                "DDiT dynamic SP prebuild start: role=%s, world_size=%s, "
+                "local_ranks=%s, counts=%s, total_rank_tuples=%s, degree_map=%s",
+                _ddit_role_value(self.server_args),
+                world_size,
+                local_ranks,
+                counts,
+                total_groups,
+                getattr(self.server_args, "ddit_sp_degree_map", None),
+            )
         for count in counts:
+            if rank == 0:
+                logger.info(
+                    "DDiT dynamic SP prebuild count=%s start: combinations=%s",
+                    count,
+                    math.comb(len(local_ranks), count),
+                )
             for ranks in itertools.combinations(local_ranks, count):
+                built_groups += 1
+                if rank == 0 and (
+                    built_groups == 1
+                    or built_groups == total_groups
+                    or built_groups % 10 == 0
+                ):
+                    logger.info(
+                        "DDiT dynamic SP prebuild progress: %s/%s latest_ranks=%s",
+                        built_groups,
+                        total_groups,
+                        ranks,
+                    )
                 self.get(tuple(ranks))
+            if rank == 0:
+                logger.info("DDiT dynamic SP prebuild count=%s done", count)
+        if rank == 0:
+            logger.info("DDiT dynamic SP prebuild entering final barrier")
         dist.barrier()
+        if rank == 0:
+            logger.info("DDiT dynamic SP prebuild done")
 
     @contextlib.contextmanager
     def use(self, ranks: tuple[int, ...]) -> Iterator[None]:
@@ -181,10 +223,32 @@ def use_dynamic_sp_group(server_args: Any, ranks: tuple[int, ...]) -> Iterator[N
 
 
 def prebuild_dynamic_sp_groups(server_args: Any) -> None:
-    if getattr(server_args, "enable_ddit", False) and getattr(
-        server_args, "ddit_prebuild_sp_groups", True
-    ):
+    if should_prebuild_dynamic_sp_groups(server_args):
         get_dynamic_sp_registry(server_args).prebuild()
+
+
+def _ddit_role_value(server_args: Any) -> str:
+    role = getattr(server_args, "disagg_role", None)
+    if role is None:
+        return "monolithic"
+    return getattr(role, "value", str(role)).lower()
+
+
+def should_prebuild_dynamic_sp_groups(server_args: Any) -> bool:
+    if not getattr(server_args, "enable_ddit", False):
+        return False
+    if not getattr(server_args, "ddit_prebuild_sp_groups", True):
+        return False
+
+    role_value = _ddit_role_value(server_args)
+    if role_value in {"encoder", "server"}:
+        logger.info(
+            "Skipping DDiT dynamic SP prebuild for role=%s; dynamic SP is only "
+            "needed by DiT/VAE compute roles.",
+            role_value,
+        )
+        return False
+    return True
 
 
 def current_rank_in(ranks: tuple[int, ...]) -> bool:

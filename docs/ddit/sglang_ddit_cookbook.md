@@ -123,6 +123,8 @@ Scheduler 看到的是 completed step count，因此可以在 step boundary 做 
 
 `--ddit-sp-degree-map shortpath` 是当前 DDiT 实验推荐的 degree solver。它不改变 prebuild 的外层逻辑：`prebuild_dynamic_sp_groups` 仍然枚举 allowed rank tuples 并调用 registry；registry 在解析 degree 时发现 `shortpath`，就按 model id 和 rank count 查内置表。`wan2.1-t2v-1.3b` 使用 `1->1x1, 2->2x1, 4->4x1, 8->2x4`；`z-image` 使用 `1->1x1, 2->2x1, 4->2x2, 8->2x4`。这个规则只在 DDiT dynamic SP group 中生效，用来避免某些 rank count 下 Ulysses degree 与模型 attention heads 不兼容；text encoder full-rank TP、普通 SP 和非 DDiT disagg path 都不会走它。
 
+two-instance 模式下，encoder/server role 不需要 DiT/VAE dynamic SP，因此会跳过 `prebuild_dynamic_sp_groups`。只有 ddit_worker 或 monolithic compute role 会预建 dynamic SP groups。启动日志会打印 distributed init、prebuild start/progress/final barrier 和 pipeline build 边界；如果启动停住，可以直接看最后一条日志判断卡在 distributed init、某个 rank tuple 的 prebuild，还是 pipeline/model loading。`scripts/launch_ddit_disagg_wan_t2v.py` 对 `forced_switch` 默认关闭 prebuild，因为 forced correctness 是单请求、按需建组更适合排错；E2E 策略默认保持 prebuild 打开，避免运行中并发 wave 首次建组。
+
 正确性约束：
 
 - rank tuple 必须来自同一节点 local ranks。
