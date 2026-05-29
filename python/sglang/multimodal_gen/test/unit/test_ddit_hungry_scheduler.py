@@ -27,7 +27,7 @@ from sglang.multimodal_gen.runtime.ddit.dynamic_sp import (
     get_dynamic_sp_registry,
 )
 from sglang.multimodal_gen.runtime.ddit.logging import LifecycleCsvLogger
-from sglang.multimodal_gen.runtime.ddit.profile import ProfileStore
+from sglang.multimodal_gen.runtime.ddit.profile import DDiTProfile, ProfileStore
 from sglang.multimodal_gen.runtime.ddit.scheduler import (
     DDiTRequestState,
     DDiTSchedulerConfig,
@@ -44,6 +44,9 @@ from sglang.multimodal_gen.runtime.ddit.scheduler import (
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingStage,
+)
 
 
 class TestDDiTHungryScheduler(unittest.TestCase):
@@ -500,6 +503,80 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual([row["request_id"] for row in lifecycle_rows], ["req"])
         self.assertEqual(summary_rows[0], {"metric": "p50", "value": "2.500000"})
 
+    def test_lifecycle_logger_writes_mixed_resolution_slo_attainment(self):
+        profile = DDiTProfile.from_payload(
+            "z-image",
+            {
+                "dit_step_times": {
+                    "720p": {"8": 1.0},
+                    "2k": {"8": 2.0},
+                },
+                "vae_times": {
+                    "720p": {"8": 3.0},
+                    "2k": {"8": 5.0},
+                },
+                "text_encoder_times": {
+                    "720p": 2.0,
+                    "2k": 4.0,
+                },
+                "dit_step_num": 10,
+            },
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lifecycle_path = os.path.join(tmpdir, "ddit_lifecycle.csv")
+            summary_path = os.path.join(tmpdir, "ddit_lifecycle_summary.csv")
+            logger = LifecycleCsvLogger(lifecycle_path, summary_path, profile=profile)
+
+            for request_id, resolution, end_time in (
+                ("req_720_fast", "720p", 100.0),
+                ("req_720_slow", "720p", 70.0),
+                ("req_2k", "2k", 250.0),
+                ("req_unknown", "unknown", 1.0),
+            ):
+                logger.record(
+                    request_id=request_id,
+                    resolution=resolution,
+                    event="add",
+                    timestamp=0.0,
+                )
+                logger.record(
+                    request_id=request_id,
+                    resolution=resolution,
+                    event="vae_end",
+                    timestamp=end_time,
+                )
+
+            with open(summary_path, newline="", encoding="utf-8") as f:
+                summary = {
+                    row["metric"]: row["value"] for row in csv.DictReader(f)
+                }
+
+        self.assertEqual(summary["slo10"], "1.000000")
+        self.assertEqual(summary["slo5"], "0.333333")
+
+    def test_profile_store_loads_slo_fields_from_normalized_model_id(self):
+        payload = {
+            "models": {
+                "z-image": {
+                    "opt_gpus_num": {"720p": 2},
+                    "dit_step_times": {"720p": {"8": 0.25}},
+                    "vae_times": {"720p": {"8": 0.5}},
+                    "text_encoder_times": {"720p": 0.75},
+                    "dit_step_num": 4,
+                },
+                "other": {
+                    "dit_step_times": {"720p": {"8": 999.0}},
+                    "vae_times": {"720p": {"8": 999.0}},
+                    "text_encoder_times": {"720p": 999.0},
+                    "dit_step_num": 1,
+                },
+            }
+        }
+        profile = ProfileStore._from_file_payload("Z-Image", payload)
+
+        self.assertEqual(profile.model_id, "z-image")
+        self.assertEqual(profile.unit_slo("720p", gpu_count=8), 2.25)
+
     def test_dynamic_sp_forced_switch_plan_without_plan_stays_bounded(self):
         server_args = SimpleNamespace(
             ddit_local_ranks="0,1,2,3,4,5,6,7",
@@ -822,6 +899,104 @@ class TestDDiTHungryScheduler(unittest.TestCase):
         self.assertEqual(first, same_count_different_ranks)
         self.assertNotEqual(first, different_ranks)
         self.assertEqual(warmup_key, real_key)
+
+    def test_ddit_scheduler_cursor_restores_stale_step_index(self):
+        class FakeScheduler:
+            def __init__(self):
+                self._begin_index = 50
+                self._step_index = 50
+                self.begin_calls = []
+
+            def set_begin_index(self, begin_index=0):
+                self.begin_calls.append(begin_index)
+                self._begin_index = begin_index
+
+        stage = object.__new__(DenoisingStage)
+        stage.scheduler = FakeScheduler()
+
+        stage._set_ddit_scheduler_cursor(34)
+
+        self.assertEqual(stage.scheduler._begin_index, 34)
+        self.assertEqual(stage.scheduler._step_index, 34)
+        self.assertEqual(stage.scheduler.begin_calls, [34])
+
+    def test_concurrent_wave_failure_releases_request_state(self):
+        scheduler = object.__new__(Scheduler)
+        scheduler.gpu_id = 0
+        scheduler.server_args = SimpleNamespace()
+        sent_errors = []
+        scheduler._ddit_send_output_to_disagg_server = (
+            lambda request_id, output: sent_errors.append(
+                (request_id, output.error)
+            )
+        )
+
+        policy = HungryFirstScheduler(
+            DDiTSchedulerConfig(local_ranks=(0, 1), allowed_gpu_counts=(1, 2))
+        )
+        policy.requests["req"] = DDiTRequestState(
+            "req",
+            resolution="720p",
+            total_steps=50,
+            phase=RequestPhase.DIT,
+            ranks=(0,),
+        )
+        policy.gpu_owner[0] = "req"
+
+        running_order = deque(["req", "other"])
+        pending_migrate = deque(
+            [
+                DDiTOp(
+                    action="dit_migrate",
+                    request_id="req",
+                    ranks=(0, 1),
+                    stage="dit",
+                    step=3,
+                ),
+                DDiTOp(
+                    action="dit_step",
+                    request_id="other",
+                    ranks=(1,),
+                    stage="dit",
+                    step=0,
+                ),
+            ]
+        )
+        tracking = {"req"}
+        wave = CommandWaveBuilder(wave_id=9, world_size=2)
+        self.assertTrue(
+            wave.add(
+                DDiTOp(
+                    action="dit_step",
+                    request_id="req",
+                    ranks=(0,),
+                    stage="dit",
+                    step=7,
+                )
+            )
+        )
+
+        scheduler._ddit_fail_concurrent_wave_requests(
+            wave=wave.build(),
+            error="boom",
+            policy=policy,
+            running_order=running_order,
+            pending_queues=[pending_migrate],
+            tracking_sets=[tracking],
+            ensuring_dynamic_sp=set(),
+            activating_dynamic_sp=set(),
+            identities={},
+            req_by_id={},
+            disagg_prepared=True,
+        )
+
+        self.assertEqual(policy.requests["req"].phase, RequestPhase.DONE)
+        self.assertEqual(policy.requests["req"].ranks, ())
+        self.assertIsNone(policy.gpu_owner[0])
+        self.assertEqual(list(running_order), ["other"])
+        self.assertEqual([op.request_id for op in pending_migrate], ["other"])
+        self.assertEqual(tracking, set())
+        self.assertEqual(sent_errors, [("req", "boom")])
 
     def test_disagg_ddit_register_prepared_returns_raw_outputs(self):
         scheduler = object.__new__(Scheduler)

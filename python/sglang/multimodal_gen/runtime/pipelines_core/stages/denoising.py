@@ -1181,9 +1181,18 @@ class DenoisingStage(PipelineStage):
     ) -> tuple[dict[str, Any], torch.Tensor]:
         """Prepare denoising state under the current dynamic SP rank set."""
         with use_dynamic_sp_group(server_args, active_ranks):
-            self.scheduler.set_begin_index(begin_index)
+            self._set_ddit_scheduler_cursor(begin_index)
             prepared_vars = self._prepare_denoising_loop(batch, server_args)
+            self._set_ddit_scheduler_cursor(begin_index)
             return prepared_vars, prepared_vars["latents"]
+
+    def _set_ddit_scheduler_cursor(self, step_index: int) -> None:
+        """Restore the mutable scheduler cursor for request-interleaved DDiT."""
+        step_index = max(0, int(step_index))
+        if hasattr(self.scheduler, "set_begin_index"):
+            self.scheduler.set_begin_index(step_index)
+        if hasattr(self.scheduler, "_step_index"):
+            self.scheduler._step_index = step_index
 
     def ddit_hungry_start(
         self,
@@ -1291,6 +1300,7 @@ class DenoisingStage(PipelineStage):
         ):
             with use_dynamic_sp_group(server_args, tuple(state["active_ranks"])):
                 if current_rank_in(tuple(state["active_ranks"])):
+                    self._set_ddit_scheduler_cursor(step_index)
                     with StageProfiler(
                         f"denoising_step_{step_index}",
                         logger=logger,
@@ -1434,6 +1444,10 @@ class DenoisingStage(PipelineStage):
         saved_is_cfg_negative = getattr(batch, "is_cfg_negative", False)
         had_did_sp_shard = hasattr(batch, "did_sp_shard_latents")
         saved_did_sp_shard = getattr(batch, "did_sp_shard_latents", False)
+        scheduler_had_step_index = hasattr(self.scheduler, "_step_index")
+        saved_scheduler_step_index = getattr(self.scheduler, "_step_index", None)
+        scheduler_had_begin_index = hasattr(self.scheduler, "_begin_index")
+        saved_scheduler_begin_index = getattr(self.scheduler, "_begin_index", None)
 
         started = time.perf_counter()
         profile_timings: dict[str, Any] = {}
@@ -1492,6 +1506,14 @@ class DenoisingStage(PipelineStage):
                 batch.did_sp_shard_latents = saved_did_sp_shard
             elif hasattr(batch, "did_sp_shard_latents"):
                 delattr(batch, "did_sp_shard_latents")
+            if scheduler_had_step_index:
+                self.scheduler._step_index = saved_scheduler_step_index
+            elif hasattr(self.scheduler, "_step_index"):
+                delattr(self.scheduler, "_step_index")
+            if scheduler_had_begin_index:
+                self.scheduler._begin_index = saved_scheduler_begin_index
+            elif hasattr(self.scheduler, "_begin_index"):
+                delattr(self.scheduler, "_begin_index")
 
     def ddit_hungry_finish(
         self,
@@ -1590,6 +1612,7 @@ class DenoisingStage(PipelineStage):
                 for i, t_host in enumerate(timesteps_cpu):
                     with use_dynamic_sp_group(server_args, active_ranks):
                         if current_rank_in(active_ranks):
+                            self._set_ddit_scheduler_cursor(i)
                             with StageProfiler(
                                 f"denoising_step_{i}",
                                 logger=logger,

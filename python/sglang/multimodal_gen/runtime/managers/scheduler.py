@@ -875,6 +875,88 @@ class Scheduler(SchedulerDisaggMixin):
         else:
             policy.requests[request_id].cur_step = int(cur_step)
 
+    def _ddit_policy_fail_request(self, policy: Any, request_id: str) -> None:
+        state = getattr(policy, "requests", {}).get(request_id)
+        if state is None:
+            return
+        gpu_owner = getattr(policy, "gpu_owner", None)
+        if isinstance(gpu_owner, dict):
+            for rank, owner in list(gpu_owner.items()):
+                if owner == request_id:
+                    gpu_owner[rank] = None
+        for attr in ("waiting", "dit_waiting", "text_encoder_queue", "window"):
+            queue = getattr(policy, attr, None)
+            if isinstance(queue, deque):
+                self._ddit_remove_request_ids_from_deque(queue, {request_id})
+        state.ranks = ()
+        state.phase = RequestPhase.DONE
+
+    def _ddit_remove_request_ids_from_deque(
+        self, queue: deque[Any], request_ids: set[str]
+    ) -> None:
+        retained: deque[Any] = deque()
+        while queue:
+            item = queue.popleft()
+            item_request_id = (
+                item.request_id if isinstance(item, DDiTOp) else str(item)
+            )
+            if item_request_id not in request_ids:
+                retained.append(item)
+        queue.extend(retained)
+
+    def _ddit_fail_concurrent_wave_requests(
+        self,
+        *,
+        wave: CommandWave,
+        error: str,
+        policy: Any,
+        running_order: deque[str],
+        pending_queues: list[deque[DDiTOp]],
+        tracking_sets: list[set[str]],
+        ensuring_dynamic_sp: set[tuple[int, ...]],
+        activating_dynamic_sp: set[tuple[Any, ...]],
+        identities: dict[str, bytes | None],
+        req_by_id: dict[str, Req],
+        disagg_prepared: bool,
+    ) -> None:
+        request_ids = {
+            str(op.request_id)
+            for op in wave.ops
+            if op.request_id and not str(op.request_id).startswith("warmup-")
+        }
+        for op in wave.ops:
+            if op.action == "ensure_dynamic_sp":
+                target_ranks = tuple(op.payload.get("target_ranks") or op.ranks)
+                ensuring_dynamic_sp.discard(target_ranks)
+            elif op.action == "activate_dynamic_sp":
+                activation_key = tuple(op.payload.get("activation_key") or ())
+                activating_dynamic_sp.discard(activation_key)
+        if not request_ids:
+            return
+
+        self._ddit_remove_request_ids_from_deque(running_order, request_ids)
+        for queue in pending_queues:
+            self._ddit_remove_request_ids_from_deque(queue, request_ids)
+        for tracking_set in tracking_sets:
+            tracking_set.difference_update(request_ids)
+
+        for request_id in sorted(request_ids):
+            req = req_by_id.get(request_id)
+            if req is not None and not self._ddit_is_warmup_req(req):
+                record_lifecycle(self.server_args, req, "vae_end", error=error)
+            self._ddit_policy_fail_request(policy, request_id)
+
+            if self.gpu_id == 0:
+                output = OutputBatch(error=error)
+                if disagg_prepared:
+                    self._ddit_send_output_to_disagg_server(request_id, output)
+                else:
+                    identity = identities.get(request_id)
+                    if identity is not None:
+                        self.return_result(output, identity, is_warmup=False)
+            identities.pop(request_id, None)
+            req_by_id.pop(request_id, None)
+
     def _ddit_log_registered_request_state(
         self,
         *,
@@ -2284,6 +2366,42 @@ class Scheduler(SchedulerDisaggMixin):
                         req_by_id.pop(request_id, None)
             except Exception as e:
                 logger.error("Concurrent DDiT event loop failed: %s", e, exc_info=True)
+                try:
+                    self._ddit_fail_concurrent_wave_requests(
+                        wave=wave,
+                        error=str(e),
+                        policy=policy,
+                        running_order=running_order,
+                        pending_queues=[
+                            pending_register,
+                            pending_dynamic_sp,
+                            pending_init,
+                            pending_migrate,
+                            pending_finish,
+                            pending_vae_prepare,
+                            pending_vae_run,
+                            pending_output_transfer,
+                        ],
+                        tracking_sets=[
+                            registering,
+                            initializing,
+                            migrating,
+                            finishing,
+                            vae_preparing,
+                            vae_running,
+                            output_transferring,
+                        ],
+                        ensuring_dynamic_sp=ensuring_dynamic_sp,
+                        activating_dynamic_sp=activating_dynamic_sp,
+                        identities=identities,
+                        req_by_id=req_by_id,
+                        disagg_prepared=disagg_prepared,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Ignoring concurrent DDiT request cleanup failure",
+                        exc_info=True,
+                    )
                 # Keep the process alive for transient request-level failures.
                 # Collective failures may still require process restart.
                 time.sleep(0.05)

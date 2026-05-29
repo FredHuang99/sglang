@@ -39,6 +39,9 @@ class DDiTProfile:
     model_id: str
     opt_gpus_num: dict[str, int] = field(default_factory=dict)
     dit_step_times: dict[str, dict[int, float]] = field(default_factory=dict)
+    vae_times: dict[str, dict[int, float]] = field(default_factory=dict)
+    text_encoder_times: dict[str, float] = field(default_factory=dict)
+    dit_step_num: int | None = None
 
     @classmethod
     def from_payload(cls, model_id: str, payload: dict[str, Any]) -> "DDiTProfile":
@@ -50,10 +53,22 @@ class DDiTProfile:
             str(resolution): {int(k): float(v) for k, v in times.items()}
             for resolution, times in payload.get("dit_step_times", {}).items()
         }
+        vae_times = {
+            str(resolution): {int(k): float(v) for k, v in times.items()}
+            for resolution, times in payload.get("vae_times", {}).items()
+        }
+        text_encoder_times = {
+            str(resolution): float(value)
+            for resolution, value in payload.get("text_encoder_times", {}).items()
+        }
+        dit_step_num = payload.get("dit_step_num")
         return cls(
             model_id=model_id,
             opt_gpus_num=opt_gpus_num,
             dit_step_times=dit_step_times,
+            vae_times=vae_times,
+            text_encoder_times=text_encoder_times,
+            dit_step_num=int(dit_step_num) if dit_step_num is not None else None,
         )
 
     def opt_gpu_count(self, resolution: str, allowed_gpu_counts: tuple[int, ...]) -> int:
@@ -77,6 +92,18 @@ class DDiTProfile:
         cur_step = request.cur_step if current_step is None else int(current_step)
         remaining_steps = max(0, int(request.total_steps) - int(cur_step))
         return remaining_steps * self.per_step_time(request.resolution, gpu_count)
+
+    def unit_slo(self, resolution: str, *, gpu_count: int = 8) -> float | None:
+        text_time = self.text_encoder_times.get(resolution)
+        dit_time = self.dit_step_times.get(resolution, {}).get(gpu_count)
+        vae_time = self.vae_times.get(resolution, {}).get(gpu_count)
+        if text_time is None or dit_time is None or vae_time is None:
+            return None
+        if self.dit_step_num is None:
+            return None
+        return float(text_time) + float(vae_time) + float(dit_time) * int(
+            self.dit_step_num
+        )
 
 
 def resolve_profile_model_id(server_args: Any) -> str:

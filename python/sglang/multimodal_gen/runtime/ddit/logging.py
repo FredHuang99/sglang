@@ -14,6 +14,7 @@ from typing import Any
 import torch.distributed as dist
 
 from .config import resolve_resolution_key
+from .profile import DDiTProfile, ProfileStore
 
 LIFECYCLE_COLUMNS = [
     "request_id",
@@ -27,7 +28,7 @@ LIFECYCLE_COLUMNS = [
     "error",
 ]
 LIFECYCLE_SUMMARY_COLUMNS = ["metric", "value"]
-SUMMARY_ROW_NAMES = ("p50", "p90", "p99")
+SUMMARY_ROW_NAMES = ("p50", "p90", "p99", "slo10", "slo5")
 
 
 def _is_rank_zero() -> bool:
@@ -58,9 +59,15 @@ class DDiTLogPaths:
 class LifecycleCsvLogger:
     """One-row-per-request lifecycle CSV logger."""
 
-    def __init__(self, path: str, summary_path: str | None = None):
+    def __init__(
+        self,
+        path: str,
+        summary_path: str | None = None,
+        profile: DDiTProfile | None = None,
+    ):
         self.path = path
         self.summary_path = summary_path or self._default_summary_path(path)
+        self.profile = profile
         self._lock = threading.Lock()
         self._rows: dict[str, dict[str, Any]] = {}
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -171,7 +178,7 @@ class LifecycleCsvLogger:
         return f"{root}_summary{ext or '.csv'}"
 
     def _lifespan_summary_rows(self) -> list[tuple[str, float]]:
-        lifespans = []
+        completed: list[tuple[dict[str, Any], float]] = []
         for row in self._rows.values():
             try:
                 add_time = float(row.get("add_time") or "")
@@ -179,14 +186,42 @@ class LifecycleCsvLogger:
             except (TypeError, ValueError):
                 continue
             if vae_end_time >= add_time:
-                lifespans.append(vae_end_time - add_time)
+                completed.append((row, vae_end_time - add_time))
 
+        lifespans = [latency for _row, latency in completed]
         if not lifespans:
             return []
-        return [
+        rows = [
             ("p50", _percentile_nearest_rank(lifespans, 50)),
             ("p90", _percentile_nearest_rank(lifespans, 90)),
             ("p99", _percentile_nearest_rank(lifespans, 99)),
+        ]
+        rows.extend(self._slo_attainment_rows(completed))
+        return rows
+
+    def _slo_attainment_rows(
+        self, completed: list[tuple[dict[str, Any], float]]
+    ) -> list[tuple[str, float]]:
+        if self.profile is None:
+            return []
+
+        denominators = {"slo10": 0, "slo5": 0}
+        attained = {"slo10": 0, "slo5": 0}
+        for row, latency in completed:
+            resolution = str(row.get("resolution") or "")
+            unit_slo = self.profile.unit_slo(resolution, gpu_count=8)
+            if unit_slo is None:
+                continue
+            thresholds = {"slo10": unit_slo * 10.0, "slo5": unit_slo * 5.0}
+            for name, threshold in thresholds.items():
+                denominators[name] += 1
+                if latency <= threshold:
+                    attained[name] += 1
+
+        return [
+            (name, attained[name] / denominators[name])
+            for name in ("slo10", "slo5")
+            if denominators[name] > 0
         ]
 
 
@@ -275,7 +310,13 @@ def get_loggers(
     cached = _LOGGER_CACHE.get(paths.log_dir)
     if cached is not None:
         return cached
-    lifecycle = LifecycleCsvLogger(paths.lifecycle_csv, paths.lifecycle_summary_csv)
+    try:
+        profile = ProfileStore.load(server_args)
+    except Exception:
+        profile = None
+    lifecycle = LifecycleCsvLogger(
+        paths.lifecycle_csv, paths.lifecycle_summary_csv, profile=profile
+    )
     switches = RankSwitchJsonlLogger(paths.rank_switch_jsonl)
     op_trace = OpTraceJsonlLogger(paths.op_trace_jsonl)
     _LOGGER_CACHE[paths.log_dir] = (lifecycle, switches, op_trace)
