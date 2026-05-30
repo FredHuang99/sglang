@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import time
 from typing import Any, Dict, Optional
 
@@ -47,6 +48,92 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
+_WORKLOAD_PROGRESS_LOCK = threading.Lock()
+_WORKLOAD_PROGRESS: dict[str, dict[str, Any]] = {}
+
+
+def _workload_metadata_from_batch(batch: Req) -> tuple[str | None, int | None]:
+    workload_id = batch.extra.get("ddit_workload_id")
+    if not workload_id:
+        return None, None
+    try:
+        expected = int(batch.extra.get("ddit_workload_num_requests") or 0)
+    except (TypeError, ValueError):
+        expected = 0
+    if expected <= 0:
+        return str(workload_id), None
+    return str(workload_id), expected
+
+
+def _track_workload_registered(job_id: str, batch: Req) -> None:
+    workload_id, expected = _workload_metadata_from_batch(batch)
+    if not workload_id or expected is None:
+        return
+    with _WORKLOAD_PROGRESS_LOCK:
+        progress = _WORKLOAD_PROGRESS.setdefault(
+            workload_id,
+            {
+                "expected": expected,
+                "registered": set(),
+                "completed": set(),
+                "failed": set(),
+                "start_time": time.time(),
+                "reported": False,
+            },
+        )
+        progress["expected"] = max(int(progress["expected"]), expected)
+        progress["registered"].add(job_id)
+
+
+def _track_workload_finished(job_id: str, batch: Req, *, failed: bool) -> None:
+    workload_id, expected = _workload_metadata_from_batch(batch)
+    if not workload_id or expected is None:
+        return
+    with _WORKLOAD_PROGRESS_LOCK:
+        progress = _WORKLOAD_PROGRESS.setdefault(
+            workload_id,
+            {
+                "expected": expected,
+                "registered": set(),
+                "completed": set(),
+                "failed": set(),
+                "start_time": time.time(),
+                "reported": False,
+            },
+        )
+        progress["expected"] = max(int(progress["expected"]), expected)
+        progress["registered"].add(job_id)
+        if failed:
+            progress["failed"].add(job_id)
+        else:
+            progress["completed"].add(job_id)
+        expected = int(progress["expected"])
+        completed = len(progress["completed"])
+        failed_count = len(progress["failed"])
+        terminal = completed + failed_count
+        if progress["reported"] or terminal < expected:
+            return
+        progress["reported"] = True
+        elapsed = time.time() - float(progress["start_time"])
+
+    if failed_count:
+        logger.warning(
+            "DDiT workload %s finished with failures: completed=%d failed=%d "
+            "expected=%d elapsed=%.2fs",
+            workload_id,
+            completed,
+            failed_count,
+            expected,
+            elapsed,
+        )
+    else:
+        logger.info(
+            "DDiT workload %s all %d/%d requests completed in %.2f seconds.",
+            workload_id,
+            completed,
+            expected,
+            elapsed,
+        )
 
 
 def _build_video_sampling_params(request_id: str, request: VideoGenerationsRequest):
@@ -157,11 +244,13 @@ async def _dispatch_job_async(
             update_fields, request_id=job_id, result=result
         )
         await VIDEO_STORE.update_fields(job_id, update_fields)
+        _track_workload_finished(job_id, batch, failed=False)
     except Exception as e:
         logger.error(f"{e}")
         await VIDEO_STORE.update_fields(
             job_id, {"status": "failed", "error": {"message": str(e)}}
         )
+        _track_workload_finished(job_id, batch, failed=True)
     finally:
         for td in temp_dirs or []:
             shutil.rmtree(td, ignore_errors=True)
@@ -353,6 +442,11 @@ async def create_video(
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:
         batch.extra["diffusers_kwargs"] = req.diffusers_kwargs
+    if req.ddit_workload_id:
+        batch.extra["ddit_workload_id"] = req.ddit_workload_id
+    if req.ddit_workload_num_requests:
+        batch.extra["ddit_workload_num_requests"] = int(req.ddit_workload_num_requests)
+    _track_workload_registered(request_id, batch)
     # Enqueue the job asynchronously and return immediately
     asyncio.create_task(
         _dispatch_job_async(

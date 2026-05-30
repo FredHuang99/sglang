@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import importlib.util
-import io
 import json
 import sys
 import tempfile
@@ -265,26 +264,25 @@ class TestDDiTMixedWorkloadClient(unittest.TestCase):
         self.assertLess(starts[1] - starts[0], 0.12)
         self.assertLess(starts[2] - starts[1], 0.12)
 
-    def test_completion_summary_reports_all_requests_completed(self):
-        stream = io.StringIO()
-        self.module.print_completion_summary(
-            [
-                {
-                    "status_code": 200,
-                    "client_submit_time": 10.0,
-                    "client_response_time": 12.5,
-                },
-                {
-                    "status_code": 200,
-                    "client_submit_time": 11.0,
-                    "client_response_time": 13.0,
-                },
-            ],
-            expected=2,
-            stream=stream,
+    def test_workload_metadata_is_added_when_workload_id_is_provided(self):
+        workload = self.module.build_workload(
+            num_requests=2,
+            resolutions=["720p"],
+            ratios=[1.0],
+            seed=1,
+            prompt="test",
+            size_map={"720p": "1280x720"},
+            workload_id="workload-1",
         )
 
-        self.assertIn("all 2/2 requests completed in 3.00s", stream.getvalue())
+        self.assertEqual(
+            {item.payload["ddit_workload_id"] for item in workload},
+            {"workload-1"},
+        )
+        self.assertEqual(
+            {item.payload["ddit_workload_num_requests"] for item in workload},
+            {2},
+        )
 
 
 if __name__ == "__main__":

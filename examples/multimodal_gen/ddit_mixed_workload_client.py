@@ -7,7 +7,6 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import json
 import os
 import random
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -272,6 +271,7 @@ def build_workload(
     include_input_reference: bool = False,
     extra_payload: dict[str, Any] | None = None,
     ddit_vae_k_resolver: Any | None = None,
+    workload_id: str | None = None,
 ) -> list[WorkloadRequest]:
     if len(resolutions) != len(ratios):
         raise ValueError(
@@ -291,6 +291,9 @@ def build_workload(
                 "resolution_key": resolution,
                 "ddit_resolution_key": resolution,
             }
+            if workload_id:
+                payload["ddit_workload_id"] = workload_id
+                payload["ddit_workload_num_requests"] = num_requests
             if include_input_reference and image_path:
                 payload["input_reference"] = image_path
             if ddit_vae_k_resolver is not None:
@@ -417,47 +420,6 @@ def send_workload(
     return [record for record in responses if record is not None]
 
 
-def print_completion_summary(
-    responses: list[dict[str, Any]], *, expected: int, stream: Any = sys.stderr
-) -> None:
-    completed = sum(
-        1
-        for record in responses
-        if record.get("status_code") == 200 and not record.get("error")
-    )
-    failed = len(responses) - completed
-    submit_times = [
-        float(record["client_submit_time"])
-        for record in responses
-        if record.get("client_submit_time") is not None
-    ]
-    response_times = [
-        float(record["client_response_time"])
-        for record in responses
-        if record.get("client_response_time") is not None
-    ]
-    elapsed_s = (
-        max(response_times) - min(submit_times)
-        if submit_times and response_times
-        else None
-    )
-    elapsed_text = f" in {elapsed_s:.2f}s" if elapsed_s is not None else ""
-    if completed == expected and failed == 0:
-        print(
-            f"[DDiT workload] all {completed}/{expected} requests completed"
-            f"{elapsed_text}.",
-            file=stream,
-            flush=True,
-        )
-    else:
-        print(
-            f"[DDiT workload] finished {len(responses)}/{expected} responses "
-            f"({completed} completed, {failed} failed){elapsed_text}.",
-            file=stream,
-            flush=True,
-        )
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-url", default="http://127.0.0.1:30000")
@@ -562,6 +524,7 @@ def main() -> None:
             profile_model_id=args.ddit_profile_model_id,
             project_root=args.project_root,
         ),
+        workload_id=f"ddit-workload-{int(time.time() * 1000)}-{args.seed}-{args.num_requests}",
     )
     if args.dry_run:
         print(json.dumps([item.payload for item in workload], indent=2))
@@ -573,7 +536,6 @@ def main() -> None:
         timeout=args.timeout,
         max_inflight=args.max_inflight,
     )
-    print_completion_summary(responses, expected=len(workload))
     print(json.dumps(responses, indent=2))
 
 

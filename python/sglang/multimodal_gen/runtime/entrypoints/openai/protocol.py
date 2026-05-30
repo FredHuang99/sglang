@@ -116,6 +116,8 @@ class VideoGenerationsRequest(BaseModel):
     ddit_switch_plan: Optional[Any] = None
     ddit_vae_k: Optional[int] = None
     ddit_vae_ranks: Optional[str] = None
+    ddit_workload_id: Optional[str] = None
+    ddit_workload_num_requests: Optional[int] = None
 
 
 class VideoListResponse(BaseModel):
