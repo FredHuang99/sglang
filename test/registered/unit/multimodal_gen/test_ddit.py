@@ -1,5 +1,6 @@
 import importlib.util
 import os
+import sys
 import tempfile
 import time
 import unittest
@@ -30,8 +31,48 @@ def _load_client_module():
     )
     spec = importlib.util.spec_from_file_location("ddit_mixed_workload_client", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def _load_mock_simulator_module():
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../.."))
+    path = os.path.join(
+        root, "examples", "multimodal_gen", "ddit_mock_simulator.py"
+    )
+    spec = importlib.util.spec_from_file_location("ddit_mock_simulator", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _write_mock_profile(tmp_dir):
+    path = os.path.join(tmp_dir, "profile.json")
+    payload = {
+        "models": {
+            "z-image": {
+                "opt_gpus_num": {"720p": 2, "2k": 2},
+                "opt_vae_k": {"720p": 1, "2k": 1},
+                "dit_step_times": {
+                    "720p": {"1": 10.0, "2": 1.0, "8": 1.0},
+                    "2k": {"1": 12.0, "2": 2.0, "8": 2.0},
+                },
+                "vae_times": {
+                    "720p": {"1": 0.1, "2": 0.2, "8": 0.2},
+                    "2k": {"1": 0.1, "2": 0.2, "8": 0.2},
+                },
+                "text_encoder_times": {"720p": 0.1, "2k": 0.1},
+                "dit_step_num": 2,
+            }
+        }
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        import json
+
+        json.dump(payload, f)
+    return path
 
 
 class TestDDiTConfig(CustomTestCase):
@@ -180,6 +221,73 @@ class TestMixedWorkloadClient(CustomTestCase):
 
         self.assertLess(time.perf_counter() - start, 0.25)
         self.assertEqual(len(responses), 3)
+
+
+class TestDDiTMockSimulator(CustomTestCase):
+    def test_profile_loader_normalizes_model_and_reads_timings(self):
+        simulator = _load_mock_simulator_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_path = _write_mock_profile(tmp_dir)
+            profile = simulator.DDiTProfile.load(profile_path, "Z_Image")
+
+        self.assertEqual(profile.model_id, "z-image")
+        self.assertEqual(profile.opt_gpu_count("720p", (1, 2)), 2)
+        self.assertEqual(profile.opt_vae_count("720p", (1, 2)), 1)
+        self.assertEqual(profile.per_step_time("2k", 2), 2.0)
+        self.assertAlmostEqual(profile.unit_slo("720p", gpu_count=8), 2.3)
+
+    def test_hungry_scale_up_can_happen_before_last_remaining_step(self):
+        simulator = _load_mock_simulator_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_path = _write_mock_profile(tmp_dir)
+            config = simulator.SimulationConfig(
+                profile_path=profile_path,
+                policy="hungry_first",
+                num_nodes=1,
+                gpus_per_node=2,
+                allowed_gpu_counts=(1, 2),
+                resolutions=("720p",),
+                ratios=(1.0,),
+                num_requests=1,
+                rate="burst",
+                out_dir=tmp_dir,
+            )
+            sim = simulator.DDiTMockSimulator(config)
+            req = sim.requests[0]
+            req.node_id = 0
+            req.phase = "dit"
+            req.ranks = (0,)
+            req.cur_step = 1
+            req.total_steps = 2
+            req.last_scheduled_step = 0
+            sim.nodes[0].owners[0] = req.request_id
+
+            changed = sim._schedule_scale_up(1.0)
+
+        self.assertTrue(changed)
+        self.assertEqual(req.ranks, (0, 1))
+
+    def test_small_sweep_case_completes_all_requests(self):
+        simulator = _load_mock_simulator_module()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            profile_path = _write_mock_profile(tmp_dir)
+            config = simulator.SimulationConfig(
+                profile_path=profile_path,
+                policy="wsjf_scale_up",
+                num_nodes=2,
+                gpus_per_node=2,
+                allowed_gpu_counts=(1, 2),
+                resolutions=("720p", "2k"),
+                ratios=(0.5, 0.5),
+                num_requests=4,
+                rate="1.0",
+                out_dir=tmp_dir,
+            )
+            result = simulator.run_simulation(config, write=True)
+
+            self.assertEqual(result["summary"]["completed_count"], 4)
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "ddit_lifecycle.csv")))
+            self.assertTrue(os.path.exists(os.path.join(tmp_dir, "ddit_rank_switch.jsonl")))
 
 
 class TestLifecycleCsvLogger(CustomTestCase):
