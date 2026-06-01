@@ -272,7 +272,9 @@ class ServerArgs:
     disagg_role: RoleType = RoleType.MONOLITHIC
     disagg_timeout: int = 3600  # seconds, timeout for pending disagg requests
     disagg_downstream_wait_timeout: int = 1800  # seconds, wait for downstream slot
-    disagg_dispatch_policy: str = "round_robin"  # "round_robin" or "max_free_slots"
+    disagg_dispatch_policy: str = (
+        "round_robin"  # "round_robin", "max_free_slots", or "weighted_shiftserve"
+    )
     disagg_mode: bool = False  # True when running as a disaggregated instance
     disagg_instance_id: int = 0  # Stable per-role instance ID inside a pool
     disagg_max_slots_per_instance: int = 8
@@ -282,6 +284,7 @@ class ServerArgs:
     disagg_transfer_pool_size: int = (
         256 * 1024 * 1024
     )  # P2P transfer buffer size (bytes)
+    disagg_transfer_calibration_mode: Literal["warmup", "fixed"] = "warmup"
     disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
     disagg_p2p_hostname: str = "127.0.0.1"  # Hostname for P2P transfer engine
     disagg_ib_device: str | None = None  # InfiniBand device for mooncake RDMA
@@ -332,6 +335,13 @@ class ServerArgs:
                 "ulysses_degree": self.denoiser_ulysses,
                 "ring_degree": self.denoiser_ring,
             }
+        elif role_type == RoleType.DIT_VAE:
+            return {
+                "tp_size": self.denoiser_tp,
+                "sp_degree": self.denoiser_sp or self.decoder_sp,
+                "ulysses_degree": self.denoiser_ulysses,
+                "ring_degree": self.denoiser_ring,
+            }
         elif role_type == RoleType.DECODER:
             return {**_none, "sp_degree": self.decoder_sp}
         return _none
@@ -341,6 +351,7 @@ class ServerArgs:
         RoleType.ENCODER: 1,
         RoleType.DENOISER: 2,
         RoleType.DECODER: 3,
+        RoleType.DIT_VAE: 3,
     }
 
     def derive_pool_result_endpoint(self) -> str:
@@ -885,10 +896,13 @@ class ServerArgs:
             "--disagg-dispatch-policy",
             type=str,
             default=ServerArgs.disagg_dispatch_policy,
-            choices=["round_robin", "max_free_slots"],
+            choices=["round_robin", "max_free_slots", "weighted_shiftserve"],
             help="Dispatch policy for pool mode disagg routing. "
             "'round_robin' cycles across instances; "
             "'max_free_slots' dispatches to the least-loaded instance. "
+            "'weighted_shiftserve' is selected by ShiftServe when weighted "
+            "routing is performed by the outer server and falls back to "
+            "round-robin inside DiffusionServer. "
             "Default: round_robin.",
         )
         parser.add_argument(
@@ -929,6 +943,17 @@ class ServerArgs:
             type=int,
             default=256 * 1024 * 1024,
             help="Size of the P2P transfer buffer pool in bytes (default: 256 MiB).",
+        )
+        parser.add_argument(
+            "--disagg-transfer-calibration-mode",
+            type=str,
+            default=ServerArgs.disagg_transfer_calibration_mode,
+            choices=["warmup", "fixed"],
+            help=(
+                "Transfer buffer sizing mode. 'warmup' keeps existing warmup "
+                "reconfiguration; 'fixed' keeps --disagg-transfer-pool-size "
+                "unchanged and skips warmup-driven buffer resizing."
+            ),
         )
         parser.add_argument(
             "--disagg-transfer-pin-memory",

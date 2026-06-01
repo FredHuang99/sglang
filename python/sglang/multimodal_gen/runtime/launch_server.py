@@ -941,7 +941,7 @@ def dispatch_launch(server_args: ServerArgs):
         launch_server(server_args)
     elif role == RoleType.SERVER:
         launch_disagg_server(server_args)
-    elif role in (RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER):
+    elif role in (RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER, RoleType.DIT_VAE):
         launch_disagg_role(server_args)
     else:
         raise ValueError(f"Unknown disagg_role: {role}")

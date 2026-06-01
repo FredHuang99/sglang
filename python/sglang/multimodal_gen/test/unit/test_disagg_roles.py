@@ -20,6 +20,7 @@ class TestRoleType(unittest.TestCase):
 
     def test_from_string_backward_compat(self):
         self.assertEqual(RoleType.from_string("denoising"), RoleType.DENOISER)
+        self.assertEqual(RoleType.from_string("ddit_worker"), RoleType.DIT_VAE)
 
     def test_from_string_invalid(self):
         with self.assertRaises(ValueError):
@@ -32,6 +33,7 @@ class TestRoleType(unittest.TestCase):
         self.assertIn("denoiser", choices)
         self.assertIn("denoising", choices)
         self.assertIn("decoder", choices)
+        self.assertIn("dit_vae", choices)
 
 
 class TestGetModuleRole(unittest.TestCase):
@@ -129,6 +131,13 @@ class TestFilterModulesLTX2(unittest.TestCase):
             extra_allowed_modules={"vae", "audio_vae"},
         )
         self.assertEqual(result, ["transformer", "scheduler", "vae", "audio_vae"])
+
+    def test_dit_vae_keeps_denoiser_and_decoder_modules(self):
+        result = filter_modules_for_role(self.LTX2_MODULES, RoleType.DIT_VAE)
+        self.assertEqual(
+            result,
+            ["transformer", "scheduler", "vae", "audio_vae", "vocoder"],
+        )
 
 
 if __name__ == "__main__":

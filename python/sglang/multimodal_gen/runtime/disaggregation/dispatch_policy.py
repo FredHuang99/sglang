@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 _POLICY_KWARGS = {
     "round_robin": frozenset(),
     "max_free_slots": frozenset({"max_slots_per_instance"}),
+    "weighted_shiftserve": frozenset(),
 }
 _KNOWN_POLICY_KWARGS = frozenset().union(*_POLICY_KWARGS.values())
 
@@ -137,6 +138,10 @@ class MaxFreeSlotsFirst(DispatchPolicy):
             return best_id
 
 
+class WeightedShiftServeFallback(RoundRobin):
+    """Round-robin compatibility mode for ShiftServe-owned weighted routing."""
+
+
 class PoolDispatcher:
     """Wraps three independent dispatch policies for encoder/denoiser/decoder pools."""
 
@@ -205,6 +210,7 @@ def create_dispatch_policy(name: str, num_instances: int, **kwargs) -> DispatchP
     policies = {
         "round_robin": RoundRobin,
         "max_free_slots": MaxFreeSlotsFirst,
+        "weighted_shiftserve": WeightedShiftServeFallback,
     }
     cls = policies.get(name)
     if cls is None:

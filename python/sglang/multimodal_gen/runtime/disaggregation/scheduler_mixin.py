@@ -534,7 +534,11 @@ class SchedulerDisaggMixin:
         return self._prepare_disagg_req_for_compute(req)
 
     def _role_has_inbound_transfer(self: Scheduler) -> bool:
-        return self._disagg_role in (RoleType.DENOISER, RoleType.DECODER)
+        return self._disagg_role in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+            RoleType.DIT_VAE,
+        )
 
     def _role_has_outbound_transfer(self: Scheduler) -> bool:
         return self._disagg_role in (RoleType.ENCODER, RoleType.DENOISER)
@@ -543,7 +547,11 @@ class SchedulerDisaggMixin:
         return self._disagg_role in (RoleType.ENCODER, RoleType.DENOISER)
 
     def _role_accepts_ready_failed(self: Scheduler) -> bool:
-        return self._disagg_role in (RoleType.DENOISER, RoleType.DECODER)
+        return self._disagg_role in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+            RoleType.DIT_VAE,
+        )
 
     def _prune_aborted_requests(self: Scheduler) -> None:
         aborted = getattr(self, "_aborted_request_ids", None)
@@ -725,6 +733,10 @@ class SchedulerDisaggMixin:
         configured_pool_size = int(
             getattr(sa, "disagg_transfer_pool_size", 256 * 1024 * 1024)
         )
+        calibration_mode = getattr(sa, "disagg_transfer_calibration_mode", "warmup")
+        if calibration_mode == "fixed":
+            measured_transfer_bytes = None
+            measured_meta_bytes = None
         pool_size = configured_pool_size
         capacity_slot_size = round_allocation_size(64 * 1024 * 1024)
         if measured_transfer_bytes is not None:
@@ -940,6 +952,8 @@ class SchedulerDisaggMixin:
         measured_transfer_bytes: int | None,
         measured_meta_bytes: int | None,
     ) -> None:
+        if getattr(self.server_args, "disagg_transfer_calibration_mode", "warmup") == "fixed":
+            return
         if self._transfer_manager is None or measured_transfer_bytes is None:
             return
         if measured_transfer_bytes <= 0:
@@ -1212,7 +1226,7 @@ class SchedulerDisaggMixin:
             self._pool_result_push.send_multipart(
                 encode_transfer_msg(TransferDoneMsg(request_id=request_id, error=error))
             )
-        elif self._disagg_role == RoleType.DECODER:
+        elif self._disagg_role in (RoleType.DECODER, RoleType.DIT_VAE):
             send_tensors(
                 self._pool_result_push,
                 {},
@@ -1230,7 +1244,7 @@ class SchedulerDisaggMixin:
                 f"request_id mismatch in transfer metadata: "
                 f"ready={request_id}, metadata={scalar_request_id}"
             )
-        if self._disagg_role == RoleType.DENOISER:
+        if self._disagg_role in (RoleType.DENOISER, RoleType.DIT_VAE):
             num_steps = scalar_fields.get("num_inference_steps")
             if (
                 isinstance(num_steps, bool)
@@ -1488,6 +1502,14 @@ class SchedulerDisaggMixin:
             self._disagg_denoiser_compute(req, item.request_id, item.role_name)
         elif self._disagg_role == RoleType.DECODER:
             self._disagg_decoder_compute(req, item.request_id, item.role_name)
+            if item.scalar_fields.get("is_warmup"):
+                inbound_sizes = self._warmup_inbound_sizes.pop(item.request_id, (0, 0))
+                self._schedule_transfer_reconfigure(
+                    inbound_sizes[0],
+                    inbound_sizes[1],
+                )
+        elif self._disagg_role == RoleType.DIT_VAE:
+            self._disagg_dit_vae_compute(req, item.request_id, item.role_name)
             if item.scalar_fields.get("is_warmup"):
                 inbound_sizes = self._warmup_inbound_sizes.pop(item.request_id, (0, 0))
                 self._schedule_transfer_reconfigure(
@@ -2419,7 +2441,7 @@ class SchedulerDisaggMixin:
             with self._compute_stream_context():
                 self.worker.execute_forward([req], return_req=True)
 
-        elif self._disagg_role == RoleType.DECODER:
+        elif self._disagg_role in (RoleType.DECODER, RoleType.DIT_VAE):
             req.save_output = False
             req.return_file_paths_only = False
             with self._compute_stream_context():
@@ -2618,6 +2640,82 @@ class SchedulerDisaggMixin:
         )
 
         logger.debug("Transfer DECODER: processed %s in %.2f s", request_id, duration_s)
+
+    def _disagg_dit_vae_compute(
+        self: Scheduler, req: Req, request_id: str, role_name: str
+    ) -> None:
+        """Run a combined DiT+VAE pipeline and send the final result to DS.
+
+        This is intentionally shaped like decoder completion because the full
+        DIT_VAE role consumes encoder tensors and returns final media without a
+        denoiser->decoder transfer hop.
+        """
+
+        disagg_error = getattr(req, "_disagg_error", None)
+        if disagg_error:
+            if self._pool_result_push is not None:
+                send_tensors(
+                    self._pool_result_push,
+                    {},
+                    {
+                        "request_id": request_id,
+                        "error": f"Upstream error: {disagg_error}",
+                    },
+                )
+            return
+
+        req.save_output = False
+        req.return_file_paths_only = False
+        if self._is_request_aborted(request_id):
+            return
+
+        start_time = time.monotonic()
+        with self._compute_stream_context():
+            output_batch = self.worker.execute_forward([req])
+        self._make_current_stream_wait_for_compute()
+        duration_s = time.monotonic() - start_time
+        compute_finish_time_s = time.time()
+        self._profile_role_update(
+            request_id,
+            role_finish_time_s=compute_finish_time_s,
+            compute_duration_ms=duration_s * 1000.0,
+        )
+
+        if self._is_request_aborted(request_id):
+            return
+
+        tensor_fields = {}
+        scalar_fields = {"request_id": request_id}
+        if output_batch.output is not None:
+            tensor_fields["output"] = output_batch.output
+        if output_batch.audio is not None:
+            tensor_fields["audio"] = output_batch.audio
+        if output_batch.audio_sample_rate is not None:
+            scalar_fields["audio_sample_rate"] = output_batch.audio_sample_rate
+        if output_batch.error is not None:
+            scalar_fields["error"] = output_batch.error
+
+        result_sent_time_s = None
+        if self._pool_result_push is not None:
+            send_tensors(self._pool_result_push, tensor_fields, scalar_fields)
+            result_sent_time_s = time.time()
+
+        if self._disagg_metrics:
+            if output_batch.error:
+                self._disagg_metrics.record_request_failed(request_id)
+            else:
+                self._disagg_metrics.record_request_complete(request_id)
+
+        self._profile_role_finalize(
+            request_id,
+            status="failed" if output_batch.error else "completed",
+            error=output_batch.error,
+            role_finish_time_s=compute_finish_time_s,
+            compute_duration_ms=duration_s * 1000.0,
+            result_sent_time_s=result_sent_time_s,
+        )
+
+        logger.debug("Transfer DIT_VAE: processed %s in %.2f s", request_id, duration_s)
 
     def _disagg_encoder_step(
         self: Scheduler,

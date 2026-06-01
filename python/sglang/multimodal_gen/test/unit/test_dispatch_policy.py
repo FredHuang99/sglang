@@ -6,6 +6,7 @@ import unittest
 from sglang.multimodal_gen.runtime.disaggregation.dispatch_policy import (
     MaxFreeSlotsFirst,
     RoundRobin,
+    WeightedShiftServeFallback,
     create_dispatch_policy,
 )
 
@@ -159,6 +160,13 @@ class TestCreateDispatchPolicy(unittest.TestCase):
     def test_unknown_policy_raises(self):
         with self.assertRaises(ValueError):
             create_dispatch_policy("unknown", num_instances=2)
+
+    def test_weighted_shiftserve_falls_back_to_round_robin(self):
+        policy = create_dispatch_policy(
+            "weighted_shiftserve", num_instances=2, max_slots_per_instance=3
+        )
+        self.assertIsInstance(policy, WeightedShiftServeFallback)
+        self.assertEqual([policy.select() for _ in range(3)], [0, 1, 0])
 
 
 if __name__ == "__main__":

@@ -3,7 +3,11 @@
 
 from enum import Enum
 
-_ROLE_ALIASES = {"denoising": "denoiser"}
+_ROLE_ALIASES = {
+    "denoising": "denoiser",
+    "ddit_worker": "dit_vae",
+    "dit_vae_worker": "dit_vae",
+}
 
 
 class RoleType(str, Enum):
@@ -11,6 +15,7 @@ class RoleType(str, Enum):
     ENCODER = "encoder"
     DENOISER = "denoiser"
     DECODER = "decoder"
+    DIT_VAE = "dit_vae"
     SERVER = "server"  # Head node (no GPU, routes requests)
 
     @classmethod
@@ -89,6 +94,11 @@ def filter_modules_for_role(
         module_role = get_module_role(name)
 
         if module_role is None:
+            filtered.append(name)
+        elif role == RoleType.DIT_VAE and module_role in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+        ):
             filtered.append(name)
         elif module_role == role:
             filtered.append(name)

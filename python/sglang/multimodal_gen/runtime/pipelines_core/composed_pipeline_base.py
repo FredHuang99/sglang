@@ -361,6 +361,11 @@ class ComposedPipelineBase(ABC):
                         self._disagg_role == RoleType.MONOLITHIC
                         or module_role is None
                         or module_role == self._disagg_role
+                        or (
+                            self._disagg_role == RoleType.DIT_VAE
+                            and module_role
+                            in (RoleType.DENOISER, RoleType.DECODER)
+                        )
                     ):
                         self.required_config_modules.append("transformer_2")
                     else:
@@ -542,6 +547,11 @@ class ComposedPipelineBase(ABC):
         if self._disagg_role == RoleType.MONOLITHIC:
             return True
         if role_affinity == self._disagg_role:
+            return True
+        if self._disagg_role == RoleType.DIT_VAE and role_affinity in (
+            RoleType.DENOISER,
+            RoleType.DECODER,
+        ):
             return True
 
         logger.info(
