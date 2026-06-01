@@ -381,6 +381,61 @@ class GPUWorker:
                 output_batch.metrics = req.metrics
         return output_batch
 
+    def execute_stage_forward(
+        self,
+        batch: List[Req],
+        stage_names: list[str],
+        return_req: bool = False,
+    ) -> OutputBatch | Req:
+        """Execute a named subset of the composed pipeline stages."""
+
+        assert self.pipeline is not None
+        req = batch[0]
+        output_batch = None
+        try:
+            start_time = time.monotonic()
+            req.log(server_args=self.server_args)
+            result = self.pipeline.forward_stage_names(
+                req,
+                self.server_args,
+                stage_names,
+            )
+            if return_req and isinstance(result, Req):
+                duration_ms = (time.monotonic() - start_time) * 1000
+                if result.metrics is not None:
+                    result.metrics.total_duration_ms = duration_ms
+                    result.metrics.finish_time_s = time.time()
+                return result
+            if isinstance(result, Req):
+                output_batch = OutputBatch(
+                    output=result.output,
+                    audio=getattr(result, "audio", None),
+                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
+                    metrics=result.metrics,
+                    trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
+                    trajectory_latents=getattr(result, "trajectory_latents", None),
+                    noise_pred=getattr(result, "noise_pred", None),
+                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
+                )
+            else:
+                output_batch = result
+            duration_ms = (time.monotonic() - start_time) * 1000
+            if output_batch.metrics is not None:
+                output_batch.metrics.total_duration_ms = duration_ms
+                output_batch.metrics.finish_time_s = time.time()
+        except Exception as e:
+            logger.error(
+                f"Error executing stage subset for request {req.request_id}: {e}",
+                exc_info=True,
+            )
+            if output_batch is None:
+                output_batch = OutputBatch()
+            output_batch.error = f"Error executing request {req.request_id}: {e}"
+            if req.metrics is not None:
+                req.metrics.finish_time_s = time.time()
+                output_batch.metrics = req.metrics
+        return output_batch
+
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
     ) -> List[str]:

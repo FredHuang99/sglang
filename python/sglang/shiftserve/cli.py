@@ -26,6 +26,28 @@ from sglang.shiftserve.router import ShiftServeRequest, ShiftServeRouter
 from sglang.shiftserve.scheduler import SchedulerMode
 
 
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "y", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {value}")
+
+
+def _add_bool_arg(
+    parser: argparse.ArgumentParser,
+    name: str,
+    *,
+    default: bool = False,
+) -> None:
+    dest = name.removeprefix("--").replace("-", "_")
+    parser.add_argument(name, nargs="?", const=True, default=default, type=_parse_bool)
+    parser.add_argument(f"--no-{name.removeprefix('--')}", action="store_false", dest=dest)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ShiftServe PE/diffusion flip tooling")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -40,15 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("--pe-model-path", required=True)
     launch.add_argument("--diffusion-model-path", required=True)
     launch.add_argument("--server-addr", required=True)
-    launch.add_argument("--weighted-schedule", action=argparse.BooleanOptionalAction, default=False)
+    _add_bool_arg(launch, "--weighted-schedule", default=False)
     _add_common_launch_args(launch)
 
     simulate = sub.add_parser("simulate")
     simulate.add_argument("--traffic-json", required=True)
     simulate.add_argument("--mode", choices=["no_flip", "can_flip", "manual_flip"], default="no_flip")
-    simulate.add_argument("--weighted-schedule", action=argparse.BooleanOptionalAction, default=False)
+    _add_bool_arg(simulate, "--weighted-schedule", default=False)
     simulate.add_argument("--window-size", type=int, default=16)
-    simulate.add_argument("--margin-enabled", action=argparse.BooleanOptionalAction, default=False)
+    _add_bool_arg(simulate, "--margin-enabled", default=False)
     simulate.add_argument("--margin-ratio", type=float, default=0.0)
     simulate.add_argument("--request-rate", type=float)
     simulate.add_argument("--out-dir", required=True)
@@ -65,11 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _add_common_launch_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--rank0-broadcast",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-    )
+    _add_bool_arg(parser, "--rank0-broadcast", default=False)
     parser.add_argument(
         "--transfer-pool-size",
         type=int,
@@ -87,6 +105,21 @@ def _add_common_launch_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--disagg-timeout", type=int, default=LaunchDefaults.disagg_timeout)
     parser.add_argument("--disagg-downstream-timeout", type=int, default=LaunchDefaults.disagg_downstream_timeout)
+    parser.add_argument(
+        "--dit-vae-dit-bs",
+        type=int,
+        default=LaunchDefaults.dit_vae_dit_bs,
+    )
+    parser.add_argument(
+        "--dit-vae-vae-bs",
+        type=int,
+        default=LaunchDefaults.dit_vae_vae_bs,
+    )
+    parser.add_argument(
+        "--dit-vae-stage-concurrency",
+        choices=["pipeline", "serial_debug"],
+        default=LaunchDefaults.dit_vae_stage_concurrency,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -123,6 +156,9 @@ def main(argv: list[str] | None = None) -> None:
             disagg_timeout=args.disagg_timeout,
             disagg_downstream_timeout=args.disagg_downstream_timeout,
             rank0_broadcast=args.rank0_broadcast,
+            dit_vae_dit_bs=args.dit_vae_dit_bs,
+            dit_vae_vae_bs=args.dit_vae_vae_bs,
+            dit_vae_stage_concurrency=args.dit_vae_stage_concurrency,
         )
         builder = LaunchCommandBuilder(defaults)
         commands = builder.build_launch_plan(

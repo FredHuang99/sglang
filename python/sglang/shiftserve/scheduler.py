@@ -45,6 +45,161 @@ class RunningRequest:
 
 
 @dataclass
+class DITVAEStageRequest:
+    """A request inside one DIT_VAE bundle's internal stage pipeline."""
+
+    request_id: str
+    remaining_steps: int = 0
+    migration_priority: int = 0
+    dit_started_at_s: float | None = None
+    dit_done_at_s: float | None = None
+    vae_started_at_s: float | None = None
+    vae_done_at_s: float | None = None
+
+
+@dataclass
+class DITVAEBundleState:
+    """One launched DIT_VAE instance with independent DiT and VAE stage slots."""
+
+    bundle_id: str
+    node_id: str
+    paired_te_id: str | None = None
+    active: bool = True
+    ready: bool = True
+    draining: bool = False
+    launching: bool = False
+    dit_bs: int = 1
+    vae_bs: int = 1
+    dit_queue: deque[DITVAEStageRequest] = field(default_factory=deque)
+    vae_queue: deque[DITVAEStageRequest] = field(default_factory=deque)
+    dit_running: dict[int, DITVAEStageRequest] = field(default_factory=dict)
+    vae_running: dict[int, DITVAEStageRequest] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.dit_bs < 1 or self.vae_bs < 1:
+            raise ValueError("DIT_VAE stage slots must satisfy dit_bs>=1 and vae_bs>=1")
+
+    def is_eligible(self) -> bool:
+        return self.active and self.ready and not self.draining and not self.launching
+
+    def dit_free_slots(self) -> int:
+        return max(self.dit_bs - len(self.dit_running), 0)
+
+    def vae_free_slots(self) -> int:
+        return max(self.vae_bs - len(self.vae_running), 0)
+
+    def enqueue_dit(self, request: DITVAEStageRequest, *, head: bool = False) -> None:
+        if head:
+            self.dit_queue.appendleft(request)
+        else:
+            self.dit_queue.append(request)
+
+    def enqueue_vae(self, request: DITVAEStageRequest, *, head: bool = False) -> None:
+        if head:
+            self.vae_queue.appendleft(request)
+        else:
+            self.vae_queue.append(request)
+
+    def start_next_dit(
+        self, *, now_s: float | None = None
+    ) -> tuple[int, DITVAEStageRequest] | None:
+        slot = self._first_free_slot(self.dit_running, self.dit_bs)
+        if slot is None or not self.dit_queue:
+            return None
+        request = self.dit_queue.popleft()
+        request.dit_started_at_s = now_s
+        self.dit_running[slot] = request
+        return slot, request
+
+    def finish_dit(
+        self, request_id: str, *, now_s: float | None = None
+    ) -> DITVAEStageRequest:
+        slot = self._find_running_slot(self.dit_running, request_id, stage_name="DiT")
+        request = self.dit_running.pop(slot)
+        request.dit_done_at_s = now_s
+        self.vae_queue.append(request)
+        return request
+
+    def start_next_vae(
+        self, *, now_s: float | None = None
+    ) -> tuple[int, DITVAEStageRequest] | None:
+        slot = self._first_free_slot(self.vae_running, self.vae_bs)
+        if slot is None or not self.vae_queue:
+            return None
+        request = self.vae_queue.popleft()
+        request.vae_started_at_s = now_s
+        self.vae_running[slot] = request
+        return slot, request
+
+    def finish_vae(
+        self, request_id: str, *, now_s: float | None = None
+    ) -> DITVAEStageRequest:
+        slot = self._find_running_slot(self.vae_running, request_id, stage_name="VAE")
+        request = self.vae_running.pop(slot)
+        request.vae_done_at_s = now_s
+        return request
+
+    def work_items(self) -> int:
+        return (
+            len(self.dit_queue)
+            + len(self.vae_queue)
+            + len(self.dit_running)
+            + len(self.vae_running)
+        )
+
+    def estimate_candidate_finish_ms(
+        self,
+        profile: StageCostProfile,
+        request: "RequestEstimate",
+    ) -> float:
+        """Estimate finish time through a two-stage tandem DiT->VAE pipeline."""
+
+        candidate_dit_ms = self._dit_ms(request.remaining_steps, profile)
+        dit_ahead_ms = sum(
+            self._dit_ms(r.remaining_steps, profile)
+            for r in self.dit_running.values()
+        )
+        dit_ahead_count = len(self.dit_running)
+        if not request.insert_at_head:
+            dit_ahead_ms += sum(
+                self._dit_ms(r.remaining_steps, profile) for r in self.dit_queue
+            )
+            dit_ahead_count += len(self.dit_queue)
+
+        vae_available_ms = len(self.vae_running) * profile.vae_ms
+        vae_available_ms += len(self.vae_queue) * profile.vae_ms
+        candidate_dit_finish_ms = dit_ahead_ms + candidate_dit_ms
+        candidate_vae_ahead_ms = vae_available_ms + dit_ahead_count * profile.vae_ms
+        return max(candidate_dit_finish_ms, candidate_vae_ahead_ms) + profile.vae_ms
+
+    @staticmethod
+    def _dit_ms(remaining_steps: int | None, profile: StageCostProfile) -> float:
+        steps = profile.dit_steps if remaining_steps is None else remaining_steps
+        return max(steps, 0) * profile.dit_per_step_ms
+
+    @staticmethod
+    def _first_free_slot(
+        running: dict[int, DITVAEStageRequest], capacity: int
+    ) -> int | None:
+        for slot in range(capacity):
+            if slot not in running:
+                return slot
+        return None
+
+    @staticmethod
+    def _find_running_slot(
+        running: dict[int, DITVAEStageRequest],
+        request_id: str,
+        *,
+        stage_name: str,
+    ) -> int:
+        for slot, request in running.items():
+            if request.request_id == request_id:
+                return slot
+        raise KeyError(f"{request_id} is not running in DIT_VAE {stage_name} slot")
+
+
+@dataclass
 class InstanceRuntimeState:
     instance_id: str
     kind: StageKind
@@ -59,12 +214,44 @@ class InstanceRuntimeState:
     node_group_id: str | None = None
     pipeline_group_id: str | None = None
     max_slots: int = 1
+    paired_te_id: str | None = None
+    stage_slots: dict[str, int] = field(default_factory=dict)
+    dit_vae_bundle: DITVAEBundleState | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind == StageKind.DIT_VAE and self.dit_vae_bundle is None:
+            self.dit_vae_bundle = DITVAEBundleState(
+                bundle_id=self.instance_id,
+                node_id=self.node_id,
+                paired_te_id=self.paired_te_id,
+                active=self.active,
+                ready=self.ready,
+                draining=self.draining,
+                launching=self.launching,
+                dit_bs=int(self.stage_slots.get("dit_bs", 1)),
+                vae_bs=int(self.stage_slots.get("vae_bs", 1)),
+            )
 
     def is_eligible(self) -> bool:
+        if self.kind == StageKind.DIT_VAE and self.dit_vae_bundle is not None:
+            self._sync_bundle_status()
+            return self.dit_vae_bundle.is_eligible()
         return self.active and self.ready and not self.draining and not self.launching
 
     def queue_work_items(self) -> int:
+        if self.kind == StageKind.DIT_VAE and self.dit_vae_bundle is not None:
+            return self.dit_vae_bundle.work_items()
         return len(self.queue)
+
+    def _sync_bundle_status(self) -> None:
+        if self.dit_vae_bundle is None:
+            return
+        self.dit_vae_bundle.active = self.active
+        self.dit_vae_bundle.ready = self.ready
+        self.dit_vae_bundle.draining = self.draining
+        self.dit_vae_bundle.launching = self.launching
+        self.dit_vae_bundle.node_id = self.node_id
+        self.dit_vae_bundle.paired_te_id = self.paired_te_id
 
 
 @dataclass(frozen=True)
@@ -260,7 +447,21 @@ class ShiftServeScheduler:
         request_id: str,
         *,
         head: bool = False,
+        remaining_steps: int | None = None,
     ) -> None:
+        if instance.kind == StageKind.DIT_VAE and instance.dit_vae_bundle is not None:
+            instance.dit_vae_bundle.enqueue_dit(
+                DITVAEStageRequest(
+                    request_id=request_id,
+                    remaining_steps=(
+                        self.cost_profile.dit_steps
+                        if remaining_steps is None
+                        else remaining_steps
+                    ),
+                ),
+                head=head,
+            )
+            return
         if head:
             instance.queue.appendleft(request_id)
         else:
@@ -271,6 +472,11 @@ class ShiftServeScheduler:
         instance: InstanceRuntimeState,
         request: RequestEstimate,
     ) -> float:
+        if instance.kind == StageKind.DIT_VAE and instance.dit_vae_bundle is not None:
+            return instance.dit_vae_bundle.estimate_candidate_finish_ms(
+                self.cost_profile,
+                request,
+            )
         running = self._estimate_running_ms(instance)
         queued = instance.queue_work_items() * self._estimate_new_request_ms(
             instance.kind, request, instance
@@ -291,10 +497,17 @@ class ShiftServeScheduler:
             if running.generated_tokens <= 0:
                 return profile.ttft_ms + max(expected_bin - 1, 0) * profile.tpot_ms
             if running.generated_tokens > expected_bin:
-                expected_bin = max(expected_bin, running.generated_tokens)
+                expected_bin = self._promote_expected_bin(
+                    expected_bin,
+                    running.generated_tokens,
+                )
             return max(expected_bin - running.generated_tokens, 0) * profile.tpot_ms
         if running.stage in (StageKind.DIT, StageKind.DIT_VAE):
-            steps = running.remaining_steps or profile.dit_steps
+            steps = (
+                profile.dit_steps
+                if running.remaining_steps is None
+                else running.remaining_steps
+            )
             return max(steps, 0) * profile.dit_per_step_ms
         if running.stage == StageKind.TE:
             return profile.te_ms
@@ -318,11 +531,29 @@ class ShiftServeScheduler:
         if stage == StageKind.TE:
             return profile.te_ms
         if stage == StageKind.DIT:
-            steps = request.remaining_steps or profile.dit_steps
+            steps = (
+                profile.dit_steps
+                if request.remaining_steps is None
+                else request.remaining_steps
+            )
             return max(steps, 0) * profile.dit_per_step_ms
         if stage == StageKind.DIT_VAE:
-            steps = request.remaining_steps or profile.dit_steps
+            if instance.dit_vae_bundle is not None:
+                return instance.dit_vae_bundle.estimate_candidate_finish_ms(
+                    profile,
+                    request,
+                )
+            steps = (
+                profile.dit_steps
+                if request.remaining_steps is None
+                else request.remaining_steps
+            )
             return max(steps, 0) * profile.dit_per_step_ms + profile.vae_ms
         if stage == StageKind.VAE:
             return profile.vae_ms
         return 0.0
+
+    def _promote_expected_bin(self, expected_bin: int, generated_tokens: int) -> int:
+        if expected_bin < self.token_estimator.long_bin:
+            return self.token_estimator.long_bin
+        return max(expected_bin, generated_tokens)

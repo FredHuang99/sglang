@@ -67,7 +67,10 @@ python -m sglang.shiftserve.cli launch-plan \
   --rank0-broadcast \
   --transfer-pool-size 2147483648 \
   --transfer-pin-memory auto \
-  --max-slots-per-instance 1
+  --max-slots-per-instance 1 \
+  --dit-vae-dit-bs 1 \
+  --dit-vae-vae-bs 1 \
+  --dit-vae-stage-concurrency pipeline
 ```
 
 ## Trace CSV 转 Traffic JSON
@@ -123,9 +126,110 @@ python -m sglang.shiftserve.cli traffic-from-csv \
 | `--disagg-timeout` | `3600` | diffusion role/server timeout |
 | `--disagg-downstream-timeout` | `1800` | encoder->DiT 和 DiT->VAE downstream wait timeout |
 | `--disagg-transfer-calibration-mode` | `fixed` | generated diffusion launch args 跳过 warmup buffer resizing |
+| `--dit-vae-dit-bs` | `1` | `InstanceRuntimeState.dit_vae_bundle` 和 runtime DIT_VAE 内部 DiT stage slot 容量 |
+| `--dit-vae-vae-bs` | `1` | `InstanceRuntimeState.dit_vae_bundle` 和 runtime DIT_VAE 内部 VAE stage slot 容量 |
+| `--dit-vae-stage-concurrency` | `pipeline` | `scheduler_mixin._disagg_dit_vae_compute` 选择 split-stage pipeline 或 `serial_debug` 整体 forward |
 
 ## 输出文件
 
 - `request_events.csv`：每个 lifecycle event 一行，包含 stage、instance、generated tokens、completed steps、migration/fallback reason。
 - `request_events.jsonl`：和 CSV 相同的事件，方便脚本解析。
 - `run_summary.csv`：固定 7 个指标：`p50`、`p90`、`p99`、`throughput`、`lifespan`、`slo10_attainment`、`slo5_attainment`。
+
+## JSON 示例与字段说明
+
+### `deployment.json`
+
+```json
+{
+  "nodes": [
+    {"node_id": "node-a", "host": "10.0.0.1", "role_host": "10.0.0.1", "node_type": "A100"},
+    {"node_id": "node-b", "host": "10.0.0.2", "role_host": "10.0.0.2", "node_type": "H100"}
+  ],
+  "instances": [
+    {
+      "id": "pe-a0",
+      "kind": "pe",
+      "node_id": "node-a",
+      "device": "cuda",
+      "gpu_ids": [0],
+      "ranks": 1,
+      "ports": {"http": 30000},
+      "source_active": true,
+      "target_active": false
+    },
+    {
+      "id": "te-b0",
+      "kind": "te",
+      "node_id": "node-b",
+      "device": "cpu",
+      "ports": {"work": 31000, "control": 31001},
+      "source_active": true,
+      "target_active": true
+    },
+    {
+      "id": "ditvae-b0",
+      "kind": "dit_vae",
+      "node_id": "node-b",
+      "device": "cuda",
+      "gpu_ids": [0],
+      "ranks": 1,
+      "ports": {"work": 32000, "control": 32001},
+      "paired_te_id": "te-b0",
+      "stage_slots": {"dit_bs": 1, "vae_bs": 1},
+      "source_active": true,
+      "target_active": false
+    }
+  ],
+  "flip_plan": [
+    {"direction": "short_to_long", "sources": ["pe-a0"], "targets": ["ditvae-b0"]}
+  ],
+  "bins": {"short": 512, "long": 2048},
+  "port_base": 30000
+}
+```
+
+字段要求：
+- `nodes[].node_id` 必填、全局唯一；`host` 是本机 bind/连接地址；`role_host` 是对其他节点可达的 role 地址；`node_type` 只用于实验标注。
+- `instances[].id` 必填、全局唯一；`kind` 可填 `pe|te|dit|vae|dit_vae`，也支持 alias：`llm`、`encoder`、`denoiser`、`decoder`、`ddit_worker`。
+- `ports` 必须包含该 role 的端口：`pe` 需要 `http`，`te/dit/vae/dit_vae` 需要 `work` 和 `control`；同一 `node_id` 上不能冲突。
+- `paired_te_id` 用于 `dit_vae` bundle 绑定同 node TE。
+- `stage_slots.dit_bs` 和 `stage_slots.vae_bs` 是同一个 `dit_vae` instance 内部的 stage capacity，默认都是 1；它们不是启动两个实例，也不是把 `--max-slots-per-instance` 改成 2。
+
+### `profile.json`
+
+```json
+{
+  "model_id": "wan-validation",
+  "node_type": "H100",
+  "ranks": 1,
+  "tp": 1,
+  "sp": 1,
+  "pe": {"ttft_ms": 120.0, "tpot_ms": 8.5, "init_s": 42.0},
+  "diffusion": {
+    "te_s": 0.12,
+    "dit_steps": 30,
+    "dit_per_step_s": 0.18,
+    "vae_s": 0.45,
+    "init_s": 55.0
+  },
+  "rank0_broadcast": {"enabled": true, "init_s": 34.0}
+}
+```
+
+字段要求：时间单位按 key 写明，`*_ms` 是毫秒、`*_s` 是秒；`dit_steps` 必须是正整数；`rank0_broadcast` 可选，用于 launch ablation 记录。
+
+### `traffic.json`
+
+```json
+{
+  "duration_min": 10,
+  "default_rate_per_min": 4,
+  "intervals": [
+    {"start_min": 0, "end_min": 5, "rate_per_min": 4, "bin": "short", "input_tokens": 128},
+    {"start_min": 5, "end_min": 10, "rate_per_min": 2, "bin": "long", "input_tokens": 256}
+  ]
+}
+```
+
+字段要求：`duration_min`、`default_rate_per_min` 是数字；`intervals[].start_min/end_min` 用分钟，必须落在实验时长内；`bin` 填 `short` 或 `long`，对应 `deployment.json` 的 `bins`；`input_tokens` 可选，不填时使用默认值。

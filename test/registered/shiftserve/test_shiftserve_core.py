@@ -4,6 +4,7 @@ from sglang.shiftserve.client import build_request_specs
 from sglang.shiftserve.config import DeploymentConfig, TrafficConfig
 from sglang.shiftserve.launcher import LaunchCommandBuilder, LaunchDefaults, PortAllocator
 from sglang.shiftserve.scheduler import (
+    DITVAEStageRequest,
     HysteresisFlipMonitor,
     InstanceRuntimeState,
     RequestEstimate,
@@ -42,6 +43,10 @@ class TestShiftServeConfig(CustomTestCase):
         )
         self.assertEqual(deployment.instances["llm0"].kind, "pe")
         self.assertEqual(deployment.instances["ditvae0"].kind, "dit_vae")
+        self.assertEqual(
+            deployment.instances["ditvae0"].stage_slots,
+            {"dit_bs": 1, "vae_bs": 1},
+        )
         PortAllocator.validate(deployment)
 
     def test_port_collision_raises(self):
@@ -117,6 +122,61 @@ class TestShiftServeScheduler(CustomTestCase):
         self.assertEqual(result.instance_id, "dit0")
         self.assertEqual(result.fallback_reason, "same_node_or_pipeline_group_unavailable")
 
+    def test_dit_vae_bundle_releases_dit_slot_before_vae_finish(self):
+        instance = InstanceRuntimeState(
+            "ditvae0",
+            StageKind.DIT_VAE,
+            "node-b",
+            paired_te_id="te0",
+            stage_slots={"dit_bs": 1, "vae_bs": 1},
+        )
+        bundle = instance.dit_vae_bundle
+        assert bundle is not None
+
+        scheduler = ShiftServeScheduler()
+        scheduler.enqueue(instance, "a", remaining_steps=10)
+        dit_slot_a, dit_req_a = bundle.start_next_dit()
+        self.assertEqual(dit_slot_a, 0)
+        self.assertEqual(dit_req_a.request_id, "a")
+
+        bundle.finish_dit("a")
+        vae_slot_a, vae_req_a = bundle.start_next_vae()
+        self.assertEqual(vae_slot_a, 0)
+        self.assertEqual(vae_req_a.request_id, "a")
+        self.assertEqual(bundle.dit_free_slots(), 1)
+        self.assertEqual(bundle.vae_free_slots(), 0)
+
+        scheduler.enqueue(instance, "b", remaining_steps=10)
+        dit_slot_b, dit_req_b = bundle.start_next_dit()
+        self.assertEqual(dit_slot_b, 0)
+        self.assertEqual(dit_req_b.request_id, "b")
+        self.assertEqual(bundle.dit_running[0].request_id, "b")
+        self.assertEqual(bundle.vae_running[0].request_id, "a")
+
+    def test_dit_vae_weighted_uses_tandem_pipeline_formula(self):
+        instance = InstanceRuntimeState(
+            "ditvae0",
+            StageKind.DIT_VAE,
+            "node-b",
+            stage_slots={"dit_bs": 1, "vae_bs": 1},
+        )
+        bundle = instance.dit_vae_bundle
+        assert bundle is not None
+        bundle.vae_running[0] = DITVAEStageRequest("a", remaining_steps=0)
+        scheduler = ShiftServeScheduler(
+            mode=SchedulerMode.WEIGHTED,
+            cost_profile=StageCostProfile(
+                dit_steps=10,
+                dit_per_step_ms=5,
+                vae_ms=100,
+            ),
+        )
+        estimate = scheduler.estimate_work_ms(
+            instance,
+            RequestEstimate("b", StageKind.DIT_VAE, remaining_steps=10),
+        )
+        self.assertEqual(estimate, 200)
+
 
 class TestShiftServeLauncherAndTraffic(CustomTestCase):
     def test_launch_defaults_include_required_flags(self):
@@ -138,6 +198,14 @@ class TestShiftServeLauncherAndTraffic(CustomTestCase):
                         "gpu_ids": [0],
                         "ports": {"work": 31000, "control": 31001},
                     },
+                    {
+                        "id": "ditvae0",
+                        "kind": "dit_vae",
+                        "node_id": "a",
+                        "gpu_ids": [1],
+                        "stage_slots": {"dit_bs": 1, "vae_bs": 1},
+                        "ports": {"work": 32000, "control": 32001},
+                    },
                 ],
             }
         )
@@ -151,6 +219,7 @@ class TestShiftServeLauncherAndTraffic(CustomTestCase):
         )
         pe = commands["pe0"]
         dit = commands["dit0"]
+        ditvae = commands["ditvae0"]
         self.assertIn("--disable-piecewise-cuda-graph", pe)
         self.assertIn("--cuda-graph-max-bs", pe)
         self.assertIn("4096", pe)
@@ -161,6 +230,10 @@ class TestShiftServeLauncherAndTraffic(CustomTestCase):
         self.assertIn("--pin-cpu-memory", dit)
         self.assertIn("false", dit)
         self.assertIn("rank0-broadcast", dit)
+        self.assertIn("--dit-vae-dit-bs", ditvae)
+        self.assertIn("--dit-vae-vae-bs", ditvae)
+        self.assertIn("--dit-vae-stage-concurrency", ditvae)
+        self.assertIn("dit_vae", ditvae)
 
     def test_traffic_plan_generates_short_and_long_requests(self):
         traffic = TrafficConfig.from_dict(

@@ -23,6 +23,7 @@ INSTANCE_KIND_ALIASES = {
     "den": "dit",
     "decoder": "vae",
     "dec": "vae",
+    "ddit_worker": "dit_vae",
     "dit_vae_worker": "dit_vae",
 }
 VALID_INSTANCE_KINDS = {"pe", "te", "dit", "vae", "dit_vae"}
@@ -57,6 +58,22 @@ def _as_int_list(value: Any, *, field_name: str) -> list[int]:
     if len(set(result)) != len(result):
         raise ValueError(f"{field_name} contains duplicate values: {result}")
     return result
+
+
+def _normalize_stage_slots(raw: Any, *, kind: str, instance_id: str) -> dict[str, int]:
+    if raw is None:
+        return {"dit_bs": 1, "vae_bs": 1} if kind == "dit_vae" else {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"Instance {instance_id} stage_slots must be an object")
+    slots = {str(k): int(v) for k, v in raw.items()}
+    if kind == "dit_vae":
+        slots.setdefault("dit_bs", 1)
+        slots.setdefault("vae_bs", 1)
+        if slots["dit_bs"] < 1 or slots["vae_bs"] < 1:
+            raise ValueError(
+                f"Instance {instance_id} stage_slots must satisfy dit_bs>=1 and vae_bs>=1"
+            )
+    return slots
 
 
 def normalize_instance_kind(kind: str) -> str:
@@ -105,6 +122,9 @@ class InstanceConfig:
     target_active: bool = False
     node_group_id: str | None = None
     pipeline_group_id: str | None = None
+    paired_te_id: str | None = None
+    paired_dit_vae_id: str | None = None
+    stage_slots: dict[str, int] = field(default_factory=dict)
     model_id: str | None = None
     node_type: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -135,6 +155,9 @@ class InstanceConfig:
             "target_active",
             "node_group_id",
             "pipeline_group_id",
+            "paired_te_id",
+            "paired_dit_vae_id",
+            "stage_slots",
             "model_id",
             "node_type",
         }
@@ -150,6 +173,13 @@ class InstanceConfig:
             target_active=bool(raw.get("target_active", False)),
             node_group_id=raw.get("node_group_id"),
             pipeline_group_id=raw.get("pipeline_group_id"),
+            paired_te_id=raw.get("paired_te_id"),
+            paired_dit_vae_id=raw.get("paired_dit_vae_id"),
+            stage_slots=_normalize_stage_slots(
+                raw.get("stage_slots"),
+                kind=kind,
+                instance_id=instance_id,
+            ),
             model_id=raw.get("model_id"),
             node_type=raw.get("node_type"),
             metadata={k: v for k, v in raw.items() if k not in known},

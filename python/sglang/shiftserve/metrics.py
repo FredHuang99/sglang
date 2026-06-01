@@ -18,6 +18,9 @@ class RequestEvent:
     timestamp_s: float
     stage: str | None = None
     instance_id: str | None = None
+    bundle_id: str | None = None
+    dit_slot_id: int | None = None
+    vae_slot_id: int | None = None
     attempt_id: int = 0
     generated_tokens: int | None = None
     completed_steps: int | None = None
@@ -37,6 +40,9 @@ class MetricsRecorder:
         *,
         stage: str | None = None,
         instance_id: str | None = None,
+        bundle_id: str | None = None,
+        dit_slot_id: int | None = None,
+        vae_slot_id: int | None = None,
         attempt_id: int = 0,
         generated_tokens: int | None = None,
         completed_steps: int | None = None,
@@ -49,6 +55,9 @@ class MetricsRecorder:
             timestamp_s=time.time() if timestamp_s is None else float(timestamp_s),
             stage=stage,
             instance_id=instance_id,
+            bundle_id=bundle_id,
+            dit_slot_id=dit_slot_id,
+            vae_slot_id=vae_slot_id,
             attempt_id=attempt_id,
             generated_tokens=generated_tokens,
             completed_steps=completed_steps,
@@ -75,6 +84,9 @@ class MetricsRecorder:
                 "timestamp_s",
                 "stage",
                 "instance_id",
+                "bundle_id",
+                "dit_slot_id",
+                "vae_slot_id",
                 "attempt_id",
                 "generated_tokens",
                 "completed_steps",

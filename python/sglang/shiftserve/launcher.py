@@ -24,6 +24,9 @@ class LaunchDefaults:
     pe_max_running_requests: int = 1
     pe_mem_fraction_static: float | None = None
     rank0_broadcast: bool = False
+    dit_vae_dit_bs: int = 1
+    dit_vae_vae_bs: int = 1
+    dit_vae_stage_concurrency: str = "pipeline"
 
 
 class PortAllocator:
@@ -182,6 +185,19 @@ class LaunchCommandBuilder:
             args.extend(["--disagg-role-device", instance.device])
         if instance.kind in {"dit", "dit_vae"}:
             args.extend(["--sp-degree", str(max(instance.ranks, 1))])
+        if instance.kind == "dit_vae":
+            dit_bs = instance.stage_slots.get("dit_bs", self.defaults.dit_vae_dit_bs)
+            vae_bs = instance.stage_slots.get("vae_bs", self.defaults.dit_vae_vae_bs)
+            args.extend(
+                [
+                    "--dit-vae-dit-bs",
+                    str(dit_bs),
+                    "--dit-vae-vae-bs",
+                    str(vae_bs),
+                    "--dit-vae-stage-concurrency",
+                    self.defaults.dit_vae_stage_concurrency,
+                ]
+            )
         if self.defaults.rank0_broadcast and instance.kind in {"dit", "vae", "dit_vae"}:
             args.extend(
                 [

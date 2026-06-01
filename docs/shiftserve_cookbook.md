@@ -46,6 +46,100 @@ sequenceDiagram
 
 在当前 validation 实现中，`ShiftServeRouter.submit` 会记录 `system_enter`，选择 PE，记录 PE enter/end，更新 PE token window，检查 flip hysteresis，然后记录 TE/DiT/VAE lifecycle events。真实 PE 和 diffusion client 后续可以替换 `MockStageClient`，但 scheduler 和 metrics 的语义不变。
 
+## DIT_VAE 双阶段 Pipeline
+
+`DIT_VAE` 在启动、停止、flip 时仍然是一个 instance / bundle；但在调度和运行时内部，它不再是“一个请求占住整条 DiT+VAE 串行链路”。现在同一个 bundle 有两个 stage slot：`dit_bs=1` 和 `vae_bs=1`。当请求 A 的 DiT 完成后，A 进入同 bundle 的 `vae_queue` 并占用 VAE slot，DiT slot 立即释放；请求 B 可以进入同一个 bundle 的 DiT slot。
+
+```mermaid
+stateDiagram-v2
+  [*] --> DITQueue
+  DITQueue --> DITRunning: dit slot free
+  DITRunning --> VAEQueue: DiT done, release dit slot
+  VAEQueue --> VAERunning: vae slot free
+  VAERunning --> Done: VAE done
+  DITRunning --> MigratedDIT: flip at step boundary
+  VAEQueue --> SameNodeMigratedVAE: same-node tensor migration
+  VAERunning --> Done: not interrupted
+```
+
+对应 CLI / JSON：`--dit-vae-dit-bs`、`--dit-vae-vae-bs`、`--dit-vae-stage-concurrency`，以及 `deployment.json` 里的 `stage_slots: {"dit_bs": 1, "vae_bs": 1}`。
+
+关键源码：`scheduler.py` 中的 bundle state。
+
+```python
+@dataclass
+class DITVAEBundleState:
+    bundle_id: str
+    node_id: str
+    paired_te_id: str | None = None
+    dit_bs: int = 1
+    vae_bs: int = 1
+    dit_queue: deque[DITVAEStageRequest] = field(default_factory=deque)
+    vae_queue: deque[DITVAEStageRequest] = field(default_factory=deque)
+    dit_running: dict[int, DITVAEStageRequest] = field(default_factory=dict)
+    vae_running: dict[int, DITVAEStageRequest] = field(default_factory=dict)
+```
+
+为什么这样写：`DIT_VAE` 的资源生命周期和迁移成本仍然应该按一个进程/实例算，避免 flip 时 DiT、VAE launch 两次；但 stage capacity 必须拆开，否则 steady-state 下无法 pipeline。
+
+关键源码：DiT 完成后释放 DiT slot，并把 request 放入 VAE queue。
+
+```python
+def finish_dit(self, request_id: str, *, now_s: float | None = None) -> DITVAEStageRequest:
+    slot = self._find_running_slot(self.dit_running, request_id, stage_name="DiT")
+    request = self.dit_running.pop(slot)
+    request.dit_done_at_s = now_s
+    self.vae_queue.append(request)
+    return request
+```
+
+这段是 A-in-VAE / B-in-DiT 语义的核心：`pop(slot)` 让 DiT slot 变空，`self.vae_queue.append(request)` 让同一个 request 继续在 bundle 内部进入 VAE，而不是重新选择外部 VAE instance。
+
+关键源码：weighted 模式使用 tandem pipeline finish time，而不是简单 `dit + vae`。
+
+```python
+candidate_dit_finish_ms = dit_ahead_ms + candidate_dit_ms
+candidate_vae_ahead_ms = vae_available_ms + dit_ahead_count * profile.vae_ms
+return max(candidate_dit_finish_ms, candidate_vae_ahead_ms) + profile.vae_ms
+```
+
+为什么这样写：candidate 的 VAE 不能早于它自己的 DiT 完成，也不能早于当前 VAE slot 和前面 DiT 请求将来产生的 VAE 工作；所以 finish time 是两条约束的 `max` 再加自己的 `vae_ms`。对应代码分支由 `--weighted-schedule true` 触发；`false` 时仍走 round-robin，不读取这套 cost。
+
+关键源码：`router.py` 对 DIT_VAE 显式记录 TE、DiT、VAE 三段日志。
+
+```python
+dit_started = bundle.start_next_dit()
+self.metrics.mark(request.request_id, "dit_enter", stage=StageKind.DIT.value,
+                  instance_id=diffusion.instance_id, bundle_id=bundle.bundle_id,
+                  dit_slot_id=dit_slot_id)
+self.stage_client.run_stage(StageKind.DIT, request)
+bundle.finish_dit(request.request_id)
+...
+vae_started = bundle.start_next_vae()
+self.metrics.mark(request.request_id, "vae_enter", stage=StageKind.VAE.value,
+                  instance_id=diffusion.instance_id, bundle_id=bundle.bundle_id,
+                  vae_slot_id=vae_slot_id)
+```
+
+为什么这样写：日志必须能还原 request 的真实 stage 生命周期，不能因为外部 role 名叫 `DIT_VAE` 就丢掉 `vae_enter/vae_end`。对应输出字段在 `request_events.csv/jsonl` 中包括 `bundle_id`、`dit_slot_id`、`vae_slot_id`。
+
+关键源码：diffusion runtime 侧 `_disagg_dit_vae_compute` 默认按 stage name 拆开执行。
+
+```python
+dit_result = self.worker.execute_stage_forward(
+    [req],
+    ["denoising_stage"],
+    return_req=True,
+)
+...
+output_batch = self.worker.execute_stage_forward(
+    [dit_result],
+    ["decoding_stage"],
+)
+```
+
+为什么这样写：这保持一个 `dit_vae` role launch command，但 runtime 不再只用一次 `execute_forward([req])` 跑完整 pipeline。`--dit-vae-stage-concurrency serial_debug` 保留旧路径用于定位底层 stage API 问题；默认 `pipeline` 使用 split-stage path。
+
 ## Flip Workflow
 
 ```mermaid
@@ -120,6 +214,8 @@ flowchart TB
 
 - `StageKind`：公开 stage enum：PE、TE、DiT、VAE、DIT_VAE。
 - `SchedulerMode`：`ROUND_ROBIN` 或 `WEIGHTED`；由 CLI `--weighted-schedule` 控制。
+- `DITVAEStageRequest`：记录一个 request 在 DIT_VAE 内部 DiT/VAE stage 的时间戳、remaining steps 和 migration priority。
+- `DITVAEBundleState`：一个 `dit_vae` launch/flip unit，内部持有 `dit_queue`、`vae_queue`、`dit_running`、`vae_running` 和 `dit_bs/vae_bs`。
 - `InstanceRuntimeState`：记录 active/ready/draining/launching、queue、running request、grouping constraint、PE token window。
 - `WindowedTokenEstimator`：按 PE instance 维护 output length window，并映射 short/long bin。
 - `HysteresisFlipMonitor`：全局 PE completion window 和 high/low threshold crossing。
@@ -279,14 +375,15 @@ if self.defaults.rank0_broadcast and instance.kind in {"dit", "vae", "dit_vae"}:
 - `runtime/disaggregation/roles.py`：新增 `RoleType.DIT_VAE`，并添加 `ddit_worker`/`dit_vae_worker` aliases。
 - `runtime/disaggregation/dispatch_policy.py`：新增 `weighted_shiftserve`，在 DiffusionServer 内部 fallback 到 round-robin，因为 weighted routing 由 ShiftServe 外层 server 负责。
 - `runtime/server_args.py`：接受 `weighted_shiftserve`，新增 `--disagg-transfer-calibration-mode fixed|warmup`，并映射 `DIT_VAE` result offset。
-- `runtime/disaggregation/scheduler_mixin.py`：fixed calibration mode 跳过 measured warmup resizing；新增 `_disagg_dit_vae_compute`。
-- `runtime/pipelines_core/composed_pipeline_base.py`：`DIT_VAE` 可以加载/执行 denoiser 和 decoder stages/modules。
+- `runtime/disaggregation/scheduler_mixin.py`：fixed calibration mode 跳过 measured warmup resizing；`_disagg_dit_vae_compute` 默认按 `denoising_stage` 和 `decoding_stage` 拆开执行。
+- `runtime/pipelines_core/composed_pipeline_base.py`：`DIT_VAE` 可以加载/执行 denoiser 和 decoder stages/modules，并通过 `forward_stage_names` 执行指定 stage subset。
+- `runtime/managers/gpu_worker.py`：新增 `execute_stage_forward`，让 runtime 能在同一个 `dit_vae` worker 里先跑 DiT、再跑 VAE。
 - `runtime/launch_server.py`：standalone role launcher 接受 `DIT_VAE`。
 
 设计思路：`DIT_VAE` 作为 first-class role 引入，但保留现有三角色 validation path，避免 full mode 改动影响 validation。
 
 ## Test Map
 
-- `test/registered/shiftserve/test_shiftserve_core.py`：CPU CI tests，覆盖 config aliases、port collision、round-robin baseline、weighted selection、hysteresis、same-node fallback、launch defaults、traffic generation。
+- `test/registered/shiftserve/test_shiftserve_core.py`：CPU CI tests，覆盖 config aliases、port collision、round-robin baseline、weighted selection、DIT_VAE 双 stage slot、tandem estimate、hysteresis、same-node fallback、launch defaults、traffic generation。
 - `python/sglang/multimodal_gen/test/unit/test_dispatch_policy.py`：验证 `weighted_shiftserve` compatibility policy。
 - `python/sglang/multimodal_gen/test/unit/test_disagg_roles.py`：验证 `DIT_VAE` aliases 和 denoiser+decoder module filtering。

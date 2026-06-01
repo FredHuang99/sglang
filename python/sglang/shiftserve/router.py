@@ -110,23 +110,80 @@ class ShiftServeRouter:
         diffusion = self.instances[diffusion_selection.instance_id]
         self.scheduler.enqueue(diffusion, request.request_id)
 
-        self.metrics.mark(request.request_id, "te_enter", stage=StageKind.TE.value)
+        te_instance_id = self._paired_te_instance_id(diffusion)
+        self.metrics.mark(
+            request.request_id,
+            "te_enter",
+            stage=StageKind.TE.value,
+            instance_id=te_instance_id,
+            bundle_id=diffusion.instance_id if diffusion.kind == StageKind.DIT_VAE else None,
+        )
         self.stage_client.run_stage(StageKind.TE, request)
-        self.metrics.mark(request.request_id, "te_end", stage=StageKind.TE.value)
         self.metrics.mark(
             request.request_id,
-            "dit_enter",
-            stage=diffusion_stage.value,
-            instance_id=diffusion.instance_id,
+            "te_end",
+            stage=StageKind.TE.value,
+            instance_id=te_instance_id,
+            bundle_id=diffusion.instance_id if diffusion.kind == StageKind.DIT_VAE else None,
         )
-        self.stage_client.run_stage(diffusion_stage, request)
-        self.metrics.mark(
-            request.request_id,
-            "dit_end",
-            stage=diffusion_stage.value,
-            instance_id=diffusion.instance_id,
-        )
-        if diffusion_stage != StageKind.DIT_VAE:
+        if diffusion.kind == StageKind.DIT_VAE and diffusion.dit_vae_bundle is not None:
+            bundle = diffusion.dit_vae_bundle
+            dit_started = bundle.start_next_dit()
+            dit_slot_id = dit_started[0] if dit_started is not None else None
+            self.metrics.mark(
+                request.request_id,
+                "dit_enter",
+                stage=StageKind.DIT.value,
+                instance_id=diffusion.instance_id,
+                bundle_id=bundle.bundle_id,
+                dit_slot_id=dit_slot_id,
+            )
+            self.stage_client.run_stage(StageKind.DIT, request)
+            if dit_started is not None:
+                bundle.finish_dit(request.request_id)
+            self.metrics.mark(
+                request.request_id,
+                "dit_end",
+                stage=StageKind.DIT.value,
+                instance_id=diffusion.instance_id,
+                bundle_id=bundle.bundle_id,
+                dit_slot_id=dit_slot_id,
+            )
+            vae_started = bundle.start_next_vae()
+            vae_slot_id = vae_started[0] if vae_started is not None else None
+            self.metrics.mark(
+                request.request_id,
+                "vae_enter",
+                stage=StageKind.VAE.value,
+                instance_id=diffusion.instance_id,
+                bundle_id=bundle.bundle_id,
+                vae_slot_id=vae_slot_id,
+            )
+            self.stage_client.run_stage(StageKind.VAE, request)
+            if vae_started is not None:
+                bundle.finish_vae(request.request_id)
+            self.metrics.mark(
+                request.request_id,
+                "vae_end",
+                stage=StageKind.VAE.value,
+                instance_id=diffusion.instance_id,
+                bundle_id=bundle.bundle_id,
+                vae_slot_id=vae_slot_id,
+            )
+        else:
+            self.metrics.mark(
+                request.request_id,
+                "dit_enter",
+                stage=diffusion_stage.value,
+                instance_id=diffusion.instance_id,
+            )
+            self.stage_client.run_stage(diffusion_stage, request)
+            self.metrics.mark(
+                request.request_id,
+                "dit_end",
+                stage=diffusion_stage.value,
+                instance_id=diffusion.instance_id,
+            )
             self.metrics.mark(request.request_id, "vae_enter", stage=StageKind.VAE.value)
             self.stage_client.run_stage(StageKind.VAE, request)
             self.metrics.mark(request.request_id, "vae_end", stage=StageKind.VAE.value)
@@ -152,6 +209,18 @@ class ShiftServeRouter:
                 instance.ready = True
                 instance.draining = False
                 instance.launching = False
+
+    def _paired_te_instance_id(self, diffusion: InstanceRuntimeState) -> str | None:
+        if diffusion.dit_vae_bundle is not None and diffusion.dit_vae_bundle.paired_te_id:
+            return diffusion.dit_vae_bundle.paired_te_id
+        same_node_te = sorted(
+            (
+                instance.instance_id
+                for instance in self.instances.values()
+                if instance.kind == StageKind.TE and instance.node_id == diffusion.node_id
+            )
+        )
+        return same_node_te[0] if same_node_te else None
 
     @classmethod
     def for_dry_run(

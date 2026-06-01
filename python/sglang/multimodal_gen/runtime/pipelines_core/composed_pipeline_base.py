@@ -618,6 +618,36 @@ class ComposedPipelineBase(ABC):
         """Get a stage by name."""
         return self._stage_name_mapping.get(stage_name)
 
+    @torch.no_grad()
+    def forward_stage_names(
+        self,
+        batch: Req,
+        server_args: ServerArgs,
+        stage_names: list[str],
+    ) -> OutputBatch:
+        """Execute a named subset of stages without rebuilding the pipeline."""
+
+        stages = []
+        missing = []
+        for stage_name in stage_names:
+            stage = self._stage_name_mapping.get(stage_name)
+            if stage is None:
+                missing.append(stage_name)
+            else:
+                stages.append(stage)
+        if missing:
+            raise ValueError(
+                f"Pipeline does not contain stage(s) {missing}; "
+                f"available={list(self._stage_name_mapping.keys())}"
+            )
+        if not batch.is_warmup and not batch.suppress_logs:
+            logger.info(
+                "Running pipeline stage subset: %s",
+                stage_names,
+                main_process_only=True,
+            )
+        return self.executor.execute_with_profiling(stages, batch, server_args)
+
     def add_standard_text_encoding_stage(
         self,
         text_encoder_key: str = "text_encoder",

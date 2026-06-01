@@ -286,6 +286,9 @@ class ServerArgs:
     )  # P2P transfer buffer size (bytes)
     disagg_transfer_calibration_mode: Literal["warmup", "fixed"] = "warmup"
     disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
+    dit_vae_dit_bs: int = 1
+    dit_vae_vae_bs: int = 1
+    dit_vae_stage_concurrency: Literal["pipeline", "serial_debug"] = "pipeline"
     disagg_p2p_hostname: str = "127.0.0.1"  # Hostname for P2P transfer engine
     disagg_ib_device: str | None = None  # InfiniBand device for mooncake RDMA
     disagg_server_addr: str | None = (
@@ -448,6 +451,8 @@ class ServerArgs:
         self._validate_weight_loading()
         self._validate_parallelism()
         self._validate_cfg_parallel()
+        if self.dit_vae_dit_bs < 1 or self.dit_vae_vae_bs < 1:
+            raise ValueError("DIT_VAE stage slots must satisfy dit_bs>=1 and vae_bs>=1")
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -964,6 +969,28 @@ class ServerArgs:
                 "CUDA host-register same-host shared-memory transfer buffers. "
                 "'auto' pins CUDA role buffers and falls back on failure; "
                 "'required' fails startup if pinning fails; 'off' disables it."
+            ),
+        )
+        parser.add_argument(
+            "--dit-vae-dit-bs",
+            type=int,
+            default=ServerArgs.dit_vae_dit_bs,
+            help="DiT stage concurrency slots inside one launched DIT_VAE instance.",
+        )
+        parser.add_argument(
+            "--dit-vae-vae-bs",
+            type=int,
+            default=ServerArgs.dit_vae_vae_bs,
+            help="VAE stage concurrency slots inside one launched DIT_VAE instance.",
+        )
+        parser.add_argument(
+            "--dit-vae-stage-concurrency",
+            type=str,
+            default=ServerArgs.dit_vae_stage_concurrency,
+            choices=["pipeline", "serial_debug"],
+            help=(
+                "DIT_VAE internal scheduling mode. 'pipeline' releases the DiT "
+                "slot before VAE decode; 'serial_debug' keeps the old whole-request path."
             ),
         )
         parser.add_argument(

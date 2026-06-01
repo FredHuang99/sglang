@@ -605,6 +605,17 @@ class SchedulerDisaggMixin:
         self._transfer_reconfigured = False
         self._warmup_inbound_sizes = {}
         self._role_profile_writer = None
+        self._dit_vae_dit_bs = max(1, int(getattr(server_args, "dit_vae_dit_bs", 1)))
+        self._dit_vae_vae_bs = max(1, int(getattr(server_args, "dit_vae_vae_bs", 1)))
+        self._dit_vae_stage_concurrency = getattr(
+            server_args,
+            "dit_vae_stage_concurrency",
+            "pipeline",
+        )
+        self._dit_vae_dit_queue = deque()
+        self._dit_vae_vae_queue = deque()
+        self._dit_vae_dit_running = 0
+        self._dit_vae_vae_running = 0
 
         if self._disagg_role != RoleType.MONOLITHIC:
             self._disagg_metrics = DisaggMetrics(role=self._disagg_role.value)
@@ -2441,12 +2452,37 @@ class SchedulerDisaggMixin:
             with self._compute_stream_context():
                 self.worker.execute_forward([req], return_req=True)
 
-        elif self._disagg_role in (RoleType.DECODER, RoleType.DIT_VAE):
+        elif self._disagg_role == RoleType.DECODER:
             req.save_output = False
             req.return_file_paths_only = False
             with self._compute_stream_context():
                 self.worker.execute_forward([req])
             self._make_current_stream_wait_for_compute()
+        elif self._disagg_role == RoleType.DIT_VAE:
+            req.save_output = False
+            req.return_file_paths_only = False
+            if (
+                self._dit_vae_stage_concurrency == "serial_debug"
+                or not hasattr(self.worker, "execute_stage_forward")
+            ):
+                with self._compute_stream_context():
+                    self.worker.execute_forward([req])
+                self._make_current_stream_wait_for_compute()
+            else:
+                with self._compute_stream_context():
+                    dit_result = self.worker.execute_stage_forward(
+                        [req],
+                        ["denoising_stage"],
+                        return_req=True,
+                    )
+                self._make_current_stream_wait_for_compute()
+                if isinstance(dit_result, Req):
+                    with self._compute_stream_context():
+                        self.worker.execute_stage_forward(
+                            [dit_result],
+                            ["decoding_stage"],
+                        )
+                    self._make_current_stream_wait_for_compute()
 
     def _build_disagg_req(self: Scheduler, scalar_fields: dict, tensors: dict) -> Req:
         """Reconstruct a Req from transfer scalar fields and loaded GPU tensors.
@@ -2644,12 +2680,7 @@ class SchedulerDisaggMixin:
     def _disagg_dit_vae_compute(
         self: Scheduler, req: Req, request_id: str, role_name: str
     ) -> None:
-        """Run a combined DiT+VAE pipeline and send the final result to DS.
-
-        This is intentionally shaped like decoder completion because the full
-        DIT_VAE role consumes encoder tensors and returns final media without a
-        denoiser->decoder transfer hop.
-        """
+        """Run DIT_VAE as one launch unit with separate DiT and VAE stages."""
 
         disagg_error = getattr(req, "_disagg_error", None)
         if disagg_error:
@@ -2670,9 +2701,62 @@ class SchedulerDisaggMixin:
             return
 
         start_time = time.monotonic()
-        with self._compute_stream_context():
-            output_batch = self.worker.execute_forward([req])
-        self._make_current_stream_wait_for_compute()
+        if (
+            self._dit_vae_stage_concurrency == "serial_debug"
+            or not hasattr(self.worker, "execute_stage_forward")
+        ):
+            with self._compute_stream_context():
+                output_batch = self.worker.execute_forward([req])
+            self._make_current_stream_wait_for_compute()
+        else:
+            self._dit_vae_dit_queue.append(request_id)
+            self._dit_vae_dit_running += 1
+            logger.debug(
+                "Transfer DIT_VAE: request %s entered DiT slot "
+                "(dit_running=%d, dit_queue=%d)",
+                request_id,
+                self._dit_vae_dit_running,
+                len(self._dit_vae_dit_queue),
+            )
+            try:
+                with self._compute_stream_context():
+                    dit_result = self.worker.execute_stage_forward(
+                        [req],
+                        ["denoising_stage"],
+                        return_req=True,
+                    )
+                self._make_current_stream_wait_for_compute()
+            finally:
+                if self._dit_vae_dit_queue:
+                    self._dit_vae_dit_queue.popleft()
+                self._dit_vae_dit_running = max(self._dit_vae_dit_running - 1, 0)
+
+            if not isinstance(dit_result, Req):
+                output_batch = dit_result
+            else:
+                self._dit_vae_vae_queue.append(request_id)
+                logger.debug(
+                    "Transfer DIT_VAE: request %s moved DiT->VAE "
+                    "(dit_running=%d, vae_queue=%d)",
+                    request_id,
+                    self._dit_vae_dit_running,
+                    len(self._dit_vae_vae_queue),
+                )
+                self._dit_vae_vae_running += 1
+                try:
+                    with self._compute_stream_context():
+                        output_batch = self.worker.execute_stage_forward(
+                            [dit_result],
+                            ["decoding_stage"],
+                        )
+                    self._make_current_stream_wait_for_compute()
+                finally:
+                    if self._dit_vae_vae_queue:
+                        self._dit_vae_vae_queue.popleft()
+                    self._dit_vae_vae_running = max(
+                        self._dit_vae_vae_running - 1,
+                        0,
+                    )
         duration_s = time.monotonic() - start_time
         compute_finish_time_s = time.time()
         self._profile_role_update(
