@@ -193,8 +193,10 @@ def new_group_optional_kwargs() -> dict[str, Any]:
 
 
 def memory_snapshot() -> dict[str, Any]:
+    proc_memory = proc_status_memory_snapshot()
     snapshot: dict[str, Any] = {
         "cpu_maxrss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        **proc_memory,
     }
     if torch.cuda.is_available():
         device = torch.cuda.current_device()
@@ -206,9 +208,134 @@ def memory_snapshot() -> dict[str, Any]:
                 "cuda_max_allocated": torch.cuda.max_memory_allocated(device),
                 "cuda_free": free,
                 "cuda_total": total,
+                "cuda_used": total - free,
             }
         )
     return snapshot
+
+
+def proc_status_memory_snapshot() -> dict[str, int]:
+    fields = {
+        "VmRSS": "cpu_rss_kb",
+        "VmHWM": "cpu_hwm_kb",
+    }
+    snapshot = {field_name: 0 for field_name in fields.values()}
+    status_path = Path("/proc/self/status")
+    if not status_path.exists():
+        return snapshot
+    try:
+        for line in status_path.read_text(encoding="utf-8").splitlines():
+            key, sep, rest = line.partition(":")
+            if not sep or key not in fields:
+                continue
+            value = rest.strip().split()[0]
+            snapshot[fields[key]] = int(value)
+    except Exception:
+        return snapshot
+    return snapshot
+
+
+def snapshot_delta(
+    after: dict[str, Any],
+    before: dict[str, Any],
+    key: str,
+) -> int | float:
+    return after.get(key, 0) - before.get(key, 0)
+
+
+def memory_profile_summary(
+    *,
+    enabled: bool,
+    before_prebuild: dict[str, Any],
+    after_prebuild: dict[str, Any],
+    after_coverage: dict[str, Any],
+    created_device_groups: int,
+    created_cpu_groups: int,
+) -> dict[str, Any]:
+    if not enabled:
+        return {
+            "memory_profile_enabled": False,
+            "memory_prebuild_before": {},
+            "memory_prebuild_after": {},
+            "memory_coverage_after": {},
+        }
+    created_device_groups_for_avg = max(1, int(created_device_groups))
+    prebuild_cuda_used_delta = snapshot_delta(
+        after_prebuild, before_prebuild, "cuda_used"
+    )
+    prebuild_cpu_rss_delta = snapshot_delta(
+        after_prebuild, before_prebuild, "cpu_rss_kb"
+    )
+    prebuild_cpu_hwm_delta = snapshot_delta(
+        after_prebuild, before_prebuild, "cpu_hwm_kb"
+    )
+    coverage_cuda_used_delta = snapshot_delta(
+        after_coverage, after_prebuild, "cuda_used"
+    )
+    total_cuda_used_delta = snapshot_delta(
+        after_coverage, before_prebuild, "cuda_used"
+    )
+    return {
+        "memory_profile_enabled": True,
+        "memory_prebuild_before": before_prebuild,
+        "memory_prebuild_after": after_prebuild,
+        "memory_coverage_after": after_coverage,
+        "prebuild_cuda_free_delta_bytes": snapshot_delta(
+            after_prebuild, before_prebuild, "cuda_free"
+        ),
+        "prebuild_cuda_used_delta_bytes": prebuild_cuda_used_delta,
+        "prebuild_torch_allocated_delta_bytes": snapshot_delta(
+            after_prebuild, before_prebuild, "cuda_allocated"
+        ),
+        "prebuild_torch_reserved_delta_bytes": snapshot_delta(
+            after_prebuild, before_prebuild, "cuda_reserved"
+        ),
+        "prebuild_cpu_rss_delta_kb": prebuild_cpu_rss_delta,
+        "prebuild_cpu_hwm_delta_kb": prebuild_cpu_hwm_delta,
+        "prebuild_cpu_maxrss_delta_kb": snapshot_delta(
+            after_prebuild, before_prebuild, "cpu_maxrss_kb"
+        ),
+        "coverage_cuda_used_delta_bytes": coverage_cuda_used_delta,
+        "coverage_torch_allocated_delta_bytes": snapshot_delta(
+            after_coverage, after_prebuild, "cuda_allocated"
+        ),
+        "coverage_torch_reserved_delta_bytes": snapshot_delta(
+            after_coverage, after_prebuild, "cuda_reserved"
+        ),
+        "coverage_cpu_rss_delta_kb": snapshot_delta(
+            after_coverage, after_prebuild, "cpu_rss_kb"
+        ),
+        "coverage_cpu_hwm_delta_kb": snapshot_delta(
+            after_coverage, after_prebuild, "cpu_hwm_kb"
+        ),
+        "total_cuda_used_delta_bytes": total_cuda_used_delta,
+        "total_torch_allocated_delta_bytes": snapshot_delta(
+            after_coverage, before_prebuild, "cuda_allocated"
+        ),
+        "total_torch_reserved_delta_bytes": snapshot_delta(
+            after_coverage, before_prebuild, "cuda_reserved"
+        ),
+        "total_cpu_rss_delta_kb": snapshot_delta(
+            after_coverage, before_prebuild, "cpu_rss_kb"
+        ),
+        "total_cpu_hwm_delta_kb": snapshot_delta(
+            after_coverage, before_prebuild, "cpu_hwm_kb"
+        ),
+        "per_created_device_group_cuda_used_bytes": (
+            prebuild_cuda_used_delta / created_device_groups_for_avg
+        ),
+        "per_created_device_group_cpu_rss_kb": (
+            prebuild_cpu_rss_delta / created_device_groups_for_avg
+        ),
+        "per_created_device_group_cpu_hwm_kb": (
+            prebuild_cpu_hwm_delta / created_device_groups_for_avg
+        ),
+        "per_created_cpu_group_cpu_rss_kb": (
+            prebuild_cpu_rss_delta / int(created_cpu_groups)
+            if int(created_cpu_groups) > 0
+            else None
+        ),
+    }
 
 
 class LightweightBuilder:
@@ -266,6 +393,7 @@ class HeavyProxyBuilder:
         self.backend = backend
         self.touch_collective = touch_collective
         self.use_sglang = use_sglang
+        self.pg_cache: dict[tuple[int, ...], Any] = {}
 
     def build(self, ranks: tuple[int, ...], model_id: str, degree_map: str) -> BuildStats:
         stats = BuildStats()
@@ -338,10 +466,12 @@ class HeavyProxyBuilder:
         stats.created_cpu_groups += len(group_ranks)
 
     def _create_device_pg(self, ranks: tuple[int, ...], stats: BuildStats) -> Any:
+        ranks = tuple(sorted(int(rank) for rank in ranks))
         started = time.perf_counter()
         pg = dist.new_group(ranks=list(ranks), backend=self.backend, **new_group_optional_kwargs())
         stats.new_group_ms += (time.perf_counter() - started) * 1000.0
         stats.created_device_groups += 1
+        self.pg_cache.setdefault(ranks, pg)
         if self.touch_collective and len(ranks) > 1:
             stats.collective_touch_ms += touch_group(ranks, pg)
         return pg
@@ -500,6 +630,7 @@ def main() -> None:
         default="0;0,1;0,1,2,3;0,1,2,3,4,5,6,7",
         help="Semicolon-separated rank tuples used when --coverage-warmup-mode=custom",
     )
+    parser.add_argument("--memory-profile", action="store_true")
     parser.add_argument("--heavy-sglang-coordinator", action="store_true")
     parser.add_argument("--max-specs", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
@@ -518,14 +649,13 @@ def main() -> None:
         if args.mode == "lightweight":
             builder = LightweightBuilder(backend, args.touch_collective)
         else:
-            if args.coverage_warmup:
-                raise ValueError("--coverage-warmup is only supported with --mode lightweight")
             builder = HeavyProxyBuilder(
                 backend, args.touch_collective, args.heavy_sglang_coordinator
             )
 
         rows: list[dict[str, Any]] = []
         started = time.perf_counter()
+        memory_before_prebuild = memory_snapshot()
         for idx, ranks in enumerate(rank_tuples, start=1):
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats()
@@ -551,13 +681,21 @@ def main() -> None:
                 "cuda_reserved_delta": after.get("cuda_reserved", 0)
                 - before.get("cuda_reserved", 0),
                 "cuda_free_delta": after.get("cuda_free", 0) - before.get("cuda_free", 0),
+                "cuda_used_delta": after.get("cuda_used", 0) - before.get("cuda_used", 0),
                 "cpu_maxrss_kb": after.get("cpu_maxrss_kb", 0),
+                "cpu_rss_kb": after.get("cpu_rss_kb", 0),
+                "cpu_rss_delta_kb": after.get("cpu_rss_kb", 0)
+                - before.get("cpu_rss_kb", 0),
+                "cpu_hwm_kb": after.get("cpu_hwm_kb", 0),
+                "cpu_hwm_delta_kb": after.get("cpu_hwm_kb", 0)
+                - before.get("cpu_hwm_kb", 0),
             }
             rows.append(row)
             if stats.error:
                 break
         dist.barrier()
         prebuild_elapsed_s = time.perf_counter() - started
+        memory_after_prebuild = memory_snapshot()
         coverage_summary: dict[str, Any]
         if args.coverage_warmup:
             coverage_summary = run_coverage_warmup(args, builder, world_size)
@@ -576,7 +714,18 @@ def main() -> None:
                 "total_coverage_warmup_ms": 0.0,
             }
         dist.barrier()
+        memory_after_coverage = memory_snapshot()
         total_elapsed_s = time.perf_counter() - started
+        total_created_device_groups = sum(r["created_device_groups"] for r in rows)
+        total_created_cpu_groups = sum(r["created_cpu_groups"] for r in rows)
+        memory_summary = memory_profile_summary(
+            enabled=bool(args.memory_profile),
+            before_prebuild=memory_before_prebuild,
+            after_prebuild=memory_after_prebuild,
+            after_coverage=memory_after_coverage,
+            created_device_groups=total_created_device_groups,
+            created_cpu_groups=total_created_cpu_groups,
+        )
         summary = {
             "mode": args.mode,
             "rank": rank,
@@ -585,8 +734,8 @@ def main() -> None:
             "completed_specs": len(rows),
             "prebuild_elapsed_s": prebuild_elapsed_s,
             "elapsed_s": total_elapsed_s,
-            "total_created_device_groups": sum(r["created_device_groups"] for r in rows),
-            "total_created_cpu_groups": sum(r["created_cpu_groups"] for r in rows),
+            "total_created_device_groups": total_created_device_groups,
+            "total_created_cpu_groups": total_created_cpu_groups,
             "total_reused_device_groups": sum(r["reused_device_groups"] for r in rows),
             "total_new_group_ms": sum(r["new_group_ms"] for r in rows),
             "total_collective_touch_ms": sum(r["collective_touch_ms"] for r in rows),
@@ -596,6 +745,7 @@ def main() -> None:
             ),
             "errors": [r for r in rows if r["error"]],
             **coverage_summary,
+            **memory_summary,
         }
         write_rank_outputs(Path(args.out_dir), rank, rows, summary)
         if rank == 0:
