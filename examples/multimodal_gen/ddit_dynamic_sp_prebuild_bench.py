@@ -124,6 +124,63 @@ def rank_tuples_for_args(args: argparse.Namespace, world_size: int) -> list[tupl
     raise ValueError("--rank-tuples must be all, canonical, or sample:N")
 
 
+def parse_rank_tuple_specs(value: str) -> tuple[tuple[int, ...], ...]:
+    rank_tuples: list[tuple[int, ...]] = []
+    for item in str(value or "").split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        ranks = tuple(sorted(parse_csv_ints(item)))
+        if len(set(ranks)) != len(ranks):
+            raise ValueError(f"Duplicate rank in --coverage-warmup-ranks item: {item}")
+        rank_tuples.append(ranks)
+    return tuple(rank_tuples)
+
+
+def coverage_rank_tuples_for_args(
+    args: argparse.Namespace, world_size: int
+) -> tuple[tuple[int, ...], ...]:
+    ranks = tuple(range(world_size))
+    counts = parse_csv_ints(args.allowed_counts)
+    mode = args.coverage_warmup_mode
+    if mode == "custom":
+        rank_tuples = parse_rank_tuple_specs(args.coverage_warmup_ranks)
+    elif mode == "rank_count":
+        rank_tuples = tuple(
+            ranks[:count] for count in sorted(set(counts)) if 0 < count <= world_size
+        )
+    elif mode == "coverage":
+        coverage: list[tuple[int, ...]] = []
+        for count in sorted(set(counts)):
+            if count <= 0 or count > world_size:
+                continue
+            if count == 1:
+                coverage.extend((rank,) for rank in ranks)
+                continue
+            for start in range(0, world_size, count):
+                group = ranks[start : start + count]
+                if len(group) == count:
+                    coverage.append(group)
+        rank_tuples = tuple(coverage)
+    else:
+        raise ValueError("--coverage-warmup-mode must be coverage, rank_count, or custom")
+
+    validated: list[tuple[int, ...]] = []
+    rank_set = set(ranks)
+    for rank_tuple in rank_tuples:
+        normalized = tuple(sorted(int(rank) for rank in rank_tuple))
+        if not normalized:
+            continue
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(f"Duplicate rank in coverage warmup tuple: {normalized}")
+        if not set(normalized).issubset(rank_set):
+            raise ValueError(
+                f"Coverage warmup tuple {normalized} is outside world_size={world_size}"
+            )
+        validated.append(normalized)
+    return tuple(sorted(set(validated), key=lambda item: (len(item), item)))
+
+
 def new_group_optional_kwargs() -> dict[str, Any]:
     try:
         parameters = inspect.signature(dist.new_group).parameters
@@ -308,6 +365,72 @@ def touch_group(ranks: tuple[int, ...], pg: Any) -> float:
     return (time.perf_counter() - started) * 1000.0
 
 
+def touch_cached_coverage_group(
+    ranks: tuple[int, ...],
+    pg_cache: dict[tuple[int, ...], Any],
+) -> tuple[float, bool, str]:
+    ranks = tuple(sorted(int(rank) for rank in ranks))
+    if len(ranks) <= 1:
+        if torch.cuda.is_available() and dist.get_rank() in ranks:
+            torch.cuda.synchronize()
+        return 0.0, False, "skip_singleton"
+    if ranks == tuple(range(dist.get_world_size())):
+        pg = dist.group.WORLD
+    else:
+        pg = pg_cache.get(ranks)
+    if pg is None:
+        return 0.0, False, "missing_process_group"
+    return touch_group(ranks, pg), True, "touched"
+
+
+def run_coverage_warmup(
+    args: argparse.Namespace,
+    builder: Any,
+    world_size: int,
+) -> dict[str, Any]:
+    selected = coverage_rank_tuples_for_args(args, world_size)
+    pg_cache = getattr(builder, "pg_cache", None)
+    if pg_cache is None:
+        raise RuntimeError("--coverage-warmup is only supported by lightweight mode")
+
+    total_ms = 0.0
+    touched = 0
+    skipped_singleton = 0
+    missing: list[tuple[int, ...]] = []
+    per_tuple: list[dict[str, Any]] = []
+    for ranks in selected:
+        elapsed_ms, did_touch, status = touch_cached_coverage_group(ranks, pg_cache)
+        total_ms += elapsed_ms
+        if did_touch:
+            touched += 1
+        elif status == "skip_singleton":
+            skipped_singleton += 1
+        elif status == "missing_process_group":
+            missing.append(ranks)
+        per_tuple.append(
+            {
+                "ranks": list(ranks),
+                "rank_count": len(ranks),
+                "status": status,
+                "collective_touch_ms": elapsed_ms,
+            }
+        )
+
+    return {
+        "coverage_warmup_enabled": True,
+        "coverage_warmup_mode": args.coverage_warmup_mode,
+        "coverage_warmup_kind": "collective_touch_only",
+        "coverage_warmup_count": len(selected),
+        "coverage_warmup_non_singleton_count": touched,
+        "coverage_warmup_singleton_skipped_count": skipped_singleton,
+        "coverage_warmup_missing_pg_count": len(missing),
+        "coverage_warmup_missing_pg_tuples": [list(ranks) for ranks in missing],
+        "coverage_warmup_tuples": [list(ranks) for ranks in selected],
+        "coverage_warmup_per_tuple": per_tuple,
+        "total_coverage_warmup_ms": total_ms,
+    }
+
+
 def init_dist(args: argparse.Namespace) -> str:
     if torch.cuda.is_available():
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -321,6 +444,25 @@ def init_dist(args: argparse.Namespace) -> str:
             kwargs["device_id"] = torch.device(f"cuda:{torch.cuda.current_device()}")
         dist.init_process_group(**kwargs)
     return backend
+
+
+def cleanup_dist(run_barrier: bool) -> None:
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    if run_barrier:
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+    try:
+        dist.destroy_process_group()
+    except Exception:
+        pass
 
 
 def write_rank_outputs(out_dir: Path, rank: int, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
@@ -347,77 +489,120 @@ def main() -> None:
     parser.add_argument("--model-id", default="z-image")
     parser.add_argument("--sp-degree-map", default="shortpath")
     parser.add_argument("--touch-collective", action="store_true")
+    parser.add_argument("--coverage-warmup", action="store_true")
+    parser.add_argument(
+        "--coverage-warmup-mode",
+        choices=("coverage", "rank_count", "custom"),
+        default="coverage",
+    )
+    parser.add_argument(
+        "--coverage-warmup-ranks",
+        default="0;0,1;0,1,2,3;0,1,2,3,4,5,6,7",
+        help="Semicolon-separated rank tuples used when --coverage-warmup-mode=custom",
+    )
     parser.add_argument("--heavy-sglang-coordinator", action="store_true")
     parser.add_argument("--max-specs", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", required=True)
     args = parser.parse_args()
 
-    backend = init_dist(args)
-    world_size = dist.get_world_size()
-    rank = dist.get_rank()
-    rank_tuples = rank_tuples_for_args(args, world_size)
-    if args.max_specs > 0:
-        rank_tuples = rank_tuples[: args.max_specs]
-    builder: Any
-    if args.mode == "lightweight":
-        builder = LightweightBuilder(backend, args.touch_collective)
-    else:
-        builder = HeavyProxyBuilder(
-            backend, args.touch_collective, args.heavy_sglang_coordinator
-        )
+    completed = False
+    try:
+        backend = init_dist(args)
+        world_size = dist.get_world_size()
+        rank = dist.get_rank()
+        rank_tuples = rank_tuples_for_args(args, world_size)
+        if args.max_specs > 0:
+            rank_tuples = rank_tuples[: args.max_specs]
+        builder: Any
+        if args.mode == "lightweight":
+            builder = LightweightBuilder(backend, args.touch_collective)
+        else:
+            if args.coverage_warmup:
+                raise ValueError("--coverage-warmup is only supported with --mode lightweight")
+            builder = HeavyProxyBuilder(
+                backend, args.touch_collective, args.heavy_sglang_coordinator
+            )
 
-    rows: list[dict[str, Any]] = []
-    started = time.perf_counter()
-    for idx, ranks in enumerate(rank_tuples, start=1):
-        if torch.cuda.is_available():
-            torch.cuda.reset_peak_memory_stats()
-        before = memory_snapshot()
-        stats = builder.build(ranks, args.model_id, args.sp_degree_map)
-        after = memory_snapshot()
-        row = {
-            "spec_index": idx,
+        rows: list[dict[str, Any]] = []
+        started = time.perf_counter()
+        for idx, ranks in enumerate(rank_tuples, start=1):
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+            before = memory_snapshot()
+            stats = builder.build(ranks, args.model_id, args.sp_degree_map)
+            after = memory_snapshot()
+            row = {
+                "spec_index": idx,
+                "mode": args.mode,
+                "rank": rank,
+                "world_size": world_size,
+                "ranks": json.dumps(list(ranks)),
+                "rank_count": len(ranks),
+                "created_device_groups": stats.created_device_groups,
+                "created_cpu_groups": stats.created_cpu_groups,
+                "reused_device_groups": stats.reused_device_groups,
+                "new_group_ms": stats.new_group_ms,
+                "collective_touch_ms": stats.collective_touch_ms,
+                "elapsed_ms": stats.elapsed_ms,
+                "error": stats.error,
+                "cuda_allocated_delta": after.get("cuda_allocated", 0)
+                - before.get("cuda_allocated", 0),
+                "cuda_reserved_delta": after.get("cuda_reserved", 0)
+                - before.get("cuda_reserved", 0),
+                "cuda_free_delta": after.get("cuda_free", 0) - before.get("cuda_free", 0),
+                "cpu_maxrss_kb": after.get("cpu_maxrss_kb", 0),
+            }
+            rows.append(row)
+            if stats.error:
+                break
+        dist.barrier()
+        prebuild_elapsed_s = time.perf_counter() - started
+        coverage_summary: dict[str, Any]
+        if args.coverage_warmup:
+            coverage_summary = run_coverage_warmup(args, builder, world_size)
+        else:
+            coverage_summary = {
+                "coverage_warmup_enabled": False,
+                "coverage_warmup_mode": args.coverage_warmup_mode,
+                "coverage_warmup_kind": "collective_touch_only",
+                "coverage_warmup_count": 0,
+                "coverage_warmup_non_singleton_count": 0,
+                "coverage_warmup_singleton_skipped_count": 0,
+                "coverage_warmup_missing_pg_count": 0,
+                "coverage_warmup_missing_pg_tuples": [],
+                "coverage_warmup_tuples": [],
+                "coverage_warmup_per_tuple": [],
+                "total_coverage_warmup_ms": 0.0,
+            }
+        dist.barrier()
+        total_elapsed_s = time.perf_counter() - started
+        summary = {
             "mode": args.mode,
             "rank": rank,
             "world_size": world_size,
-            "ranks": json.dumps(list(ranks)),
-            "rank_count": len(ranks),
-            "created_device_groups": stats.created_device_groups,
-            "created_cpu_groups": stats.created_cpu_groups,
-            "reused_device_groups": stats.reused_device_groups,
-            "new_group_ms": stats.new_group_ms,
-            "collective_touch_ms": stats.collective_touch_ms,
-            "elapsed_ms": stats.elapsed_ms,
-            "error": stats.error,
-            "cuda_allocated_delta": after.get("cuda_allocated", 0)
-            - before.get("cuda_allocated", 0),
-            "cuda_reserved_delta": after.get("cuda_reserved", 0)
-            - before.get("cuda_reserved", 0),
-            "cuda_free_delta": after.get("cuda_free", 0) - before.get("cuda_free", 0),
-            "cpu_maxrss_kb": after.get("cpu_maxrss_kb", 0),
+            "rank_specs": len(rank_tuples),
+            "completed_specs": len(rows),
+            "prebuild_elapsed_s": prebuild_elapsed_s,
+            "elapsed_s": total_elapsed_s,
+            "total_created_device_groups": sum(r["created_device_groups"] for r in rows),
+            "total_created_cpu_groups": sum(r["created_cpu_groups"] for r in rows),
+            "total_reused_device_groups": sum(r["reused_device_groups"] for r in rows),
+            "total_new_group_ms": sum(r["new_group_ms"] for r in rows),
+            "total_collective_touch_ms": sum(r["collective_touch_ms"] for r in rows),
+            "total_prebuild_plus_coverage_warmup_ms": (
+                prebuild_elapsed_s * 1000.0
+                + float(coverage_summary["total_coverage_warmup_ms"])
+            ),
+            "errors": [r for r in rows if r["error"]],
+            **coverage_summary,
         }
-        rows.append(row)
-        if stats.error:
-            break
-    dist.barrier()
-    total_elapsed_s = time.perf_counter() - started
-    summary = {
-        "mode": args.mode,
-        "rank": rank,
-        "world_size": world_size,
-        "rank_specs": len(rank_tuples),
-        "completed_specs": len(rows),
-        "elapsed_s": total_elapsed_s,
-        "total_created_device_groups": sum(r["created_device_groups"] for r in rows),
-        "total_created_cpu_groups": sum(r["created_cpu_groups"] for r in rows),
-        "total_reused_device_groups": sum(r["reused_device_groups"] for r in rows),
-        "total_new_group_ms": sum(r["new_group_ms"] for r in rows),
-        "total_collective_touch_ms": sum(r["collective_touch_ms"] for r in rows),
-        "errors": [r for r in rows if r["error"]],
-    }
-    write_rank_outputs(Path(args.out_dir), rank, rows, summary)
-    if rank == 0:
-        print(json.dumps(summary, indent=2, sort_keys=True))
+        write_rank_outputs(Path(args.out_dir), rank, rows, summary)
+        if rank == 0:
+            print(json.dumps(summary, indent=2, sort_keys=True))
+        completed = True
+    finally:
+        cleanup_dist(run_barrier=completed)
 
 
 if __name__ == "__main__":
