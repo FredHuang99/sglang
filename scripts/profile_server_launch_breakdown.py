@@ -13,7 +13,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:
+    requests = None
 
 import profile_server_launch_time as launch_time
 
@@ -67,6 +70,20 @@ EXPECTED_TASK_KEYS: dict[str, list[str]] = {
         "component_load:vae",
         "component_load:transformer",
         "component_load:scheduler",
+        "component_cpu_materialization:text_encoder",
+        "component_cpu_materialization:tokenizer",
+        "component_cpu_materialization:vae",
+        "component_cpu_materialization:transformer",
+        "component_cpu_materialization:scheduler",
+        "component_load_stats:text_encoder",
+        "component_load_stats:tokenizer",
+        "component_load_stats:vae",
+        "component_load_stats:transformer",
+        "component_load_stats:scheduler",
+        "role_launch_total:encoder",
+        "role_launch_total:denoiser",
+        "role_launch_total:decoder",
+        "role_launch_total:shared",
         "pipeline_initialize",
         "pipeline_stage_create",
         "worker_ready_signal",
@@ -211,6 +228,8 @@ def build_diffusion_command(
         "false",
         "--pin-cpu-memory",
         "false",
+        "--use-fsdp-inference",
+        "false",
     ]
     if preset.model_id:
         command.extend(["--model-id", preset.model_id])
@@ -225,6 +244,15 @@ def build_diffusion_command(
     if preset.trust_remote_code:
         command.append("--trust-remote-code")
     return command
+
+
+def llm_setup_args(llm_setup: launch_time.LLMSetup) -> dict[str, Any]:
+    return {
+        "chunked_prefill_size": llm_setup.chunked_prefill_size,
+        "max_running_requests": llm_setup.max_running_requests,
+        "max_total_tokens": llm_setup.max_total_tokens,
+        "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
+    }
 
 
 def prepare_case_env(launch_tasks_path: Path, *, diffusion: bool) -> dict[str, str]:
@@ -262,6 +290,10 @@ def wait_for_server_endpoints(
     timeout_s: int,
     expected_task_type: str | None,
 ) -> tuple[int | None, int, dict[str, Any]]:
+    if requests is None:
+        raise RuntimeError(
+            "The requests package is required to wait for server readiness."
+        )
     start_ns = time.perf_counter_ns()
     deadline = time.time() + timeout_s
     health_ready_ns: int | None = None
@@ -597,11 +629,7 @@ def measure_promptenhancer_case(
             task_summary=task_summary,
             extra={
                 "setup_name": llm_setup.key,
-                "setup_args": {
-                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
-                    "max_running_requests": llm_setup.max_running_requests,
-                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
-                },
+                "setup_args": llm_setup_args(llm_setup),
                 "ready_url_health": f"{base_url}/health",
                 "ready_url_models": f"{base_url}/v1/models",
             },
@@ -627,11 +655,7 @@ def measure_promptenhancer_case(
             task_summary=task_summary,
             extra={
                 "setup_name": llm_setup.key,
-                "setup_args": {
-                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
-                    "max_running_requests": llm_setup.max_running_requests,
-                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
-                },
+                "setup_args": llm_setup_args(llm_setup),
                 "ready_url_health": f"{base_url}/health",
                 "ready_url_models": f"{base_url}/v1/models",
             },
@@ -657,11 +681,7 @@ def measure_promptenhancer_case(
             task_summary=task_summary,
             extra={
                 "setup_name": llm_setup.key,
-                "setup_args": {
-                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
-                    "max_running_requests": llm_setup.max_running_requests,
-                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
-                },
+                "setup_args": llm_setup_args(llm_setup),
                 "ready_url_health": f"{base_url}/health",
                 "ready_url_models": f"{base_url}/v1/models",
             },
@@ -932,11 +952,7 @@ def main() -> None:
                             task_summary=summarize_launch_tasks([], family="sglang"),
                             extra={
                                 "setup_name": llm_setup.key,
-                                "setup_args": {
-                                    "chunked_prefill_size": llm_setup.chunked_prefill_size,
-                                    "max_running_requests": llm_setup.max_running_requests,
-                                    "cuda_graph_max_bs": llm_setup.cuda_graph_max_bs,
-                                },
+                                "setup_args": llm_setup_args(llm_setup),
                             },
                         )
                         summary["cases"].append(record)

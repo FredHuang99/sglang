@@ -77,15 +77,21 @@ class TestDiffusionProfileStageBreakdown(unittest.TestCase):
         self.assertEqual(args.num_warmup_runs, 2)
 
     def test_resolution_mapping(self):
+        self.assertEqual(
+            psb.PROFILE_RESOLUTION_MAP["wan2.1-t2v-1.3b"]["480p"],
+            (832, 480),
+        )
         self.assertEqual(psb.resolve_resolution("wan2.2-ti2v-5b", "720p"), (1280, 704))
         self.assertEqual(psb.resolve_resolution("wan2.2-ti2v-5b", "144p"), (256, 128))
         self.assertEqual(psb.resolve_resolution("wan2.1-t2v-1.3b", "360p"), (640, 352))
         self.assertEqual(psb.resolve_resolution("z-image", "240p"), (432, 240))
+        self.assertEqual(psb.resolve_resolution("z-image", "360p"), (640, 352))
+        self.assertEqual(psb.resolve_resolution("z-image", "720p"), (1280, 720))
 
     def test_parallelism_auto_and_head_conflict_fallback(self):
         parallel = psb.resolve_parallelism(
+            model_name="wan2.2-ti2v-5b",
             gpu_num=8,
-            attention_heads=40,
             ulysses_degree=None,
             ring_degree=None,
         )
@@ -94,20 +100,19 @@ class TestDiffusionProfileStageBreakdown(unittest.TestCase):
         self.assertEqual(parallel.ring_degree, 1)
 
         parallel = psb.resolve_parallelism(
+            model_name="z-image",
             gpu_num=8,
-            attention_heads=30,
             ulysses_degree=None,
             ring_degree=None,
         )
         self.assertTrue(parallel.valid)
         self.assertEqual(parallel.ulysses_degree, 2)
         self.assertEqual(parallel.ring_degree, 4)
-        self.assertTrue(parallel.is_fallback)
 
     def test_parallelism_user_values_are_validated_by_product(self):
         parallel = psb.resolve_parallelism(
+            model_name="z-image",
             gpu_num=4,
-            attention_heads=30,
             ulysses_degree=3,
             ring_degree=1,
         )
@@ -115,8 +120,8 @@ class TestDiffusionProfileStageBreakdown(unittest.TestCase):
         self.assertIn("sp_degree", parallel.error)
 
         parallel = psb.resolve_parallelism(
+            model_name="z-image",
             gpu_num=4,
-            attention_heads=30,
             ulysses_degree=2,
             ring_degree=None,
         )
@@ -151,7 +156,7 @@ class TestDiffusionProfileStageBreakdown(unittest.TestCase):
         }
         durations = psb.extract_stage_durations(report)
         self.assertEqual(durations["text_encoder"], 1.2)
-        self.assertEqual(durations["denoising"], 3.456)
+        self.assertEqual(durations["denoiser"], 3.456)
         self.assertEqual(durations["decoder"], 0.789)
 
     def test_extract_stage_durations_denoise_step_fallback(self):
@@ -167,30 +172,30 @@ class TestDiffusionProfileStageBreakdown(unittest.TestCase):
         }
         durations = psb.extract_stage_durations(report)
         self.assertEqual(durations["text_encoder"], 0.1)
-        self.assertEqual(durations["denoising"], 0.03)
+        self.assertEqual(durations["denoiser"], 0.03)
         self.assertEqual(durations["decoder"], 0.3)
 
     def test_average_measured_durations_excludes_warmup(self):
         run_results = [
             make_case_result(
                 "1_144p",
-                {"text_encoder": 100.0, "denoising": 100.0, "decoder": 100.0},
+                {"text_encoder": 100.0, "denoiser": 100.0, "decoder": 100.0},
             ),
             make_case_result(
                 "1_144p",
-                {"text_encoder": 200.0, "denoising": 200.0, "decoder": 200.0},
+                {"text_encoder": 200.0, "denoiser": 200.0, "decoder": 200.0},
             ),
             make_case_result(
                 "1_144p",
-                {"text_encoder": 1.0, "denoising": 10.0, "decoder": 100.0},
+                {"text_encoder": 1.0, "denoiser": 10.0, "decoder": 100.0},
             ),
             make_case_result(
                 "1_144p",
-                {"text_encoder": 2.0, "denoising": 20.0, "decoder": 200.0},
+                {"text_encoder": 2.0, "denoiser": 20.0, "decoder": 200.0},
             ),
             make_case_result(
                 "1_144p",
-                {"text_encoder": 3.0, "denoising": 30.0, "decoder": 300.0},
+                {"text_encoder": 3.0, "denoiser": 30.0, "decoder": 300.0},
             ),
         ]
         durations = psb.average_measured_durations(
@@ -198,7 +203,7 @@ class TestDiffusionProfileStageBreakdown(unittest.TestCase):
             num_warmup_runs=2,
         )
         self.assertEqual(durations["text_encoder"], 2.0)
-        self.assertEqual(durations["denoising"], 20.0)
+        self.assertEqual(durations["denoiser"], 20.0)
         self.assertEqual(durations["decoder"], 200.0)
 
     def test_write_csv_failure_row(self):

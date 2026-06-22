@@ -5,6 +5,7 @@
 import importlib
 import os
 import pkgutil
+import time
 import traceback
 from abc import ABC
 from typing import Any, Type
@@ -14,7 +15,7 @@ from diffusers import AutoModel
 from torch import nn
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
-from sglang.launch_task_recorder import profile_launch_task
+from sglang.launch_task_recorder import profile_launch_task, record_launch_task_timing
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -124,6 +125,7 @@ class ComponentLoader(ABC):
             component_model_path,
             gpu_mem_before_loading,
         )
+        materialization_start_ns = time.perf_counter_ns()
         try:
             component = self.load_customized(
                 component_model_path, server_args, component_name
@@ -152,6 +154,25 @@ class ComponentLoader(ABC):
                 component_name,
                 component.__class__.__name__,
             )
+        materialization_elapsed_ms = (
+            time.perf_counter_ns() - materialization_start_ns
+        ) / 1_000_000.0
+        record_launch_task_timing(
+            task="component_cpu_materialization",
+            family="sglang-diffusion",
+            component=component_name,
+            elapsed_ms=materialization_elapsed_ms,
+            extra={
+                "component_model_path": component_model_path,
+                "loader": self.__class__.__name__,
+                "library": transformers_or_diffusers,
+                "source": source if component is not None else "unknown",
+                "definition": (
+                    "Elapsed wall-clock time spent materializing the component "
+                    "object through the component loader before post-load stats."
+                ),
+            },
+        )
 
         if component is None:
             logger.error("Load %s failed", component_name)
@@ -194,7 +215,7 @@ class ComponentLoader(ABC):
                 consumed,
                 current_gpu_mem,
             )
-        return component, {
+        load_stats = {
             "gpu_load_consumed_gb": _round_metric(consumed),
             "loaded_weight_file_size_gb": loaded_weight_file_size_gb,
             "final_module_size_gb": (
@@ -205,6 +226,19 @@ class ComponentLoader(ABC):
             "source": source if component is not None else "unknown",
             "loaded_weight_files": loaded_weight_paths if component is not None else [],
         }
+        record_launch_task_timing(
+            task="component_load_stats",
+            family="sglang-diffusion",
+            component=component_name,
+            elapsed_ms=0.0,
+            extra={
+                "component_model_path": component_model_path,
+                "loader": self.__class__.__name__,
+                "library": transformers_or_diffusers,
+                **load_stats,
+            },
+        )
+        return component, load_stats
 
     def load_native(
         self,

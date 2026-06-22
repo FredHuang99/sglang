@@ -9,16 +9,18 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Literal, cast
 
 import torch
 from tqdm import tqdm
 
-from sglang.launch_task_recorder import record_launch_task
+from sglang.launch_task_recorder import record_launch_task, record_launch_task_timing
 from sglang.multimodal_gen.runtime.disaggregation.roles import (
     RoleType,
     filter_modules_for_role,
+    get_module_role,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
@@ -452,6 +454,18 @@ class ComposedPipelineBase(ABC):
         logger.info("Loading required components: %s", required_modules)
 
         loaded_components = {}
+        role_elapsed_ms: dict[RoleType | None, float] = {
+            RoleType.ENCODER: 0.0,
+            RoleType.DENOISER: 0.0,
+            RoleType.DECODER: 0.0,
+            None: 0.0,
+        }
+        role_components: dict[RoleType | None, list[str]] = {
+            RoleType.ENCODER: [],
+            RoleType.DENOISER: [],
+            RoleType.DECODER: [],
+            None: [],
+        }
         for module_name, (
             transformers_or_diffusers,
             architecture,
@@ -474,6 +488,8 @@ class ComposedPipelineBase(ABC):
             else:
                 load_module_name = module_name
 
+            component_role = get_module_role(load_module_name)
+            component_start_ns = time.perf_counter_ns()
             if loaded_modules is not None and module_name in loaded_modules:
                 logger.info("Using module %s already provided", module_name)
                 loaded_components[module_name] = loaded_modules[module_name]
@@ -483,6 +499,13 @@ class ComposedPipelineBase(ABC):
                     get_memory_usage_of_component(loaded_modules[module_name])
                 )
                 self.component_loaded_weight_files[load_module_name] = []
+                elapsed_ms = (
+                    time.perf_counter_ns() - component_start_ns
+                ) / 1_000_000.0
+                role_elapsed_ms[component_role] = (
+                    role_elapsed_ms.get(component_role, 0.0) + elapsed_ms
+                )
+                role_components.setdefault(component_role, []).append(load_module_name)
                 continue
 
             component_model_path = self._resolve_component_path(
@@ -511,6 +534,13 @@ class ComposedPipelineBase(ABC):
             if module_name in loaded_components:
                 logger.warning("Overwriting module %s", module_name)
             loaded_components[module_name] = module
+            elapsed_ms = (
+                time.perf_counter_ns() - component_start_ns
+            ) / 1_000_000.0
+            role_elapsed_ms[component_role] = (
+                role_elapsed_ms.get(component_role, 0.0) + elapsed_ms
+            )
+            role_components.setdefault(component_role, []).append(load_module_name)
 
         # Check if all required modules were loaded
         for module_name in required_modules:
@@ -526,6 +556,35 @@ class ComposedPipelineBase(ABC):
             "Memory usage of loaded modules (GiB): %s. avail mem: %s GB",
             self.memory_usages,
             round(current_platform.get_available_gpu_memory(), 2),
+        )
+
+        for role in (RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER):
+            record_launch_task_timing(
+                task="role_launch_total",
+                family="sglang-diffusion",
+                component=role.value,
+                elapsed_ms=role_elapsed_ms.get(role, 0.0),
+                extra={
+                    "components": role_components.get(role, []),
+                    "definition": (
+                        "Sum of role-owned component initialization elapsed time "
+                        "inside ComposedPipelineBase.load_modules(). Shared "
+                        "components and global server startup are excluded."
+                    ),
+                },
+            )
+        record_launch_task_timing(
+            task="role_launch_total",
+            family="sglang-diffusion",
+            component="shared",
+            elapsed_ms=role_elapsed_ms.get(None, 0.0),
+            extra={
+                "components": role_components.get(None, []),
+                "definition": (
+                    "Sum of shared component initialization elapsed time outside "
+                    "the encoder/denoiser/decoder role buckets."
+                ),
+            },
         )
 
         return loaded_components

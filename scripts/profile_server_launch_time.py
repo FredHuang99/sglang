@@ -21,7 +21,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
-import requests
+try:
+    import requests
+except ModuleNotFoundError:
+    requests = None
 
 logging.basicConfig(
     level=logging.INFO,
@@ -84,6 +87,7 @@ class LLMSetup:
     description: str
     chunked_prefill_size: int | None = None
     max_running_requests: int | None = None
+    max_total_tokens: int | None = None
     cuda_graph_max_bs: int | None = None
 
 
@@ -120,6 +124,29 @@ LLM_SETUPS: dict[str, LLMSetup] = {
         max_running_requests=1,
         cuda_graph_max_bs=1,
     ),
+    "constrained_4096": LLMSetup(
+        key="constrained_4096",
+        description=(
+            "Use max_running_requests 1, max_total_tokens 4096, "
+            "chunked_prefill_size 4096, and cuda_graph_max_bs 1."
+        ),
+        chunked_prefill_size=4096,
+        max_running_requests=1,
+        max_total_tokens=4096,
+        cuda_graph_max_bs=1,
+    ),
+}
+
+
+DIFFUSION_REGISTRY_HF_PATHS: dict[str, str] = {
+    "wan2.2-ti2v-5b": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    "wan2.1-t2v-1.3b": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "z-image": "Tongyi-MAI/Z-Image",
+}
+
+DIFFUSION_REGISTRY_MODEL_IDS: dict[str, str] = {
+    key: value.rsplit("/", 1)[-1]
+    for key, value in DIFFUSION_REGISTRY_HF_PATHS.items()
 }
 
 
@@ -152,7 +179,7 @@ PRESETS: dict[str, LaunchPreset] = {
         key="wan2.2-ti2v-5b",
         family="diffusion",
         model_path="/workspace/models/Wan2_2_TI2V_5B",
-        model_id="Wan2.2-TI2V-5B-Diffusers",
+        model_id=DIFFUSION_REGISTRY_MODEL_IDS["wan2.2-ti2v-5b"],
         output_subdir="wan2_2_ti2v_5b/launch",
         expected_task_type="TI2V",
         sampling_factory=make_wan22_ti2v_sampling,
@@ -161,7 +188,7 @@ PRESETS: dict[str, LaunchPreset] = {
         key="wan2.1-t2v-1.3b",
         family="diffusion",
         model_path="/workspace/models/Wan2_1_T2V_1_3B",
-        model_id="Wan2.1-T2V-1.3B-Diffusers",
+        model_id=DIFFUSION_REGISTRY_MODEL_IDS["wan2.1-t2v-1.3b"],
         output_subdir="wan2_1_t2v_1_3b/launch",
         expected_task_type="T2V",
         sampling_factory=make_want2v_13b_sampling,
@@ -170,7 +197,7 @@ PRESETS: dict[str, LaunchPreset] = {
         key="z-image",
         family="diffusion",
         model_path="/workspace/models/Z_Image",
-        model_id="Z-Image",
+        model_id=DIFFUSION_REGISTRY_MODEL_IDS["z-image"],
         output_subdir="z_image/launch",
         expected_task_type="T2I",
         sampling_factory=make_zimage_sampling,
@@ -508,6 +535,11 @@ def build_promptenhancer_command(
         if llm_setup is not None and llm_setup.max_running_requests is not None
         else None
     )
+    effective_max_total_tokens = (
+        llm_setup.max_total_tokens
+        if llm_setup is not None and llm_setup.max_total_tokens is not None
+        else None
+    )
     effective_cuda_graph_max_bs = (
         llm_setup.cuda_graph_max_bs
         if llm_setup is not None and llm_setup.cuda_graph_max_bs is not None
@@ -527,6 +559,8 @@ def build_promptenhancer_command(
         "--tp-size",
         str(tp_size),
     ]
+    if preset.model_id:
+        command.extend(["--served-model-name", preset.model_id])
     if preset.trust_remote_code:
         command.append("--trust-remote-code")
     if preset.context_length is not None:
@@ -541,6 +575,8 @@ def build_promptenhancer_command(
         command.extend(["--chunked-prefill-size", str(effective_chunked_prefill_size)])
     if effective_max_running_requests is not None:
         command.extend(["--max-running-requests", str(effective_max_running_requests)])
+    if effective_max_total_tokens is not None:
+        command.extend(["--max-total-tokens", str(effective_max_total_tokens)])
     if effective_cuda_graph_max_bs is not None:
         command.extend(["--cuda-graph-max-bs", str(effective_cuda_graph_max_bs)])
     return command
@@ -593,6 +629,8 @@ def build_diffusion_command_preview(
         "false",
         "--pin-cpu-memory",
         "false",
+        "--use-fsdp-inference",
+        "false",
     ]
     if preset.model_id:
         command.extend(["--model-id", preset.model_id])
@@ -616,6 +654,10 @@ def wait_for_promptenhancer_ready(
     server_log_path: Path,
     timeout_s: int,
 ) -> dict[str, Any]:
+    if requests is None:
+        raise RuntimeError(
+            "The requests package is required to wait for server readiness."
+        )
     start_time = time.perf_counter()
     last_log_at = -1.0
     while True:

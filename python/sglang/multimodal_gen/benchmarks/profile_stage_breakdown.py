@@ -29,24 +29,49 @@ DEFAULT_NUM_RUNS = 5
 DEFAULT_NUM_WARMUP_RUNS = 2
 WAN22_DEFAULT_IMAGE_RELATIVE_PATH = Path("examples") / "assets" / "example_image.png"
 
-CANONICAL_RESOLUTIONS: dict[str, tuple[int, int]] = {
-    "144p": (256, 144),
-    "240p": (432, 240),
-    "360p": (640, 360),
-    "480p": (832, 480),
-    "720p": (1280, 720),
-    "1k": (1024, 576),
-    "2k": (2048, 1152),
+PROFILE_RESOLUTION_MAP: dict[str, dict[str, tuple[int, int]]] = {
+    "wan2.1-t2v-1.3b": {
+        "144p": (256, 144),
+        "240p": (432, 240),
+        "360p": (640, 352),
+        "480p": (832, 480),
+        "720p": (1280, 720),
+        "1k": (1024, 576),
+        "2k": (2048, 1152),
+    },
+    "wan2.2-ti2v-5b": {
+        "144p": (256, 128),
+        "240p": (416, 224),
+        "360p": (640, 352),
+        "480p": (832, 480),
+        "720p": (1280, 704),
+        "1k": (1024, 576),
+        "2k": (2048, 1152),
+    },
+    "z-image": {
+        "144p": (256, 144),
+        "240p": (432, 240),
+        "360p": (640, 352),
+        "480p": (832, 480),
+        "720p": (1280, 720),
+        "1k": (1024, 576),
+        "2k": (2048, 1152),
+    },
 }
 
 STAGE_NAME_TO_COLUMN = {
     "TextEncodingStage": "text_encoder",
-    "DenoisingStage": "denoising",
+    "DenoisingStage": "denoiser",
     "DecodingStage": "decoder",
 }
 
-CSV_COLUMNS = ("row_name", "text_encoder", "denoising", "decoder")
-STAGE_COLUMNS = ("text_encoder", "denoising", "decoder")
+CSV_COLUMNS = (
+    "row_name",
+    "text_encoder_duration_s",
+    "denoiser_duration_s",
+    "decoder_duration_s",
+)
+STAGE_COLUMNS = ("text_encoder", "denoiser", "decoder")
 DETAIL_COLUMNS = (
     "row_name",
     "model",
@@ -66,7 +91,7 @@ DETAIL_COLUMNS = (
     "successful_measured_runs",
     "run_statuses",
     "text_encoder",
-    "denoising",
+    "denoiser",
     "decoder",
     "perf_path",
     "case_dir",
@@ -86,11 +111,22 @@ class ModelPreset:
     default_image_paths: tuple[str, ...] = ()
 
 
+REGISTRY_HF_PATHS: dict[str, str] = {
+    "wan2.2-ti2v-5b": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+    "wan2.1-t2v-1.3b": "Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    "z-image": "Tongyi-MAI/Z-Image",
+}
+
+REGISTRY_MODEL_IDS: dict[str, str] = {
+    key: value.rsplit("/", 1)[-1] for key, value in REGISTRY_HF_PATHS.items()
+}
+
+
 MODEL_PRESETS: dict[str, ModelPreset] = {
     "wan2.2-ti2v-5b": ModelPreset(
         name="wan2.2-ti2v-5b",
-        hf_path="Wan-AI/Wan2.2-TI2V-5B-Diffusers",
-        model_id="Wan2.2-TI2V-5B-Diffusers",
+        hf_path=REGISTRY_HF_PATHS["wan2.2-ti2v-5b"],
+        model_id=REGISTRY_MODEL_IDS["wan2.2-ti2v-5b"],
         size_multiple=32,
         attention_heads=40,
         default_prompt=(
@@ -100,8 +136,8 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
     ),
     "wan2.1-t2v-1.3b": ModelPreset(
         name="wan2.1-t2v-1.3b",
-        hf_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
-        model_id="Wan2.1-T2V-1.3B-Diffusers",
+        hf_path=REGISTRY_HF_PATHS["wan2.1-t2v-1.3b"],
+        model_id=REGISTRY_MODEL_IDS["wan2.1-t2v-1.3b"],
         size_multiple=16,
         attention_heads=40,
         default_prompt=(
@@ -110,8 +146,8 @@ MODEL_PRESETS: dict[str, ModelPreset] = {
     ),
     "z-image": ModelPreset(
         name="z-image",
-        hf_path="Tongyi-MAI/Z-Image",
-        model_id="Z-Image",
+        hf_path=REGISTRY_HF_PATHS["z-image"],
+        model_id=REGISTRY_MODEL_IDS["z-image"],
         size_multiple=16,
         attention_heads=30,
         default_prompt="A detailed studio photograph of a futuristic glass sculpture",
@@ -130,7 +166,7 @@ class ParallelConfig:
 
     @property
     def is_fallback(self) -> bool:
-        return self.reason == "head_conflict_fallback"
+        return False
 
 
 @dataclasses.dataclass
@@ -171,9 +207,13 @@ class CaseResult:
     def to_csv_row(self) -> dict[str, str]:
         return {
             "row_name": self.row_name,
-            "text_encoder": format_duration(self.durations_s.get("text_encoder")),
-            "denoising": format_duration(self.durations_s.get("denoising")),
-            "decoder": format_duration(self.durations_s.get("decoder")),
+            "text_encoder_duration_s": format_duration(
+                self.durations_s.get("text_encoder")
+            ),
+            "denoiser_duration_s": format_duration(
+                self.durations_s.get("denoiser")
+            ),
+            "decoder_duration_s": format_duration(self.durations_s.get("decoder")),
         }
 
     def to_detail_row(self) -> dict[str, str]:
@@ -196,7 +236,7 @@ class CaseResult:
             "successful_measured_runs": str(self.successful_measured_runs),
             "run_statuses": "|".join(self.run_statuses),
             "text_encoder": format_duration(self.durations_s.get("text_encoder")),
-            "denoising": format_duration(self.durations_s.get("denoising")),
+            "denoiser": format_duration(self.durations_s.get("denoiser")),
             "decoder": format_duration(self.durations_s.get("decoder")),
             "perf_path": self.perf_path,
             "case_dir": self.case_dir,
@@ -223,28 +263,17 @@ def average_values(values: Sequence[float | None]) -> float | None:
     return sum(valid_values) / len(valid_values)
 
 
-def round_down_to_multiple(value: int, multiple: int) -> int:
-    rounded = value - (value % multiple)
-    if rounded <= 0:
-        raise ValueError(f"Cannot round {value} down to a positive multiple of {multiple}")
-    return rounded
-
-
 def resolve_resolution(model_name: str, label: str) -> tuple[int, int]:
-    if label not in CANONICAL_RESOLUTIONS:
+    model_resolutions = PROFILE_RESOLUTION_MAP.get(model_name)
+    if model_resolutions is None:
+        raise ValueError(
+            f"Unknown model '{model_name}'. Expected one of: {', '.join(MODEL_PRESETS)}"
+        )
+    if label not in model_resolutions:
         raise ValueError(
             f"Unknown resolution '{label}'. Expected one of: {', '.join(ALL_RESOLUTIONS)}"
         )
-
-    if model_name == "wan2.2-ti2v-5b" and label == "720p":
-        return 1280, 704
-
-    preset = MODEL_PRESETS[model_name]
-    width, height = CANONICAL_RESOLUTIONS[label]
-    return (
-        round_down_to_multiple(width, preset.size_multiple),
-        round_down_to_multiple(height, preset.size_multiple),
-    )
+    return model_resolutions[label]
 
 
 def detect_attention_heads(model_path: str, fallback: int) -> int:
@@ -328,8 +357,8 @@ def resolve_repo_relative_path(path: str) -> str:
 
 
 def resolve_parallelism(
+    model_name: str,
     gpu_num: int,
-    attention_heads: int | None,
     ulysses_degree: int | None,
     ring_degree: int | None,
 ) -> ParallelConfig:
@@ -369,19 +398,34 @@ def resolve_parallelism(
             reason="user",
         )
 
-    candidate = ParallelConfig(
-        sp_degree=sp_degree,
-        ulysses_degree=sp_degree,
-        ring_degree=1,
-        reason="auto",
-    )
-    if attention_heads is None or attention_heads % candidate.ulysses_degree == 0:
-        return candidate
+    if model_name == "wan2.2-ti2v-5b":
+        ulysses_degree = sp_degree
+    elif model_name == "wan2.1-t2v-1.3b":
+        ulysses_degree = 4 if sp_degree == 8 else sp_degree
+    elif model_name == "z-image":
+        ulysses_degree = 1 if sp_degree == 1 else 2
+    else:
+        return invalid_parallelism(
+            sp_degree,
+            None,
+            None,
+            f"unsupported model for reduced SP policy: {model_name}",
+        )
 
-    fallback = fallback_parallelism(gpu_num, reason="head_conflict_fallback")
-    if fallback.valid and attention_heads % fallback.ulysses_degree == 0:
-        return fallback
-    return candidate
+    if sp_degree % ulysses_degree != 0:
+        return invalid_parallelism(
+            sp_degree,
+            ulysses_degree,
+            None,
+            f"sp_degree={sp_degree} is not divisible by ulysses_degree={ulysses_degree}",
+        )
+    ring_degree = sp_degree // ulysses_degree
+    return ParallelConfig(
+        sp_degree=sp_degree,
+        ulysses_degree=ulysses_degree,
+        ring_degree=ring_degree,
+        reason="reduced_sp_policy",
+    )
 
 
 def invalid_parallelism(
@@ -466,7 +510,7 @@ def extract_stage_durations(report: Mapping[str, Any]) -> dict[str, float | None
             if isinstance(duration_ms, (int, float)):
                 durations_ms[STAGE_NAME_TO_COLUMN[name]] = float(duration_ms)
 
-    if "denoising" not in durations_ms:
+    if "denoiser" not in durations_ms:
         denoise_steps = report.get("denoise_steps_ms", []) or []
         denoise_total = 0.0
         found_step = False
@@ -479,11 +523,11 @@ def extract_stage_durations(report: Mapping[str, Any]) -> dict[str, float | None
                 denoise_total += float(duration_ms)
                 found_step = True
         if found_step:
-            durations_ms["denoising"] = denoise_total
+            durations_ms["denoiser"] = denoise_total
 
     return {
         "text_encoder": ms_to_seconds(durations_ms.get("text_encoder")),
-        "denoising": ms_to_seconds(durations_ms.get("denoising")),
+        "denoiser": ms_to_seconds(durations_ms.get("denoiser")),
         "decoder": ms_to_seconds(durations_ms.get("decoder")),
     }
 
@@ -548,6 +592,8 @@ def build_generate_command(
         "--vae-cpu-offload",
         "false",
         "--pin-cpu-memory",
+        "false",
+        "--use-fsdp-inference",
         "false",
         "--output-path",
         str(case_dir / "outputs"),
@@ -883,7 +929,7 @@ def make_failure_result(
         status=status,
         returncode=returncode,
         elapsed_s=elapsed_s,
-        durations_s={"text_encoder": None, "denoising": None, "decoder": None},
+        durations_s={"text_encoder": None, "denoiser": None, "decoder": None},
         perf_path=str(case_dir / "perf.json"),
         case_dir=str(case_dir),
         error_tail=error_tail,
@@ -1059,7 +1105,7 @@ def run_case_with_optional_retry(
     dry_run: bool,
     base_gpu_id: int | None,
 ) -> CaseResult:
-    result = run_case(
+    return run_case(
         preset=preset,
         model_path=model_path,
         prompt=prompt,
@@ -1074,51 +1120,6 @@ def run_case_with_optional_retry(
         dry_run=dry_run,
         base_gpu_id=base_gpu_id,
     )
-    if (
-        dry_run
-        or result.status not in {"failed", "timeout"}
-        or parallel.is_fallback
-        or not should_retry_with_head_fallback(
-            RunOutput(
-                returncode=result.returncode,
-                elapsed_s=result.elapsed_s or 0.0,
-                timed_out=result.status == "timeout",
-                stdout_tail="",
-                stderr_tail=result.error_tail,
-            )
-        )
-    ):
-        return result
-
-    fallback = fallback_parallelism(gpu_num)
-    if not fallback.valid or (
-        fallback.ulysses_degree == parallel.ulysses_degree
-        and fallback.ring_degree == parallel.ring_degree
-    ):
-        return result
-
-    retry_result = run_case(
-        preset=preset,
-        model_path=model_path,
-        prompt=prompt,
-        image_paths=image_paths,
-        gpu_num=gpu_num,
-        resolution=resolution,
-        width=width,
-        height=height,
-        parallel=fallback,
-        case_dir=case_dir / "fallback_u2",
-        timeout_s=timeout_s,
-        dry_run=dry_run,
-        base_gpu_id=base_gpu_id,
-    )
-    retry_result.error_tail = (
-        "Retried after initial launch failure that looked like an attention-head "
-        f"parallelism conflict. Initial error tail: {result.error_tail}"
-        if retry_result.status == "ok"
-        else retry_result.error_tail
-    )
-    return retry_result
 
 
 def run_repeated_case_with_optional_retry(
@@ -1237,7 +1238,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     details_json_path = output_dir / "stage_breakdown_details.json"
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    attention_heads = detect_attention_heads(model_path, preset.attention_heads)
     detected_gpus = None if args.no_gpu_availability_check else available_gpu_count()
     results: list[CaseResult] = []
 
@@ -1277,8 +1277,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
 
             parallel = resolve_parallelism(
+                model_name=preset.name,
                 gpu_num=gpu_num,
-                attention_heads=attention_heads,
                 ulysses_degree=args.ulysses_degree,
                 ring_degree=args.ring_degree,
             )
