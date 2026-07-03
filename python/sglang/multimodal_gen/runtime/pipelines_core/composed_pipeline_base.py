@@ -378,10 +378,6 @@ class ComposedPipelineBase(ABC):
                 if "transformer_2" not in self.required_config_modules:
                     # Re-apply disagg role filter: only add transformer_2 if the
                     # role actually needs denoising modules.
-                    from sglang.multimodal_gen.runtime.disaggregation.roles import (
-                        get_module_role,
-                    )
-
                     module_role = get_module_role("transformer_2")
                     if (
                         self._disagg_role == RoleType.MONOLITHIC
