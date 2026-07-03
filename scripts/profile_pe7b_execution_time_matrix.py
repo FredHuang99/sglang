@@ -406,7 +406,7 @@ def build_bench_command(
         "--port",
         str(port),
         "--model",
-        preset.model_id,
+        preset.model_path,
         "--served-model-name",
         preset.model_id,
         "--tokenizer",

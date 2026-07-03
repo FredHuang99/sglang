@@ -206,7 +206,7 @@ class TestLaunchTimeSummaryScripts(CustomTestCase):
             output_file=repo_root() / "bench.jsonl",
             run_tag="unit",
         )
-        self.assertEqual(bench_cmd[bench_cmd.index("--model") + 1], preset.model_id)
+        self.assertEqual(bench_cmd[bench_cmd.index("--model") + 1], preset.model_path)
         self.assertEqual(
             bench_cmd[bench_cmd.index("--served-model-name") + 1], preset.model_id
         )
