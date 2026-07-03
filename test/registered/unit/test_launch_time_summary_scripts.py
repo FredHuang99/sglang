@@ -217,6 +217,43 @@ class TestLaunchTimeSummaryScripts(CustomTestCase):
         self.assertEqual(bench_cmd[bench_cmd.index("--max-concurrency") + 1], "1")
         self.assertEqual(bench_cmd[bench_cmd.index("--warmup-requests") + 1], "0")
 
+    def test_pe7b_execution_default_io_matrix_matches_reprefill_cases(self):
+        cases = pe7b_exec.default_io_cases()
+        self.assertEqual(len(cases), 119)
+        self.assertEqual(cases[0], (128, 384))
+        self.assertEqual(cases[-1], (2048, 128))
+        self.assertEqual(
+            pe7b_exec.DEFAULT_OUTPUT_LENS[1],
+            [256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 1920],
+        )
+        self.assertIn((256, 1920), cases)
+        self.assertIn((1792, 384), cases)
+        self.assertNotIn((256, 128), cases)
+        self.assertNotIn((1792, 128), cases)
+
+    def test_pe7b_execution_resolves_custom_and_legacy_io_cases(self):
+        default_args = pe7b_exec.parse_args(["--gpu-nums", "1"])
+        self.assertEqual(default_args.io_cases, pe7b_exec.default_io_cases())
+
+        matrix_args = pe7b_exec.parse_args(
+            ["--io-matrix", "128:384,512", "256:256"]
+        )
+        self.assertEqual(
+            matrix_args.io_cases,
+            [(128, 384), (128, 512), (256, 256)],
+        )
+
+        flat_args = pe7b_exec.parse_args(
+            ["--input-lens", "128", "256", "--output-lens", "384", "512"]
+        )
+        self.assertEqual(
+            flat_args.io_cases,
+            [(128, 384), (128, 512), (256, 384), (256, 512)],
+        )
+
+        with self.assertRaises(SystemExit):
+            pe7b_exec.parse_args(["--io-matrix", "128:384", "--input-lens", "128"])
+
     def test_pe7b_execution_averages_only_measured_runs(self):
         runs = [
             pe7b_exec.BenchRun(

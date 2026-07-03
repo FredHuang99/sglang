@@ -20,8 +20,44 @@ if str(SCRIPT_DIR) not in sys.path:
 import profile_server_launch_time as launch_time
 
 DEFAULT_GPU_NUMS = [1, 2, 4, 8]
-DEFAULT_INPUT_LENS = [128, 256]
-DEFAULT_OUTPUT_LENS = [384, 512, 640, 768, 896, 1024, 1152]
+DEFAULT_INPUT_LENS = [
+    128,
+    256,
+    384,
+    512,
+    640,
+    768,
+    896,
+    1024,
+    1152,
+    1280,
+    1408,
+    1536,
+    1664,
+    1792,
+    1920,
+    2048,
+]
+DEFAULT_OUTPUT_LENS = [
+    [384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1664, 1920, 2048],
+    [256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1792, 1920],
+    [128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1664, 1792],
+    [128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1536, 1664],
+    [128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1408, 1536],
+    [128, 256, 384, 512, 640, 768, 896, 1024, 1280, 1408],
+    [128, 256, 384, 512, 640, 768, 896, 1152, 1280],
+    [128, 256, 384, 512, 640, 768, 1024, 1152],
+    [128, 256, 384, 512, 640, 896, 1024],
+    [128, 256, 384, 512, 768, 896],
+    [128, 256, 384, 640, 768],
+    [128, 256, 512, 640],
+    [128, 384, 512],
+    [256, 384],
+    [128, 256],
+    [128],
+]
+DEFAULT_FLAT_INPUT_LENS = [128]
+DEFAULT_FLAT_OUTPUT_LENS = DEFAULT_OUTPUT_LENS[0]
 DEFAULT_NUM_RUNS = 5
 DEFAULT_NUM_WARMUP_RUNS = 2
 PE7B_PRESET_KEY = "promptenhancer-7b"
@@ -188,6 +224,76 @@ def parse_int_list(raw_values: list[str] | None, *, default: list[int]) -> list[
     return values
 
 
+def default_io_cases() -> list[tuple[int, int]]:
+    if len(DEFAULT_INPUT_LENS) != len(DEFAULT_OUTPUT_LENS):
+        raise ValueError(
+            "DEFAULT_INPUT_LENS and DEFAULT_OUTPUT_LENS must have the same length."
+        )
+    return [
+        (input_len, output_len)
+        for input_len, output_lens in zip(DEFAULT_INPUT_LENS, DEFAULT_OUTPUT_LENS)
+        for output_len in output_lens
+    ]
+
+
+def parse_io_matrix(raw_values: list[str] | None) -> list[tuple[int, int]]:
+    if not raw_values:
+        return []
+    tokens: list[str] = []
+    for raw in raw_values:
+        tokens.extend(part for part in raw.split() if part)
+
+    cases: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for token in tokens:
+        if ":" not in token:
+            raise ValueError(
+                f"Invalid --io-matrix item {token!r}; expected INPUT:OUT1,OUT2."
+            )
+        input_token, output_token = token.split(":", 1)
+        input_len = int(input_token)
+        if input_len <= 0:
+            raise ValueError(f"Input length must be positive, got {input_len}.")
+        output_lens = parse_int_list([output_token], default=[])
+        if not output_lens:
+            raise ValueError(f"No output lengths found in --io-matrix item {token!r}.")
+        for output_len in output_lens:
+            pair = (input_len, output_len)
+            if pair not in seen:
+                seen.add(pair)
+                cases.append(pair)
+    return cases
+
+
+def resolve_io_cases(
+    *,
+    input_lens: list[str] | None,
+    output_lens: list[str] | None,
+    io_matrix: list[str] | None,
+) -> list[tuple[int, int]]:
+    if io_matrix:
+        if input_lens or output_lens:
+            raise ValueError(
+                "--io-matrix cannot be combined with --input-lens or --output-lens."
+            )
+        return parse_io_matrix(io_matrix)
+
+    if not input_lens and not output_lens:
+        return default_io_cases()
+
+    resolved_input_lens = parse_int_list(
+        input_lens, default=DEFAULT_FLAT_INPUT_LENS
+    )
+    resolved_output_lens = parse_int_list(
+        output_lens, default=DEFAULT_FLAT_OUTPUT_LENS
+    )
+    return [
+        (input_len, output_len)
+        for input_len in resolved_input_lens
+        for output_len in resolved_output_lens
+    ]
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -199,6 +305,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--gpu-nums", nargs="*", default=None)
     parser.add_argument("--input-lens", nargs="*", default=None)
     parser.add_argument("--output-lens", nargs="*", default=None)
+    parser.add_argument(
+        "--io-matrix",
+        nargs="*",
+        default=None,
+        help=(
+            "Structured input/output matrix, e.g. "
+            "'128:384,512,640' '256:256,384'. Cannot be combined with "
+            "--input-lens or --output-lens."
+        ),
+    )
     parser.add_argument("--model-path", default=None)
     parser.add_argument(
         "--output-dir",
@@ -221,8 +337,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = parser.parse_args(argv)
 
     args.gpu_nums = parse_int_list(args.gpu_nums, default=DEFAULT_GPU_NUMS)
-    args.input_lens = parse_int_list(args.input_lens, default=DEFAULT_INPUT_LENS)
-    args.output_lens = parse_int_list(args.output_lens, default=DEFAULT_OUTPUT_LENS)
+    try:
+        args.io_cases = resolve_io_cases(
+            input_lens=args.input_lens,
+            output_lens=args.output_lens,
+            io_matrix=args.io_matrix,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if args.timeout_s <= 0:
         raise SystemExit("--timeout-s must be positive")
     if args.num_runs <= 0:
@@ -645,69 +767,68 @@ def main(argv: list[str] | None = None) -> None:
                 server_error = str(exc)
 
         try:
-            for input_len in args.input_lens:
-                for output_len in args.output_lens:
-                    case_dir = tp_dir / f"input{input_len}_output{output_len}"
-                    if not server_ready:
-                        result = make_case_failure(
-                            tp_size=tp_size,
-                            input_len=input_len,
-                            output_len=output_len,
-                            case_dir=case_dir,
-                            server_log_path=server_log_path,
-                            server_command=server_command,
-                            status="skipped" if server_error else "dry_run",
-                            reason=server_error,
-                            num_runs=args.num_runs,
-                            num_warmup_runs=args.num_warmup_runs,
-                        )
-                    else:
-                        run_results: list[BenchRun] = []
-                        for run_index in range(1, args.num_runs + 1):
-                            is_warmup = run_index <= args.num_warmup_runs
-                            run_kind = "warmup" if is_warmup else "measure"
-                            run_dir = case_dir / f"run_{run_index:02d}_{run_kind}"
-                            print(
-                                f"[request] tp{tp_size} input={input_len} "
-                                f"output={output_len} run {run_index}/{args.num_runs} "
-                                f"({run_kind})"
-                            )
-                            run = run_bench_once(
-                                preset=preset,
-                                host=args.host,
-                                port=port,
-                                input_len=input_len,
-                                output_len=output_len,
-                                run_dir=run_dir,
-                                run_index=run_index,
-                                is_warmup=is_warmup,
-                                timeout_s=args.timeout_s,
-                                dry_run=args.dry_run,
-                            )
-                            run_results.append(run)
-
-                        result = aggregate_case(
-                            tp_size=tp_size,
-                            input_len=input_len,
-                            output_len=output_len,
-                            case_dir=case_dir,
-                            server_log_path=server_log_path,
-                            server_command=server_command,
-                            run_results=run_results,
-                        )
-
-                    results.append(result)
-                    print(f"[{result.status}] {result.row_name} -> {result.to_csv_row()}")
-                    write_outputs(
-                        results=results,
-                        csv_path=csv_path,
-                        details_csv_path=details_csv_path,
-                        details_json_path=details_json_path,
+            for input_len, output_len in args.io_cases:
+                case_dir = tp_dir / f"input{input_len}_output{output_len}"
+                if not server_ready:
+                    result = make_case_failure(
+                        tp_size=tp_size,
+                        input_len=input_len,
+                        output_len=output_len,
+                        case_dir=case_dir,
+                        server_log_path=server_log_path,
+                        server_command=server_command,
+                        status="skipped" if server_error else "dry_run",
+                        reason=server_error,
+                        num_runs=args.num_runs,
+                        num_warmup_runs=args.num_warmup_runs,
                     )
-                    if args.fail_fast and result.status not in {"ok", "dry_run"}:
-                        raise SystemExit(
-                            f"Stopping after {result.status}: {result.reason}"
+                else:
+                    run_results: list[BenchRun] = []
+                    for run_index in range(1, args.num_runs + 1):
+                        is_warmup = run_index <= args.num_warmup_runs
+                        run_kind = "warmup" if is_warmup else "measure"
+                        run_dir = case_dir / f"run_{run_index:02d}_{run_kind}"
+                        print(
+                            f"[request] tp{tp_size} input={input_len} "
+                            f"output={output_len} run {run_index}/{args.num_runs} "
+                            f"({run_kind})"
                         )
+                        run = run_bench_once(
+                            preset=preset,
+                            host=args.host,
+                            port=port,
+                            input_len=input_len,
+                            output_len=output_len,
+                            run_dir=run_dir,
+                            run_index=run_index,
+                            is_warmup=is_warmup,
+                            timeout_s=args.timeout_s,
+                            dry_run=args.dry_run,
+                        )
+                        run_results.append(run)
+
+                    result = aggregate_case(
+                        tp_size=tp_size,
+                        input_len=input_len,
+                        output_len=output_len,
+                        case_dir=case_dir,
+                        server_log_path=server_log_path,
+                        server_command=server_command,
+                        run_results=run_results,
+                    )
+
+                results.append(result)
+                print(f"[{result.status}] {result.row_name} -> {result.to_csv_row()}")
+                write_outputs(
+                    results=results,
+                    csv_path=csv_path,
+                    details_csv_path=details_csv_path,
+                    details_json_path=details_json_path,
+                )
+                if args.fail_fast and result.status not in {"ok", "dry_run"}:
+                    raise SystemExit(
+                        f"Stopping after {result.status}: {result.reason}"
+                    )
         finally:
             launch_time.stop_server(server_process)
 
