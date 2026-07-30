@@ -42,6 +42,7 @@
 | `__init__.py` | 标记 Python package，并重导出四个常用 protocol 符号 | 不启动任何运行时资源 |
 | `multimodal_gen/__init__.py` | 延迟导出 `DiffGenerator`/配置公共 API | 导入窄 runtime 子模块时不预加载通用 pipeline/engine |
 | `runtime/layers/quantization/__init__.py` | 延迟解析具体量化 backend | BF16/FP32 SFWan 不导入未使用的 FP8/DeepGEMM/SRT 依赖 |
+| `runtime/loader/transformer_load_utils.py` | 使用 diffusion 本地 `QuantizationConfig` 描述 Transformer checkpoint | 不因类型注解导入 LLM SRT quantization/DeepGEMM/C10d |
 | `runtime/distributed/local_single_process.py` | 无 C10d 时的严格 world-size-one group/coordinator | 不实现跨 rank send/recv，不伪造 ProcessGroup |
 | `test/registered/multimodal_gen/test_jetson_sfwan_service.py` | CPU fake 注册测试 | 不下载 checkpoint，不运行 CUDA |
 

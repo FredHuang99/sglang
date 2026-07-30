@@ -797,6 +797,22 @@ class TestSfWanLocalDistributedCompatibility(CustomTestCase):
             "sglang.multimodal_gen.runtime.layers.quantization.fp8"
         )
 
+    def test_transformer_loader_uses_diffusion_quantization_base(self):
+        from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+            QuantizationConfig as DiffusionQuantizationConfig,
+        )
+        from sglang.multimodal_gen.runtime.loader import transformer_load_utils
+
+        self.assertIs(
+            transformer_load_utils.QuantizationConfig,
+            DiffusionQuantizationConfig,
+        )
+        source = inspect.getsource(transformer_load_utils)
+        self.assertNotIn(
+            "from sglang.srt.layers.quantization import QuantizationConfig",
+            source,
+        )
+
     def test_local_initializer_builds_every_world_size_one_group(self):
         with (
             mock.patch.object(
