@@ -1196,6 +1196,33 @@ class TestSfWanLocalDistributedCompatibility(CustomTestCase):
         self.assertIsInstance(model, _FakeModel)
         load_state_dict.assert_called_once()
 
+    def test_fsdp_shard_model_restores_default_mixed_precision_policy(self):
+        model = torch.nn.Module()
+        model.layer = torch.nn.Linear(1, 1)
+        policy = object()
+
+        with (
+            mock.patch.object(fsdp_load, "_FSDP_AVAILABLE", True),
+            mock.patch.object(
+                fsdp_load,
+                "MixedPrecisionPolicy",
+                return_value=policy,
+            ) as policy_factory,
+            mock.patch.object(fsdp_load, "fully_shard") as fully_shard,
+        ):
+            fsdp_load.shard_model(
+                model,
+                cpu_offload=False,
+                fsdp_shard_conditions=[
+                    lambda name, _module: name == "layer",
+                ],
+            )
+
+        policy_factory.assert_called_once_with()
+        self.assertEqual(fully_shard.call_count, 2)
+        for call in fully_shard.call_args_list:
+            self.assertIs(call.kwargs["mp_policy"], policy)
+
 
 class TestSfWanCpuOffloadConfiguration(CustomTestCase):
     """CPU-offload choices are explicit, role-safe, and request-stable."""

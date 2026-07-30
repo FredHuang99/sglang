@@ -412,6 +412,11 @@ def shard_model(
 
     """
     require_fsdp_support("shard_model")
+    if mp_policy is None:
+        # Keep this lazy so Jetson PyTorch builds without FSDP can import this
+        # module, while preserving PyTorch fully_shard's non-None default policy
+        # on normal CUDA builds.
+        mp_policy = MixedPrecisionPolicy()
 
     fsdp_shard_conditions, condition_source = _resolve_fsdp_shard_conditions(
         model, fsdp_shard_conditions
