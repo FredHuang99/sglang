@@ -853,6 +853,62 @@ class TestSfWanLocalDistributedCompatibility(CustomTestCase):
             "sglang.multimodal_gen.runtime.cache.cache_dit_integration"
         )
 
+    def test_sm87_flash_attention_dispatches_to_external_fa2(self):
+        from sglang.kernels.ops.attention import flash_attention_v3
+
+        is_fa3_supported = inspect.unwrap(flash_attention_v3._is_fa3_supported)
+        with (
+            mock.patch.object(
+                flash_attention_v3,
+                "get_device_capability",
+                return_value=(8, 7),
+            ),
+            mock.patch.object(flash_attention_v3, "is_musa", return_value=False),
+            mock.patch.object(flash_attention_v3.torch.version, "cuda", "12.9"),
+        ):
+            self.assertFalse(is_fa3_supported())
+
+        expected = object()
+        fa2_flash_attn_func = mock.Mock(return_value=expected)
+        fake_flash_attn = ModuleType("flash_attn")
+        fake_flash_attn.flash_attn_func = fa2_flash_attn_func
+
+        with (
+            mock.patch.object(
+                flash_attention_v3,
+                "_is_fa3_supported",
+                return_value=False,
+            ),
+            mock.patch.object(
+                flash_attention_v3,
+                "_load_fa3_kernels",
+                side_effect=AssertionError("FA3 loader must not run on SM87"),
+            ),
+            mock.patch.dict(sys.modules, {"flash_attn": fake_flash_attn}),
+        ):
+            result = inspect.unwrap(flash_attention_v3.flash_attn_varlen_func)(
+                object(),
+                object(),
+                object(),
+                None,
+                None,
+                softmax_scale=0.125,
+                causal=False,
+            )
+
+        self.assertIs(result, expected)
+        fa2_flash_attn_func.assert_called_once()
+        self.assertEqual(
+            fa2_flash_attn_func.call_args.kwargs,
+            {
+                "softmax_scale": 0.125,
+                "causal": False,
+                "window_size": (-1, -1),
+                "softcap": 0.0,
+                "return_attn_probs": False,
+            },
+        )
+
     def test_local_initializer_builds_every_world_size_one_group(self):
         with (
             mock.patch.object(

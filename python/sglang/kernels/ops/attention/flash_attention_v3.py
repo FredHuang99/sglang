@@ -33,7 +33,7 @@ def _load_fa3_kernels():
     # which is expected to be more stable and compatible
     if envs.SGLANG_USE_SGL_FA3_KERNEL.get():
         logger.debug(
-            f"SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
+            "SGLANG_USE_SGL_FA3_KERNEL=True, use sgl-kernel implementation for FlashAttention v3 "
         )
         return _load_fa3_kernel_from_sgl()
 
@@ -94,6 +94,15 @@ def _is_fa3_supported(device=None) -> bool:
     if is_musa():
         return major >= 3
     if torch.version.cuda is not None and torch.version.cuda >= "12.3":
+        # Jetson Orin is SM87, but its locally built sgl-kernel package does
+        # not provide the FA3 extension. Route it to the external
+        # flash-attn package (FA2) below instead of trying to import
+        # sgl_kernel.flash_attn.
+        if (major, minor) == (8, 7):
+            logger.info(
+                "Using external FlashAttention-2 on SM87; skipping sgl-kernel FA3."
+            )
+            return False
         return major == 9 or major == 8
     return False
 

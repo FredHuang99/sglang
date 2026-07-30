@@ -257,11 +257,6 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> AttentionBackendEnum:
-        if platform.is_sm120():
-            logger.info(
-                "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
-            )
-            return AttentionBackendEnum.TORCH_SDPA
         return AttentionBackendEnum.FA
 
 
@@ -419,16 +414,11 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def _resolve_default_attn_backend(cls) -> AttentionBackendEnum:
-        if cls.is_sm120():
-            # On SM12.x, the sgl-kernel FlashAttention wheels may not include
-            # support yet. Default to Torch SDPA for correctness.
-            logger.info("Defaulting to Torch SDPA backend on SM12.x")
-            return AttentionBackendEnum.TORCH_SDPA
         return AttentionBackendEnum.FA
 
     @classmethod
     def _prepare_flash_attention_for_blackwell(cls) -> bool:
-        if not cls.is_blackwell():
+        if not (cls.is_blackwell() or cls.is_sm120()):
             return True
 
         try:
@@ -445,6 +435,7 @@ class CudaPlatformBase(Platform):
             return False
 
         set_fa_ver(4)
+        logger.info("Using FlashAttention-4 on Blackwell.")
         return True
 
     @classmethod

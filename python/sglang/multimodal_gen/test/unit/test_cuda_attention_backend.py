@@ -61,15 +61,31 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             "sglang.multimodal_gen.runtime.layers.attention.backends.aiter.AITerBackend",
         )
 
-    def test_default_backend_uses_torch_sdpa_on_sm120(self):
+    def test_default_backend_uses_flash_attention_4_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
 
-        self.assertEqual(self.resolve(None), SDPA_BACKEND_CLS_STR)
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.set_fa_ver"
+        ) as set_fa_ver:
+            self.assertEqual(
+                self.resolve(None),
+                "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend",
+            )
 
-    def test_requested_flash_attention_uses_torch_sdpa_on_sm120(self):
+        set_fa_ver.assert_called_once_with(4)
+
+    def test_requested_flash_attention_uses_flash_attention_4_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
 
-        self.assertEqual(self.resolve(AttentionBackendEnum.FA), SDPA_BACKEND_CLS_STR)
+        with patch(
+            "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.set_fa_ver"
+        ) as set_fa_ver:
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.FA),
+                "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend",
+            )
+
+        set_fa_ver.assert_called_once_with(4)
 
     def test_default_backend_falls_back_for_non_flash_attention_dtype(self):
         self.assertEqual(self.resolve(None, torch.float32), SDPA_BACKEND_CLS_STR)
