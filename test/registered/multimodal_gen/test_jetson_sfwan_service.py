@@ -83,7 +83,11 @@ from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.distributed.local_single_process import (
     LocalSingleProcessGroupCoordinator,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.causal_attention_cache import (
+    CrossAttentionKVCache,
+)
 from sglang.multimodal_gen.runtime.loader import fsdp_load
+from sglang.multimodal_gen.runtime.models.dits.wanvideo import WanT2VCrossAttention
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -166,6 +170,109 @@ class TestSfWanFrameMath(CustomTestCase):
 
 class TestSfWanFastVideoNumericalContract(CustomTestCase):
     """Pin the dtype, timestep, RNG, and low-level call contract."""
+
+    def test_cross_attention_caches_text_kv_across_dit_forwards(self):
+        class _Projection:
+            def __init__(self, offset):
+                self.offset = offset
+                self.calls = 0
+
+            def __call__(self, value):
+                self.calls += 1
+                return value + self.offset, None
+
+        class _CoreAttention:
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, q, k, v):
+                self.calls.append(
+                    (q.detach().clone(), k.detach().clone(), v.detach().clone())
+                )
+                return q
+
+        to_q = _Projection(1)
+        to_k = _Projection(2)
+        to_v = _Projection(3)
+        to_out = _Projection(0)
+        core_attention = _CoreAttention()
+        attention = SimpleNamespace(
+            to_q=to_q,
+            to_k=to_k,
+            to_v=to_v,
+            to_out=to_out,
+            norm_q=lambda value: value,
+            norm_k=lambda value: value,
+            tp_rmsnorm=False,
+            local_num_heads=2,
+            head_dim=2,
+            attn=core_attention,
+        )
+        cache = CrossAttentionKVCache(
+            k=torch.zeros((1, 3, 2, 2)),
+            v=torch.zeros((1, 3, 2, 2)),
+        )
+        first_context = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+        second_context = first_context + 100
+
+        first_output = WanT2VCrossAttention.forward(
+            attention,
+            torch.zeros((1, 2, 4)),
+            first_context,
+            None,
+            crossattn_cache=cache,
+        )
+        cached_k = cache.k.clone()
+        cached_v = cache.v.clone()
+
+        self.assertTrue(cache.is_init)
+        self.assertEqual(tuple(cache.k.shape), (1, 3, 2, 2))
+        self.assertEqual(tuple(cache.v.shape), (1, 3, 2, 2))
+        self.assertEqual((to_q.calls, to_k.calls, to_v.calls), (1, 1, 1))
+        self.assertEqual(tuple(first_output.shape), (1, 2, 4))
+
+        # The remaining three DMD calls and clean-KV forward reuse text K/V.
+        for _ in range(4):
+            WanT2VCrossAttention.forward(
+                attention,
+                torch.ones((1, 2, 4)),
+                second_context,
+                None,
+                crossattn_cache=cache,
+            )
+
+        self.assertEqual((to_q.calls, to_k.calls, to_v.calls), (5, 1, 1))
+        torch.testing.assert_close(cache.k, cached_k)
+        torch.testing.assert_close(cache.v, cached_v)
+        torch.testing.assert_close(core_attention.calls[-1][1], cached_k)
+        torch.testing.assert_close(core_attention.calls[-1][2], cached_v)
+
+        cache.reset()
+        WanT2VCrossAttention.forward(
+            attention,
+            torch.ones((1, 2, 4)),
+            second_context,
+            None,
+            crossattn_cache=cache,
+        )
+
+        self.assertEqual((to_q.calls, to_k.calls, to_v.calls), (6, 2, 2))
+        self.assertFalse(torch.equal(cache.k, cached_k))
+        self.assertFalse(torch.equal(cache.v, cached_v))
+
+        WanT2VCrossAttention.forward(
+            attention,
+            torch.ones((1, 2, 4)),
+            first_context,
+            None,
+        )
+        WanT2VCrossAttention.forward(
+            attention,
+            torch.ones((1, 2, 4)),
+            first_context,
+            None,
+        )
+        self.assertEqual((to_q.calls, to_k.calls, to_v.calls), (8, 4, 4))
 
     def test_positive_prompt_encoding_uses_exact_fastvideo_inputs(self):
         observed = {}
