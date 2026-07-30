@@ -1,6 +1,7 @@
 """CPU-only derived-property tests for the minimal SFWan service."""
 
 import asyncio
+import builtins
 import contextvars
 import importlib.util
 import inspect
@@ -811,6 +812,45 @@ class TestSfWanLocalDistributedCompatibility(CustomTestCase):
         self.assertNotIn(
             "from sglang.srt.layers.quantization import QuantizationConfig",
             source,
+        )
+
+    def test_cache_package_does_not_eagerly_import_cache_dit(self):
+        import sglang.multimodal_gen.runtime.cache as cache_package
+
+        probe_name = "_sfwan_cache_lazy_import_probe"
+        spec = importlib.util.spec_from_file_location(
+            probe_name,
+            Path(cache_package.__file__),
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name.endswith(".cache.cache_dit_integration"):
+                raise AssertionError("cache_dit integration was imported eagerly")
+            return real_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=guarded_import):
+            spec.loader.exec_module(module)
+
+        self.assertIn("TeaCacheContext", vars(module))
+        self.assertNotIn("CacheDitConfig", vars(module))
+        self.assertTrue(callable(module.__getattr__))
+
+        fake_config = type("FakeCacheDitConfig", (), {})
+        fake_integration = SimpleNamespace(CacheDitConfig=fake_config)
+        with mock.patch.object(
+            module,
+            "import_module",
+            return_value=fake_integration,
+        ) as import_module:
+            self.assertIs(module.CacheDitConfig, fake_config)
+
+        import_module.assert_called_once_with(
+            "sglang.multimodal_gen.runtime.cache.cache_dit_integration"
         )
 
     def test_local_initializer_builds_every_world_size_one_group(self):

@@ -10,13 +10,16 @@ diffusion transformer (DiT) inference:
 
 """
 
-from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
-    CacheDitConfig,
-    enable_cache_on_dual_transformer,
-    enable_cache_on_transformer,
-    get_scm_mask,
-)
+from importlib import import_module
+
 from sglang.multimodal_gen.runtime.cache.teacache import TeaCacheContext, TeaCacheMixin
+
+_CACHE_DIT_EXPORTS = {
+    "CacheDitConfig",
+    "enable_cache_on_transformer",
+    "enable_cache_on_dual_transformer",
+    "get_scm_mask",
+}
 
 __all__ = [
     # TeaCache (always available)
@@ -28,3 +31,18 @@ __all__ = [
     "enable_cache_on_dual_transformer",
     "get_scm_mask",
 ]
+
+
+def __getattr__(name: str):
+    if name in _CACHE_DIT_EXPORTS:
+        module = import_module(
+            "sglang.multimodal_gen.runtime.cache.cache_dit_integration"
+        )
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(__all__))
