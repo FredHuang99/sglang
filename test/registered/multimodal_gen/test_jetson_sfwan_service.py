@@ -2,6 +2,7 @@
 
 import asyncio
 import contextvars
+import importlib.util
 import inspect
 import json
 import math
@@ -10,6 +11,7 @@ import sys
 import time
 import unittest
 from contextlib import nullcontext
+from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest import mock
 
@@ -757,6 +759,43 @@ class TestSfWanLocalDistributedCompatibility(CustomTestCase):
         fake_dist = SimpleNamespace(is_available=lambda: True)
         with mock.patch.object(parallel_state.torch, "distributed", fake_dist):
             self.assertFalse(parallel_state.is_torch_distributed_initialized())
+
+    def test_multimodal_public_api_does_not_eagerly_load_generic_runtime(self):
+        import sglang.multimodal_gen as multimodal_gen
+
+        probe_name = "_sfwan_multimodal_lazy_import_probe"
+        spec = importlib.util.spec_from_file_location(
+            probe_name,
+            Path(multimodal_gen.__file__),
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        self.assertNotIn("DiffGenerator", vars(module))
+        self.assertNotIn("PipelineConfig", vars(module))
+        self.assertNotIn("SamplingParams", vars(module))
+        self.assertTrue(callable(module.__getattr__))
+
+    def test_builtin_quantization_backend_is_loaded_only_when_selected(self):
+        from sglang.multimodal_gen.runtime.layers import (
+            quantization as diffusion_quantization,
+        )
+
+        fake_fp8_config = type("FakeFp8Config", (), {})
+        fake_fp8_module = SimpleNamespace(Fp8Config=fake_fp8_config)
+        with mock.patch.object(
+            diffusion_quantization,
+            "import_module",
+            return_value=fake_fp8_module,
+        ) as import_module:
+            result = diffusion_quantization.get_quantization_config("fp8")
+
+        self.assertIs(result, fake_fp8_config)
+        import_module.assert_called_once_with(
+            "sglang.multimodal_gen.runtime.layers.quantization.fp8"
+        )
 
     def test_local_initializer_builds_every_world_size_one_group(self):
         with (

@@ -40,6 +40,8 @@
 | [`client.py`](client.py) | 异步请求调度、burst/fixed/Poisson、DiT/VAE profile client | 不持有服务端 cache |
 | [`README.md`](README.md) | 快速启动命令和数值契约摘要 | 不替代本文的实现审计 |
 | `__init__.py` | 标记 Python package，并重导出四个常用 protocol 符号 | 不启动任何运行时资源 |
+| `multimodal_gen/__init__.py` | 延迟导出 `DiffGenerator`/配置公共 API | 导入窄 runtime 子模块时不预加载通用 pipeline/engine |
+| `runtime/layers/quantization/__init__.py` | 延迟解析具体量化 backend | BF16/FP32 SFWan 不导入未使用的 FP8/DeepGEMM/SRT 依赖 |
 | `runtime/distributed/local_single_process.py` | 无 C10d 时的严格 world-size-one group/coordinator | 不实现跨 rank send/recv，不伪造 ProcessGroup |
 | `test/registered/multimodal_gen/test_jetson_sfwan_service.py` | CPU fake 注册测试 | 不下载 checkpoint，不运行 CUDA |
 
@@ -250,6 +252,12 @@ tuner 不会改写用户选择。它先初始化 distributed runtime，再按实
   `layerwise_offload_components`；所有组件加载后再显式调用
   `configure_layerwise_offload_modules()`，缺少可配置组件时立即失败。
 - VAE 的 true 值在两类 backend 中都保持 per-chunk 整体 module 搬迁。
+
+为保证上述 local 初始化能先于通用框架发生，`multimodal_gen` 的三个公共
+顶层导出使用模块级 `__getattr__` 延迟解析；diffusion quantization registry
+也只在实际选择 `fp8/modelopt/...` 时导入相应 backend。参考 SFWan 的
+BF16/FP32 路径不会因为一次 package import 而进入未使用的 DeepGEMM 或
+`sglang.srt.distributed`。
 
 关闭某组件 offload 时，该组件常驻目标 device。服务不额外暴露
 `use_fsdp_inference`，从而避免“local backend + FSDP”等无效组合。
