@@ -3,6 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/utils.py
 
+from __future__ import annotations
+
 import argparse
 import ctypes
 import importlib
@@ -22,7 +24,11 @@ from typing import Any, TypeVar, cast
 import cloudpickle
 import torch
 import yaml
-from torch.distributed.fsdp import MixedPrecisionPolicy
+
+try:
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+except (ImportError, ModuleNotFoundError):
+    MixedPrecisionPolicy = Any
 
 import sglang.multimodal_gen.envs as envs
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -140,7 +146,6 @@ def current_stream() -> torch.cuda.Stream | None:
 
 
 class StoreBoolean(argparse.Action):
-
     def __init__(self, option_strings, dest, default=False, required=False, help=None):
         super().__init__(
             option_strings=option_strings,
@@ -162,7 +167,7 @@ class StoreBoolean(argparse.Action):
                 setattr(namespace, self.dest, False)
             else:
                 raise ValueError(
-                    f"Invalid boolean value: {values}. " "Expected 'true' or 'false'."
+                    f"Invalid boolean value: {values}. Expected 'true' or 'false'."
                 )
         else:
             setattr(namespace, self.dest, bool(values))
@@ -300,8 +305,7 @@ class FlexibleArgumentParser(argparse.ArgumentParser):
         if args[0] == "serve":
             if index == 1:
                 raise ValueError(
-                    "No model_tag specified! Please check your command-line"
-                    " arguments."
+                    "No model_tag specified! Please check your command-line arguments."
                 )
             command = args_before_config[0]
             model_tag = args_before_config[1]
@@ -489,7 +493,7 @@ def update_environment_variables(envs: dict[str, str]):
     for k, v in envs.items():
         if k in os.environ and os.environ[k] != v:
             logger.warning(
-                "Overwriting environment variable %s " "from '%s' to '%s'",
+                "Overwriting environment variable %s from '%s' to '%s'",
                 k,
                 os.environ[k],
                 v,
@@ -514,7 +518,7 @@ def run_method(
             func = getattr(obj, method)
         except AttributeError:
             raise NotImplementedError(
-                f"Method {method!r} is not" " implemented."
+                f"Method {method!r} is not implemented."
             ) from None
     else:
         func = partial(method, obj)  # type: ignore
@@ -548,7 +552,6 @@ def get_exception_traceback() -> str:
 
 
 class TypeBasedDispatcher:
-
     def __init__(self, mapping: list[tuple[type, Callable]]):
         self._mapping = mapping
 
@@ -625,9 +628,9 @@ def dict_to_3d_list(
     """
     # Case 1: no data, but fixed shape requested
     if mask_strategy is None:
-        assert (
-            t_max is not None and l_max is not None and h_max is not None
-        ), "If mask_strategy is None, you must provide t_max, l_max, and h_max"
+        assert t_max is not None and l_max is not None and h_max is not None, (
+            "If mask_strategy is None, you must provide t_max, l_max, and h_max"
+        )
         return [
             [[None for _ in range(h_max)] for _ in range(l_max)] for _ in range(t_max)
         ]

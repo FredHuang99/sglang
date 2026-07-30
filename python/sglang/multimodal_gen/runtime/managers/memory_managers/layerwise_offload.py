@@ -1,9 +1,18 @@
+from __future__ import annotations
+
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Dict, List, Set, Tuple
 
 import torch
-from torch.distributed.tensor import DTensor
+
+try:
+    from torch.distributed.tensor import DTensor
+except (ImportError, ModuleNotFoundError):
+
+    class DTensor:
+        """Sentinel used only for false isinstance checks without DTensor."""
+
 
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload_components import (
     LAYERWISE_OFFLOAD_ALL_COMPONENTS,

@@ -31,6 +31,8 @@ If you only need to use the distributed environment without model parallelism,
  you can skip the model parallel initialization and destruction steps.
 """
 
+from __future__ import annotations
+
 import contextlib
 import datetime
 import os
@@ -51,12 +53,47 @@ from sglang.multimodal_gen.runtime.distributed.utils import StatelessProcessGrou
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 from ..utils.distributed import RankGenerator
-from .group_coordinator import (
-    GroupCoordinator,
-    PipelineGroupCoordinator,
-    SequenceParallelGroupCoordinator,
-    get_local_torch_device,
-)
+
+
+def is_torch_distributed_available() -> bool:
+    """Return whether this PyTorch build contains the real C10d runtime."""
+
+    checker = getattr(torch.distributed, "is_available", None)
+    return bool(callable(checker) and checker())
+
+
+def is_torch_distributed_initialized() -> bool:
+    """Safely query C10d initialization on builds that may expose only stubs."""
+
+    if not is_torch_distributed_available():
+        return False
+    checker = getattr(torch.distributed, "is_initialized", None)
+    return bool(callable(checker) and checker())
+
+
+if is_torch_distributed_available():
+    from .group_coordinator import (
+        GroupCoordinator,
+        PipelineGroupCoordinator,
+        SequenceParallelGroupCoordinator,
+        get_local_torch_device,
+    )
+else:
+    from .local_single_process import (
+        LocalPipelineGroupCoordinator as PipelineGroupCoordinator,
+    )
+    from .local_single_process import (
+        LocalSequenceParallelGroupCoordinator as SequenceParallelGroupCoordinator,
+    )
+    from .local_single_process import (
+        LocalSingleProcessGroupCoordinator as GroupCoordinator,
+    )
+
+    def get_local_torch_device() -> torch.device:
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
+        return current_platform.get_local_torch_device()
+
 
 logger = init_logger(__name__)
 
@@ -70,6 +107,7 @@ _VAE_DECODE: GroupCoordinator | None = None
 _DIT: ProcessGroup | None = None
 _VAE: ProcessGroup | None = None
 _VAE_DECODE_PARALLEL_AXES = "tp-sp-pp-cfg"
+_LOCAL_SINGLE_PROCESS_MODE = False
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 
@@ -224,6 +262,13 @@ def init_distributed_environment(
     device_id: torch.device | None = None,
     timeout: int | None = None,
 ):
+    if not is_torch_distributed_available():
+        raise RuntimeError(
+            "init_distributed_environment requires a PyTorch build with C10d. "
+            "Use maybe_init_distributed_environment_and_model_parallel with "
+            "world size one to select the local backend."
+        )
+
     # Determine the appropriate backend based on the platform
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -243,7 +288,7 @@ def init_distributed_environment(
         backend,
         timeout,
     )
-    if not torch.distributed.is_initialized():
+    if not is_torch_distributed_initialized():
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
             "distributed environment"
@@ -263,7 +308,6 @@ def init_distributed_environment(
         )
 
         if timeout is not None:
-
             extra_args["timeout"] = datetime.timedelta(seconds=timeout)
             logger.info(f"Setting distributed timeout to {timeout} seconds")
 
@@ -290,9 +334,9 @@ def init_distributed_environment(
         ranks = list(range(torch.distributed.get_world_size()))
         _WORLD = init_world_group(ranks, local_rank, backend)
     else:
-        assert (
-            _WORLD.world_size == torch.distributed.get_world_size()
-        ), "world group already initialized with a different world size"
+        assert _WORLD.world_size == torch.distributed.get_world_size(), (
+            "world group already initialized with a different world size"
+        )
     _sync_srt_world_group()
 
 
@@ -511,6 +555,94 @@ def get_dp_rank() -> int:
     return get_dp_group().rank_in_group
 
 
+def is_local_single_process_mode() -> bool:
+    """Return whether strict world-size-one groups replace C10d groups."""
+
+    return _LOCAL_SINGLE_PROCESS_MODE
+
+
+def get_distributed_backend_name() -> str:
+    """Return the effective communication backend for status reporting."""
+
+    if is_local_single_process_mode():
+        return "local"
+    if not is_torch_distributed_initialized():
+        return "uninitialized"
+    backend = torch.distributed.get_backend()
+    return str(backend).lower()
+
+
+def _initialize_local_single_process_model_parallel(
+    *,
+    tp_size: int,
+    sp_size: int,
+    cfg_degree: int,
+    ulysses_degree: int,
+    ring_degree: int,
+    dp_size: int,
+    local_rank: int,
+    world_size: int,
+    rank: int,
+) -> None:
+    """Initialize identity groups without importing or calling C10d."""
+
+    requested_degrees = {
+        "world_size": (world_size, 1),
+        "rank": (rank, 0),
+        "local_rank": (local_rank, 0),
+        "tp_size": (tp_size, 1),
+        "sp_size": (sp_size, 1),
+        "cfg_degree": (cfg_degree, 1),
+        "ulysses_degree": (ulysses_degree, 1),
+        "ring_degree": (ring_degree, 1),
+        "dp_size": (dp_size, 1),
+    }
+    invalid = {
+        name: actual
+        for name, (actual, expected) in requested_degrees.items()
+        if actual != expected
+    }
+    if invalid:
+        rendered = ", ".join(f"{name}={value}" for name, value in invalid.items())
+        raise RuntimeError(
+            "This PyTorch build has no C10d support. The local SGLang "
+            "Diffusion backend supports only world size one and rank 0; "
+            f"invalid settings: {rendered}."
+        )
+
+    global _LOCAL_SINGLE_PROCESS_MODE
+    global _WORLD, _TP, _SP, _PP, _CFG, _DP, _VAE_DECODE, _DIT
+
+    if _WORLD is not None:
+        if not _LOCAL_SINGLE_PROCESS_MODE or not model_parallel_is_initialized():
+            raise RuntimeError(
+                "Distributed state is already initialized with an incompatible backend."
+            )
+        return
+
+    from .local_single_process import LocalSingleProcessGroupCoordinator
+
+    def make_group(group_name: str) -> LocalSingleProcessGroupCoordinator:
+        group = LocalSingleProcessGroupCoordinator(
+            group_ranks=[[0]],
+            local_rank=0,
+            torch_distributed_backend="local",
+            group_name=group_name,
+        )
+        _register_group(group)
+        return group
+
+    _WORLD = make_group("world")
+    _DP = make_group("dp_group")
+    _CFG = make_group("cfg_group")
+    _PP = make_group("pp_group")
+    _SP = make_group("sp_group")
+    _TP = make_group("tp_group")
+    _VAE_DECODE = make_group("vae_decode_group")
+    _DIT = make_group("dit_group")
+    _LOCAL_SINGLE_PROCESS_MODE = True
+
+
 def maybe_init_distributed_environment_and_model_parallel(
     tp_size: int,
     sp_size: int,
@@ -523,18 +655,43 @@ def maybe_init_distributed_environment_and_model_parallel(
 ):
     from sglang.multimodal_gen.runtime.platforms import current_platform
 
-    if _WORLD is not None and model_parallel_is_initialized():
-        # make sure the tp and sp sizes are correct
-        assert (
-            get_tp_world_size() == tp_size
-        ), f"You are trying to initialize model parallel groups with size {tp_size}, but they are already initialized with size {get_tp_world_size()}"
-        assert (
-            get_sp_world_size() == sp_size
-        ), f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
-        return
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
+
+    if not is_torch_distributed_available():
+        _initialize_local_single_process_model_parallel(
+            tp_size=tp_size,
+            sp_size=sp_size,
+            cfg_degree=cfg_degree,
+            ulysses_degree=ulysses_degree,
+            ring_degree=ring_degree,
+            dp_size=dp_size,
+            local_rank=local_rank,
+            world_size=world_size,
+            rank=rank,
+        )
+        logger.info(
+            "Initialized strict local SGLang Diffusion backend for world size one",
+            main_process_only=False,
+        )
+        if current_platform.is_cuda_alike():
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+        elif current_platform.is_npu():
+            device = torch.device(f"npu:{local_rank}")
+            torch.npu.set_device(device)
+        return
+
+    if _WORLD is not None and model_parallel_is_initialized():
+        # make sure the tp and sp sizes are correct
+        assert get_tp_world_size() == tp_size, (
+            f"You are trying to initialize model parallel groups with size {tp_size}, but they are already initialized with size {get_tp_world_size()}"
+        )
+        assert get_sp_world_size() == sp_size, (
+            f"You are trying to initialize model parallel groups with size {sp_size}, but they are already initialized with size {get_sp_world_size()}"
+        )
+        return
     device = get_local_torch_device()
     logger.info(
         "Initializing distributed environment with world_size=%d, device=%s, timeout=%s",
@@ -620,20 +777,23 @@ def get_tp_rank() -> int:
 
 
 def destroy_distributed_environment() -> None:
-    global _WORLD
-    _clear_srt_world_group()
+    global _WORLD, _LOCAL_SINGLE_PROCESS_MODE
+    if not _LOCAL_SINGLE_PROCESS_MODE:
+        _clear_srt_world_group()
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
-    if torch.distributed.is_initialized():
+    if is_torch_distributed_initialized():
         torch.distributed.destroy_process_group()
+    _LOCAL_SINGLE_PROCESS_MODE = False
 
 
 def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
     destroy_model_parallel()
     destroy_distributed_environment()
-    with contextlib.suppress(AssertionError):
-        torch.distributed.destroy_process_group()
+    if is_torch_distributed_initialized():
+        with contextlib.suppress(AssertionError):
+            torch.distributed.destroy_process_group()
     if shutdown_ray:
         import ray  # Lazy import Ray
 
@@ -649,9 +809,9 @@ def is_the_same_node_as(
     memory system (shared access to shared memory).
     """
     if isinstance(pg, ProcessGroup):
-        assert (
-            torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL
-        ), "in_the_same_node_as should be tested with a non-NCCL group."
+        assert torch.distributed.get_backend(pg) != torch.distributed.Backend.NCCL, (
+            "in_the_same_node_as should be tested with a non-NCCL group."
+        )
         # local rank inside the group
         rank = torch.distributed.get_rank(group=pg)
         world_size = torch.distributed.get_world_size(group=pg)
@@ -794,9 +954,9 @@ def is_pipeline_last_stage() -> bool:
 
 # CFG
 def get_cfg_group() -> GroupCoordinator:
-    assert (
-        _CFG is not None
-    ), "classifier_free_guidance parallel group is not initialized"
+    assert _CFG is not None, (
+        "classifier_free_guidance parallel group is not initialized"
+    )
     return _CFG
 
 
@@ -906,7 +1066,7 @@ def destroy_model_parallel() -> None:
             group.destroy()
 
     for group in (_DIT, _VAE):
-        if group is not None:
+        if group is not None and is_torch_distributed_initialized():
             torch.distributed.destroy_process_group(group)
 
     _TP, _SP, _DP, _CFG, _PP, _VAE_DECODE, _DIT, _VAE = (None,) * 8

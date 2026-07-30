@@ -90,6 +90,7 @@ def _initialize_single_gpu_runtime(device_index: int) -> Any:
     torch.cuda.set_device(device_index)
 
     from sglang.multimodal_gen.runtime.distributed import (
+        get_world_size,
         maybe_init_distributed_environment_and_model_parallel,
     )
 
@@ -102,9 +103,59 @@ def _initialize_single_gpu_runtime(device_index: int) -> Any:
         dp_size=1,
         distributed_init_method=f"tcp://127.0.0.1:{os.environ['MASTER_PORT']}",
     )
-    if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
+    if get_world_size() != 1:
         raise RuntimeError("the minimal SFWan service supports world size one only")
     return torch.device(f"cuda:{device_index}")
+
+
+def _distributed_runtime_contract() -> tuple[str, bool]:
+    from sglang.multimodal_gen.runtime.distributed import (
+        get_distributed_backend_name,
+        is_local_single_process_mode,
+    )
+
+    return get_distributed_backend_name(), is_local_single_process_mode()
+
+
+def _resolve_offload_settings(
+    *,
+    load_config: ModelLoadConfig,
+    component_names: tuple[str, ...],
+    local_single_process: bool,
+) -> tuple[list[str] | None, dict[str, str]]:
+    effective = {
+        "text_encoder": (
+            "fsdp_cpu_offload" if load_config.text_encoder_cpu_offload else "resident"
+        ),
+        "dit": "fsdp" if load_config.dit_cpu_offload else "resident",
+        "vae": ("per_chunk_module" if load_config.vae_cpu_offload else "resident"),
+    }
+    if not local_single_process:
+        return None, effective
+
+    layerwise_components: list[str] = []
+    if load_config.text_encoder_cpu_offload and "text_encoder" in component_names:
+        layerwise_components.append("text_encoder")
+        effective["text_encoder"] = "layerwise"
+    if load_config.dit_cpu_offload and "transformer" in component_names:
+        layerwise_components.append("dit")
+        effective["dit"] = "layerwise"
+    return layerwise_components or None, effective
+
+
+def _component_runtime_contract(
+    components: "_ComponentSet",
+    component_keys: tuple[str, ...],
+) -> dict[str, Any]:
+    return {
+        "distributed_backend": components.distributed_backend,
+        "cpu_offload_requested": {
+            key: components.cpu_offload_requested[key] for key in component_keys
+        },
+        "cpu_offload_effective": {
+            key: components.cpu_offload_effective[key] for key in component_keys
+        },
+    }
 
 
 class _ComponentSet:
@@ -117,6 +168,23 @@ class _ComponentSet:
         component_names: tuple[str, ...],
     ) -> None:
         self.device = _initialize_single_gpu_runtime(load_config.device_index)
+        (
+            self.distributed_backend,
+            self.local_single_process,
+        ) = _distributed_runtime_contract()
+        self.cpu_offload_requested = {
+            "text_encoder": load_config.text_encoder_cpu_offload,
+            "dit": load_config.dit_cpu_offload,
+            "vae": load_config.vae_cpu_offload,
+        }
+        (
+            layerwise_offload_components,
+            self.cpu_offload_effective,
+        ) = _resolve_offload_settings(
+            load_config=load_config,
+            component_names=component_names,
+            local_single_process=self.local_single_process,
+        )
 
         from sglang.multimodal_gen.configs.pipeline_configs import (
             SelfForcingWanT2V480PConfig,
@@ -135,6 +203,7 @@ class _ComponentSet:
         )
         self.pipeline_config = SelfForcingWanT2V480PConfig()
         self.pipeline_config.vae_precision = load_config.vae_precision
+        layerwise_selection = set(layerwise_offload_components or ())
         self.server_args = ServerArgs(
             model_path=self.model_path,
             pipeline_config=self.pipeline_config,
@@ -142,10 +211,18 @@ class _ComponentSet:
             tp_size=1,
             sp_degree=1,
             performance_mode="manual",
-            text_encoder_cpu_offload=load_config.text_encoder_cpu_offload,
-            dit_cpu_offload=load_config.dit_cpu_offload,
+            text_encoder_cpu_offload=(
+                load_config.text_encoder_cpu_offload
+                and "text_encoder" not in layerwise_selection
+            ),
+            dit_cpu_offload=(
+                load_config.dit_cpu_offload and "dit" not in layerwise_selection
+            ),
             vae_cpu_offload=load_config.vae_cpu_offload,
-            use_fsdp_inference=load_config.dit_cpu_offload,
+            use_fsdp_inference=(
+                load_config.dit_cpu_offload and not self.local_single_process
+            ),
+            layerwise_offload_components=layerwise_offload_components,
         )
         set_global_server_args(self.server_args)
         model_index_path = Path(self.model_path) / "model_index.json"
@@ -155,6 +232,27 @@ class _ComponentSet:
         self.modules: dict[str, Any] = {}
         for name in component_names:
             self.modules[name] = self._load_component(name)
+        if layerwise_offload_components:
+            from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
+                configure_layerwise_offload_modules,
+            )
+
+            configured = configure_layerwise_offload_modules(
+                self.modules,
+                self.server_args,
+                component_names=layerwise_offload_components,
+            )
+            expected = set()
+            if "text_encoder" in layerwise_offload_components:
+                expected.add("text_encoder")
+            if "dit" in layerwise_offload_components:
+                expected.add("transformer")
+            missing = expected.difference(configured)
+            if missing:
+                raise RuntimeError(
+                    "Jetson local CPU offload requires layerwise-capable "
+                    f"components; configuration failed for {sorted(missing)}."
+                )
 
     def _load_component(self, name: str) -> Any:
         from sglang.multimodal_gen.runtime.loader.component_loaders import (
@@ -456,6 +554,10 @@ class SfWanDitModel:
             "text_length": 512,
             "cfg": False,
             "profile_enabled": load_config.enable_profile,
+            **_component_runtime_contract(
+                self._components,
+                ("text_encoder", "dit"),
+            ),
             "cpu_offload": {
                 "text_encoder": load_config.text_encoder_cpu_offload,
                 "dit": load_config.dit_cpu_offload,
@@ -1091,6 +1193,10 @@ class SfWanVaeModel:
             "vae_dtype": load_config.vae_precision,
             "feature_cache_scope": "request",
             "profile_enabled": load_config.enable_profile,
+            **_component_runtime_contract(
+                self._components,
+                ("vae",),
+            ),
             "cpu_offload": {
                 "vae": load_config.vae_cpu_offload,
             },
@@ -1360,6 +1466,10 @@ class SfWanMonolithicModel:
             "vae": self.vae.contract,
             "latent_transport": "in_memory_gpu",
             "profile_enabled": load_config.enable_profile,
+            **_component_runtime_contract(
+                components,
+                ("text_encoder", "dit", "vae"),
+            ),
         }
 
     def generate(

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import dataclasses
 import glob
 import os
@@ -9,7 +11,6 @@ from typing import cast
 import torch
 import torch.distributed as dist
 from torch import nn
-from torch.distributed import init_device_mesh
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME
 
 from sglang.multimodal_gen.configs.models import EncoderConfig, ModelConfig
@@ -20,14 +21,18 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_group,
 )
-from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    GroupCoordinator,
+    is_torch_distributed_available,
     patch_tensor_parallel_group,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentLoader,
 )
-from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
+from sglang.multimodal_gen.runtime.loader.fsdp_load import (
+    require_fsdp_support,
+    shard_model,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     set_default_torch_dtype,
     skip_init_modules,
@@ -124,7 +129,9 @@ class TextEncoderLoader(ComponentLoader):
         encoder_idx = (
             self._extract_encoder_index(component_name or "text_encoder_2")
             if component_name
-            else 1 if component_model_path.rstrip("/").endswith("text_encoder_2") else 0
+            else 1
+            if component_model_path.rstrip("/").endswith("text_encoder_2")
+            else 0
         )
         encoder_dtype = server_args.pipeline_config.text_encoder_precisions[encoder_idx]
         dtype = precision_to_dtype(
@@ -433,6 +440,17 @@ class TextEncoderLoader(ComponentLoader):
                     )
                     model = model.to(local_torch_device)
                 elif fsdp_cpu_offload:
+                    require_fsdp_support("text-encoder FSDP CPU offload")
+                    if not is_torch_distributed_available():
+                        raise RuntimeError(
+                            "text-encoder FSDP CPU offload requires C10d; select "
+                            "layerwise offload on this PyTorch build."
+                        )
+                    init_device_mesh = getattr(dist, "init_device_mesh", None)
+                    if init_device_mesh is None:
+                        raise RuntimeError(
+                            "torch.distributed.init_device_mesh is unavailable."
+                        )
                     mesh = init_device_mesh(
                         current_platform.device_type,
                         mesh_shape=(1, dist.get_world_size()),

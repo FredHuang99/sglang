@@ -8,6 +8,8 @@
 # Adapted from
 # https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/tensor_parallel/utils.py
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
+
 import dataclasses
 import pickle
 import time
@@ -16,9 +18,10 @@ from collections.abc import Sequence
 from typing import Any
 
 import torch
-from torch.distributed import TCPStore
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+TCPStore = getattr(torch.distributed, "TCPStore", None)
 
 logger = init_logger(__name__)
 
@@ -74,7 +77,7 @@ class StatelessProcessGroup:
 
     rank: int
     world_size: int
-    store: torch._C._distributed_c10d.Store
+    store: Any
     data_expiration_seconds: int = 3600  # 1 hour
 
     # dst rank -> counter
@@ -127,13 +130,13 @@ class StatelessProcessGroup:
         """
         if self.rank == src:
             self.expire_data()
-            key = f"broadcast_from/{src}/" f"{self.broadcast_send_counter}"
+            key = f"broadcast_from/{src}/{self.broadcast_send_counter}"
             self.store.set(key, pickle.dumps(obj))
             self.broadcast_send_counter += 1
             self.entries.append((key, time.perf_counter()))
             return obj
         else:
-            key = f"broadcast_from/{src}/" f"{self.broadcast_recv_src_counter[src]}"
+            key = f"broadcast_from/{src}/{self.broadcast_recv_src_counter[src]}"
             recv_obj = pickle.loads(self.store.get(key))
             self.broadcast_recv_src_counter[src] += 1
             return recv_obj
@@ -181,6 +184,11 @@ class StatelessProcessGroup:
         can call `StatelessProcessGroup.create` to form a group, and then process A, B,
         C, and D can call `StatelessProcessGroup.create` to form another group.
         """  # noqa
+        if TCPStore is None:
+            raise RuntimeError(
+                "StatelessProcessGroup requires torch.distributed.TCPStore, but "
+                "this PyTorch build was compiled without C10d support."
+            )
         store = TCPStore(
             host_name=host,
             port=port,

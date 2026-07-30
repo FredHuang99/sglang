@@ -6,6 +6,8 @@
 # Copyright 2024 The TorchTune Authors.
 # Copyright 2025 The sglang-diffusion Authors.
 
+from __future__ import annotations
+
 from collections import Counter, defaultdict
 from collections.abc import Callable, Generator
 from itertools import chain
@@ -13,15 +15,28 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.distributed import DeviceMesh, init_device_mesh
-from torch.distributed._tensor import distribute_tensor
-from torch.distributed.fsdp import (
-    CPUOffloadPolicy,
-    FSDPModule,
-    MixedPrecisionPolicy,
-    fully_shard,
-)
 from torch.nn.modules.module import _IncompatibleKeys
+
+try:
+    from torch.distributed import DeviceMesh, init_device_mesh
+    from torch.distributed._tensor import distribute_tensor
+    from torch.distributed.fsdp import (
+        CPUOffloadPolicy,
+        FSDPModule,
+        MixedPrecisionPolicy,
+        fully_shard,
+    )
+
+    _FSDP_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    DeviceMesh = Any
+    FSDPModule = ()
+    MixedPrecisionPolicy = Any
+    CPUOffloadPolicy = None
+    distribute_tensor = None
+    fully_shard = None
+    init_device_mesh = None
+    _FSDP_AVAILABLE = False
 
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
@@ -55,6 +70,18 @@ _QUANTIZED_DTYPES = (
     torch.int8,
 )
 _DTYPE_MISMATCH_EXAMPLE_LIMIT = 3
+
+
+def is_fsdp_available() -> bool:
+    return _FSDP_AVAILABLE
+
+
+def require_fsdp_support(feature: str = "FSDP inference") -> None:
+    if not _FSDP_AVAILABLE:
+        raise RuntimeError(
+            f"{feature} requires C10d, DeviceMesh, DTensor, and FSDP, but this "
+            "PyTorch build was compiled without those distributed features."
+        )
 
 
 def _is_bitsandbytes_quant_config(quant_config: Any | None) -> bool:
@@ -213,10 +240,20 @@ def maybe_load_fsdp_model(
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
 
+    if fsdp_inference:
+        require_fsdp_support()
+
     # 1. prepare for loading
     default_torch_dtype = param_dtype if param_dtype else torch.bfloat16
-    mp_policy = MixedPrecisionPolicy(
-        default_torch_dtype, reduce_dtype, output_dtype, cast_forward_inputs=False
+    mp_policy = (
+        MixedPrecisionPolicy(
+            default_torch_dtype,
+            reduce_dtype,
+            output_dtype,
+            cast_forward_inputs=False,
+        )
+        if _FSDP_AVAILABLE
+        else None
     )
 
     set_mixed_precision_policy(
@@ -349,7 +386,7 @@ def shard_model(
     *,
     cpu_offload: bool,
     reshard_after_forward: bool = True,
-    mp_policy: MixedPrecisionPolicy | None = MixedPrecisionPolicy(),  # noqa
+    mp_policy: MixedPrecisionPolicy | None = None,
     mesh: DeviceMesh | None = None,
     fsdp_shard_conditions: list[Callable[[str, nn.Module], bool]] | None = None,
     pin_cpu_memory: bool = True,
@@ -374,6 +411,8 @@ def shard_model(
         pin_cpu_memory (bool): If set to True, FSDP will pin the CPU memory of the offloaded parameters.
 
     """
+    require_fsdp_support("shard_model")
+
     fsdp_shard_conditions, condition_source = _resolve_fsdp_shard_conditions(
         model, fsdp_shard_conditions
     )
@@ -455,7 +494,7 @@ def load_model_from_full_model_state_dict(
         valid_target_names=set(meta_sd.keys()),
     )  # type: ignore
 
-    is_fsdp_model = isinstance(model, FSDPModule) or any(
+    is_fsdp_model = (_FSDP_AVAILABLE and isinstance(model, FSDPModule)) or any(
         hasattr(p, "device_mesh") for p in meta_sd.values()
     )
 

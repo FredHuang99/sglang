@@ -4,6 +4,8 @@
 # Adapted from vllm: https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/model_executor/model_loader/weight_utils.py
 """Utilities for downloading, loading, initializing and verifying model weights."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -15,8 +17,15 @@ from pathlib import Path
 import filelock
 import torch
 from safetensors.torch import safe_open
-from torch.distributed.tensor import DTensor
 from tqdm.auto import tqdm
+
+try:
+    from torch.distributed.tensor import DTensor
+except (ImportError, ModuleNotFoundError):
+
+    class DTensor:
+        """Sentinel used only for false isinstance checks without DTensor."""
+
 
 try:
     from runai_model_streamer import SafetensorsStreamer
@@ -26,7 +35,10 @@ except ImportError:
     HAS_RUNAI_MODEL_STREAMER = False
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
+    is_torch_distributed_initialized,
+)
 from sglang.multimodal_gen.runtime.loader.weight_load_plan import WeightLoadPlan
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -40,7 +52,6 @@ temp_dir = tempfile.gettempdir()
 
 
 class DisabledTqdm(tqdm):
-
     def __init__(self, *args, **kwargs):
         kwargs["disable"] = True
         super().__init__(*args, **kwargs)
@@ -190,7 +201,7 @@ def safetensors_weights_iterator(
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        not is_torch_distributed_initialized() or torch.distributed.get_rank() == 0
     )
     if weight_load_plan is not None:
         checkpoint_device = torch.device(weight_load_plan.checkpoint_load_device)
@@ -302,7 +313,7 @@ def pt_weights_iterator(
     """Iterate over the weights in the model bin/pt files."""
     device = "cpu" if to_cpu else str(get_local_torch_device())
     enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+        not is_torch_distributed_initialized() or torch.distributed.get_rank() == 0
     )
     for bin_file in tqdm(
         hf_weights_files,

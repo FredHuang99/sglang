@@ -20,7 +20,6 @@ import contextvars
 from contextlib import contextmanager, nullcontext
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -34,6 +33,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_decode_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
+    is_torch_distributed_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
@@ -720,7 +720,6 @@ class WanMidBlock(nn.Module):
 
 
 class WanResidualDownBlock(nn.Module):
-
     def __init__(
         self,
         in_dim,
@@ -881,7 +880,7 @@ class WanEncoder3d(nn.Module):
         scale = 1.0
 
         world_size = 1
-        if dist.is_initialized():
+        if is_torch_distributed_initialized():
             world_size = get_sp_world_size()
 
         if use_parallel_encode and world_size > 1:
@@ -942,7 +941,7 @@ class WanEncoder3d(nn.Module):
         self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
-        if dist.is_initialized():
+        if is_torch_distributed_initialized():
             self.world_size = get_sp_world_size()
             self.rank = get_sp_parallel_rank()
 
@@ -1231,7 +1230,7 @@ class WanDecoder3d(nn.Module):
         dims = [dim * u for u in [dim_mult[-1]] + dim_mult[::-1]]
 
         world_size = 1
-        if dist.is_initialized():
+        if is_torch_distributed_initialized():
             world_size = get_decode_parallel_world_size()
 
         if use_parallel_decode and world_size > 1:
@@ -1300,7 +1299,7 @@ class WanDecoder3d(nn.Module):
         self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
-        if dist.is_initialized():
+        if is_torch_distributed_initialized():
             self.world_size = get_decode_parallel_world_size()
             self.rank = get_decode_parallel_rank()
 

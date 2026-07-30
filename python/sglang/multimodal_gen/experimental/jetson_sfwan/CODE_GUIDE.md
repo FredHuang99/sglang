@@ -21,7 +21,12 @@
 - `profile_execution` 只表示模型执行。queue、HTTP、parse、D2H/H2D、
   RGB D2H 和 MP4 不得与它相加。
 - CPU offload 的启动默认值固定为 T5 开、DiT 关、VAE 关；三个选择由
-  server CLI 明确传到 loader，SGLang 自动调优不会改写它们。
+  server CLI 明确传到 loader，SGLang 自动调优不会改写它们。完整 C10d
+  环境使用原 FSDP 路径；Jetson 无 C10d 环境把 T5/DiT offload 映射为
+  layerwise，把 VAE offload 保持为 per-chunk module。
+- Jetson local distributed backend 严格固定 world size/rank/local rank 为
+  `1/0/0`；它不创建 TCPStore、ProcessGroup 或 NCCL communicator，也不
+  宣称支持任何多 rank 能力。
 
 ## 2. 文件地图
 
@@ -35,6 +40,7 @@
 | [`client.py`](client.py) | 异步请求调度、burst/fixed/Poisson、DiT/VAE profile client | 不持有服务端 cache |
 | [`README.md`](README.md) | 快速启动命令和数值契约摘要 | 不替代本文的实现审计 |
 | `__init__.py` | 标记 Python package，并重导出四个常用 protocol 符号 | 不启动任何运行时资源 |
+| `runtime/distributed/local_single_process.py` | 无 C10d 时的严格 world-size-one group/coordinator | 不实现跨 rank send/recv，不伪造 ProcessGroup |
 | `test/registered/multimodal_gen/test_jetson_sfwan_service.py` | CPU fake 注册测试 | 不下载 checkpoint，不运行 CUDA |
 
 依赖方向是单向的：
@@ -165,6 +171,7 @@ latent：
 | `model.py` | `DecodedChunk` / `MonolithicOutput` | VAE/monolithic 返回，handler 消费 | 携带 RGB chunk、帧数和角色指标 |
 | `model.py` | `_ComponentSet` | 一个进程一次；monolithic 两角色共享 | 收口 SGLang loader 和 world-size=1 初始化 |
 | `model.py` | `SfWanDitModel` / `SfWanVaeModel` / `SfWanMonolithicModel` | 唯一 model executor thread 使用 | 三种明确数值角色；不做通用 pipeline 抽象 |
+| `runtime/distributed/local_single_process.py` | `LocalSingleProcessGroupCoordinator` | 无 C10d 进程初始化一次；各逻辑并行组共享 | 提供单 rank identity collective；跨 rank P2P 明确失败 |
 | `engine.py` | `ReceivedChunk` | `VaeJobRecord` 从接收到消费 | 把 `data`（HTTP body view、SHM ref 或 CPU fake）、digest、接收时间和 ingress 诊断绑在一起 |
 | `engine.py` | `PendingChunk` | HTTP DiT sender 从 D2H 启动到序列化完成 | 保持 GPU source、pinned slot 和 ready event 生命周期 |
 | `engine.py` | `JobRecord` / `VaeJobRecord` | runtime 注册，FCFS engine 驱动至 terminal | 保存请求级状态；VAE 子类再保存乱序 chunk |
@@ -206,9 +213,10 @@ pickle。CUDA VAE 使用 `parse_latent_safetensors_payload()` 做严格 header
 - `model_path`：Hugging Face ID 或本地 checkpoint。
 - `device_index`：当前单 GPU 进程使用的 CUDA device。
 - `vae_precision`：`fp32` 是参考精度；`fp16` 仅用于实验。
-- `text_encoder_cpu_offload`：T5 是否使用 FSDP CPU offload；默认开。
-- `dit_cpu_offload`：causal DiT 是否使用单卡 FSDP inference + CPU
-  offload；默认关。
+- `text_encoder_cpu_offload`：请求 T5 CPU offload；默认开。完整 C10d
+  环境使用原 FSDP CPU offload，Jetson local 环境使用 layerwise offload。
+- `dit_cpu_offload`：请求 causal DiT CPU offload；默认关。完整 C10d
+  环境使用单卡 FSDP inference，Jetson local 环境使用 layerwise offload。
 - `vae_cpu_offload`：VAE 是否在每个三 latent chunk 周围整模型搬入/搬出；
   默认关。
 - `enable_profile`：是否执行低层计时。
@@ -233,11 +241,20 @@ server CLI
 ```
 
 `_ComponentSet` 强制 `performance_mode="manual"`，因此 ServerArgs 的 auto
-tuner 不会把用户选择替换为 layerwise offload 或其他 residency 策略。
-`dit_cpu_offload=true` 同时设置 `use_fsdp_inference=true`；这是直接调用
-causal Transformer forward 时的必要配对。否则普通非 FSDP 模型会把权重
-留在 CPU，而输入在 GPU，形成 device mismatch。关闭 DiT offload 时两项
-都为 false。该服务不额外暴露 `use_fsdp_inference`，避免产生无效组合。
+tuner 不会改写用户选择。它先初始化 distributed runtime，再按实际 backend
+解析 offload：
+
+- 完整 C10d backend：保持原实现，T5 offload 使用 FSDP CPU offload；
+  `dit_cpu_offload=true` 同时设置 `use_fsdp_inference=true`。
+- Jetson local backend：不请求任何 FSDP。T5/DiT 的 true 值写入
+  `layerwise_offload_components`；所有组件加载后再显式调用
+  `configure_layerwise_offload_modules()`，缺少可配置组件时立即失败。
+- VAE 的 true 值在两类 backend 中都保持 per-chunk 整体 module 搬迁。
+
+关闭某组件 offload 时，该组件常驻目标 device。服务不额外暴露
+`use_fsdp_inference`，从而避免“local backend + FSDP”等无效组合。
+`_ComponentSet` 同时记录 backend、requested 和 effective 三组只读信息，
+供 `/v1/engine` 审核实际运行条件。
 
 #### `LatentChunk`
 
@@ -492,9 +509,15 @@ GPU source；只有对应 event 完成后才释放，cancel/close 也遵守同�
 `start()` 还把 `ServerConfig` 的三个 offload bool 原样写入
 `ModelLoadConfig`。未加载组件对应的选项只是无效配置：例如 vae role
 不会构造 T5/DiT，因此 text/DiT offload 不会产生权重、stream 或 buffer。
-`/v1/engine` 的 `contract.cpu_offload` 只列当前角色实际加载的组件；
-monolithic 则在嵌套的 `contract.dit.cpu_offload` 与
-`contract.vae.cpu_offload` 中展示全部三项。
+`/v1/engine` 的每个角色 contract 保留旧 `cpu_offload` 字段，并新增：
+
+- `distributed_backend`：例如 `local` 或 `nccl`。
+- `cpu_offload_requested`：当前角色组件对应的 CLI bool。
+- `cpu_offload_effective`：`resident`、`layerwise`、
+  `per_chunk_module`、`fsdp` 或 `fsdp_cpu_offload`。
+
+monolithic 在嵌套的 `contract.dit` 与 `contract.vae` 中分别展示实际加载
+组件；未加载组件的选项不会分配权重、stream 或 buffer。
 
 重要 handler：
 
@@ -852,8 +875,8 @@ throughput。`profile_execution` 与 raw lifecycle/transfer 指标必须分别�
 | `--device-index` | 0 | 全部 | 当前进程 CUDA device |
 | `--latent-transport` | http | dit/vae | `http` 或同 Linux CUDA 主机 `shm` |
 | `--vae-precision` | fp32 | mono/vae | FP32 参考；FP16 非参考实验 |
-| `--text-encoder-cpu-offload [true\|false]` | 开 | mono/dit | T5 FSDP CPU offload；单独写 flag 等价于 true |
-| `--dit-cpu-offload [true\|false]` | 关 | mono/dit | 同时启用单卡 FSDP inference；块权重搬迁计入 DiT forward |
+| `--text-encoder-cpu-offload [true\|false]` | 开 | mono/dit | 完整 C10d 为 FSDP CPU offload；Jetson local 为 layerwise；单独写 flag 等价于 true |
+| `--dit-cpu-offload [true\|false]` | 关 | mono/dit | 完整 C10d 为单卡 FSDP inference；Jetson local 为 layerwise；权重搬迁计入 forward |
 | `--vae-cpu-offload [true\|false]` | 关 | mono/vae | 每个三 latent chunk 前整模型 H2D、结果组装后整模型 D2H |
 | `--enable-profile` | 关 | 全部 | 开启详细计时并允许 profile request |
 | `--enable-nvtx` | 关 | 全部 | 独立 NVTX range |

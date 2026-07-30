@@ -1,11 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from sglang.multimodal_gen.runtime.distributed.communication_op import *
-from sglang.multimodal_gen.runtime.distributed.group_coordinator import (
-    get_local_torch_device,
-)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     cleanup_dist_env_and_memory,
+    get_distributed_backend_name,
     get_decode_parallel_group_coordinator,
     get_decode_parallel_rank,
     get_decode_parallel_world_size,
@@ -21,12 +18,17 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_world_group,
     get_world_rank,
     get_world_size,
+    get_local_torch_device,
     init_distributed_environment,
     initialize_model_parallel,
+    is_local_single_process_mode,
+    is_torch_distributed_available,
+    is_torch_distributed_initialized,
     maybe_init_distributed_environment_and_model_parallel,
     model_parallel_is_initialized,
 )
-from sglang.multimodal_gen.runtime.distributed.utils import *
+from sglang.multimodal_gen.runtime.distributed.communication_op import *  # noqa: F403
+from sglang.multimodal_gen.runtime.distributed.utils import *  # noqa: F403
 
 # SPDX-License-Identifier: Apache-2.0
 
@@ -38,6 +40,10 @@ __all__ = [
     "cleanup_dist_env_and_memory",
     "model_parallel_is_initialized",
     "maybe_init_distributed_environment_and_model_parallel",
+    "is_torch_distributed_available",
+    "is_torch_distributed_initialized",
+    "is_local_single_process_mode",
+    "get_distributed_backend_name",
     # World group
     "get_world_group",
     "get_world_rank",

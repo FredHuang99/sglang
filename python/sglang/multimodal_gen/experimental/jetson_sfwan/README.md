@@ -108,15 +108,18 @@ CPU offload is selected when each server starts:
 
 | Flag | Default | Effective roles | Behavior |
 |---|---:|---|---|
-| `--text-encoder-cpu-offload [true\|false]` | `true` | monolithic, dit | SGLang FSDP CPU offload for the T5 encoder |
-| `--dit-cpu-offload [true\|false]` | `false` | monolithic, dit | single-GPU FSDP inference with DiT blocks CPU-offloaded between forwards |
+| `--text-encoder-cpu-offload [true\|false]` | `true` | monolithic, dit | FSDP CPU offload with full C10d; layerwise offload on the strict Jetson local backend |
+| `--dit-cpu-offload [true\|false]` | `false` | monolithic, dit | single-GPU FSDP CPU offload with full C10d; layerwise offload on the strict Jetson local backend |
 | `--vae-cpu-offload [true\|false]` | `false` | monolithic, vae | move the complete VAE to GPU before each three-latent chunk and back to CPU afterward |
 
 The flag alone means `true`; for example, `--dit-cpu-offload` enables DiT
 offload, while `--text-encoder-cpu-offload false` keeps T5 GPU-resident.
 Irrelevant role flags are accepted but load no component and allocate no
 offload resource. The internal SGLang loader runs in `performance_mode=manual`,
-so its automatic tuner does not replace these explicit choices.
+so its automatic tuner does not replace these explicit choices. PyTorch builds
+without C10d are accepted only at world size one with every parallel degree
+equal to one; that path creates identity local groups and never constructs
+NCCL, TCPStore, ProcessGroup, or FSDP state.
 
 VAE offload moves only registered model parameters and buffers. The
 request-scoped feature cache remains on GPU across chunks and is reset only at
@@ -129,11 +132,11 @@ DiT chunk i -> VAE weights H2D -> VAE decode chunk i -> RGB CPU
 
 VAE weight swaps are outside `profile_execution`, but remain inside
 `decode_wall_ms`, request wall time, and `monolithic_total_ms`. T5 offload is
-inside text-encoding wall time; DiT FSDP block movement occurs inside each
-Transformer forward and is therefore included in its forward metric.
-`GET /v1/engine` exposes the effective choices under `contract.cpu_offload`
-for a single-role server; monolithic reports them in
-`contract.dit.cpu_offload` and `contract.vae.cpu_offload`.
+inside text-encoding wall time; DiT FSDP or layerwise block movement occurs
+inside each Transformer forward and is therefore included in its forward
+metric. `GET /v1/engine` exposes `contract.distributed_backend`,
+`contract.cpu_offload_requested`, and `contract.cpu_offload_effective`.
+The legacy role-specific `contract.cpu_offload` booleans remain available.
 
 ## 5090 monolithic
 

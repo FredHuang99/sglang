@@ -4,6 +4,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.7.3/vllm/distributed/communication_op.py
 
+from __future__ import annotations
+
+from typing import Any
+
 import torch
 import torch.distributed as dist
 
@@ -59,9 +63,12 @@ def cfg_model_parallel_all_gather(
 
 def cfg_model_parallel_all_reduce(
     input_: torch.Tensor,
-    op: torch._C._distributed_c10d.ReduceOp = torch._C._distributed_c10d.ReduceOp.SUM,
+    op: Any | None = None,
 ) -> torch.Tensor:
     """All-reduce the input tensor across CFG parallel group."""
     if not input_.is_contiguous():
         input_ = input_.contiguous()
+    if op is None:
+        reduce_op = getattr(dist, "ReduceOp", None)
+        op = getattr(reduce_op, "SUM", None)
     return get_cfg_group().all_reduce(input_, op=op)

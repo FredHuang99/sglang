@@ -17,12 +17,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 
-# wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
-# see https://github.com/pytorch/pytorch/issues/133254
-# change to default for other models
-flex_attention = torch.compile(
-    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs"
-)
 import torch.distributed as dist
 
 from sglang.multimodal_gen.configs.models.dits import WanVideoConfig
@@ -31,6 +25,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_rank,
     get_tp_world_size,
+    is_torch_distributed_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.attention import LocalAttention
 from sglang.multimodal_gen.runtime.layers.elementwise import MulAdd
@@ -70,6 +65,13 @@ from sglang.multimodal_gen.runtime.platforms import (
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.utils import add_prefix
+
+# wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
+# see https://github.com/pytorch/pytorch/issues/133254
+# change to default for other models
+flex_attention = torch.compile(
+    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs"
+)
 
 logger = init_logger(__name__)
 
@@ -412,9 +414,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.self_attn_residual_norm(
             hidden_states, attn_output, gate_msa, null_shift, null_scale
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 2. Cross-attention
         attn_output = self.attn2(
@@ -426,9 +429,10 @@ class CausalWanTransformerBlock(nn.Module):
         norm_hidden_states, hidden_states = self.cross_attn_residual_norm(
             hidden_states, attn_output, 1, c_shift_msa, c_scale_msa
         )
-        norm_hidden_states, hidden_states = norm_hidden_states.to(
-            orig_dtype
-        ), hidden_states.to(orig_dtype)
+        norm_hidden_states, hidden_states = (
+            norm_hidden_states.to(orig_dtype),
+            hidden_states.to(orig_dtype),
+        )
 
         # 3. Feed-forward
         ff_output = self.ffn(norm_hidden_states)
@@ -587,7 +591,7 @@ class CausalWanTransformer3DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             device=device,
         )
 
-        if not dist.is_initialized() or dist.get_rank() == 0:
+        if not is_torch_distributed_initialized() or dist.get_rank() == 0:
             print(
                 f" cache a block wise causal mask with block size of {num_frame_per_block} frames"
             )

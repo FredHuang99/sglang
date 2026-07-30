@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_decode_parallel_world_size,
     get_sp_parallel_rank,
     get_sp_world_size,
+    is_torch_distributed_initialized,
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
@@ -40,7 +41,7 @@ def _cached_decode_parallel_world_size(
 
 
 def _decode_parallel_world_size() -> int:
-    is_dist_initialized = dist.is_initialized()
+    is_dist_initialized = is_torch_distributed_initialized()
     is_model_parallel_initialized = model_parallel_is_initialized()
     if not is_dist_initialized or not is_model_parallel_initialized:
         return _cached_decode_parallel_world_size(
@@ -748,7 +749,6 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
 
 # adapted from https://github.com/huggingface/diffusers/blob/e7ffeae0a191f710881d1fbde00cd6ff025e81f2/src/diffusers/models/autoencoders/vae.py#L691
 class DiagonalGaussianDistribution:
-
     def __init__(self, parameters: torch.Tensor, deterministic: bool = False):
         self.parameters = parameters
         self.mean, self.logvar = torch.chunk(parameters, 2, dim=1)

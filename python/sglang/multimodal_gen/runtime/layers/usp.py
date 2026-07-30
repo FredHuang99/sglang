@@ -1,12 +1,22 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+from __future__ import annotations
+
 import logging
 from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
-import torch.distributed._functional_collectives as ft_c
-from torch.distributed.tensor.experimental._attention import _cp_options
+
+try:
+    import torch.distributed._functional_collectives as ft_c
+except (ImportError, ModuleNotFoundError):
+    ft_c = None
+
+try:
+    from torch.distributed.tensor.experimental._attention import _cp_options
+except (ImportError, ModuleNotFoundError):
+    _cp_options = None
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
@@ -15,7 +25,8 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.srt.utils.common import torch_release
 
-_cp_options.enable_load_balance = False
+if _cp_options is not None:
+    _cp_options.enable_load_balance = False
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -30,12 +41,17 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     When tracing the code, the result tensor is not an AsyncCollectiveTensor,
     so we cannot call ``wait()``.
     """
-    if isinstance(tensor, ft_c.AsyncCollectiveTensor):
+    if ft_c is not None and isinstance(tensor, ft_c.AsyncCollectiveTensor):
         return tensor.wait()
     return tensor
 
 
 def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
+    if not callable(getattr(dist, "all_to_all_single", None)):
+        raise RuntimeError(
+            "Ulysses sequence parallelism requires C10d all_to_all_single, "
+            "which is unavailable in this PyTorch build."
+        )
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
@@ -52,6 +68,11 @@ def _usp_all_to_all_single_varlen(
     output_split_sizes: list[int],
     input_split_sizes: list[int],
 ) -> torch.Tensor:
+    if not callable(getattr(dist, "all_to_all_single", None)):
+        raise RuntimeError(
+            "Ulysses sequence parallelism requires C10d all_to_all_single, "
+            "which is unavailable in this PyTorch build."
+        )
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x = x.flatten().contiguous()
@@ -101,9 +122,9 @@ def _usp_input_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local, s_global = h_global // world_size, s_local * world_size
 
@@ -150,9 +171,9 @@ def _usp_input_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -166,12 +187,12 @@ def _usp_input_all_to_all_varlen(
         # Shape transition: [b, s_local, h_global, d] -> [h_global, b, s_local, d]
         permute_order = (2, 0, 1, 3)
 
-    assert (
-        s_local == seq_lens[rank]
-    ), f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
-    assert (
-        h_global % world_size == 0
-    ), f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    assert s_local == seq_lens[rank], (
+        f"s_local ({s_local}) must equal seq_lens[{rank}] ({seq_lens[rank]})"
+    )
+    assert h_global % world_size == 0, (
+        f"h_global ({h_global}) must be divisible by world_size ({world_size})"
+    )
 
     h_local = h_global // world_size
 
@@ -234,9 +255,9 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
         # Shape transition: [b, s_global, h_local, d] -> [s_global, b, h_local, d]
         permute_order = (1, 0, 2, 3)
 
-    assert (
-        s_global % world_size == 0
-    ), f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    assert s_global % world_size == 0, (
+        f"s_global ({s_global}) must be divisible by world_size ({world_size})"
+    )
 
     s_local, h_global = s_global // world_size, h_local * world_size
 
@@ -283,9 +304,9 @@ def _usp_output_all_to_all_varlen(
 
     assert x.ndim == 4, f"x must have 4 dimensions, got {x.ndim}"
     assert head_dim in (1, 2), f"head_dim must be 1 or 2, got {head_dim}"
-    assert (
-        len(seq_lens) == world_size
-    ), f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    assert len(seq_lens) == world_size, (
+        f"seq_lens must have length {world_size}, got {len(seq_lens)}"
+    )
 
     rank = get_ulysses_parallel_rank()
 
@@ -299,9 +320,9 @@ def _usp_output_all_to_all_varlen(
         # Shape transition: [b, s_global, h_local, d] -> [h_local, b, s_global, d]
         permute_order = (2, 0, 1, 3)
 
-    assert s_global == sum(
-        seq_lens
-    ), f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    assert s_global == sum(seq_lens), (
+        f"s_global ({s_global}) must equal sum(seq_lens) ({sum(seq_lens)})"
+    )
 
     s_local = seq_lens[rank]
 
@@ -360,9 +381,15 @@ def ring_attn(
         dropout_p: Dropout probability.
     """
     # torch.distributed.tensor.experimental._attention is not a public API,
-    from torch.distributed.tensor.experimental._attention import (
-        _templated_ring_attention,
-    )
+    try:
+        from torch.distributed.tensor.experimental._attention import (
+            _templated_ring_attention,
+        )
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "Ring attention requires PyTorch distributed tensor attention APIs, "
+            "which are unavailable in this PyTorch build."
+        ) from exc
 
     ring_pg = get_sp_group().ring_group
     assert ring_pg is not None, "Ring process group is not initialized."

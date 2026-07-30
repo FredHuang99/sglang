@@ -39,10 +39,12 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.model import (
     SfWanMonolithicModel,
     SfWanVaeModel,
     _ComponentSet,
+    _component_runtime_contract,
     _denormalize_vae_latents_fastvideo,
     _fastvideo_t5_postprocess,
     _map_fastvideo_dmd_timesteps,
     _pred_noise_to_pred_video_fastvideo,
+    _resolve_offload_settings,
     _timed_cuda_call,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.protocol import (
@@ -74,6 +76,11 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
     build_shared_memory_descriptor,
     _shared_memory_header,
 )
+from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.distributed.local_single_process import (
+    LocalSingleProcessGroupCoordinator,
+)
+from sglang.multimodal_gen.runtime.loader import fsdp_load
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -716,6 +723,222 @@ class TestSfWanFastVideoNumericalContract(CustomTestCase):
         )
 
 
+class TestSfWanLocalDistributedCompatibility(CustomTestCase):
+    """Jetson builds without C10d get identity groups, never fake multi-rank."""
+
+    def tearDown(self):
+        if parallel_state.is_local_single_process_mode():
+            parallel_state.destroy_model_parallel()
+            parallel_state.destroy_distributed_environment()
+        super().tearDown()
+
+    def test_local_group_has_strict_identity_semantics(self):
+        group = LocalSingleProcessGroupCoordinator(group_name="test")
+        tensor = torch.arange(4)
+
+        self.assertEqual(group.rank, 0)
+        self.assertEqual(group.rank_in_group, 0)
+        self.assertEqual(group.world_size, 1)
+        self.assertEqual(group.ranks, [0])
+        self.assertIs(group.ulysses_group, group)
+        self.assertIs(group.ring_group, group)
+        self.assertIs(group.all_reduce(tensor), tensor)
+        self.assertIs(group.all_gather(tensor), tensor)
+        gathered = group.all_gather(tensor, separate_tensors=True)
+        self.assertEqual(len(gathered), 1)
+        self.assertIs(gathered[0], tensor)
+        self.assertIs(group.all_to_all_4D(tensor), tensor)
+        self.assertIs(group.broadcast(tensor), tensor)
+        self.assertIsNone(group.barrier())
+        with self.assertRaisesRegex(RuntimeError, "Peer-to-peer"):
+            group.send(tensor, dst=0)
+
+    def test_missing_is_initialized_is_safe(self):
+        fake_dist = SimpleNamespace(is_available=lambda: True)
+        with mock.patch.object(parallel_state.torch, "distributed", fake_dist):
+            self.assertFalse(parallel_state.is_torch_distributed_initialized())
+
+    def test_local_initializer_builds_every_world_size_one_group(self):
+        with (
+            mock.patch.object(
+                parallel_state,
+                "is_torch_distributed_available",
+                return_value=False,
+            ),
+            mock.patch.object(
+                torch.distributed,
+                "init_process_group",
+                create=True,
+            ) as init_process_group,
+            mock.patch.dict(
+                "os.environ",
+                {"LOCAL_RANK": "0", "RANK": "0", "WORLD_SIZE": "1"},
+            ),
+        ):
+            parallel_state.maybe_init_distributed_environment_and_model_parallel(
+                tp_size=1,
+                sp_size=1,
+                cfg_degree=1,
+                ulysses_degree=1,
+                ring_degree=1,
+                dp_size=1,
+            )
+
+        init_process_group.assert_not_called()
+        self.assertTrue(parallel_state.is_local_single_process_mode())
+        self.assertEqual(parallel_state.get_distributed_backend_name(), "local")
+        self.assertEqual(parallel_state.get_world_size(), 1)
+        self.assertEqual(parallel_state.get_tp_world_size(), 1)
+        self.assertEqual(parallel_state.get_sp_world_size(), 1)
+        self.assertEqual(parallel_state.get_dp_world_size(), 1)
+        self.assertEqual(
+            parallel_state.get_classifier_free_guidance_world_size(),
+            1,
+        )
+        self.assertEqual(parallel_state.get_pipeline_parallel_world_size(), 1)
+        self.assertEqual(parallel_state.get_decode_parallel_world_size(), 1)
+
+    def test_local_initializer_rejects_multi_rank_settings(self):
+        cases = [
+            {"WORLD_SIZE": "2"},
+            {"RANK": "1"},
+        ]
+        for environment in cases:
+            with (
+                self.subTest(environment=environment),
+                mock.patch.object(
+                    parallel_state,
+                    "is_torch_distributed_available",
+                    return_value=False,
+                ),
+                mock.patch.dict(
+                    "os.environ",
+                    {
+                        "LOCAL_RANK": "0",
+                        "RANK": "0",
+                        "WORLD_SIZE": "1",
+                        **environment,
+                    },
+                ),
+                self.assertRaisesRegex(RuntimeError, "world size one"),
+            ):
+                parallel_state.maybe_init_distributed_environment_and_model_parallel(
+                    tp_size=1,
+                    sp_size=1,
+                    cfg_degree=1,
+                    ulysses_degree=1,
+                    ring_degree=1,
+                    dp_size=1,
+                )
+
+        for degree_name in (
+            "tp_size",
+            "sp_size",
+            "cfg_degree",
+            "ulysses_degree",
+            "ring_degree",
+            "dp_size",
+        ):
+            arguments = {
+                "tp_size": 1,
+                "sp_size": 1,
+                "cfg_degree": 1,
+                "ulysses_degree": 1,
+                "ring_degree": 1,
+                "dp_size": 1,
+            }
+            arguments[degree_name] = 2
+            with (
+                self.subTest(degree_name=degree_name),
+                mock.patch.object(
+                    parallel_state,
+                    "is_torch_distributed_available",
+                    return_value=False,
+                ),
+                mock.patch.dict(
+                    "os.environ",
+                    {"LOCAL_RANK": "0", "RANK": "0", "WORLD_SIZE": "1"},
+                ),
+                self.assertRaisesRegex(RuntimeError, degree_name),
+            ):
+                parallel_state.maybe_init_distributed_environment_and_model_parallel(
+                    **arguments
+                )
+
+    def test_normal_distributed_branch_is_preserved(self):
+        with (
+            mock.patch.object(
+                parallel_state,
+                "is_torch_distributed_available",
+                return_value=True,
+            ),
+            mock.patch.object(
+                parallel_state,
+                "init_distributed_environment",
+            ) as init_environment,
+            mock.patch.object(
+                parallel_state,
+                "initialize_model_parallel",
+            ) as init_model_parallel,
+            mock.patch.dict(
+                "os.environ",
+                {"LOCAL_RANK": "0", "RANK": "0", "WORLD_SIZE": "1"},
+            ),
+        ):
+            parallel_state.maybe_init_distributed_environment_and_model_parallel(
+                tp_size=1,
+                sp_size=1,
+                cfg_degree=1,
+                ulysses_degree=1,
+                ring_degree=1,
+                dp_size=1,
+            )
+
+        init_environment.assert_called_once()
+        init_model_parallel.assert_called_once()
+
+    def test_fsdp_unavailable_has_a_clear_failure(self):
+        with mock.patch.object(fsdp_load, "_FSDP_AVAILABLE", False):
+            self.assertFalse(fsdp_load.is_fsdp_available())
+            with self.assertRaisesRegex(RuntimeError, "compiled without"):
+                fsdp_load.require_fsdp_support()
+
+    def test_fsdp_unavailable_keeps_the_non_fsdp_loader_path(self):
+        class _FakeModel(torch.nn.Module):
+            param_names_mapping = {}
+
+            def post_load_weights(self):
+                return None
+
+        with (
+            mock.patch.object(fsdp_load, "_FSDP_AVAILABLE", False),
+            mock.patch.object(fsdp_load, "set_mixed_precision_policy"),
+            mock.patch.object(
+                fsdp_load,
+                "safetensors_weights_iterator",
+                return_value=iter(()),
+            ),
+            mock.patch.object(
+                fsdp_load,
+                "load_model_from_full_model_state_dict",
+            ) as load_state_dict,
+        ):
+            model = fsdp_load.maybe_load_fsdp_model(
+                model_cls=_FakeModel,
+                init_params={},
+                weight_dir_list=[],
+                device=torch.device("cpu"),
+                hsdp_replicate_dim=1,
+                hsdp_shard_dim=1,
+                param_dtype=torch.float32,
+                reduce_dtype=torch.float32,
+                fsdp_inference=False,
+            )
+
+        self.assertIsInstance(model, _FakeModel)
+        load_state_dict.assert_called_once()
+
+
 class TestSfWanCpuOffloadConfiguration(CustomTestCase):
     """CPU-offload choices are explicit, role-safe, and request-stable."""
 
@@ -839,6 +1062,10 @@ class TestSfWanCpuOffloadConfiguration(CustomTestCase):
                     return_value=torch.device("cpu"),
                 ),
                 mock.patch(
+                    f"{model_module}._distributed_runtime_contract",
+                    return_value=("nccl", False),
+                ),
+                mock.patch(
                     "pathlib.Path.open",
                     mock.mock_open(read_data="{}"),
                 ),
@@ -864,6 +1091,163 @@ class TestSfWanCpuOffloadConfiguration(CustomTestCase):
                 components.server_args.use_fsdp_inference,
                 dit_cpu_offload,
             )
+            self.assertEqual(components.distributed_backend, "nccl")
+
+    def test_local_offload_resolution_is_role_aware(self):
+        defaults = ModelLoadConfig(model_path="unused")
+        selected, effective = _resolve_offload_settings(
+            load_config=defaults,
+            component_names=("transformer", "text_encoder"),
+            local_single_process=True,
+        )
+        self.assertEqual(selected, ["text_encoder"])
+        self.assertEqual(
+            effective,
+            {
+                "text_encoder": "layerwise",
+                "dit": "resident",
+                "vae": "resident",
+            },
+        )
+
+        all_enabled = ModelLoadConfig(
+            model_path="unused",
+            text_encoder_cpu_offload=True,
+            dit_cpu_offload=True,
+            vae_cpu_offload=True,
+        )
+        selected, effective = _resolve_offload_settings(
+            load_config=all_enabled,
+            component_names=("transformer", "text_encoder", "vae"),
+            local_single_process=True,
+        )
+        self.assertEqual(selected, ["text_encoder", "dit"])
+        self.assertEqual(effective["text_encoder"], "layerwise")
+        self.assertEqual(effective["dit"], "layerwise")
+        self.assertEqual(effective["vae"], "per_chunk_module")
+
+        vae_only, effective = _resolve_offload_settings(
+            load_config=all_enabled,
+            component_names=("vae",),
+            local_single_process=True,
+        )
+        self.assertIsNone(vae_only)
+        self.assertEqual(effective["vae"], "per_chunk_module")
+
+    def test_runtime_contract_separates_requested_and_effective_offload(self):
+        components = SimpleNamespace(
+            distributed_backend="local",
+            cpu_offload_requested={
+                "text_encoder": True,
+                "dit": False,
+                "vae": True,
+            },
+            cpu_offload_effective={
+                "text_encoder": "layerwise",
+                "dit": "resident",
+                "vae": "per_chunk_module",
+            },
+        )
+        contract = _component_runtime_contract(
+            components,
+            ("text_encoder", "dit"),
+        )
+        self.assertEqual(contract["distributed_backend"], "local")
+        self.assertEqual(
+            contract["cpu_offload_requested"],
+            {"text_encoder": True, "dit": False},
+        )
+        self.assertEqual(
+            contract["cpu_offload_effective"],
+            {"text_encoder": "layerwise", "dit": "resident"},
+        )
+
+    def test_local_component_set_configures_layerwise_after_loading(self):
+        captured = {}
+        model_module = "sglang.multimodal_gen.experimental.jetson_sfwan.model"
+
+        def _server_args(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(**kwargs)
+
+        class _FakePipelineConfig:
+            vae_precision = "fp32"
+
+        pipeline_configs = ModuleType("sglang.multimodal_gen.configs.pipeline_configs")
+        pipeline_configs.SelfForcingWanT2V480PConfig = _FakePipelineConfig
+        server_args_module = ModuleType("sglang.multimodal_gen.runtime.server_args")
+        server_args_module.ServerArgs = _server_args
+        server_args_module.set_global_server_args = mock.Mock()
+        hf_utils = ModuleType("sglang.multimodal_gen.runtime.utils.hf_diffusers_utils")
+        hf_utils.maybe_download_model = lambda *_args, **_kwargs: "unused"
+        layerwise_module = ModuleType(
+            "sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload"
+        )
+        configure = mock.Mock(return_value=["transformer", "text_encoder"])
+        layerwise_module.configure_layerwise_offload_modules = configure
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    pipeline_configs.__name__: pipeline_configs,
+                    server_args_module.__name__: server_args_module,
+                    hf_utils.__name__: hf_utils,
+                    layerwise_module.__name__: layerwise_module,
+                },
+            ),
+            mock.patch(
+                f"{model_module}._initialize_single_gpu_runtime",
+                return_value=torch.device("cpu"),
+            ),
+            mock.patch(
+                f"{model_module}._distributed_runtime_contract",
+                return_value=("local", True),
+            ),
+            mock.patch.object(
+                _ComponentSet,
+                "_load_component",
+                side_effect=lambda name: SimpleNamespace(name=name),
+            ),
+            mock.patch(
+                "pathlib.Path.open",
+                mock.mock_open(read_data="{}"),
+            ),
+        ):
+            components = _ComponentSet(
+                load_config=ModelLoadConfig(
+                    model_path="unused",
+                    text_encoder_cpu_offload=True,
+                    dit_cpu_offload=True,
+                    vae_cpu_offload=True,
+                ),
+                component_names=("transformer", "text_encoder", "vae"),
+            )
+
+        self.assertEqual(
+            captured["layerwise_offload_components"], ["text_encoder", "dit"]
+        )
+        self.assertFalse(captured["text_encoder_cpu_offload"])
+        self.assertFalse(captured["dit_cpu_offload"])
+        self.assertFalse(captured["use_fsdp_inference"])
+        self.assertTrue(captured["vae_cpu_offload"])
+        configure.assert_called_once_with(
+            components.modules,
+            components.server_args,
+            component_names=["text_encoder", "dit"],
+        )
+        self.assertEqual(
+            components.cpu_offload_requested,
+            {"text_encoder": True, "dit": True, "vae": True},
+        )
+        self.assertEqual(
+            components.cpu_offload_effective,
+            {
+                "text_encoder": "layerwise",
+                "dit": "layerwise",
+                "vae": "per_chunk_module",
+            },
+        )
 
     def test_vae_offload_helpers_move_only_weights_and_keep_feature_cache(self):
         class _FakeVae:
@@ -1036,10 +1420,19 @@ class TestSfWanCpuOffloadConfiguration(CustomTestCase):
             def _factory(load_config):
                 return SimpleNamespace(
                     contract={
+                        "distributed_backend": "local",
+                        "cpu_offload_requested": {
+                            "text_encoder": load_config.text_encoder_cpu_offload,
+                            "dit": load_config.dit_cpu_offload,
+                        },
+                        "cpu_offload_effective": {
+                            "text_encoder": "resident",
+                            "dit": "layerwise",
+                        },
                         "cpu_offload": {
                             "text_encoder": load_config.text_encoder_cpu_offload,
                             "dit": load_config.dit_cpu_offload,
-                        }
+                        },
                     }
                 )
 
@@ -1054,8 +1447,9 @@ class TestSfWanCpuOffloadConfiguration(CustomTestCase):
             )
             await runtime.start()
             try:
+                contract = runtime.engine_status().contract
                 self.assertEqual(
-                    runtime.engine_status().contract["cpu_offload"],
+                    contract["cpu_offload"],
                     {
                         "text_encoder": False,
                         "dit": True,
@@ -1063,7 +1457,22 @@ class TestSfWanCpuOffloadConfiguration(CustomTestCase):
                 )
                 self.assertNotIn(
                     "vae",
-                    runtime.engine_status().contract["cpu_offload"],
+                    contract["cpu_offload"],
+                )
+                self.assertEqual(contract["distributed_backend"], "local")
+                self.assertEqual(
+                    contract["cpu_offload_requested"],
+                    {
+                        "text_encoder": False,
+                        "dit": True,
+                    },
+                )
+                self.assertEqual(
+                    contract["cpu_offload_effective"],
+                    {
+                        "text_encoder": "resident",
+                        "dit": "layerwise",
+                    },
                 )
             finally:
                 await runtime.close()
@@ -2856,6 +3265,17 @@ class TestSfWanModeIsolation(CustomTestCase):
     def test_monolithic_constructs_one_component_set(self):
         fake_components = SimpleNamespace(
             device=torch.device("cpu"),
+            distributed_backend="local",
+            cpu_offload_requested={
+                "text_encoder": True,
+                "dit": False,
+                "vae": False,
+            },
+            cpu_offload_effective={
+                "text_encoder": "layerwise",
+                "dit": "resident",
+                "vae": "resident",
+            },
         )
         fake_dit = SimpleNamespace(contract={"role": "dit"})
         fake_vae = SimpleNamespace(contract={"role": "vae"})
@@ -2881,6 +3301,11 @@ class TestSfWanModeIsolation(CustomTestCase):
         dit_constructor.assert_called_once()
         vae_constructor.assert_called_once()
         self.assertEqual(model.contract["latent_transport"], "in_memory_gpu")
+        self.assertEqual(model.contract["distributed_backend"], "local")
+        self.assertEqual(
+            model.contract["cpu_offload_effective"]["text_encoder"],
+            "layerwise",
+        )
 
     def test_dit_profile_never_constructs_a_sender_or_vae_job(self):
         class _FakeDitProfileModel:
