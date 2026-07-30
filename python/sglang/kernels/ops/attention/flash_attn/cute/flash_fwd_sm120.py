@@ -7,6 +7,7 @@
 
 import cutlass
 import cutlass.utils as utils_basic
+from cutlass.base_dsl.arch import Arch
 
 from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd import (
     FlashAttentionForwardSm80,
@@ -17,6 +18,14 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
     # Keep arch = 80 to use CpAsync code paths (no TMA for output).
     # The compilation target is determined by the GPU at compile time, not this field.
     arch = 80
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # The base constructor records the physical SM120 architecture. Restore the
+        # SM80 algorithm selector so the inherited kernel does not enable TMA output.
+        self.arch = Arch.sm_80
+        self.is_split_kv = False
+        self.pack_gqa = False
 
     @staticmethod
     def can_implement(
@@ -49,9 +58,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         smem_usage_K = tile_n * head_dim * num_stages * 2
         smem_usage_V = tile_n * head_dim_v * num_stages * 2
         smem_usage_QV = (
-            (smem_usage_Q + smem_usage_V)
-            if not Q_in_regs
-            else max(smem_usage_Q, smem_usage_V)
+            (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
         )
         smem_usage = smem_usage_QV + smem_usage_K
         # SM120 has 99 KB shared memory (vs 163 KB on SM80)

@@ -1,5 +1,6 @@
 """CPU-only derived-property tests for the minimal SFWan service."""
 
+import ast
 import asyncio
 import builtins
 import contextvars
@@ -1015,6 +1016,46 @@ class TestSfWanLocalDistributedCompatibility(CustomTestCase):
                 "return_attn_probs": False,
             },
         )
+
+    def test_sm120_flash_attention_restores_sm80_algorithm_selector(self):
+        source_path = (
+            Path(__file__).resolve().parents[3]
+            / "python"
+            / "sglang"
+            / "kernels"
+            / "ops"
+            / "attention"
+            / "flash_attn"
+            / "cute"
+            / "flash_fwd_sm120.py"
+        )
+        module = ast.parse(source_path.read_text(encoding="utf-8"))
+        sm120_class = next(
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "FlashAttentionForwardSm120"
+        )
+        initializer = next(
+            node
+            for node in sm120_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+
+        self.assertIsInstance(initializer.body[0], ast.Expr)
+        self.assertEqual(
+            ast.unparse(initializer.body[0].value),
+            "super().__init__(*args, **kwargs)",
+        )
+
+        assignments = {
+            ast.unparse(statement.targets[0]): ast.unparse(statement.value)
+            for statement in initializer.body
+            if isinstance(statement, ast.Assign)
+        }
+        self.assertEqual(assignments["self.arch"], "Arch.sm_80")
+        self.assertEqual(assignments["self.is_split_kv"], "False")
+        self.assertEqual(assignments["self.pack_gqa"], "False")
 
     def test_local_initializer_builds_every_world_size_one_group(self):
         with (
