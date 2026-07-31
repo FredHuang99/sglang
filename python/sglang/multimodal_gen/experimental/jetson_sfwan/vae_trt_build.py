@@ -224,6 +224,57 @@ def _portable_nearest_upsample_for_export(wrapper: Any) -> Any:
             module.mode = original_mode
 
 
+def _normalize_export_cache_tensors(
+    *,
+    cache: list[Any],
+    active_cache_indices: tuple[int, ...],
+    reference_tensor: Any,
+) -> tuple[Any, ...]:
+    """Make the chunk-boundary cache match the TensorRT FP16 binding ABI."""
+
+    import torch
+
+    if len(active_cache_indices) != TRT_VAE_CACHE_COUNT:
+        raise ValueError(
+            f"TensorRT export requires {TRT_VAE_CACHE_COUNT} active cache "
+            f"indices, got {len(active_cache_indices)}"
+        )
+    if not isinstance(reference_tensor, torch.Tensor):
+        raise TypeError("TensorRT export cache reference must be a tensor")
+
+    supported_dtypes = {
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    }
+    normalized: list[Any] = []
+    for binding_index, source_index in enumerate(active_cache_indices):
+        if source_index < 0 or source_index >= len(cache):
+            raise ValueError(
+                f"cache binding {binding_index} has invalid source slot {source_index}"
+            )
+        tensor = cache[source_index]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(
+                f"cache binding {binding_index} from source slot {source_index} "
+                f"is {type(tensor).__name__}, not a tensor"
+            )
+        if tensor.dtype not in supported_dtypes:
+            raise TypeError(
+                f"cache binding {binding_index} from source slot {source_index} "
+                f"has unsupported dtype {tensor.dtype}"
+            )
+        if tensor.device != reference_tensor.device:
+            raise ValueError(
+                f"cache binding {binding_index} from source slot {source_index} "
+                f"is on {tensor.device}, expected {reference_tensor.device}"
+            )
+        tensor = tensor.to(dtype=torch.float16).contiguous()
+        cache[source_index] = tensor
+        normalized.append(tensor)
+    return tuple(normalized)
+
+
 def _run_decoder_chunk(
     *,
     post_quant_conv: Any,
@@ -303,7 +354,12 @@ def _make_export_wrappers(
                 cache=cache,
                 first_request_chunk=True,
             )
-            return (rgb, *(cache[index] for index in active_cache_indices))
+            cache_outputs = _normalize_export_cache_tensors(
+                cache=cache,
+                active_cache_indices=active_cache_indices,
+                reference_tensor=latent,
+            )
+            return (rgb, *cache_outputs)
 
     class SteadyChunkWrapper(torch.nn.Module):
         def __init__(self) -> None:
@@ -329,7 +385,12 @@ def _make_export_wrappers(
                 cache=cache,
                 first_request_chunk=False,
             )
-            return (rgb, *(cache[index] for index in active_cache_indices))
+            cache_outputs = _normalize_export_cache_tensors(
+                cache=cache,
+                active_cache_indices=active_cache_indices,
+                reference_tensor=latent,
+            )
+            return (rgb, *cache_outputs)
 
     return InitialChunkWrapper().eval(), SteadyChunkWrapper().eval()
 
@@ -465,16 +526,97 @@ def _validate_model_contract(vae: Any) -> None:
         raise ValueError("TensorRT SFWan VAE requires 16-channel mean/std")
 
 
+def _validate_onnx_fp16_io_contract(
+    *,
+    model: Any,
+    path: Path,
+    expected_input_shapes: dict[str, tuple[int, ...]],
+    expected_output_shapes: dict[str, tuple[int, ...]],
+) -> None:
+    import onnx
+
+    def _validate_values(
+        *,
+        values: Any,
+        expected_shapes: dict[str, tuple[int, ...]],
+        kind: str,
+    ) -> None:
+        actual_names = [value.name for value in values]
+        expected_names = list(expected_shapes)
+        if actual_names != expected_names:
+            raise ValueError(
+                f"{path.name} ONNX {kind} names are {actual_names}, "
+                f"expected {expected_names}"
+            )
+        for value in values:
+            tensor_type = value.type.tensor_type
+            if int(tensor_type.elem_type) != int(onnx.TensorProto.FLOAT16):
+                raise ValueError(
+                    f"{path.name} ONNX {kind} {value.name!r} must be float16, "
+                    f"got elem_type={tensor_type.elem_type}"
+                )
+            dimensions = tensor_type.shape.dim
+            if any(
+                bool(dimension.dim_param) or int(dimension.dim_value) <= 0
+                for dimension in dimensions
+            ):
+                raise ValueError(
+                    f"{path.name} ONNX {kind} {value.name!r} must have a "
+                    "fully static positive shape"
+                )
+            actual_shape = tuple(int(dimension.dim_value) for dimension in dimensions)
+            expected_shape = expected_shapes[value.name]
+            if actual_shape != expected_shape:
+                raise ValueError(
+                    f"{path.name} ONNX {kind} {value.name!r} shape is "
+                    f"{actual_shape}, expected {expected_shape}"
+                )
+
+    _validate_values(
+        values=model.graph.input,
+        expected_shapes=expected_input_shapes,
+        kind="input",
+    )
+    _validate_values(
+        values=model.graph.output,
+        expected_shapes=expected_output_shapes,
+        kind="output",
+    )
+
+
 def _export_onnx(
     *,
     wrapper: Any,
     arguments: tuple[Any, ...],
     input_names: list[str],
     output_names: list[str],
+    output_shapes: list[tuple[int, ...]],
     path: Path,
 ) -> None:
     import onnx
     import torch
+
+    if len(arguments) != len(input_names):
+        raise ValueError("ONNX export argument and input-name counts differ")
+    if len(output_shapes) != len(output_names):
+        raise ValueError("ONNX export output-shape and output-name counts differ")
+    if not arguments:
+        raise ValueError("ONNX export requires at least one tensor input")
+    expected_device = arguments[0].device
+    for name, argument in zip(input_names, arguments, strict=True):
+        if not isinstance(argument, torch.Tensor):
+            raise TypeError(f"ONNX export input {name!r} is not a tensor")
+        if argument.dtype != torch.float16:
+            raise TypeError(
+                f"ONNX export input {name!r} must be float16, got {argument.dtype}"
+            )
+        if argument.device != expected_device:
+            raise ValueError(
+                f"ONNX export input {name!r} is on {argument.device}, "
+                f"expected {expected_device}"
+            )
+        if not argument.is_contiguous():
+            raise ValueError(f"ONNX export input {name!r} must be contiguous")
 
     with (
         torch.inference_mode(),
@@ -496,6 +638,15 @@ def _export_onnx(
         )
     model = onnx.load(str(path), load_external_data=True)
     onnx.checker.check_model(model, full_check=True)
+    _validate_onnx_fp16_io_contract(
+        model=model,
+        path=path,
+        expected_input_shapes={
+            name: tuple(int(dimension) for dimension in argument.shape)
+            for name, argument in zip(input_names, arguments, strict=True)
+        },
+        expected_output_shapes=dict(zip(output_names, output_shapes, strict=True)),
+    )
 
 
 def _trt_logger(trt: Any) -> Any:
@@ -767,7 +918,11 @@ def build_engines(
             first_request_chunk=True,
         )
         active_indices = _active_cache_indices(initial_cache)
-        initial_cache_tensors = [initial_cache[index] for index in active_indices]
+        initial_cache_tensors = _normalize_export_cache_tensors(
+            cache=initial_cache,
+            active_cache_indices=active_indices,
+            reference_tensor=latent_chunks[0],
+        )
         cache_shapes = [tuple(tensor.shape) for tensor in initial_cache_tensors]
         cache_elements = sum(math.prod(shape) for shape in cache_shapes)
         if cache_elements != TRT_VAE_CACHE_TOTAL_ELEMENTS:
@@ -790,7 +945,12 @@ def build_engines(
             first_request_chunk=False,
         )
         steady_indices = _active_cache_indices(steady_cache)
-        steady_shapes = [tuple(steady_cache[index].shape) for index in steady_indices]
+        steady_cache_tensors = _normalize_export_cache_tensors(
+            cache=steady_cache,
+            active_cache_indices=steady_indices,
+            reference_tensor=latent_chunks[1],
+        )
+        steady_shapes = [tuple(tensor.shape) for tensor in steady_cache_tensors]
         if steady_indices != active_indices or steady_shapes != cache_shapes:
             raise ValueError("initial and steady VAE cache contracts do not match")
         if tuple(steady_rgb.shape) != (1, 3, 12, height, width):
@@ -810,6 +970,7 @@ def build_engines(
         arguments=(latent_chunks[0],),
         input_names=["latent"],
         output_names=["rgb", *cache_output_names],
+        output_shapes=[(1, 3, 9, height, width), *cache_shapes],
         path=initial_fp16_path,
     )
     _export_onnx(
@@ -817,6 +978,7 @@ def build_engines(
         arguments=(latent_chunks[1], *initial_cache_tensors),
         input_names=["latent", *cache_input_names],
         output_names=["rgb", *cache_output_names],
+        output_shapes=[(1, 3, 12, height, width), *cache_shapes],
         path=steady_fp16_path,
     )
 

@@ -85,8 +85,11 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
     _shared_memory_header,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
+    _make_export_wrappers,
+    _normalize_export_cache_tensors,
     _portable_conv3d_layout_for_export,
     _portable_nearest_upsample_for_export,
+    _validate_onnx_fp16_io_contract,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
@@ -3752,6 +3755,166 @@ class TestSfWanModeIsolation(CustomTestCase):
 
 
 class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
+    def test_trt_export_cache_boundary_normalizes_fp16(self):
+        active_indices = tuple(range(32))
+        reference = torch.zeros(1, dtype=torch.float16)
+        source_dtypes = (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        )
+        cache = [None] * 33
+        for index in active_indices:
+            cache[index] = (
+                torch.arange(
+                    6,
+                    dtype=source_dtypes[index % len(source_dtypes)],
+                )
+                .reshape(2, 3)
+                .transpose(0, 1)
+            )
+
+        normalized = _normalize_export_cache_tensors(
+            cache=cache,
+            active_cache_indices=active_indices,
+            reference_tensor=reference,
+        )
+
+        self.assertEqual(len(normalized), 32)
+        self.assertTrue(all(tensor.dtype == torch.float16 for tensor in normalized))
+        self.assertTrue(all(tensor.is_contiguous() for tensor in normalized))
+        self.assertTrue(
+            all(cache[index] is normalized[index] for index in active_indices)
+        )
+
+        with self.assertRaisesRegex(ValueError, "32 active cache"):
+            _normalize_export_cache_tensors(
+                cache=cache,
+                active_cache_indices=active_indices[:-1],
+                reference_tensor=reference,
+            )
+
+        integer_cache = [torch.zeros(1, dtype=torch.int64) for _ in range(32)] + [None]
+        with self.assertRaisesRegex(TypeError, "unsupported dtype"):
+            _normalize_export_cache_tensors(
+                cache=integer_cache,
+                active_cache_indices=active_indices,
+                reference_tensor=reference,
+            )
+
+    def test_trt_export_wrappers_emit_fp16_cache_outputs(self):
+        active_indices = tuple(range(32))
+        fake_vae = SimpleNamespace(
+            config=SimpleNamespace(patch_size=None),
+            post_quant_conv=torch.nn.Identity(),
+            decoder=torch.nn.Identity(),
+        )
+        initial_wrapper, steady_wrapper = _make_export_wrappers(
+            vae=fake_vae,
+            cache_slot_count=33,
+            active_cache_indices=active_indices,
+        )
+        latent = torch.zeros((1, 16, 3, 2, 2), dtype=torch.float16)
+
+        def _fake_decoder_chunk(**kwargs):
+            for index in active_indices:
+                kwargs["cache"][index] = torch.full(
+                    (1, 1, 1, 1, 1),
+                    float(index),
+                    dtype=torch.float32,
+                )
+            frames = 9 if kwargs["first_request_chunk"] else 12
+            return torch.zeros(
+                (1, 3, frames, 2, 2),
+                dtype=torch.float16,
+            )
+
+        with mock.patch(
+            "sglang.multimodal_gen.experimental.jetson_sfwan."
+            "vae_trt_build._run_decoder_chunk",
+            side_effect=_fake_decoder_chunk,
+        ):
+            initial_outputs = initial_wrapper(latent)
+            steady_outputs = steady_wrapper(latent, *initial_outputs[1:])
+
+        self.assertEqual(len(initial_outputs), 33)
+        self.assertEqual(len(steady_outputs), 33)
+        self.assertTrue(
+            all(tensor.dtype == torch.float16 for tensor in initial_outputs)
+        )
+        self.assertTrue(all(tensor.dtype == torch.float16 for tensor in steady_outputs))
+
+    def test_trt_onnx_io_contract_rejects_non_fp16_binding(self):
+        fake_onnx = ModuleType("onnx")
+        fake_onnx.TensorProto = SimpleNamespace(FLOAT16=10)
+
+        def _value_info(name, dtype, shape):
+            return SimpleNamespace(
+                name=name,
+                type=SimpleNamespace(
+                    tensor_type=SimpleNamespace(
+                        elem_type=dtype,
+                        shape=SimpleNamespace(
+                            dim=[
+                                SimpleNamespace(
+                                    dim_param="",
+                                    dim_value=dimension,
+                                )
+                                for dimension in shape
+                            ]
+                        ),
+                    )
+                ),
+            )
+
+        expected_inputs = {"latent": (1, 16, 3, 2, 2)}
+        expected_outputs = {
+            "rgb": (1, 3, 9, 16, 16),
+            "cache_out_000": (1, 1, 2, 2, 2),
+        }
+        valid_model = SimpleNamespace(
+            graph=SimpleNamespace(
+                input=[
+                    _value_info(
+                        "latent",
+                        10,
+                        expected_inputs["latent"],
+                    )
+                ],
+                output=[
+                    _value_info(name, 10, shape)
+                    for name, shape in expected_outputs.items()
+                ],
+            )
+        )
+        with mock.patch.dict(sys.modules, {"onnx": fake_onnx}):
+            _validate_onnx_fp16_io_contract(
+                model=valid_model,
+                path=Path("initial_fp16.onnx"),
+                expected_input_shapes=expected_inputs,
+                expected_output_shapes=expected_outputs,
+            )
+
+            invalid_model = SimpleNamespace(
+                graph=SimpleNamespace(
+                    input=valid_model.graph.input,
+                    output=[
+                        _value_info("rgb", 1, expected_outputs["rgb"]),
+                        valid_model.graph.output[1],
+                    ],
+                )
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                "output 'rgb' must be float16",
+            ):
+                _validate_onnx_fp16_io_contract(
+                    model=invalid_model,
+                    path=Path("initial_fp16.onnx"),
+                    expected_input_shapes=expected_inputs,
+                    expected_output_shapes=expected_outputs,
+                )
+
     def test_onnx_export_layout_context_is_scoped_and_exception_safe(self):
         from sglang.multimodal_gen.runtime.layers import parallel_conv
         from sglang.multimodal_gen.runtime.models.vaes import wanvae as wanvae_module
