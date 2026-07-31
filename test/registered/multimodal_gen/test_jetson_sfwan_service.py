@@ -86,6 +86,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _portable_conv3d_layout_for_export,
+    _portable_nearest_upsample_for_export,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
@@ -3797,6 +3798,66 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             getattr(parallel_conv, "_match_conv3d_input_format"),
             original_parallel_match,
         )
+
+    def test_onnx_export_nearest_context_is_scoped_and_exception_safe(self):
+        from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanUpsample
+
+        wrapper = torch.nn.Sequential(
+            *(
+                WanUpsample(
+                    scale_factor=(2.0, 2.0),
+                    mode="nearest-exact",
+                )
+                for _ in range(3)
+            )
+        )
+        upsamplers = list(wrapper.children())
+
+        with _portable_nearest_upsample_for_export(wrapper):
+            self.assertEqual(
+                [module.mode for module in upsamplers],
+                ["nearest", "nearest", "nearest"],
+            )
+
+        self.assertEqual(
+            [module.mode for module in upsamplers],
+            ["nearest-exact", "nearest-exact", "nearest-exact"],
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "export failed"):
+            with _portable_nearest_upsample_for_export(wrapper):
+                raise RuntimeError("export failed")
+
+        self.assertEqual(
+            [module.mode for module in upsamplers],
+            ["nearest-exact", "nearest-exact", "nearest-exact"],
+        )
+
+    def test_onnx_export_nearest_context_rejects_non_contract_modules(self):
+        from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanUpsample
+
+        wrong_count = torch.nn.Sequential(
+            WanUpsample(
+                scale_factor=(2.0, 2.0),
+                mode="nearest-exact",
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "expects 3"):
+            with _portable_nearest_upsample_for_export(wrong_count):
+                pass
+
+        wrong_scale = torch.nn.Sequential(
+            *(
+                WanUpsample(
+                    scale_factor=(3.0, 3.0) if index == 0 else (2.0, 2.0),
+                    mode="nearest-exact",
+                )
+                for index in range(3)
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "scale_factor"):
+            with _portable_nearest_upsample_for_export(wrong_scale):
+                pass
 
     def test_trt_precision_requires_engine_dir_and_rejects_cpu_offload(self):
         self.assertTrue(_uses_trt_vae("fp16_trt"))

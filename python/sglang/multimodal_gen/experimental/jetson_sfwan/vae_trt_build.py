@@ -30,6 +30,8 @@ from .vae_trt_runtime import (
     TRT_VAE_WIDTH,
 )
 
+EXPECTED_EXPORT_NEAREST_UPSAMPLES = 3
+
 
 def _write_json(path: Path, value: Any) -> None:
     path.write_text(
@@ -143,6 +145,83 @@ def _portable_conv3d_layout_for_export() -> Any:
             "_match_conv3d_input_format",
             original_parallel_match,
         )
+
+
+def _assert_nearest_2x_export_equivalence() -> None:
+    """Fail closed unless this Torch build gives identical 2x nearest results."""
+
+    import torch
+
+    sample = torch.arange(
+        15,
+        dtype=torch.float32,
+    ).reshape(1, 1, 3, 5)
+    nearest_exact = torch.nn.functional.interpolate(
+        sample,
+        scale_factor=(2.0, 2.0),
+        mode="nearest-exact",
+    )
+    nearest = torch.nn.functional.interpolate(
+        sample,
+        scale_factor=(2.0, 2.0),
+        mode="nearest",
+    )
+    if not torch.equal(nearest_exact, nearest):
+        raise RuntimeError(
+            "nearest-exact and nearest are not identical for fixed 2x "
+            "upsampling in this Torch build"
+        )
+
+
+@contextmanager
+def _portable_nearest_upsample_for_export(wrapper: Any) -> Any:
+    """Use ONNX-exportable nearest only for fixed, equivalent 2x upsampling."""
+
+    from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanUpsample
+
+    upsamplers = [
+        module
+        for module in wrapper.modules()
+        if isinstance(module, WanUpsample) and module.mode == "nearest-exact"
+    ]
+    if len(upsamplers) != EXPECTED_EXPORT_NEAREST_UPSAMPLES:
+        raise ValueError(
+            "SFWan TensorRT ONNX export expects "
+            f"{EXPECTED_EXPORT_NEAREST_UPSAMPLES} nearest-exact upsamplers, "
+            f"found {len(upsamplers)}"
+        )
+
+    for module in upsamplers:
+        scale_factor = module.scale_factor
+        if isinstance(scale_factor, (int, float)):
+            normalized_scale = (float(scale_factor), float(scale_factor))
+        else:
+            normalized_scale = tuple(float(value) for value in scale_factor)
+        if (
+            module.size is not None
+            or normalized_scale != (2.0, 2.0)
+            or module.align_corners is not None
+            or module.recompute_scale_factor not in (None, False)
+        ):
+            raise ValueError(
+                "nearest-exact export substitution only supports size=None, "
+                "scale_factor=(2, 2), align_corners=None, and "
+                "recompute_scale_factor unset"
+            )
+
+    _assert_nearest_2x_export_equivalence()
+    original_modes = [module.mode for module in upsamplers]
+    try:
+        for module in upsamplers:
+            module.mode = "nearest"
+        yield
+    finally:
+        for module, original_mode in zip(
+            upsamplers,
+            original_modes,
+            strict=True,
+        ):
+            module.mode = original_mode
 
 
 def _run_decoder_chunk(
@@ -401,6 +480,7 @@ def _export_onnx(
         torch.inference_mode(),
         _portable_causal_pad_for_export(),
         _portable_conv3d_layout_for_export(),
+        _portable_nearest_upsample_for_export(wrapper),
     ):
         torch.onnx.export(
             wrapper,
