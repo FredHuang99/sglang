@@ -84,6 +84,9 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
     build_shared_memory_descriptor,
     _shared_memory_header,
 )
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
+    _portable_conv3d_layout_for_export,
+)
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
     TRT_VAE_CACHE_TOTAL_ELEMENTS,
@@ -3748,6 +3751,53 @@ class TestSfWanModeIsolation(CustomTestCase):
 
 
 class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
+    def test_onnx_export_layout_context_is_scoped_and_exception_safe(self):
+        from sglang.multimodal_gen.runtime.layers import parallel_conv
+        from sglang.multimodal_gen.runtime.models.vaes import wanvae as wanvae_module
+
+        original_wan_match = wanvae_module.match_conv3d_input_format
+        original_parallel_match = getattr(
+            parallel_conv,
+            "_match_conv3d_input_format",
+        )
+        value = object()
+        weight = object()
+
+        with _portable_conv3d_layout_for_export():
+            self.assertIs(
+                wanvae_module.match_conv3d_input_format(value, weight),
+                value,
+            )
+            self.assertIs(
+                getattr(parallel_conv, "_match_conv3d_input_format")(
+                    value,
+                    weight,
+                ),
+                value,
+            )
+
+        self.assertIs(
+            wanvae_module.match_conv3d_input_format,
+            original_wan_match,
+        )
+        self.assertIs(
+            getattr(parallel_conv, "_match_conv3d_input_format"),
+            original_parallel_match,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "export failed"):
+            with _portable_conv3d_layout_for_export():
+                raise RuntimeError("export failed")
+
+        self.assertIs(
+            wanvae_module.match_conv3d_input_format,
+            original_wan_match,
+        )
+        self.assertIs(
+            getattr(parallel_conv, "_match_conv3d_input_format"),
+            original_parallel_match,
+        )
+
     def test_trt_precision_requires_engine_dir_and_rejects_cpu_offload(self):
         self.assertTrue(_uses_trt_vae("fp16_trt"))
         self.assertTrue(_uses_trt_vae("int8_trt"))

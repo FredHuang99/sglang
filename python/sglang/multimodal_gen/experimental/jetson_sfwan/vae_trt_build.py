@@ -102,6 +102,49 @@ def _portable_causal_pad_for_export() -> Any:
         parallel_conv.fused_causal_conv3d_cat_pad = original
 
 
+def _identity_conv3d_input_format(x: Any, _weight: Any) -> Any:
+    """Preserve logical values while omitting a PyTorch-only layout hint."""
+
+    return x
+
+
+@contextmanager
+def _portable_conv3d_layout_for_export() -> Any:
+    """Remove channels-last memory-format ops only while tracing ONNX.
+
+    SGLang converts Wan VAE Conv3d weights to ``channels_last_3d`` for native
+    PyTorch execution.  The causal Conv3d wrappers consequently insert an
+    ``aten::contiguous(memory_format=channels_last_3d)`` operation, which the
+    legacy ONNX exporter in NVIDIA's Jetson PyTorch build cannot represent.
+    ONNX tensors do not carry PyTorch stride metadata, so bypassing this
+    layout-only conversion preserves the graph's mathematical values.
+    """
+
+    from sglang.multimodal_gen.runtime.layers import parallel_conv
+    from sglang.multimodal_gen.runtime.models.vaes import wanvae as wanvae_module
+
+    original_wan_match = wanvae_module.match_conv3d_input_format
+    original_parallel_match = getattr(
+        parallel_conv,
+        "_match_conv3d_input_format",
+    )
+    wanvae_module.match_conv3d_input_format = _identity_conv3d_input_format
+    setattr(
+        parallel_conv,
+        "_match_conv3d_input_format",
+        _identity_conv3d_input_format,
+    )
+    try:
+        yield
+    finally:
+        wanvae_module.match_conv3d_input_format = original_wan_match
+        setattr(
+            parallel_conv,
+            "_match_conv3d_input_format",
+            original_parallel_match,
+        )
+
+
 def _run_decoder_chunk(
     *,
     post_quant_conv: Any,
@@ -354,7 +397,11 @@ def _export_onnx(
     import onnx
     import torch
 
-    with torch.inference_mode(), _portable_causal_pad_for_export():
+    with (
+        torch.inference_mode(),
+        _portable_causal_pad_for_export(),
+        _portable_conv3d_layout_for_export(),
+    ):
         torch.onnx.export(
             wrapper,
             arguments,
