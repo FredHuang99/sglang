@@ -34,6 +34,9 @@
 |---|---|---|
 | [`protocol.py`](protocol.py) | 请求/响应 schema、帧数和 shape 校验、safetensors 编解码、SHM descriptor | 不加载模型，不管理 queue |
 | [`model.py`](model.py) | FastVideo 对齐的 prompt、DMD、clean-KV、causal VAE 低层调用 | 不接 HTTP，不决定 FCFS |
+| [`vae_trt_build.py`](vae_trt_build.py) | 在目标 Orin 上捕获原生 Wan VAE、收集 dummy scale、导出 initial/steady ONNX 并构建四个 TensorRT plan | 不进入 server 热路径，不实现新的 decoder 数学 |
+| [`vae_trt_qdq.py`](vae_trt_qdq.py) | 对 ONNX 中 28 个 residual Conv3d 的 84 个展开 call site 插入显式 INT8 Q/DQ并做结构审计 | 不加载 Torch、TensorRT 或模型权重 |
+| [`vae_trt_runtime.py`](vae_trt_runtime.py) | 校验 manifest/plan，绑定 PyTorch CUDA tensor，执行 initial/steady context 并管理双 cache bank | 不接 HTTP，不执行 latent 传输，不提供动态 shape |
 | [`engine.py`](engine.py) | request-level FCFS、job 状态、HTTP DiT→VAE sender | 不做模型 forward |
 | [`transport.py`](transport.py) | pinned H2D、POSIX SHM、CUDA host registration、SHM sender | 不决定请求顺序 |
 | [`server.py`](server.py) | 角色装配、FastAPI 接口、model thread、job handler、MP4 | 不实现 Transformer/VAE 数学 |
@@ -177,6 +180,7 @@ latent：
 | `model.py` | `DecodedChunk` / `MonolithicOutput` | VAE/monolithic 返回，handler 消费 | 携带 RGB chunk、帧数和角色指标 |
 | `model.py` | `_ComponentSet` | 一个进程一次；monolithic 两角色共享 | 收口 SGLang loader 和 world-size=1 初始化 |
 | `model.py` | `SfWanDitModel` / `SfWanVaeModel` / `SfWanMonolithicModel` | 唯一 model executor thread 使用 | 三种明确数值角色；不做通用 pipeline 抽象 |
+| `vae_trt_runtime.py` | `TensorRTVaeRuntime` | VAE model 创建一次；两个 context/cache bank 维持到 server 退出 | 把 request 的 chunk 0 路由到 initial engine，其余 chunk 路由到 steady engine |
 | `runtime/distributed/local_single_process.py` | `LocalSingleProcessGroupCoordinator` | 无 C10d 进程初始化一次；各逻辑并行组共享 | 提供单 rank identity collective；跨 rank P2P 明确失败 |
 | `engine.py` | `ReceivedChunk` | `VaeJobRecord` 从接收到消费 | 把 `data`（HTTP body view、SHM ref 或 CPU fake）、digest、接收时间和 ingress 诊断绑在一起 |
 | `engine.py` | `PendingChunk` | HTTP DiT sender 从 D2H 启动到序列化完成 | 保持 GPU source、pinned slot 和 ready event 生命周期 |
@@ -218,7 +222,10 @@ pickle。CUDA VAE 使用 `parse_latent_safetensors_payload()` 做严格 header
 
 - `model_path`：Hugging Face ID 或本地 checkpoint。
 - `device_index`：当前单 GPU 进程使用的 CUDA device。
-- `vae_precision`：`fp32` 是参考精度；`fp16` 仅用于实验。
+- `vae_precision`：`fp32` 是参考精度，`fp16` 是原生 PyTorch
+  非参考路径；`fp16_trt` / `int8_trt` 选择固定 shape TensorRT backend。
+- `vae_engine_dir`：仅 TensorRT VAE 使用；包含 manifest、initial/steady
+  plan 和 INT8 audit。原生 PyTorch precision 设置该值会启动失败。
 - `text_encoder_cpu_offload`：请求 T5 CPU offload；默认开。完整 C10d
   环境使用原 FSDP CPU offload，Jetson local 环境使用 layerwise offload。
 - `dit_cpu_offload`：请求 causal DiT CPU offload；默认关。完整 C10d
@@ -311,6 +318,22 @@ BF16/FP32 路径不会因为一次 package import 而进入未使用的 DeepGEMM
 
 #### `SfWanVaeModel`
 
+`SfWanVaeModel` 在构造时只做一次严格 backend 分支：
+
+```text
+fp32 / fp16
+  -> 原有 _ComponentSet VAE
+  -> 原有 post_quant_conv + 三次 per-latent decoder
+
+fp16_trt / int8_trt
+  -> 不加载 PyTorch VAE decoder
+  -> TensorRTVaeRuntime(initial plan + steady plan + two cache banks)
+```
+
+两条路径共享 BF16 ingress 验证、FP32 mean/std 反归一化、输出 FP32 clamp、
+RGB CPU/MP4 和 profile 汇总。TensorRT mean/std 来自构建时写入并由 model ID
+约束的 manifest，不通过网络传输。
+
 关键成员：
 
 | 变量 | 含义 |
@@ -320,6 +343,7 @@ BF16/FP32 路径不会因为一次 package import 而进入未使用的 DeepGEMM
 | `_request_active` | 防止未 reset 就 decode |
 | `vae._feat_map` / `_conv_idx` | 请求专属 causal feature cache 状态 |
 | `_vae_weights_on_device` | 仅在 VAE offload 模式跟踪整模型当前是否已搬入 GPU |
+| `_trt_runtime` | 原生路径为 `None`；TRT 路径持有两个 execution context、双 cache bank 和静态 RGB output buffer |
 
 重要函数：
 
@@ -332,6 +356,8 @@ BF16/FP32 路径不会因为一次 package import 而进入未使用的 DeepGEMM
   CPU 转换和 `DecodedChunk` 组装之后，把整个 VAE 阻塞搬回 CPU。
 - `_decode_per_latent()`：每 chunk 一次 post-quant，三次单 latent decoder；
   只在请求第一个 latent 设置 `first_chunk=True`。
+- `_decode_trt_chunk()`：把 FP32 denormalized latent 交给 TRT runtime；
+  runtime 内 cast FP16并执行 initial/steady plan，返回后统一转 FP32 clamp。
 - `finish_request()`：清理 feature cache，并在嵌套 `finally` 中保证权重
   回到 CPU、请求所有权结束；decode 异常也走该路径。
 
@@ -848,6 +874,13 @@ VAE:
     bf16_ingress_cuda_ms/wall_ms, denorm_cuda_ms/wall_ms
     post_quant_cuda_ms
     latent_frames[0..2]: latent_index, cuda_ms, decoded_rgb_frames
+
+TensorRT VAE 的 chunks[i] 另外包含:
+    trt_engine_kind: initial | steady
+    trt_precision: fp16 | int8
+    trt_input_cast_cuda_ms
+    trt_engine_cuda_ms
+    trt_output_finalize_cuda_ms
 ```
 
 DiT 的 `chunk_execution_wall_ms` 终点在 latent callback 之前。VAE 的
@@ -886,7 +919,8 @@ throughput。`profile_execution` 与 raw lifecycle/transfer 指标必须分别�
 | `--chunk-timeout` | 600 s | vae | 当前 FCFS request 等下一块的上限 |
 | `--device-index` | 0 | 全部 | 当前进程 CUDA device |
 | `--latent-transport` | http | dit/vae | `http` 或同 Linux CUDA 主机 `shm` |
-| `--vae-precision` | fp32 | mono/vae | FP32 参考；FP16 非参考实验 |
+| `--vae-precision` | fp32 | mono/vae | `fp32/fp16` 为原生 PyTorch；`fp16_trt/int8_trt` 为固定 480×832、SM87 TensorRT |
+| `--vae-engine-dir` | 无 | mono/vae | TRT precision 必填；原生 precision 禁止；manifest/plan/audit 的目录 |
 | `--text-encoder-cpu-offload [true\|false]` | 开 | mono/dit | 完整 C10d 为 FSDP CPU offload；Jetson local 为 layerwise；单独写 flag 等价于 true |
 | `--dit-cpu-offload [true\|false]` | 关 | mono/dit | 完整 C10d 为单卡 FSDP inference；Jetson local 为 layerwise；权重搬迁计入 forward |
 | `--vae-cpu-offload [true\|false]` | 关 | mono/vae | 每个三 latent chunk 前整模型 H2D、结果组装后整模型 D2H |
@@ -942,3 +976,226 @@ throughput。`profile_execution` 与 raw lifecycle/transfer 指标必须分别�
 - [ ] profile 关闭时是否没有纯计时 Event/synchronize？
 - [ ] `profile_execution` 是否排除了 queue、network、H2D 和输出编码？
 - [ ] 任一 timeout/failure 后是否释放 cache、slot、mapping 并继续 FCFS？
+
+## 14. Jetson TensorRT VAE backend
+
+### 14.1 设计边界
+
+TensorRT 是 `SfWanVaeModel` 的一个窄 backend，不是新的 pipeline。它只在
+`vae_precision` 为 `fp16_trt` 或 `int8_trt` 时导入；原有
+`fp32/fp16` 分支不会导入 `tensorrt`、不会读取 plan，也不会分配 TRT cache
+bank。首版约束固定如下：
+
+| 项目 | 固定值 |
+|---|---|
+| GPU | Jetson AGX Orin SM87 |
+| batch | 1 |
+| RGB 分辨率 | 480×832 |
+| latent chunk | `[1,16,3,60,104]` FP16 engine input |
+| 请求 ingress | `[1,16,3,60,104]` BF16 normalized |
+| initial RGB | `[1,3,9,480,832]` FP16 |
+| steady RGB | `[1,3,12,480,832]` FP16 |
+| effective feature cache | 32 个 FP16 tensor |
+| 单 bank | 944,286,720 elements / 1,888,573,440 bytes |
+| runtime cache | 两个 bank，约 3.518 GiB |
+
+INT8 只覆盖 14 个 `WanResidualBlock` 的 `conv1/conv2`，即 28 个主要
+3×3×3 Conv3d。`post_quant_conv`、首尾卷积、shortcut、attention、norm、
+SiLU、add、upsample 和 feature cache 保持 FP16。LightX2V 提供的是
+“离线 weight scale + op 入口 activation scale + 低精度 kernel + FP16
+外围”的设计参照；它的 FP8 GEMM kernel 没有被复制到 5D Conv3d。
+
+```mermaid
+flowchart LR
+    Ingress["BF16 normalized chunk"]
+    Denorm["FP32 denormalize"]
+    Cast["FP16 cast"]
+    TRT["TensorRT graph"]
+    MainConv["28 logical Conv3d<br/>Explicit INT8 Q/DQ"]
+    Other["other VAE ops<br/>FP16"]
+    Cache["32 FP16 cache outputs"]
+    Clamp["FP32 clamp"]
+
+    Ingress --> Denorm --> Cast --> TRT
+    TRT --> MainConv --> Other
+    Other --> Cache
+    Other --> Clamp
+```
+
+### 14.2 构建调用链
+
+`vae_trt_build.py` 只在离线构建命令中运行：
+
+```mermaid
+flowchart TD
+    CLI["vae_trt_build CLI"]
+    Load["_ComponentSet loads native FP16 VAE"]
+    Targets["find 14 residual blocks / 28 Conv3d"]
+    Dummy["seeded 21-frame dummy latent"]
+    Scales["chunk 0 initial scales<br/>chunks 1..6 steady max scales"]
+    Trace["run real post_quant_conv + decoder<br/>capture 32 active caches"]
+    Export["export initial_fp16.onnx<br/>export steady_fp16.onnx"]
+    QDQ["vae_trt_qdq rewrite + structural audit"]
+    Build["TensorRT build four plans"]
+    Tactic["detailed Engine Inspector tactic audit"]
+    Manifest["manifest + scales + audit"]
+
+    CLI --> Load --> Targets --> Dummy --> Scales --> Trace --> Export
+    Export --> QDQ --> Build --> Tactic --> Manifest
+```
+
+关键点：
+
+1. `_run_decoder_chunk()` 直接调用已经加载的 `vae.post_quant_conv`、
+   `vae.decoder`、`wanvae.forward_context` 和原生 cache list；没有复制
+   decoder 数学。
+2. `_portable_causal_pad_for_export()` 只在构建作用域内暂时禁用 fused
+   cat/pad，使 ONNX 看见标准 Torch cat/pad；退出 context 后恢复全局值。
+3. 构建先真实运行 chunk 0，依据非 `None` tensor 找到 32 个有效 cache；
+   不能仅凭 33 个 causal-conv module 类型推断。
+4. initial wrapper 固定展开 `first_chunk=True/False/False` 三次 latent
+   decode；steady wrapper 固定展开三次 `first_chunk=False`。
+5. dummy latent 先整体生成 FP32，再整体转 BF16；chunk 0 的三个 call
+   共享每个 logical Conv 的 initial 最大 absmax，chunk 1–6 的十八个 call
+   共享 steady 最大 absmax。
+6. initial/steady ONNX 各自包含 84 个展开 Conv call site；同一个 logical
+   weight 在一个 graph 内共享一份 per-output-channel INT8 initializer。
+
+### 14.3 Q/DQ 重写与 fail-closed audit
+
+`vae_trt_qdq.py` 是纯 ONNX 层，不加载 server、Torch VAE 或 TensorRT。
+每个目标 Conv 被改为：
+
+```text
+FP16 activation
+  -> Cast(FP32)
+  -> QuantizeLinear(INT8, scalar FP32 scale, int8 zero)
+  -> DequantizeLinear(FP32)
+  -> Conv(
+       Dequantized activation,
+       Dequantized per-output-channel INT8 weight,
+       FP32 bias
+     )
+  -> Cast(FP16)
+```
+
+它不会生成 `QLinearConv` 或 `ConvInteger`。构建成功必须同时满足：
+
+- ONNX opset 恰为 17，checker 与 shape inference 通过；
+- 28 个 logical weight、84 个 target Conv、84 条 activation Q/DQ、
+  28 条共享 weight DQ；
+- 每个 logical module 的 call index 恰为 `0,1,2`；
+- TensorRT detailed inspector 能把每个唯一节点名
+  `int8/{initial|steady}/{module}/call_i` 映射到 layer/tactic；
+- 映射出的 format/datatype/precision/tactic 字段含 INT8/IMMA 证据。
+
+任何一个 call site 无法映射或回退 FP16/FP32，`int8_audit.json` 写出失败
+原因后构建抛错；runtime 又会二次要求 manifest 的 audit 为通过状态。因此
+“生成了 plan”不等于“宣称 INT8 成功”。
+
+### 14.4 Manifest 与启动校验
+
+`manifest.json` 是 plan 的执行契约，不是可选说明文件。启动时
+`validate_trt_vae_manifest()` 在导入 TensorRT 前验证：
+
+- schema、model ID、batch、分辨率、latent shape/dtype；
+- 32 个 cache binding 的连续 index、shape、dtype、总元素和 bank bytes；
+- initial/steady RGB shape；
+- 所选 precision 的两个 plan 路径位于 engine directory 内；
+- plan SHA256；
+- INT8 audit 状态和 84-call-site 计数。
+
+`TensorRTVaeRuntime` 随后验证当前 compute capability、CUDA major/minor、
+TensorRT 精确版本和 plan 的实际 I/O binding 名称/shape/dtype。V1 不做
+兼容性猜测或静默回退：任一不一致都会使 server 启动失败。
+
+### 14.5 Runtime 状态机和双 bank
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> InitialReady: reset_request()
+    InitialReady --> BankAValid: decode_chunk(0) / initial writes A
+    BankAValid --> BankBValid: decode_chunk(1) / steady reads A writes B
+    BankBValid --> BankAValid: decode_chunk(2) / steady reads B writes A
+    BankAValid --> BankBValid: next odd chunk
+    BankAValid --> Idle: finish_request/error
+    BankBValid --> Idle: finish_request/error
+```
+
+`TensorRTVaeRuntime` 的重要成员：
+
+| 成员 | 所有权/含义 |
+|---|---|
+| `_engines["initial"/"steady"]` | 反序列化 plan，server 生命周期 |
+| `_contexts[...]` | 每个 plan 唯一 execution context，仅 model thread 调用 |
+| `_cache_banks[0/1]` | 32-slot FP16 output/input bank；不在 chunk 间重新分配 |
+| `_rgb_outputs[...]` | 9-frame / 12-frame 静态 FP16 output buffer |
+| `_read_bank_index` | 当前有效历史 bank；reset 后为 `None` |
+| `_next_chunk_index` | 强制 chunk 严格连续，防止错误 cache 与 latent 配对 |
+
+执行时所有地址通过 PyTorch CUDA tensor 的 `data_ptr()` 绑定；使用当前
+PyTorch stream 的 `cuda_stream` 调用 `execute_async_v3`。chunk 0 只绑定
+latent、RGB 和 cache outputs；steady 还绑定上一个 read bank 的 32 个
+inputs。output 永远写另一个 bank，执行成功后才切换 `_read_bank_index`。
+没有 latent D2H/H2D，也没有每 chunk cache allocation。
+
+### 14.6 四种请求路径
+
+TensorRT 只替换 VAE model 内部，FCFS 和 transport 不变：
+
+```mermaid
+flowchart TD
+    Mode{"request mode"}
+    Mono["monolithic:<br/>DiT i -> clean-KV -> TRT VAE i -> RGB CPU"]
+    HTTP["HTTP disagg:<br/>PUT -> pinned H2D -> stream wait -> TRT VAE"]
+    SHM["SHM disagg:<br/>ready -> registered SHM H2D -> stream wait -> TRT VAE"]
+    Profile["VAE profile:<br/>7 dummy chunks via normal HTTP -> TRT VAE"]
+
+    Mode --> Mono
+    Mode --> HTTP
+    Mode --> SHM
+    Mode --> Profile
+```
+
+- monolithic TRT `_ComponentSet` 只加载 DiT/T5/scheduler/Transformer；
+  `SfWanVaeModel` 从 plan 构造 runtime，不存在第二份 PyTorch VAE 权重。
+- HTTP/SHM 的 `StagedDeviceChunk.wait_on_current_stream()` 仍发生在
+  `decode_chunk()` 之前，所以 H2D dependency 不进入 VAE execution。
+- VAE profile 仍是一个 7-chunk 完整请求；chunk 0 走 initial，chunk
+  1–6 走 steady，request 结束一次 reset。
+- TensorRT precision 不改变 waiting/running queue、乱序缓存、超时、幂等
+  或一块 look-ahead。
+
+### 14.7 TensorRT profile key
+
+只有 server 使用 `--enable-profile` 时才创建以下计时 Event：
+
+| key | value 与边界 |
+|---|---|
+| `trt_input_cast_cuda_ms` | 当前 chunk 的 denormalized FP32 latent → FP16 |
+| `trt_engine_cuda_ms` | 仅 `execute_async_v3` 排入当前 stream 的 GPU elapsed |
+| `trt_output_finalize_cuda_ms` | TRT FP16 RGB → FP32 + `clamp(-1,1)` |
+| `trt_engine_kind` | chunk 0 为 `initial`，其余为 `steady` |
+| `trt_precision` | 实际加载的 plan family：`fp16` 或 `int8` |
+
+它们位于 `metrics.profile_execution.chunks[i]`。
+`chunk_execution_cuda_ms` 是包含 denorm、cast、engine 和 finalize 的更大
+区间；`vae_execution_cuda_ms` 是七个 chunk execution 的和。HTTP parse、
+pageable→pinned、H2D、FCFS wait、RGB D2H 和 MP4 始终不进入这些 key。
+profile 关闭时，kind/precision 仍作为低成本状态存在，但三个 `*_cuda_ms`
+不会创建或返回。
+
+### 14.8 TensorRT 审核清单
+
+- [ ] build 是否在实际执行 plan 的 SM87 Orin 上完成？
+- [ ] initial/steady cache 是否都是 32 个且共 944,286,720 elements？
+- [ ] initial/steady RGB 是否分别为 9/12 帧？
+- [ ] 两个 Q/DQ graph 是否各有 84 个 target call site？
+- [ ] `int8_audit.json.passed` 是否为 true，unmapped/non-int8 是否为空？
+- [ ] manifest 的四个 plan digest 是否匹配？
+- [ ] `GET /v1/engine` 是否显示 `vae_backend=tensorrt`、正确 precision/SM/TRT？
+- [ ] chunk kind 是否为 `initial, steady, steady, steady, steady, steady, steady`？
+- [ ] reset 后下一请求的 chunk 0 是否重新走 initial？
+- [ ] `fp32/fp16` 启动是否完全不导入 TensorRT runtime？
+- [ ] monolithic TRT 是否未加载 PyTorch VAE，且仍按 chunk 同步交错？

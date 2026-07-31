@@ -32,6 +32,8 @@ from .model import (
     SfWanDitModel,
     SfWanMonolithicModel,
     SfWanVaeModel,
+    VaePrecision,
+    _uses_trt_vae,
 )
 from .protocol import (
     DEFAULT_MAX_PIXELS,
@@ -79,7 +81,8 @@ class ServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     transfer_queue_depth: int = 2
     chunk_timeout_seconds: float = 600.0
     device_index: int = 0
-    vae_precision: Literal["fp32", "fp16"] = "fp32"
+    vae_precision: VaePrecision = "fp32"
+    vae_engine_dir: str | None = None
     text_encoder_cpu_offload: bool = True
     dit_cpu_offload: bool = False
     vae_cpu_offload: bool = False
@@ -129,6 +132,21 @@ class SfWanRuntime:
             raise ValueError("--chunk-timeout-seconds must be positive")
         if config.role == "monolithic" and config.vae_url is not None:
             raise ValueError("--vae-url is not valid for the monolithic role")
+        if config.role in {"monolithic", "vae"}:
+            if _uses_trt_vae(config.vae_precision):
+                if config.vae_engine_dir is None:
+                    raise ValueError(
+                        f"--vae-precision {config.vae_precision} requires "
+                        "--vae-engine-dir"
+                    )
+                if config.vae_cpu_offload:
+                    raise ValueError(
+                        "TensorRT VAE precision does not support --vae-cpu-offload"
+                    )
+            elif config.vae_engine_dir is not None:
+                raise ValueError(
+                    "--vae-engine-dir is valid only with fp16_trt or int8_trt"
+                )
         if (
             config.role == "vae"
             and config.latent_transport == "shm"
@@ -168,6 +186,7 @@ class SfWanRuntime:
             model_path=self.config.model_path,
             device_index=self.config.device_index,
             vae_precision=self.config.vae_precision,
+            vae_engine_dir=self.config.vae_engine_dir,
             text_encoder_cpu_offload=self.config.text_encoder_cpu_offload,
             dit_cpu_offload=self.config.dit_cpu_offload,
             vae_cpu_offload=self.config.vae_cpu_offload,
@@ -238,8 +257,12 @@ class SfWanRuntime:
         self._shm_regions.clear()
         self._shm_descriptors.clear()
         self._shm_h2d_stream = None
+        model = self.model
         self.model = None
         self.model_loaded = False
+        model_close = getattr(model, "close", None)
+        if callable(model_close):
+            await self._loop.run_in_executor(self._executor, model_close)
         await asyncio.to_thread(self._executor.shutdown, True)
         if self._transfer_executor is not None:
             await asyncio.to_thread(self._transfer_executor.shutdown, True)
@@ -270,6 +293,12 @@ class SfWanRuntime:
                 "POST /v1/dit-profiles"
             )
         request.validate_server_limits(self.config.max_pixels)
+        if (
+            self.config.role == "monolithic"
+            and _uses_trt_vae(self.config.vae_precision)
+            and (request.height, request.width) != (480, 832)
+        ):
+            raise ValueError("TensorRT VAE V1 supports only 480x832 generation")
         request_id = str(uuid.uuid4())
         record = JobRecord(
             request_id=request_id,
@@ -334,6 +363,11 @@ class SfWanRuntime:
             and spec.height * spec.width > self.config.max_pixels
         ):
             raise ValueError("latent job exceeds server max_pixels")
+        if _uses_trt_vae(self.config.vae_precision) and (
+            spec.height,
+            spec.width,
+        ) != (480, 832):
+            raise ValueError("TensorRT VAE V1 accepts only 480x832 latent jobs")
 
         existing = self.jobs.get(spec.request_id)
         if existing is not None:
@@ -1290,9 +1324,10 @@ def _parse_args() -> ServerConfig:
     )
     parser.add_argument(
         "--vae-precision",
-        choices=("fp32", "fp16"),
+        choices=("fp32", "fp16", "fp16_trt", "int8_trt"),
         default="fp32",
     )
+    parser.add_argument("--vae-engine-dir")
     parser.add_argument(
         "--text-encoder-cpu-offload",
         action=StoreBoolean,
@@ -1324,6 +1359,7 @@ def _parse_args() -> ServerConfig:
         chunk_timeout_seconds=args.chunk_timeout_seconds,
         device_index=args.device_index,
         vae_precision=args.vae_precision,
+        vae_engine_dir=args.vae_engine_dir,
         text_encoder_cpu_offload=args.text_encoder_cpu_offload,
         dit_cpu_offload=args.dit_cpu_offload,
         vae_cpu_offload=args.vae_cpu_offload,

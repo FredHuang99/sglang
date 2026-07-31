@@ -138,6 +138,144 @@ metric. `GET /v1/engine` exposes `contract.distributed_backend`,
 `contract.cpu_offload_requested`, and `contract.cpu_offload_effective`.
 The legacy role-specific `contract.cpu_offload` booleans remain available.
 
+## Jetson Orin TensorRT VAE
+
+The optional TensorRT backend is deliberately isolated from the reference
+PyTorch decoder:
+
+| `--vae-precision` | VAE implementation | PyTorch VAE weights loaded |
+|---|---|---:|
+| `fp32` | existing causal Wan VAE, reference precision | yes |
+| `fp16` | existing causal Wan VAE, non-reference precision | yes |
+| `fp16_trt` | fixed-shape TensorRT FP16 plans | no |
+| `int8_trt` | fixed-shape explicit-Q/DQ TensorRT plans | no |
+
+V1 TensorRT plans are batch-one, SM87-only, and fixed to a normalized latent
+chunk of `[1,16,3,60,104]` for 480x832 output. They must be built on the same
+Jetson software stack that will execute them. The build produces separate
+`initial` and `steady` engines:
+
+- `initial`: latent input only, 9 RGB frames and 32 cache outputs;
+- `steady`: latent plus 32 cache inputs, 12 RGB frames and 32 updated cache
+  outputs.
+
+The runtime owns two FP16 cache banks and alternates `A -> B -> A`. One bank is
+1,888,573,440 bytes (about 1.759 GiB), so both banks occupy about 3.518 GiB.
+They are allocated once when the server starts and are reused across requests.
+TensorRT VAE mode does not permit `--vae-cpu-offload`.
+
+Build the four performance plans on the Orin:
+
+```bash
+export SFWAN_MODEL=wlsaidhi/SFWan2.1-T2V-1.3B-Diffusers
+export SFWAN_TRT_DIR=/workspace/engines/sfwan-vae-trt-sm87
+
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build \
+  --model-path "$SFWAN_MODEL" \
+  --output-dir "$SFWAN_TRT_DIR" \
+  --height 480 \
+  --width 832 \
+  --seed 1024 \
+  --workspace-gib 8 \
+  --profiling-verbosity none
+```
+
+The command reuses the loaded SGLang Wan VAE to collect one deterministic
+speed-only scale set, exports ONNX opset 17, inserts explicit signed INT8 Q/DQ
+around only the 28 residual-block 3x3x3 Conv3d modules, and builds FP16 and
+INT8 initial/steady plans. A build is accepted only if:
+
+- each graph has 28 logical weights and 84 unrolled target Conv call sites;
+- every target activation and weight is connected through Q/DQ;
+- TensorRT Inspector maps every target call site to INT8 tactic evidence.
+
+Inspect the fail-closed audit:
+
+```bash
+jq '{
+  passed,
+  errors,
+  initial: .tactics.initial | {
+    passed, mapped_count, unmapped_call_sites, non_int8_call_sites
+  },
+  steady: .tactics.steady | {
+    passed, mapped_count, unmapped_call_sites, non_int8_call_sites
+  }
+}' "$SFWAN_TRT_DIR/int8_audit.json"
+
+sha256sum "$SFWAN_TRT_DIR"/*.plan
+```
+
+For a separately retained detailed-inspector build, use another directory so
+it cannot replace the performance plans:
+
+```bash
+export SFWAN_TRT_AUDIT_DIR=/workspace/engines/sfwan-vae-trt-sm87-detailed
+
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build \
+  --model-path "$SFWAN_MODEL" \
+  --output-dir "$SFWAN_TRT_AUDIT_DIR" \
+  --height 480 \
+  --width 832 \
+  --seed 1024 \
+  --workspace-gib 8 \
+  --profiling-verbosity detailed
+
+/usr/src/tensorrt/bin/trtexec \
+  --loadEngine="$SFWAN_TRT_AUDIT_DIR/initial_int8.plan" \
+  --dumpLayerInfo \
+  --profilingVerbosity=detailed
+
+/usr/src/tensorrt/bin/trtexec \
+  --loadEngine="$SFWAN_TRT_AUDIT_DIR/steady_int8.plan" \
+  --dumpLayerInfo \
+  --profilingVerbosity=detailed
+```
+
+Start a VAE-only TensorRT server by choosing one of the plan precisions:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.server \
+  --role vae \
+  --model-path "$SFWAN_MODEL" \
+  --host 0.0.0.0 \
+  --port 30001 \
+  --latent-transport http \
+  --vae-precision int8_trt \
+  --vae-engine-dir "$SFWAN_TRT_DIR" \
+  --vae-cpu-offload false \
+  --enable-profile \
+  --output-dir /workspace/results/sfwan-vae-int8
+```
+
+Use `--vae-precision fp16_trt` with the same directory for the TensorRT FP16
+control. The existing VAE profile client still uploads all seven chunks:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.client profile-vae \
+  --server-url http://127.0.0.1:30001 \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --seed 1024 \
+  --warmup 10 \
+  --repeat 50 \
+  --summary-json /workspace/results/vae-int8-trt-480x832-81.json
+```
+
+With `--enable-profile`, each chunk adds
+`trt_input_cast_cuda_ms`, `trt_engine_cuda_ms`,
+`trt_output_finalize_cuda_ms`, `trt_engine_kind`, and `trt_precision` under
+`profile_execution.chunks[]`. `trt_engine_cuda_ms` covers only
+`execute_async_v3`; `chunk_execution_cuda_ms` also includes common FP32
+denormalization, the FP16 ingress cast, and FP32 output clamp. HTTP/H2D, queue,
+RGB D2H, and MP4 remain outside `profile_execution`.
+
+For monolithic execution, pass the same `--vae-precision` and
+`--vae-engine-dir` to a `--role monolithic` server. Its order remains strictly
+`DiT chunk i -> clean-KV -> TRT VAE chunk i -> RGB CPU -> DiT chunk i+1`;
+there is no latent D2H/H2D or DiT/VAE overlap.
+
 ## 5090 monolithic
 
 ```bash
@@ -351,9 +489,11 @@ synchronized wall clocks.
 
 This is a trusted-LAN research service without TLS or authentication. It does
 not include batching, multiple models, TP/SP, multiple VAE workers, RGB
-streaming, WebSockets, CUDA IPC, GPUDirect, Mooncake, ETCD, INT8, TensorRT,
-DLA, or Jetson-specific kernels. FP32 is the FastVideo-compatible VAE mode;
-FP16 is available only as an explicitly non-reference profiling option.
+streaming, WebSockets, CUDA IPC, GPUDirect, Mooncake, ETCD, DLA, dynamic-shape
+TensorRT, or a hand-written Jetson Conv3d kernel. FP32 is the
+FastVideo-compatible VAE mode; FP16 and TensorRT modes are explicitly
+non-reference profiling options. The TensorRT INT8 path quantizes only the 28
+main residual Conv3d modules and does not claim visual accuracy.
 Terminal job metadata has no TTL in V1 and is retained until server restart;
 GPU tensors, caches, pinned slots, and SHM mappings are still released at
 terminal state.

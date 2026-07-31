@@ -4,12 +4,14 @@ import ast
 import asyncio
 import builtins
 import contextvars
+import hashlib
 import importlib.util
 import inspect
 import json
 import math
 import random
 import sys
+import tempfile
 import time
 import unittest
 from contextlib import nullcontext
@@ -36,6 +38,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.engine import (
     VaeJobRecord,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.model import (
+    DIT_COMPONENT_NAMES,
     DecodedChunk,
     LatentChunk,
     ModelLoadConfig,
@@ -50,6 +53,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.model import (
     _pred_noise_to_pred_video_fastvideo,
     _resolve_offload_settings,
     _timed_cuda_call,
+    _uses_trt_vae,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.protocol import (
     DitProfileRequest,
@@ -79,6 +83,13 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
     _copy_payload_data_to_pinned,
     build_shared_memory_descriptor,
     _shared_memory_header,
+)
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
+    TRT_VAE_CACHE_BANK_BYTES,
+    TRT_VAE_CACHE_TOTAL_ELEMENTS,
+    TRT_VAE_LATENT_SHAPE,
+    TensorRTVaeRuntime,
+    validate_trt_vae_manifest,
 )
 from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.distributed.local_single_process import (
@@ -3734,6 +3745,297 @@ class TestSfWanModeIsolation(CustomTestCase):
         self.assertIn("/v1/latent-jobs", source)
         self.assertNotIn("/v1/dit", source)
         self.assertNotIn("/v1/generations", source)
+
+
+class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
+    def test_trt_precision_requires_engine_dir_and_rejects_cpu_offload(self):
+        self.assertTrue(_uses_trt_vae("fp16_trt"))
+        self.assertTrue(_uses_trt_vae("int8_trt"))
+        self.assertFalse(_uses_trt_vae("fp16"))
+
+        with self.assertRaisesRegex(ValueError, "--vae-engine-dir"):
+            SfWanRuntime(config=ServerConfig(role="vae", vae_precision="int8_trt"))
+        with self.assertRaisesRegex(ValueError, "--vae-cpu-offload"):
+            SfWanRuntime(
+                config=ServerConfig(
+                    role="monolithic",
+                    vae_precision="fp16_trt",
+                    vae_engine_dir="/engines",
+                    vae_cpu_offload=True,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "valid only"):
+            SfWanRuntime(
+                config=ServerConfig(
+                    role="vae",
+                    vae_precision="fp16",
+                    vae_engine_dir="/engines",
+                )
+            )
+
+    def test_server_parser_exposes_trt_precision_and_engine_dir(self):
+        argv = [
+            "server",
+            "--role",
+            "vae",
+            "--vae-precision",
+            "int8_trt",
+            "--vae-engine-dir",
+            "/workspace/engines",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            config = _parse_args()
+        self.assertEqual(config.vae_precision, "int8_trt")
+        self.assertEqual(config.vae_engine_dir, "/workspace/engines")
+
+    def test_manifest_validation_checks_static_cache_and_plan_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            digest_by_file = {}
+            for precision in ("fp16", "int8"):
+                for kind in ("initial", "steady"):
+                    name = f"{kind}_{precision}.plan"
+                    payload = f"{precision}-{kind}".encode()
+                    (root / name).write_bytes(payload)
+                    digest_by_file[name] = hashlib.sha256(payload).hexdigest()
+            audit_payload = json.dumps(
+                {
+                    "passed": True,
+                    "target_conv_call_sites_per_graph": 84,
+                },
+                sort_keys=True,
+            ).encode()
+            (root / "int8_audit.json").write_bytes(audit_payload)
+            audit_digest = hashlib.sha256(audit_payload).hexdigest()
+
+            cache_shapes = [[1, 1, 1, 1, TRT_VAE_CACHE_TOTAL_ELEMENTS - 31]]
+            cache_shapes.extend([[1, 1, 1, 1, 1] for _ in range(31)])
+            manifest = {
+                "schema_version": 1,
+                "model_id": "model",
+                "batch_size": 1,
+                "height": 480,
+                "width": 832,
+                "latent_shape": list(TRT_VAE_LATENT_SHAPE),
+                "latent_dtype": "float16",
+                "cache": {
+                    "allocated_slot_count": 33,
+                    "active_slot_indices": list(range(32)),
+                    "bindings": [
+                        {
+                            "index": index,
+                            "shape": shape,
+                            "dtype": "float16",
+                        }
+                        for index, shape in enumerate(cache_shapes)
+                    ],
+                    "total_elements": TRT_VAE_CACHE_TOTAL_ELEMENTS,
+                    "single_bank_bytes": TRT_VAE_CACHE_BANK_BYTES,
+                    "double_bank_bytes": TRT_VAE_CACHE_BANK_BYTES * 2,
+                },
+                "engines": {
+                    precision: {
+                        kind: {
+                            "file": f"{kind}_{precision}.plan",
+                            "sha256": digest_by_file[f"{kind}_{precision}.plan"],
+                            "rgb_shape": [
+                                1,
+                                3,
+                                9 if kind == "initial" else 12,
+                                480,
+                                832,
+                            ],
+                        }
+                        for kind in ("initial", "steady")
+                    }
+                    for precision in ("fp16", "int8")
+                },
+                "int8_audit": {
+                    "passed": True,
+                    "target_conv_call_sites_per_graph": 84,
+                    "report_file": "int8_audit.json",
+                    "report_sha256": audit_digest,
+                },
+            }
+            validated = validate_trt_vae_manifest(
+                manifest,
+                engine_dir=root,
+                precision="int8",
+                model_path="model",
+                verify_plan_hashes=True,
+            )
+            self.assertEqual(len(validated["cache_shapes"]), 32)
+            self.assertEqual(set(validated["engines"]), {"initial", "steady"})
+
+            manifest["engines"]["int8"]["steady"]["sha256"] = "0" * 64
+            with self.assertRaisesRegex(ValueError, "digest"):
+                validate_trt_vae_manifest(
+                    manifest,
+                    engine_dir=root,
+                    precision="int8",
+                    model_path="model",
+                    verify_plan_hashes=True,
+                )
+            manifest["engines"]["int8"]["steady"]["sha256"] = digest_by_file[
+                "steady_int8.plan"
+            ]
+            (root / "int8_audit.json").write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "audit digest"):
+                validate_trt_vae_manifest(
+                    manifest,
+                    engine_dir=root,
+                    precision="int8",
+                    model_path="model",
+                    verify_plan_hashes=True,
+                )
+
+    def test_trt_runtime_enforces_initial_then_steady_and_reset(self):
+        class _FakeTensor:
+            def __init__(self, dtype):
+                self.shape = TRT_VAE_LATENT_SHAPE
+                self.dtype = dtype
+
+            def to(self, *, dtype):
+                return _FakeTensor(dtype)
+
+        runtime = TensorRTVaeRuntime.__new__(TensorRTVaeRuntime)
+        runtime.precision = "int8"
+        runtime.device = "cuda:0"
+        runtime.enable_profile = False
+        runtime.enable_nvtx = False
+        runtime._torch = SimpleNamespace(float16="fp16", float32="fp32")
+        calls = []
+
+        def _execute(_self, *, kind, latent):
+            calls.append((kind, latent.dtype))
+            return f"{kind}-output"
+
+        runtime._execute = MethodType(_execute, runtime)
+        runtime.reset_request()
+        first, first_metrics = runtime.decode_chunk(
+            chunk_index=0,
+            denormalized_fp32=_FakeTensor("fp32"),
+        )
+        second, second_metrics = runtime.decode_chunk(
+            chunk_index=1,
+            denormalized_fp32=_FakeTensor("fp32"),
+        )
+        self.assertEqual(first, "initial-output")
+        self.assertEqual(second, "steady-output")
+        self.assertEqual(calls, [("initial", "fp16"), ("steady", "fp16")])
+        self.assertEqual(first_metrics["trt_engine_kind"], "initial")
+        self.assertEqual(second_metrics["trt_engine_kind"], "steady")
+
+        runtime.finish_request()
+        runtime.reset_request()
+        with self.assertRaisesRegex(ValueError, "expected chunk 0"):
+            runtime.decode_chunk(
+                chunk_index=1,
+                denormalized_fp32=_FakeTensor("fp32"),
+            )
+
+    def test_trt_runtime_alternates_cache_banks_without_in_place_overwrite(self):
+        class _FakeContext:
+            def __init__(self):
+                self.stream_handles = []
+
+            def execute_async_v3(self, *, stream_handle):
+                self.stream_handles.append(stream_handle)
+                return True
+
+        runtime = TensorRTVaeRuntime.__new__(TensorRTVaeRuntime)
+        runtime.device = "cuda:0"
+        runtime._torch = SimpleNamespace(
+            cuda=SimpleNamespace(
+                current_stream=lambda **_kwargs: SimpleNamespace(cuda_stream=17)
+            )
+        )
+        runtime._contexts = {
+            "initial": _FakeContext(),
+            "steady": _FakeContext(),
+        }
+        runtime._cache_banks = [
+            [f"a-{index}" for index in range(32)],
+            [f"b-{index}" for index in range(32)],
+        ]
+        runtime._rgb_outputs = {
+            "initial": "rgb-initial",
+            "steady": "rgb-steady",
+        }
+        runtime._read_bank_index = None
+        addresses = []
+
+        def _set_address(_self, context, name, tensor):
+            addresses.append((context, name, tensor))
+
+        runtime._set_address = MethodType(_set_address, runtime)
+        self.assertEqual(
+            runtime._execute(kind="initial", latent="latent-0"),
+            "rgb-initial",
+        )
+        self.assertEqual(runtime._read_bank_index, 0)
+        first_steady_start = len(addresses)
+        self.assertEqual(
+            runtime._execute(kind="steady", latent="latent-1"),
+            "rgb-steady",
+        )
+        self.assertEqual(runtime._read_bank_index, 1)
+        steady_addresses = {
+            name: tensor for _context, name, tensor in addresses[first_steady_start:]
+        }
+        self.assertEqual(steady_addresses["cache_in_000"], "a-0")
+        self.assertEqual(steady_addresses["cache_out_000"], "b-0")
+        self.assertNotEqual(
+            steady_addresses["cache_in_000"],
+            steady_addresses["cache_out_000"],
+        )
+
+    def test_trt_monolithic_component_loader_skips_torch_vae(self):
+        components = SimpleNamespace(
+            device="cuda:0",
+            modules={},
+            pipeline_config=SimpleNamespace(),
+            server_args=SimpleNamespace(),
+            distributed_backend="local",
+            cpu_offload_requested={
+                "text_encoder": True,
+                "dit": False,
+                "vae": False,
+            },
+            cpu_offload_effective={
+                "text_encoder": "layerwise",
+                "dit": "resident",
+                "vae": "resident",
+            },
+        )
+        fake_dit = SimpleNamespace(contract={"role": "dit"})
+        fake_vae = SimpleNamespace(contract={"role": "vae", "vae_backend": "tensorrt"})
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan.model._ComponentSet",
+                return_value=components,
+            ) as component_loader,
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan.model.SfWanDitModel",
+                return_value=fake_dit,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan.model.SfWanVaeModel",
+                return_value=fake_vae,
+            ),
+        ):
+            model = SfWanMonolithicModel(
+                load_config=ModelLoadConfig(
+                    model_path="model",
+                    vae_precision="int8_trt",
+                    vae_engine_dir="/engines",
+                )
+            )
+        self.assertEqual(
+            component_loader.call_args.kwargs["component_names"],
+            DIT_COMPONENT_NAMES,
+        )
+        self.assertEqual(model.contract["vae"]["vae_backend"], "tensorrt")
 
 
 if __name__ == "__main__":

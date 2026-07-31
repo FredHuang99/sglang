@@ -26,11 +26,15 @@ from .protocol import (
     decoded_frames_for_chunk,
 )
 
+VaePrecision = Literal["fp32", "fp16", "fp16_trt", "int8_trt"]
+TRT_VAE_PRECISIONS = frozenset({"fp16_trt", "int8_trt"})
+
 
 class ModelLoadConfig(msgspec.Struct, frozen=True, kw_only=True):
     model_path: str
     device_index: int = 0
-    vae_precision: Literal["fp32", "fp16"] = "fp32"
+    vae_precision: VaePrecision = "fp32"
+    vae_engine_dir: str | None = None
     text_encoder_cpu_offload: bool = True
     dit_cpu_offload: bool = False
     vae_cpu_offload: bool = False
@@ -67,6 +71,10 @@ DIT_COMPONENT_NAMES = (
     "scheduler",
 )
 VAE_COMPONENT_NAMES = ("vae",)
+
+
+def _uses_trt_vae(vae_precision: str) -> bool:
+    return vae_precision in TRT_VAE_PRECISIONS
 
 
 def _find_free_port() -> int:
@@ -202,7 +210,14 @@ class _ComponentSet:
             force_diffusers_model=True,
         )
         self.pipeline_config = SelfForcingWanT2V480PConfig()
-        self.pipeline_config.vae_precision = load_config.vae_precision
+        # Generic component loaders know only native Torch precision names.
+        # A TensorRT monolithic process loads DiT components here and creates
+        # its VAE directly from plans, so keep this otherwise-unused field valid.
+        self.pipeline_config.vae_precision = (
+            "fp16"
+            if _uses_trt_vae(load_config.vae_precision)
+            else load_config.vae_precision
+        )
         layerwise_selection = set(layerwise_offload_components or ())
         self.server_args = ServerArgs(
             model_path=self.model_path,
@@ -1130,6 +1145,15 @@ class SfWanVaeModel:
         import torch
 
         self._load_config = load_config
+        self._trt_runtime: Any = None
+        if _uses_trt_vae(load_config.vae_precision):
+            self._initialize_trt(
+                load_config=load_config,
+                components=components,
+                torch=torch,
+            )
+            return
+
         self._components = components or _ComponentSet(
             load_config=load_config,
             component_names=self._VAE_COMPONENTS,
@@ -1193,6 +1217,15 @@ class SfWanVaeModel:
             "vae_dtype": load_config.vae_precision,
             "feature_cache_scope": "request",
             "profile_enabled": load_config.enable_profile,
+            "vae_backend": "pytorch",
+            "vae_engine_dir": None,
+            "vae_engine_precision": load_config.vae_precision,
+            "vae_engine_schema_version": None,
+            "vae_engine_sm": None,
+            "vae_engine_tensorrt_version": None,
+            "vae_int8_audit_passed": False,
+            "vae_cache_tensor_count": 32,
+            "vae_cache_bank_bytes": None,
             **_component_runtime_contract(
                 self._components,
                 ("vae",),
@@ -1202,19 +1235,112 @@ class SfWanVaeModel:
             },
         }
 
+    def _initialize_trt(
+        self,
+        *,
+        load_config: ModelLoadConfig,
+        components: _ComponentSet | None,
+        torch: Any,
+    ) -> None:
+        if load_config.vae_engine_dir is None:
+            raise ValueError(
+                f"vae_precision={load_config.vae_precision} requires --vae-engine-dir"
+            )
+        if load_config.vae_cpu_offload:
+            raise ValueError("TensorRT VAE engines do not support --vae-cpu-offload")
+
+        self._components = components
+        if components is None:
+            self.device = _initialize_single_gpu_runtime(load_config.device_index)
+            distributed_backend, _local_mode = _distributed_runtime_contract()
+            self.pipeline_config = None
+            self.server_args = None
+        else:
+            self.device = components.device
+            distributed_backend = components.distributed_backend
+            self.pipeline_config = components.pipeline_config
+            self.server_args = components.server_args
+
+        from .vae_trt_runtime import TensorRTVaeRuntime
+
+        trt_precision = {
+            "fp16_trt": "fp16",
+            "int8_trt": "int8",
+        }[load_config.vae_precision]
+        self._trt_runtime = TensorRTVaeRuntime(
+            engine_dir=load_config.vae_engine_dir,
+            precision=trt_precision,
+            model_path=load_config.model_path,
+            device=self.device,
+            enable_profile=load_config.enable_profile,
+            enable_nvtx=load_config.enable_nvtx,
+        )
+        manifest = self._trt_runtime.manifest
+        latents_mean = manifest.get("latents_mean")
+        latents_std = manifest.get("latents_std")
+        if (
+            not isinstance(latents_mean, list)
+            or not isinstance(latents_std, list)
+            or len(latents_mean) != LATENT_CHANNELS
+            or len(latents_std) != LATENT_CHANNELS
+        ):
+            raise ValueError(
+                "TensorRT VAE manifest must provide 16-channel latents_mean/std"
+            )
+        self._latents_mean = torch.tensor(
+            latents_mean,
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, LATENT_CHANNELS, 1, 1, 1)
+        self._latents_std = torch.tensor(
+            latents_std,
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, LATENT_CHANNELS, 1, 1, 1)
+        self.vae = None
+        self.vae_dtype = torch.float16
+        self._vae_weights_on_device = True
+        self._request_active = False
+        self.contract = {
+            "batch_size": 1,
+            "latent_layout": "BCTHW",
+            "latent_dtype": "bfloat16",
+            "latent_frames_per_chunk": LATENT_FRAMES_PER_CHUNK,
+            "denormalize_dtype": "float32",
+            "vae_dtype": load_config.vae_precision,
+            "feature_cache_scope": "request",
+            "profile_enabled": load_config.enable_profile,
+            "distributed_backend": distributed_backend,
+            "cpu_offload_requested": {"vae": False},
+            "cpu_offload_effective": {"vae": "resident"},
+            "cpu_offload": {"vae": False},
+            **self._trt_runtime.contract,
+        }
+
     def reset_request(self) -> None:
         self._request_active = False
-        self.vae.reset_causal_decode_state()
+        if self._trt_runtime is not None:
+            self._trt_runtime.reset_request()
+        else:
+            self.vae.reset_causal_decode_state()
         self._request_active = True
 
     def finish_request(self) -> None:
         try:
-            self.vae.reset_causal_decode_state()
+            if self._trt_runtime is not None:
+                self._trt_runtime.finish_request()
+            else:
+                self.vae.reset_causal_decode_state()
         finally:
             try:
                 self._offload_vae_weights()
             finally:
                 self._request_active = False
+
+    def close(self) -> None:
+        if self._trt_runtime is not None:
+            self._trt_runtime.close()
+            self._trt_runtime = None
 
     def _activate_vae_for_chunk(self) -> None:
         if not getattr(
@@ -1306,10 +1432,18 @@ class SfWanVaeModel:
             if denorm_start is not None
             else None
         )
-        decoded, frame_metrics, post_quant_ms = self._decode_per_latent(
-            chunk_index=chunk_index,
-            z=z,
-        )
+        trt_metrics: dict[str, Any] = {}
+        if self._trt_runtime is not None:
+            decoded, frame_metrics, trt_metrics = self._decode_trt_chunk(
+                chunk_index=chunk_index,
+                z=z,
+            )
+            post_quant_ms = None
+        else:
+            decoded, frame_metrics, post_quant_ms = self._decode_per_latent(
+                chunk_index=chunk_index,
+                z=z,
+            )
         chunk_execution_ms = None
         if chunk_end_event is not None:
             chunk_end_event.record()
@@ -1331,13 +1465,17 @@ class SfWanVaeModel:
         metrics: dict[str, Any] = {
             "chunk_index": chunk_index,
             "decoded_rgb_frames": frame_count,
+            **{
+                key: value
+                for key, value in trt_metrics.items()
+                if key in {"trt_engine_kind", "trt_precision"}
+            },
         }
         if profile_enabled:
             assert bf16_ingress_ms is not None
             assert bf16_ingress_cuda_ms is not None
             assert denorm_ms is not None
             assert denorm_cuda_ms is not None
-            assert post_quant_ms is not None
             assert chunk_execution_ms is not None
             profile_execution = {
                 "chunk_index": chunk_index,
@@ -1349,6 +1487,7 @@ class SfWanVaeModel:
                 "post_quant_cuda_ms": post_quant_ms,
                 "latent_frames": frame_metrics,
                 "decoded_rgb_frames": frame_count,
+                **trt_metrics,
             }
             metrics["profile_execution"] = profile_execution
             if rgb_d2h_ms is not None:
@@ -1361,6 +1500,38 @@ class SfWanVaeModel:
         )
         self._offload_vae_weights()
         return result
+
+    def _decode_trt_chunk(
+        self,
+        *,
+        chunk_index: int,
+        z: Any,
+    ) -> tuple[Any, list[dict[str, Any]], dict[str, Any]]:
+        if self._trt_runtime is None:
+            raise RuntimeError("TensorRT VAE runtime is not initialized")
+        raw_output, trt_metrics = self._trt_runtime.decode_chunk(
+            chunk_index=chunk_index,
+            denormalized_fp32=z,
+        )
+        output, finalize_ms = _timed_cuda_call(
+            label=f"sfwan.vae.trt.chunk.{chunk_index}.output_finalize",
+            enabled_profile=self._load_config.enable_profile,
+            enabled_nvtx=self._load_config.enable_nvtx,
+            function=lambda: raw_output.float().clamp(-1.0, 1.0),
+        )
+        frame_counts = (1, 4, 4) if chunk_index == 0 else (4, 4, 4)
+        frame_metrics = [
+            {
+                "latent_index": latent_index,
+                "cuda_ms": None,
+                "decoded_rgb_frames": decoded_frames,
+                "fused_in_trt": True,
+            }
+            for latent_index, decoded_frames in enumerate(frame_counts)
+        ]
+        if self._load_config.enable_profile:
+            trt_metrics["trt_output_finalize_cuda_ms"] = finalize_ms
+        return output, frame_metrics, trt_metrics
 
     def _decode_per_latent(
         self,
@@ -1444,12 +1615,14 @@ class SfWanMonolithicModel:
 
     def __init__(self, *, load_config: ModelLoadConfig) -> None:
         self._load_config = load_config
+        component_names = (
+            DIT_COMPONENT_NAMES
+            if _uses_trt_vae(load_config.vae_precision)
+            else (*DIT_COMPONENT_NAMES, *VAE_COMPONENT_NAMES)
+        )
         components = _ComponentSet(
             load_config=load_config,
-            component_names=(
-                *DIT_COMPONENT_NAMES,
-                *VAE_COMPONENT_NAMES,
-            ),
+            component_names=component_names,
         )
         self.dit = SfWanDitModel(
             load_config=load_config,
@@ -1471,6 +1644,9 @@ class SfWanMonolithicModel:
                 ("text_encoder", "dit", "vae"),
             ),
         }
+
+    def close(self) -> None:
+        self.vae.close()
 
     def generate(
         self,
