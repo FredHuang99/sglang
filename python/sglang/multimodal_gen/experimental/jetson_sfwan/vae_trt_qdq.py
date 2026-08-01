@@ -15,8 +15,9 @@ import math
 from pathlib import Path
 from typing import Any
 
-QDQ_SCHEMA_VERSION = 3
+QDQ_SCHEMA_VERSION = 4
 QDQ_OPSET = 19
+QDQ_TOPOLOGY = "fp16_cast_fp32_qdq_fp32_conv_cast_fp16"
 INT8_MAX = 127.0
 MIN_QUANT_SCALE = 1.0e-8
 EXPECTED_LOGICAL_CONVS = 28
@@ -129,6 +130,22 @@ def _tensor_shape_map(model: Any) -> dict[str, list[int]]:
     return shapes
 
 
+def _tensor_element_type_map(model: Any) -> dict[str, int]:
+    element_types: dict[str, int] = {}
+    values = [
+        *model.graph.input,
+        *model.graph.output,
+        *model.graph.value_info,
+    ]
+    for value in values:
+        tensor_type = value.type.tensor_type
+        if tensor_type.HasField("elem_type") and int(tensor_type.elem_type) != 0:
+            element_types[value.name] = int(tensor_type.elem_type)
+    for initializer in model.graph.initializer:
+        element_types[initializer.name] = int(initializer.data_type)
+    return element_types
+
+
 def _normalize_rank5_shape(value: Any) -> list[int] | None:
     if not isinstance(value, (list, tuple)) or len(value) != 5:
         return None
@@ -229,53 +246,78 @@ def _is_zero_int8(initializer: Any, *, TensorProto: Any, numpy_helper: Any) -> b
 
 
 def _is_positive_finite(value: Any) -> bool:
-    return bool((value > 0).all() and math.isfinite(float(value.max())))
+    try:
+        return bool(
+            int(value.size) > 0
+            and (value > 0).all()
+            and math.isfinite(float(value.max()))
+        )
+    except (AttributeError, TypeError, ValueError):
+        return False
+
+
+def _has_qdq_contract(node: Any) -> bool:
+    return bool(
+        len(node.input) == 3
+        and all(node.input)
+        and len(node.output) == 1
+        and node.output[0]
+    )
 
 
 def _make_qdq_call_site(
     *,
     helper: Any,
     numpy_helper: Any,
+    TensorProto: Any,
     np: Any,
     graph_kind: str,
     module_name: str,
     call_index: int,
     activation_input: str,
-    weight_fp16: Any,
-    weight_scale_fp16: Any,
-    activation_scale_fp16: Any,
-    bias_fp16: Any,
-) -> tuple[list[Any], list[Any], str, str, str, dict[str, str]]:
-    """Create the canonical v3 constant->Q->DQ topology for one Conv call."""
+    weight_fp32: Any,
+    weight_scale_fp32: Any,
+    activation_scale_fp32: Any,
+    bias_fp32: Any,
+) -> tuple[list[Any], list[Any], str, str, str, str, dict[str, str]]:
+    """Create one TensorRT-10.3-compatible explicit INT8 Conv call site.
+
+    TensorRT 10.3 only supports FP32 data and scales for Q/DQ layers.  Keep
+    the surrounding exported VAE graph in FP16, but cast the activation to
+    FP32 before Q/DQ, use independent FP32 weight/bias constants, and expose
+    an FP32 Conv output for the caller to cast back to FP16.
+    """
 
     safe_module = _safe_name(module_name)
     prefix = f"sfwan_{graph_kind}_{safe_module}_call_{call_index}"
+    activation_fp32 = f"{prefix}_activation_fp32"
     activation_scale_name = f"{prefix}_activation_scale"
     activation_zero_name = f"{prefix}_activation_zero"
     activation_int8 = f"{prefix}_activation_int8"
     activation_dq = f"{prefix}_activation_dequantized"
-    weight_source_name = f"{prefix}_weight_fp16_source"
+    weight_source_name = f"{prefix}_weight_fp32_source"
     weight_scale_name = f"{prefix}_weight_scale"
     weight_zero_name = f"{prefix}_weight_zero"
     weight_int8 = f"{prefix}_weight_int8"
     weight_dq = f"{prefix}_weight_dequantized"
-    bias_name = f"{prefix}_bias_fp16"
+    bias_name = f"{prefix}_bias_fp32"
+    conv_output_fp32 = f"{prefix}_conv_output_fp32"
 
     initializers = [
         numpy_helper.from_array(
-            np.ascontiguousarray(weight_fp16, dtype=np.float16),
+            np.ascontiguousarray(weight_fp32, dtype=np.float32),
             name=weight_source_name,
         ),
         numpy_helper.from_array(
-            np.ascontiguousarray(weight_scale_fp16, dtype=np.float16),
+            np.ascontiguousarray(weight_scale_fp32, dtype=np.float32),
             name=weight_scale_name,
         ),
         numpy_helper.from_array(
-            np.zeros(weight_scale_fp16.shape, dtype=np.int8),
+            np.zeros(weight_scale_fp32.shape, dtype=np.int8),
             name=weight_zero_name,
         ),
         numpy_helper.from_array(
-            np.asarray(activation_scale_fp16, dtype=np.float16),
+            np.asarray(activation_scale_fp32, dtype=np.float32),
             name=activation_scale_name,
         ),
         numpy_helper.from_array(
@@ -283,14 +325,24 @@ def _make_qdq_call_site(
             name=activation_zero_name,
         ),
         numpy_helper.from_array(
-            np.ascontiguousarray(bias_fp16, dtype=np.float16),
+            np.ascontiguousarray(bias_fp32, dtype=np.float32),
             name=bias_name,
         ),
     ]
     nodes = [
         helper.make_node(
+            "Cast",
+            [activation_input],
+            [activation_fp32],
+            name=(
+                f"qdq/{graph_kind}/activation/{module_name}/"
+                f"call_{call_index}/cast_to_fp32"
+            ),
+            to=TensorProto.FLOAT,
+        ),
+        helper.make_node(
             "QuantizeLinear",
-            [activation_input, activation_scale_name, activation_zero_name],
+            [activation_fp32, activation_scale_name, activation_zero_name],
             [activation_int8],
             name=(
                 f"qdq/{graph_kind}/activation/{module_name}/call_{call_index}/quantize"
@@ -323,14 +375,24 @@ def _make_qdq_call_site(
         ),
     ]
     names = {
+        "activation_cast_output": activation_fp32,
         "activation_scale": activation_scale_name,
         "activation_zero": activation_zero_name,
         "weight_source": weight_source_name,
         "weight_scale": weight_scale_name,
         "weight_zero": weight_zero_name,
         "bias": bias_name,
+        "conv_output_fp32": conv_output_fp32,
     }
-    return nodes, initializers, activation_dq, weight_dq, bias_name, names
+    return (
+        nodes,
+        initializers,
+        activation_dq,
+        weight_dq,
+        bias_name,
+        conv_output_fp32,
+        names,
+    )
 
 
 def audit_qdq_model(
@@ -340,9 +402,9 @@ def audit_qdq_model(
     target_module_names: tuple[str, ...],
     shape_overrides: dict[str, dict[str, list[int]]] | None = None,
 ) -> dict[str, Any]:
-    """Validate the complete v3 structural INT8 contract after rewriting."""
+    """Validate the complete TensorRT-10.3-compatible v4 Q/DQ contract."""
 
-    _onnx, np, TensorProto, helpers = _lazy_onnx()
+    _onnx, _np, TensorProto, helpers = _lazy_onnx()
     helper, numpy_helper = helpers
     target_call_prefix = f"int8/{graph_kind}/"
     target_convs = [
@@ -379,11 +441,29 @@ def audit_qdq_model(
         if node.op_type == "DequantizeLinear"
         and node.name.startswith(f"qdq/{graph_kind}/weight/")
     ]
-    target_casts = [
-        node.name
+    activation_casts = [
+        node
+        for node in model.graph.node
+        if node.op_type == "Cast"
+        and node.name.startswith(f"qdq/{graph_kind}/activation/")
+        and node.name.endswith("/cast_to_fp32")
+    ]
+    output_casts = [
+        node
+        for node in model.graph.node
+        if node.op_type == "Cast"
+        and node.name.startswith(f"qdq/{graph_kind}/output/")
+        and node.name.endswith("/cast_to_fp16")
+    ]
+    all_target_casts = [
+        node
         for node in model.graph.node
         if node.op_type == "Cast" and node.name.startswith(f"qdq/{graph_kind}/")
     ]
+    expected_cast_names = {node.name for node in (*activation_casts, *output_casts)}
+    unexpected_target_casts = sorted(
+        node.name for node in all_target_casts if node.name not in expected_cast_names
+    )
     initializers = _initializer_map(model)
     producers = {
         output_name: node
@@ -391,7 +471,13 @@ def audit_qdq_model(
         for output_name in node.output
         if output_name
     }
+    consumers: dict[str, list[Any]] = {}
+    for node in model.graph.node:
+        for input_name in node.input:
+            if input_name:
+                consumers.setdefault(input_name, []).append(node)
     shapes = _tensor_shape_map(model)
+    element_types = _tensor_element_type_map(model)
     per_module_counts = {
         module_name: sum(
             node.name.startswith(f"{target_call_prefix}{module_name}/call_")
@@ -410,8 +496,10 @@ def audit_qdq_model(
         "target Conv": len(target_convs),
         "activation QuantizeLinear": len(activation_q),
         "activation DequantizeLinear": len(activation_dq),
+        "activation FP16-to-FP32 Cast": len(activation_casts),
         "weight QuantizeLinear": len(weight_q),
         "weight DequantizeLinear": len(weight_dq),
+        "output FP32-to-FP16 Cast": len(output_casts),
     }
     for label, count in expected_counts.items():
         if count != EXPECTED_CALL_SITES:
@@ -425,8 +513,11 @@ def audit_qdq_model(
         errors.append(f"per-module call counts are invalid: {invalid_modules}")
     if qlinear_convs:
         errors.append(f"unsupported quantized Conv operators exist: {qlinear_convs}")
-    if target_casts:
-        errors.append(f"target Q/DQ paths contain Cast nodes: {target_casts}")
+    if unexpected_target_casts:
+        errors.append(
+            "target Q/DQ paths contain unexpected Cast nodes: "
+            f"{unexpected_target_casts}"
+        )
     target_conv_names = {node.name for node in target_convs}
     if shape_overrides is not None and set(shape_overrides) != target_conv_names:
         missing = sorted(target_conv_names - set(shape_overrides))
@@ -442,6 +533,8 @@ def audit_qdq_model(
     weight_dq_outputs: set[str] = set()
     activation_q_outputs: set[str] = set()
     activation_dq_outputs: set[str] = set()
+    activation_cast_outputs: set[str] = set()
+    output_cast_outputs: set[str] = set()
     bias_sources: set[str] = set()
     signatures: list[dict[str, Any]] = []
     shape_sources: dict[str, str] = {}
@@ -449,6 +542,9 @@ def audit_qdq_model(
     for conv in target_convs:
         if len(conv.input) < 3 or not conv.input[2]:
             invalid_bindings.append(f"{conv.name}:missing_bias")
+            continue
+        if len(conv.output) != 1 or not conv.output[0]:
+            invalid_bindings.append(f"{conv.name}:invalid_output_count")
             continue
         activation_dequantize = producers.get(conv.input[0])
         weight_dequantize = producers.get(conv.input[1])
@@ -461,6 +557,12 @@ def audit_qdq_model(
         if weight_dequantize is None or weight_dequantize.op_type != "DequantizeLinear":
             invalid_bindings.append(f"{conv.name}:weight_missing_dq")
             continue
+        if not _has_qdq_contract(activation_dequantize):
+            invalid_bindings.append(f"{conv.name}:activation_dq_contract_invalid")
+            continue
+        if not _has_qdq_contract(weight_dequantize):
+            invalid_bindings.append(f"{conv.name}:weight_dq_contract_invalid")
+            continue
         activation_quantize = producers.get(activation_dequantize.input[0])
         weight_quantize = producers.get(weight_dequantize.input[0])
         if (
@@ -472,7 +574,80 @@ def audit_qdq_model(
         if weight_quantize is None or weight_quantize.op_type != "QuantizeLinear":
             invalid_bindings.append(f"{conv.name}:weight_missing_q")
             continue
+        if not _has_qdq_contract(activation_quantize):
+            invalid_bindings.append(f"{conv.name}:activation_q_contract_invalid")
+            continue
+        if not _has_qdq_contract(weight_quantize):
+            invalid_bindings.append(f"{conv.name}:weight_q_contract_invalid")
+            continue
+        activation_cast = producers.get(activation_quantize.input[0])
+        if activation_cast is None or activation_cast.op_type != "Cast":
+            invalid_bindings.append(f"{conv.name}:activation_missing_fp32_cast")
+            continue
+        if (
+            len(activation_cast.input) != 1
+            or not activation_cast.input[0]
+            or len(activation_cast.output) != 1
+            or not activation_cast.output[0]
+        ):
+            invalid_bindings.append(f"{conv.name}:activation_cast_contract_invalid")
+            continue
+        conv_output_consumers = consumers.get(conv.output[0], [])
+        if len(conv_output_consumers) != 1:
+            invalid_bindings.append(
+                f"{conv.name}:conv_output_consumer_count_{len(conv_output_consumers)}"
+            )
+            continue
+        output_cast = conv_output_consumers[0]
+        if output_cast.op_type != "Cast":
+            invalid_bindings.append(f"{conv.name}:output_missing_fp16_cast")
+            continue
 
+        call_suffix = conv.name.removeprefix(target_call_prefix)
+        expected_activation_cast_name = (
+            f"qdq/{graph_kind}/activation/{call_suffix}/cast_to_fp32"
+        )
+        expected_activation_q_name = (
+            f"qdq/{graph_kind}/activation/{call_suffix}/quantize"
+        )
+        expected_activation_dq_name = (
+            f"qdq/{graph_kind}/activation/{call_suffix}/dequantize"
+        )
+        expected_weight_q_name = f"qdq/{graph_kind}/weight/{call_suffix}/quantize"
+        expected_weight_dq_name = f"qdq/{graph_kind}/weight/{call_suffix}/dequantize"
+        expected_output_cast_name = (
+            f"qdq/{graph_kind}/output/{call_suffix}/cast_to_fp16"
+        )
+        if activation_cast.name != expected_activation_cast_name:
+            invalid_bindings.append(f"{conv.name}:activation_cast_name_invalid")
+        if output_cast.name != expected_output_cast_name:
+            invalid_bindings.append(f"{conv.name}:output_cast_name_invalid")
+        if activation_quantize.name != expected_activation_q_name:
+            invalid_bindings.append(f"{conv.name}:activation_q_name_invalid")
+        if activation_dequantize.name != expected_activation_dq_name:
+            invalid_bindings.append(f"{conv.name}:activation_dq_name_invalid")
+        if weight_quantize.name != expected_weight_q_name:
+            invalid_bindings.append(f"{conv.name}:weight_q_name_invalid")
+        if weight_dequantize.name != expected_weight_dq_name:
+            invalid_bindings.append(f"{conv.name}:weight_dq_name_invalid")
+        if int(_attribute_map(activation_cast, helper).get("to", -1)) != int(
+            TensorProto.FLOAT
+        ):
+            invalid_bindings.append(f"{conv.name}:activation_cast_not_fp32")
+        if int(_attribute_map(output_cast, helper).get("to", -1)) != int(
+            TensorProto.FLOAT16
+        ):
+            invalid_bindings.append(f"{conv.name}:output_cast_not_fp16")
+        if (
+            len(output_cast.input) != 1
+            or output_cast.input[0] != conv.output[0]
+            or len(output_cast.output) != 1
+            or not output_cast.output[0]
+        ):
+            invalid_bindings.append(f"{conv.name}:output_cast_contract_invalid")
+            continue
+
+        activation_cast_outputs.add(activation_cast.output[0])
         activation_q_outputs.add(activation_quantize.output[0])
         activation_dq_outputs.add(activation_dequantize.output[0])
         weight_q_outputs.add(weight_quantize.output[0])
@@ -481,6 +656,7 @@ def audit_qdq_model(
         bias_name = conv.input[2]
         weight_sources.add(weight_source_name)
         bias_sources.add(bias_name)
+        output_cast_outputs.add(output_cast.output[0])
 
         activation_scale = initializers.get(activation_quantize.input[1])
         activation_zero = initializers.get(activation_quantize.input[2])
@@ -489,6 +665,25 @@ def audit_qdq_model(
         weight_zero = initializers.get(weight_quantize.input[2])
         bias = initializers.get(bias_name)
         binding_errors: list[str] = []
+        expected_element_types = {
+            activation_cast.input[0]: TensorProto.FLOAT16,
+            activation_cast.output[0]: TensorProto.FLOAT,
+            activation_quantize.output[0]: TensorProto.INT8,
+            activation_dequantize.output[0]: TensorProto.FLOAT,
+            weight_quantize.input[0]: TensorProto.FLOAT,
+            weight_quantize.output[0]: TensorProto.INT8,
+            weight_dequantize.output[0]: TensorProto.FLOAT,
+            bias_name: TensorProto.FLOAT,
+            conv.output[0]: TensorProto.FLOAT,
+            output_cast.output[0]: TensorProto.FLOAT16,
+        }
+        for tensor_name, expected_type in expected_element_types.items():
+            actual_type = element_types.get(tensor_name)
+            if actual_type is not None and actual_type != int(expected_type):
+                binding_errors.append(
+                    f"tensor_type_invalid:{tensor_name}:"
+                    f"actual={actual_type}:expected={int(expected_type)}"
+                )
         if list(activation_quantize.input[1:]) != list(activation_dequantize.input[1:]):
             binding_errors.append("activation_q_dq_parameters_differ")
         if list(weight_quantize.input[1:]) != list(weight_dequantize.input[1:]):
@@ -500,7 +695,7 @@ def audit_qdq_model(
         else:
             activation_scale_array = numpy_helper.to_array(activation_scale)
             if (
-                int(activation_scale.data_type) != int(TensorProto.FLOAT16)
+                int(activation_scale.data_type) != int(TensorProto.FLOAT)
                 or activation_scale_array.ndim != 0
                 or not _is_positive_finite(activation_scale_array)
             ):
@@ -511,23 +706,25 @@ def audit_qdq_model(
             numpy_helper=numpy_helper,
         ):
             binding_errors.append("activation_zero_invalid")
+        elif numpy_helper.to_array(activation_zero).ndim != 0:
+            binding_errors.append("activation_zero_not_scalar")
         if weight_source is None:
             binding_errors.append("weight_source_missing")
             weight_shape: list[int] = []
         else:
             weight_shape = [int(value) for value in weight_source.dims]
             if (
-                int(weight_source.data_type) != int(TensorProto.FLOAT16)
+                int(weight_source.data_type) != int(TensorProto.FLOAT)
                 or len(weight_shape) != 5
             ):
-                binding_errors.append("weight_source_not_rank5_fp16")
+                binding_errors.append("weight_source_not_rank5_fp32")
         if weight_scale is None:
             binding_errors.append("weight_scale_missing")
         else:
             weight_scale_array = numpy_helper.to_array(weight_scale)
             expected_channels = weight_shape[0] if weight_shape else -1
             if (
-                int(weight_scale.data_type) != int(TensorProto.FLOAT16)
+                int(weight_scale.data_type) != int(TensorProto.FLOAT)
                 or weight_scale_array.ndim != 1
                 or int(weight_scale_array.size) != expected_channels
                 or not _is_positive_finite(weight_scale_array)
@@ -539,9 +736,14 @@ def audit_qdq_model(
             numpy_helper=numpy_helper,
         ):
             binding_errors.append("weight_zero_invalid")
+        elif weight_scale is not None and (
+            numpy_helper.to_array(weight_zero).shape
+            != numpy_helper.to_array(weight_scale).shape
+        ):
+            binding_errors.append("weight_zero_shape_invalid")
         if (
             bias is None
-            or int(bias.data_type) != int(TensorProto.FLOAT16)
+            or int(bias.data_type) != int(TensorProto.FLOAT)
             or len(bias.dims) != 1
             or (weight_shape and int(bias.dims[0]) != weight_shape[0])
         ):
@@ -551,8 +753,8 @@ def audit_qdq_model(
             continue
 
         attributes = _attribute_map(conv, helper)
-        inferred_input_shape = shapes.get(activation_quantize.input[0])
-        inferred_output_shape = shapes.get(conv.output[0])
+        inferred_input_shape = shapes.get(activation_cast.input[0])
+        inferred_output_shape = shapes.get(output_cast.output[0])
         override = (
             shape_overrides.get(conv.name) if shape_overrides is not None else None
         )
@@ -618,6 +820,8 @@ def audit_qdq_model(
         "weight DQ outputs": weight_dq_outputs,
         "activation Q outputs": activation_q_outputs,
         "activation DQ outputs": activation_dq_outputs,
+        "activation Cast outputs": activation_cast_outputs,
+        "output Cast outputs": output_cast_outputs,
         "bias sources": bias_sources,
     }
     for label, values in unique_requirements.items():
@@ -635,6 +839,7 @@ def audit_qdq_model(
 
     return {
         "schema_version": QDQ_SCHEMA_VERSION,
+        "qdq_topology": QDQ_TOPOLOGY,
         "graph_kind": graph_kind,
         "passed": not errors,
         "errors": errors,
@@ -642,8 +847,10 @@ def audit_qdq_model(
         "target_conv_call_site_count": len(target_convs),
         "activation_quantize_count": len(activation_q),
         "activation_dequantize_count": len(activation_dq),
+        "activation_cast_count": len(activation_casts),
         "weight_quantize_count": len(weight_q),
         "weight_dequantize_count": len(weight_dq),
+        "output_cast_count": len(output_casts),
         "unique_weight_source_count": len(weight_sources),
         "unique_weight_quantize_output_count": len(weight_q_outputs),
         "unique_weight_dequantize_output_count": len(weight_dq_outputs),
@@ -654,7 +861,9 @@ def audit_qdq_model(
         "shape_sources": shape_sources,
         "signature_ids": sorted({value["signature_id"] for value in signatures}),
         "unsupported_quantized_conv_nodes": qlinear_convs,
-        "target_cast_nodes": target_casts,
+        "activation_cast_nodes": [node.name for node in activation_casts],
+        "output_cast_nodes": [node.name for node in output_casts],
+        "unexpected_target_cast_nodes": unexpected_target_casts,
         "invalid_bindings": invalid_bindings,
     }
 
@@ -690,7 +899,7 @@ def rewrite_onnx_with_int8_qdq(
         target_module_names=target_module_names,
     )
 
-    onnx, np, _TensorProto, helpers = _lazy_onnx()
+    onnx, np, TensorProto, helpers = _lazy_onnx()
     helper, numpy_helper = helpers
     source = Path(source_path)
     destination = Path(destination_path)
@@ -727,15 +936,12 @@ def rewrite_onnx_with_int8_qdq(
         raw_scale = np.maximum(channel_max / INT8_MAX, MIN_QUANT_SCALE).astype(
             np.float32
         )
-        effective_scale = np.maximum(
-            raw_scale,
-            np.finfo(np.float16).tiny,
-        ).astype(np.float16)
-        module_weights[module_name] = weight.astype(np.float16)
+        effective_scale = np.maximum(raw_scale, MIN_QUANT_SCALE).astype(np.float32)
+        module_weights[module_name] = weight.astype(np.float32)
         module_weight_scales[module_name] = effective_scale
         weight_scales[module_name] = {
             "raw_fp32": raw_scale.tolist(),
-            "effective_fp16": effective_scale.tolist(),
+            "effective_fp32": effective_scale.tolist(),
         }
 
     new_nodes: list[Any] = []
@@ -752,21 +958,23 @@ def rewrite_onnx_with_int8_qdq(
             continue
         if len(node.input) < 3 or not node.input[2]:
             raise ValueError(f"target Conv {node.name!r} has no static bias")
+        if len(node.output) != 1 or not node.output[0]:
+            raise ValueError(f"target Conv {node.name!r} must have exactly one output")
         bias_initializer = source_initializers.get(node.input[2])
         if bias_initializer is None:
             raise ValueError(
                 f"target Conv bias initializer {node.input[2]!r} is missing"
             )
-        bias_fp16 = numpy_helper.to_array(bias_initializer).astype(np.float16)
+        bias_fp32 = numpy_helper.to_array(bias_initializer).astype(np.float32)
         call_index = calls_by_module[module_name]
         calls_by_module[module_name] += 1
         activation_scale = _as_positive_scale(
             activation_scales[module_name],
             module_name=module_name,
         )
-        activation_scale_fp16 = np.asarray(
-            max(activation_scale, float(np.finfo(np.float16).tiny)),
-            dtype=np.float16,
+        activation_scale_fp32 = np.asarray(
+            max(activation_scale, MIN_QUANT_SCALE),
+            dtype=np.float32,
         )
         (
             qdq_nodes,
@@ -774,19 +982,21 @@ def rewrite_onnx_with_int8_qdq(
             activation_dq,
             weight_dq,
             bias_name,
+            conv_output_fp32,
             names,
         ) = _make_qdq_call_site(
             helper=helper,
             numpy_helper=numpy_helper,
+            TensorProto=TensorProto,
             np=np,
             graph_kind=graph_kind,
             module_name=module_name,
             call_index=call_index,
             activation_input=node.input[0],
-            weight_fp16=module_weights[module_name],
-            weight_scale_fp16=module_weight_scales[module_name],
-            activation_scale_fp16=activation_scale_fp16,
-            bias_fp16=bias_fp16,
+            weight_fp32=module_weights[module_name],
+            weight_scale_fp32=module_weight_scales[module_name],
+            activation_scale_fp32=activation_scale_fp32,
+            bias_fp32=bias_fp32,
         )
         new_nodes.extend(qdq_nodes)
         new_initializers.extend(qdq_initializers)
@@ -795,7 +1005,23 @@ def rewrite_onnx_with_int8_qdq(
         rewritten.input[1] = weight_dq
         rewritten.input[2] = bias_name
         rewritten.name = f"int8/{graph_kind}/{module_name}/call_{call_index}"
+        original_output = rewritten.output[0]
+        rewritten.output[0] = conv_output_fp32
         new_nodes.append(rewritten)
+        output_cast_name = (
+            f"qdq/{graph_kind}/output/{module_name}/call_{call_index}/cast_to_fp16"
+        )
+        new_nodes.append(
+            helper.make_node(
+                "Cast",
+                [conv_output_fp32],
+                [original_output],
+                name=output_cast_name,
+                to=TensorProto.FLOAT16,
+            )
+        )
+        names["output_cast"] = output_cast_name
+        names["output_cast_output"] = original_output
         weight_qdq_paths[rewritten.name] = names
         if normalized_shape_contracts is not None:
             shape_overrides[rewritten.name] = copy.deepcopy(
@@ -847,13 +1073,12 @@ def rewrite_onnx_with_int8_qdq(
         "activation_scales": {
             name: {
                 "raw_fp32": _as_positive_scale(value, module_name=name),
-                "effective_fp16": float(
+                "effective_fp32": float(
                     np.asarray(
                         max(
-                            _as_positive_scale(value, module_name=name),
-                            float(np.finfo(np.float16).tiny),
+                            _as_positive_scale(value, module_name=name), MIN_QUANT_SCALE
                         ),
-                        dtype=np.float16,
+                        dtype=np.float32,
                     )
                 ),
             }
@@ -861,10 +1086,12 @@ def rewrite_onnx_with_int8_qdq(
         },
         "weight_scales": weight_scales,
         "weight_quantization": (
-            "independent_fp16_constant_to_symmetric_signed_int8_"
+            "independent_fp32_constant_to_symmetric_signed_int8_"
             "per_output_channel_axis_0"
         ),
-        "activation_quantization": "symmetric_signed_int8_per_tensor",
+        "activation_quantization": (
+            "fp16_cast_to_fp32_then_symmetric_signed_int8_per_tensor"
+        ),
     }
 
 
@@ -874,7 +1101,7 @@ def write_int8_conv3d_probe(
     signature: dict[str, Any],
     signature_id: str,
 ) -> str:
-    """Write one probe using the exact v3 Q/DQ topology and Conv signature."""
+    """Write one probe using the exact v4 Q/DQ topology and Conv signature."""
 
     onnx, np, TensorProto, helpers = _lazy_onnx()
     helper, numpy_helper = helpers
@@ -883,28 +1110,35 @@ def write_int8_conv3d_probe(
     canonical = _canonical_signature(signature)
     weight_shape = tuple(canonical["weight_shape"])
     output_channels = int(weight_shape[0])
-    weight_fp16 = np.full(weight_shape, 0.125, dtype=np.float16)
+    weight_fp32 = np.full(weight_shape, 0.125, dtype=np.float32)
     weight_scale = np.full(
         (output_channels,),
-        np.float16(0.125 / INT8_MAX),
-        dtype=np.float16,
+        np.float32(0.125 / INT8_MAX),
+        dtype=np.float32,
     )
     graph_kind = f"probe_{signature_id}"
     module_name = "conv"
-    qdq_nodes, initializers, activation_dq, weight_dq, bias_name, _names = (
-        _make_qdq_call_site(
-            helper=helper,
-            numpy_helper=numpy_helper,
-            np=np,
-            graph_kind=graph_kind,
-            module_name=module_name,
-            call_index=0,
-            activation_input="activation",
-            weight_fp16=weight_fp16,
-            weight_scale_fp16=weight_scale,
-            activation_scale_fp16=np.asarray(1.0 / INT8_MAX, dtype=np.float16),
-            bias_fp16=np.zeros((output_channels,), dtype=np.float16),
-        )
+    (
+        qdq_nodes,
+        initializers,
+        activation_dq,
+        weight_dq,
+        bias_name,
+        conv_output_fp32,
+        _names,
+    ) = _make_qdq_call_site(
+        helper=helper,
+        numpy_helper=numpy_helper,
+        TensorProto=TensorProto,
+        np=np,
+        graph_kind=graph_kind,
+        module_name=module_name,
+        call_index=0,
+        activation_input="activation",
+        weight_fp32=weight_fp32,
+        weight_scale_fp32=weight_scale,
+        activation_scale_fp32=np.asarray(1.0 / INT8_MAX, dtype=np.float32),
+        bias_fp32=np.zeros((output_channels,), dtype=np.float32),
     )
     call_site = f"int8/probe/{signature_id}/call_0"
     conv_attributes = {
@@ -918,9 +1152,18 @@ def write_int8_conv3d_probe(
         helper.make_node(
             "Conv",
             [activation_dq, weight_dq, bias_name],
-            ["output"],
+            [conv_output_fp32],
             name=call_site,
             **conv_attributes,
+        )
+    )
+    qdq_nodes.append(
+        helper.make_node(
+            "Cast",
+            [conv_output_fp32],
+            ["output"],
+            name=f"qdq/{graph_kind}/output/{module_name}/call_0/cast_to_fp16",
+            to=TensorProto.FLOAT16,
         )
     )
     graph = helper.make_graph(
@@ -945,7 +1188,7 @@ def write_int8_conv3d_probe(
     model = helper.make_model(
         graph,
         opset_imports=[helper.make_opsetid("", QDQ_OPSET)],
-        producer_name="sglang-jetson-sfwan-qdq-v3-probe",
+        producer_name="sglang-jetson-sfwan-qdq-v4-probe",
     )
     onnx.checker.check_model(model, full_check=True)
     model = onnx.shape_inference.infer_shapes(model, strict_mode=True)

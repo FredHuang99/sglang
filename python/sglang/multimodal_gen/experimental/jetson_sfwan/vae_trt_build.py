@@ -19,6 +19,7 @@ from .vae_trt_qdq import (
     EXPECTED_LOGICAL_CONVS,
     QDQ_OPSET,
     QDQ_SCHEMA_VERSION,
+    QDQ_TOPOLOGY,
     rewrite_onnx_with_int8_qdq,
     write_int8_conv3d_probe,
 )
@@ -1314,11 +1315,11 @@ def build_engines(
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    state_path = root / "build_state_v3.json"
+    state_path = root / "build_state_v4.json"
     resolved_timing_cache_path = (
         Path(timing_cache_path).expanduser().resolve()
         if timing_cache_path is not None
-        else root / "tensorrt_timing_qdq_v3.cache"
+        else root / "tensorrt_timing_qdq_v4.cache"
     )
     resolved_timing_cache_path.parent.mkdir(parents=True, exist_ok=True)
     load_config = ModelLoadConfig(
@@ -1366,11 +1367,12 @@ def build_engines(
         "cuda_version": str(torch.version.cuda),
         "qdq_schema_version": QDQ_SCHEMA_VERSION,
         "qdq_opset": QDQ_OPSET,
+        "qdq_topology": QDQ_TOPOLOGY,
     }
     if build_identity["compute_capability"] != [8, 7]:
         raise ValueError("TensorRT SFWan VAE plans must be built on Jetson Orin SM87")
     state = _load_json(state_path) if resume else {}
-    had_v3_state = bool(state)
+    had_v4_state = bool(state)
     if state and state.get("identity") != build_identity:
         raise ValueError(
             f"{state_path} belongs to a different build configuration; "
@@ -1390,13 +1392,27 @@ def build_engines(
         and legacy_identity.get("width") == width
         and legacy_identity.get("seed") == seed
     )
+    v3_state_path = root / "build_state_v3.json"
+    v3_state = _load_json(v3_state_path) if resume else {}
+    v3_identity = v3_state.get("identity", {})
+    v3_identity_matches = bool(
+        isinstance(v3_identity, dict)
+        and v3_identity.get("model_path") == model_path
+        and v3_identity.get("resolved_model_path") == str(components.model_path)
+        and v3_identity.get("height") == height
+        and v3_identity.get("width") == width
+        and v3_identity.get("seed") == seed
+        and v3_identity.get("compute_capability") == [8, 7]
+        and v3_identity.get("qdq_opset") == QDQ_OPSET
+    )
+    prior_source_identity_matches = legacy_identity_matches or v3_identity_matches
 
     latent_chunks = _dummy_denormalized_chunks(
         vae=vae,
         device=components.device,
         seed=seed,
     )
-    quant_scales_path = root / "quant_scales_v3.json"
+    quant_scales_path = root / "quant_scales_v4.json"
     quant_scale_identity = {
         "model_path": model_path,
         "resolved_model_path": str(components.model_path),
@@ -1430,21 +1446,31 @@ def build_engines(
         and _valid_activation_scales(existing_activation_scales)
     )
     if not can_reuse_activation_scales and resume:
-        legacy_scales_path = root / "quant_scales.json"
-        legacy_scales = _load_json(legacy_scales_path)
-        legacy_activation = legacy_scales.get("activation")
-        legacy_matches = bool(
-            legacy_identity_matches
-            and legacy_scales.get("seed") == seed
-            and _valid_activation_scales(legacy_activation)
+        legacy_scale_candidates = (
+            (root / "quant_scales_v3.json", v3_identity_matches),
+            (root / "quant_scales.json", legacy_identity_matches),
         )
-        if legacy_matches:
+        for legacy_scales_path, identity_matches in legacy_scale_candidates:
+            legacy_scales = _load_json(legacy_scales_path)
+            legacy_activation = legacy_scales.get("activation")
+            legacy_scale_identity = legacy_scales.get("identity")
+            legacy_matches = bool(
+                identity_matches
+                and (
+                    legacy_scale_identity == quant_scale_identity
+                    or legacy_scales.get("seed") == seed
+                )
+                and _valid_activation_scales(legacy_activation)
+            )
+            if not legacy_matches:
+                continue
             existing_activation_scales = legacy_activation
             can_reuse_activation_scales = True
             print(
-                "Adopting validated legacy activation scales into Q/DQ v3: "
+                "Adopting validated legacy activation scales into Q/DQ v4: "
                 f"{legacy_scales_path}"
             )
+            break
     if can_reuse_activation_scales:
         activation_scales = existing_activation_scales
         print(f"Reusing activation scales for {quant_scales_path}")
@@ -1593,7 +1619,7 @@ def build_engines(
 
     reuse_qdq_sources = (
         resume
-        and (had_v3_state or legacy_identity_matches)
+        and (had_v4_state or prior_source_identity_matches)
         and all(path.is_file() for path in qdq_source_paths.values())
     )
     if reuse_qdq_sources:
@@ -1660,8 +1686,8 @@ def build_engines(
     for kind, source_path in qdq_source_paths.items():
         fp16_performance_paths.setdefault(kind, source_path)
 
-    initial_int8_path = root / "initial_int8_qdq_v3.onnx"
-    steady_int8_path = root / "steady_int8_qdq_v3.onnx"
+    initial_int8_path = root / "initial_int8_qdq_v4.onnx"
+    steady_int8_path = root / "steady_int8_qdq_v4.onnx"
     qdq_reports = {
         "initial": rewrite_onnx_with_int8_qdq(
             source_path=qdq_source_paths["initial"],
@@ -1681,7 +1707,7 @@ def build_engines(
         ),
     }
     for kind, report in qdq_reports.items():
-        _write_json(root / f"{kind}_int8_qdq_v3_report.json", report)
+        _write_json(root / f"{kind}_int8_qdq_v4_report.json", report)
     _write_json(
         quant_scales_path,
         {
@@ -1792,19 +1818,19 @@ def build_engines(
                 raise ValueError(f"Conv signature hash collision: {signature_id}")
             record["call_sites"][kind].append(signature["call_site"])
 
-    audit_path = root / "int8_audit_v3.json"
+    audit_path = root / "int8_audit_v4.json"
     probe_audits: dict[str, Any] = {}
     probe_errors: list[str] = []
     for signature_id in sorted(signature_suite):
         suite_record = signature_suite[signature_id]
-        probe_path = root / f"int8_probe_v3_{signature_id}.onnx"
+        probe_path = root / f"int8_probe_v4_{signature_id}.onnx"
         probe_call_site = write_int8_conv3d_probe(
             path=probe_path,
             signature=suite_record["signature"],
             signature_id=signature_id,
         )
-        probe_plan_path = root / f"int8_probe_v3_{signature_id}.plan"
-        stage = f"int8_probe_v3_{signature_id}"
+        probe_plan_path = root / f"int8_probe_v4_{signature_id}.plan"
+        stage = f"int8_probe_v4_{signature_id}"
         _probe_io, probe_inspector, candidate_cache = _load_or_build_stage(
             stage=stage,
             source_path=probe_path,
@@ -1813,7 +1839,7 @@ def build_engines(
             allow_untracked_adoption=False,
         )
         del _probe_io
-        inspector_path = root / f"int8_probe_v3_{signature_id}_inspector.json"
+        inspector_path = root / f"int8_probe_v4_{signature_id}_inspector.json"
         _write_json(inspector_path, json.loads(probe_inspector))
         probe_audit = _audit_tensorrt_tactics(
             graph_kind=f"probe:{signature_id}",
@@ -1830,7 +1856,7 @@ def build_engines(
                 "plan_sha256": _sha256_file(probe_plan_path),
             }
         )
-        probe_audit_path = root / f"int8_probe_v3_{signature_id}_audit.json"
+        probe_audit_path = root / f"int8_probe_v4_{signature_id}_audit.json"
         _write_json(probe_audit_path, probe_audit)
         _mark_stage_audit(
             state_path=state_path,
@@ -1866,7 +1892,7 @@ def build_engines(
         },
         "signatures": probe_audits,
     }
-    _write_json(root / "int8_probe_suite_v3.json", probe_suite)
+    _write_json(root / "int8_probe_suite_v4.json", probe_suite)
     if not probe_suite["passed"]:
         failed_audit = {
             "schema_version": QDQ_SCHEMA_VERSION,
@@ -1917,8 +1943,8 @@ def build_engines(
     tactic_audits: dict[str, Any] = {}
     int8_plan_io: dict[str, list[dict[str, Any]]] = {}
     for kind in ("initial", "steady"):
-        plan_path = root / f"{kind}_int8_qdq_v3.plan"
-        stage = f"{kind}_int8_qdq_v3"
+        plan_path = root / f"{kind}_int8_qdq_v4.plan"
+        stage = f"{kind}_int8_qdq_v4"
         io_contract, inspector_json, candidate_cache = _load_or_build_stage(
             stage=stage,
             source_path=int8_onnx_paths[kind],
@@ -1926,7 +1952,7 @@ def build_engines(
             verbosity="detailed",
             allow_untracked_adoption=False,
         )
-        inspector_path = root / f"{kind}_int8_qdq_v3_inspector.json"
+        inspector_path = root / f"{kind}_int8_qdq_v4_inspector.json"
         _write_json(inspector_path, json.loads(inspector_json))
         tactic_audit = _audit_tensorrt_tactics(
             graph_kind=kind,
@@ -1940,7 +1966,7 @@ def build_engines(
                 "build_profiling_verbosity": "detailed",
             }
         )
-        tactic_audit_path = root / f"{kind}_int8_qdq_v3_audit.json"
+        tactic_audit_path = root / f"{kind}_int8_qdq_v4_audit.json"
         _write_json(tactic_audit_path, tactic_audit)
         _mark_stage_audit(
             state_path=state_path,
@@ -1994,7 +2020,7 @@ def build_engines(
     _write_json(audit_path, int8_audit)
 
     for kind in ("initial", "steady"):
-        plan_path = root / f"{kind}_int8_qdq_v3.plan"
+        plan_path = root / f"{kind}_int8_qdq_v4.plan"
         engines["int8"][kind] = {
             **_engine_record(
                 output_dir=root,
@@ -2010,7 +2036,7 @@ def build_engines(
         source_path = fp16_performance_paths[kind]
         plan_path = root / f"{kind}_fp16.plan"
         io_contract, _inspector, candidate_cache = _load_or_build_stage(
-            stage=f"{kind}_fp16_performance_v3",
+            stage=f"{kind}_fp16_performance_v4",
             source_path=source_path,
             plan_path=plan_path,
             verbosity=profiling_verbosity,
@@ -2065,12 +2091,13 @@ def build_engines(
             "scheme": "explicit_qdq_signed_int8",
             "qdq_schema_version": QDQ_SCHEMA_VERSION,
             "onnx_opset": QDQ_OPSET,
+            "topology": QDQ_TOPOLOGY,
             "target_module_names": list(targets),
             "logical_conv_count": EXPECTED_LOGICAL_CONVS,
             "call_sites_per_graph": EXPECTED_CALL_SITES,
             "activation": "per_tensor_symmetric_static",
             "weight": (
-                "per_call_site_independent_fp16_constant_qdq_"
+                "per_call_site_independent_fp32_constant_qdq_"
                 "per_output_channel_symmetric_axis_0"
             ),
             "calibration": {
@@ -2138,19 +2165,19 @@ def _parse_args() -> argparse.Namespace:
         "--profiling-verbosity",
         choices=("none", "detailed"),
         default="none",
-        help="FP16 plan verbosity; audited INT8 v3 plans are always detailed",
+        help="FP16 plan verbosity; audited INT8 v4 plans are always detailed",
     )
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="reuse validated ONNX/plans and build_state_v3.json stages",
+        help="reuse validated ONNX/plans and build_state_v4.json stages",
     )
     parser.add_argument(
         "--preflight-only",
         action="store_true",
         help=(
-            "rewrite/audit Q/DQ v3 and prove every unique Conv signature has an "
+            "rewrite/audit Q/DQ v4 and prove every unique Conv signature has an "
             "INT8 tactic, then exit before full VAE plan builds"
         ),
     )
@@ -2158,7 +2185,7 @@ def _parse_args() -> argparse.Namespace:
         "--timing-cache",
         help=(
             "transactional TensorRT timing cache "
-            "(default: OUTPUT_DIR/tensorrt_timing_qdq_v3.cache)"
+            "(default: OUTPUT_DIR/tensorrt_timing_qdq_v4.cache)"
         ),
     )
     return parser.parse_args()
@@ -2186,7 +2213,7 @@ def main() -> None:
                     "engine_dir": str(Path(args.output_dir).expanduser().resolve()),
                     "preflight_only": True,
                     "preflight_passed": manifest["preflight_passed"],
-                    "int8_audit": "int8_audit_v3.json",
+                    "int8_audit": "int8_audit_v4.json",
                 },
                 indent=2,
             )

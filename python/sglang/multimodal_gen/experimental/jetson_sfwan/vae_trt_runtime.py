@@ -8,7 +8,7 @@ import math
 from pathlib import Path
 from typing import Any, Literal
 
-from .vae_trt_qdq import EXPECTED_CALL_SITES, QDQ_SCHEMA_VERSION
+from .vae_trt_qdq import EXPECTED_CALL_SITES, QDQ_SCHEMA_VERSION, QDQ_TOPOLOGY
 
 TRT_VAE_MANIFEST_SCHEMA_VERSION = 1
 TRT_VAE_HEIGHT = 480
@@ -219,6 +219,7 @@ def validate_trt_vae_manifest(
         if (
             not isinstance(quantization, dict)
             or quantization.get("qdq_schema_version") != QDQ_SCHEMA_VERSION
+            or quantization.get("topology") != QDQ_TOPOLOGY
         ):
             raise ValueError(
                 f"INT8 TensorRT VAE requires Q/DQ schema {QDQ_SCHEMA_VERSION}"
@@ -380,15 +381,19 @@ def validate_trt_vae_manifest(
             if (
                 not isinstance(graph_audit, dict)
                 or graph_audit.get("schema_version") != QDQ_SCHEMA_VERSION
+                or graph_audit.get("qdq_topology") != QDQ_TOPOLOGY
                 or graph_audit.get("passed") is not True
                 or graph_audit.get("errors") != []
                 or graph_audit.get("target_conv_call_site_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("activation_cast_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("activation_quantize_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("activation_dequantize_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("weight_quantize_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("weight_dequantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("output_cast_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("unique_weight_source_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("unique_bias_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("unexpected_target_cast_nodes") != []
             ):
                 raise ValueError(
                     f"TensorRT VAE INT8 {kind} structural audit is invalid"
