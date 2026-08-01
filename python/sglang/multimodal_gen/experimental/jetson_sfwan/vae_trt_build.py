@@ -18,6 +18,7 @@ from .vae_trt_qdq import (
     EXPECTED_CALL_SITES,
     EXPECTED_LOGICAL_CONVS,
     QDQ_OPSET,
+    QDQ_SCHEMA_VERSION,
     rewrite_onnx_with_int8_qdq,
 )
 from .vae_trt_runtime import (
@@ -34,10 +35,18 @@ EXPECTED_EXPORT_NEAREST_UPSAMPLES = 3
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_text(
+    temporary = path.with_name(f"{path.name}.partial")
+    temporary.write_text(
         json.dumps(value, indent=2, sort_keys=True),
         encoding="utf-8",
     )
+    temporary.replace(path)
+
+
+def _write_bytes(path: Path, value: bytes) -> None:
+    temporary = path.with_name(f"{path.name}.partial")
+    temporary.write_bytes(value)
+    temporary.replace(path)
 
 
 def _sha256_file(path: Path) -> str:
@@ -727,6 +736,7 @@ def _build_engine_bytes(
     onnx_path: Path,
     workspace_gib: float,
     profiling_verbosity: str,
+    timing_cache_path: Path | None = None,
 ) -> tuple[bytes, list[dict[str, Any]], str]:
     logger = _trt_logger(trt)
     builder = trt.Builder(logger)
@@ -743,9 +753,18 @@ def _build_engine_bytes(
         int(workspace_gib * 1024**3),
     )
     config.profiling_verbosity = _profiling_verbosity(trt, profiling_verbosity)
+    if timing_cache_path is not None and hasattr(config, "set_timing_cache"):
+        cache_data = (
+            timing_cache_path.read_bytes() if timing_cache_path.is_file() else b""
+        )
+        timing_cache = builder.create_timing_cache(cache_data)
+        config.set_timing_cache(timing_cache, ignore_mismatch=False)
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError(f"TensorRT could not build {onnx_path}")
+    if timing_cache_path is not None and hasattr(config, "get_timing_cache"):
+        serialized_cache = config.get_timing_cache().serialize()
+        _write_bytes(timing_cache_path, bytes(serialized_cache))
     plan = bytes(serialized)
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(plan)
@@ -756,6 +775,21 @@ def _build_engine_bytes(
     inspector = engine.create_engine_inspector()
     inspector_json = inspector.get_engine_information(trt.LayerInformationFormat.JSON)
     return plan, _engine_io_contract(engine), inspector_json
+
+
+def _load_plan(
+    *,
+    trt: Any,
+    plan_path: Path,
+) -> tuple[list[dict[str, Any]], str]:
+    logger = _trt_logger(trt)
+    runtime = trt.Runtime(logger)
+    engine = runtime.deserialize_cuda_engine(plan_path.read_bytes())
+    if engine is None:
+        raise ValueError(f"TensorRT could not deserialize existing plan {plan_path}")
+    inspector = engine.create_engine_inspector()
+    inspector_json = inspector.get_engine_information(trt.LayerInformationFormat.JSON)
+    return _engine_io_contract(engine), inspector_json
 
 
 def _inspector_layers(value: Any) -> list[dict[str, Any]]:
@@ -772,6 +806,14 @@ def _inspector_layers(value: Any) -> list[dict[str, Any]]:
 
 def _inspector_layer_name(record: dict[str, Any]) -> str:
     for key in ("Name", "name", "LayerName", "layer_name"):
+        value = record.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def _inspector_layer_type(record: dict[str, Any]) -> str:
+    for key in ("LayerType", "layer_type", "Type", "type"):
         value = record.get(key)
         if isinstance(value, str):
             return value
@@ -806,6 +848,7 @@ def _audit_tensorrt_tactics(
     graph_kind: str,
     call_site_names: list[str],
     inspector_json: str,
+    expected_call_sites: int = EXPECTED_CALL_SITES,
 ) -> dict[str, Any]:
     try:
         decoded = json.loads(inspector_json)
@@ -817,7 +860,10 @@ def _audit_tensorrt_tactics(
     non_int8: list[str] = []
     for call_site in call_site_names:
         matched = [
-            layer for layer in layers if call_site in _inspector_layer_name(layer)
+            layer
+            for layer in layers
+            if call_site in _inspector_layer_name(layer)
+            and "convolution" in _inspector_layer_type(layer).lower()
         ]
         if not matched:
             unmapped.append(call_site)
@@ -826,17 +872,23 @@ def _audit_tensorrt_tactics(
         has_int8 = any(
             "int8" in value or "kint8" in value or "imma" in value for value in evidence
         )
-        if not has_int8:
+        has_float_fallback = any(
+            "f32f32" in value or "tf32" in value for value in evidence
+        )
+        if not has_int8 or has_float_fallback:
             non_int8.append(call_site)
         matches[call_site] = {
             "layer_names": [_inspector_layer_name(layer) for layer in matched],
-            "int8_evidence": has_int8,
+            "layer_types": [_inspector_layer_type(layer) for layer in matched],
+            "precision_evidence": evidence,
+            "int8_evidence": has_int8 and not has_float_fallback,
+            "float_fallback_evidence": has_float_fallback,
         }
     errors = []
-    if len(call_site_names) != EXPECTED_CALL_SITES:
+    if len(call_site_names) != expected_call_sites:
         errors.append(
             f"Q/DQ report contains {len(call_site_names)} call sites, "
-            f"expected {EXPECTED_CALL_SITES}"
+            f"expected {expected_call_sites}"
         )
     if unmapped:
         errors.append(f"{len(unmapped)} call sites could not be mapped")
@@ -854,6 +906,87 @@ def _audit_tensorrt_tactics(
     }
 
 
+def _write_int8_conv3d_probe(path: Path) -> str:
+    """Write one real-shape FP16-Q/DQ Conv3d graph before full engine builds."""
+
+    import numpy as np
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+
+    call_site = "int8/probe/conv/call_0"
+    activation_shape = (1, 192, 3, 122, 210)
+    weight_shape = (384, 192, 3, 3, 3)
+    output_shape = (1, 384, 1, 120, 208)
+    activation_scale = np.asarray(1.0 / 127.0, dtype=np.float16)
+    weight_scale = np.full((weight_shape[0],), 1.0 / 127.0, dtype=np.float16)
+    graph = helper.make_graph(
+        [
+            helper.make_node(
+                "QuantizeLinear",
+                ["activation", "activation_scale", "activation_zero"],
+                ["activation_int8"],
+                name="qdq/probe/activation/quantize",
+            ),
+            helper.make_node(
+                "DequantizeLinear",
+                ["activation_int8", "activation_scale", "activation_zero"],
+                ["activation_fp16"],
+                name="qdq/probe/activation/dequantize",
+            ),
+            helper.make_node(
+                "DequantizeLinear",
+                ["weight_int8", "weight_scale", "weight_zero"],
+                ["weight_fp16"],
+                name="qdq/probe/weight/dequantize",
+                axis=0,
+            ),
+            helper.make_node(
+                "Conv",
+                ["activation_fp16", "weight_fp16", "bias_fp16"],
+                ["output"],
+                name=call_site,
+                kernel_shape=[3, 3, 3],
+                strides=[1, 1, 1],
+            ),
+        ],
+        "sfwan_int8_conv3d_probe",
+        [
+            helper.make_tensor_value_info(
+                "activation", TensorProto.FLOAT16, activation_shape
+            )
+        ],
+        [helper.make_tensor_value_info("output", TensorProto.FLOAT16, output_shape)],
+        initializer=[
+            numpy_helper.from_array(activation_scale, name="activation_scale"),
+            numpy_helper.from_array(
+                np.asarray(0, dtype=np.int8), name="activation_zero"
+            ),
+            numpy_helper.from_array(
+                np.ones(weight_shape, dtype=np.int8), name="weight_int8"
+            ),
+            numpy_helper.from_array(weight_scale, name="weight_scale"),
+            numpy_helper.from_array(
+                np.zeros(weight_scale.shape, dtype=np.int8),
+                name="weight_zero",
+            ),
+            numpy_helper.from_array(
+                np.zeros((weight_shape[0],), dtype=np.float16),
+                name="bias_fp16",
+            ),
+        ],
+    )
+    model = helper.make_model(
+        graph,
+        opset_imports=[helper.make_opsetid("", QDQ_OPSET)],
+        producer_name="sglang-jetson-sfwan-probe",
+    )
+    onnx.checker.check_model(model, full_check=True)
+    temporary = path.with_name(f"{path.name}.partial")
+    onnx.save(model, str(temporary))
+    temporary.replace(path)
+    return call_site
+
+
 def _engine_record(
     *,
     output_dir: Path,
@@ -869,6 +1002,56 @@ def _engine_record(
     }
 
 
+def _load_json(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+    return value
+
+
+def _stage_is_current(
+    *,
+    state: dict[str, Any],
+    stage: str,
+    source_sha256: str,
+    output_path: Path,
+    profiling_verbosity: str,
+) -> bool:
+    record = state.get("stages", {}).get(stage)
+    return bool(
+        isinstance(record, dict)
+        and output_path.is_file()
+        and record.get("source_sha256") == source_sha256
+        and record.get("output_sha256") == _sha256_file(output_path)
+        and record.get("profiling_verbosity") == profiling_verbosity
+        and int(record.get("qdq_schema_version", -1)) == QDQ_SCHEMA_VERSION
+    )
+
+
+def _record_stage(
+    *,
+    state_path: Path,
+    state: dict[str, Any],
+    stage: str,
+    source_sha256: str,
+    output_path: Path,
+    profiling_verbosity: str,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    state.setdefault("stages", {})[stage] = {
+        "status": "completed",
+        "source_sha256": source_sha256,
+        "output": output_path.name,
+        "output_sha256": _sha256_file(output_path),
+        "profiling_verbosity": profiling_verbosity,
+        "qdq_schema_version": QDQ_SCHEMA_VERSION,
+        **(extra or {}),
+    }
+    _write_json(state_path, state)
+
+
 def build_engines(
     *,
     model_path: str,
@@ -879,6 +1062,8 @@ def build_engines(
     workspace_gib: float,
     profiling_verbosity: str,
     device_index: int,
+    resume: bool = False,
+    timing_cache_path: str | Path | None = None,
 ) -> dict[str, Any]:
     if (height, width) != (TRT_VAE_HEIGHT, TRT_VAE_WIDTH):
         raise ValueError("TensorRT SFWan VAE V1 supports only 480x832")
@@ -893,6 +1078,13 @@ def build_engines(
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
+    state_path = root / "build_state.json"
+    resolved_timing_cache_path = (
+        Path(timing_cache_path).expanduser().resolve()
+        if timing_cache_path is not None
+        else root / "tensorrt_timing.cache"
+    )
+    resolved_timing_cache_path.parent.mkdir(parents=True, exist_ok=True)
     load_config = ModelLoadConfig(
         model_path=model_path,
         device_index=device_index,
@@ -924,17 +1116,59 @@ def build_engines(
             f"found {cache_slot_count}"
         )
 
+    build_identity = {
+        "schema_version": 1,
+        "model_path": model_path,
+        "resolved_model_path": str(components.model_path),
+        "height": height,
+        "width": width,
+        "seed": seed,
+        "workspace_gib": workspace_gib,
+        "device_index": device_index,
+        "compute_capability": list(torch.cuda.get_device_capability(components.device)),
+        "tensorrt_version": str(trt.__version__),
+        "cuda_version": str(torch.version.cuda),
+        "qdq_schema_version": QDQ_SCHEMA_VERSION,
+        "qdq_opset": QDQ_OPSET,
+    }
+    if build_identity["compute_capability"] != [8, 7]:
+        raise ValueError("TensorRT SFWan VAE plans must be built on Jetson Orin SM87")
+    state = _load_json(state_path) if resume else {}
+    if state and state.get("identity") != build_identity:
+        raise ValueError(
+            f"{state_path} belongs to a different build configuration; "
+            "use a new --output-dir or rerun without --resume"
+        )
+    if not state:
+        state = {"identity": build_identity, "stages": {}}
+    _write_json(state_path, state)
+
     latent_chunks = _dummy_denormalized_chunks(
         vae=vae,
         device=components.device,
         seed=seed,
     )
-    activation_scales = _collect_activation_scales(
-        vae=vae,
-        target_module_names=targets,
-        latent_chunks=latent_chunks,
-        cache_slot_count=cache_slot_count,
+    existing_quant_scales = _load_json(root / "quant_scales.json") if resume else {}
+    existing_activation_scales = existing_quant_scales.get("activation")
+    can_reuse_activation_scales = bool(
+        existing_quant_scales.get("seed") == seed
+        and isinstance(existing_activation_scales, dict)
+        and all(
+            isinstance(existing_activation_scales.get(kind), dict)
+            and set(existing_activation_scales[kind]) == set(targets)
+            for kind in ("initial", "steady")
+        )
     )
+    if can_reuse_activation_scales:
+        activation_scales = existing_activation_scales
+        print(f"Reusing activation scales from {root / 'quant_scales.json'}")
+    else:
+        activation_scales = _collect_activation_scales(
+            vae=vae,
+            target_module_names=targets,
+            latent_chunks=latent_chunks,
+            cache_slot_count=cache_slot_count,
+        )
 
     with (
         torch.inference_mode(),
@@ -1001,22 +1235,75 @@ def build_engines(
     cache_output_names = [f"cache_out_{index:03d}" for index in range(32)]
     initial_fp16_path = root / "initial_fp16.onnx"
     steady_fp16_path = root / "steady_fp16.onnx"
-    _export_onnx(
-        wrapper=initial_wrapper,
-        arguments=(latent_chunks[0],),
-        input_names=["latent"],
-        output_names=["rgb", *cache_output_names],
-        output_shapes=[(1, 3, 9, height, width), *cache_shapes],
-        path=initial_fp16_path,
+    fp16_onnx_contracts = {
+        "initial": {
+            "path": initial_fp16_path,
+            "inputs": {"latent": tuple(latent_chunks[0].shape)},
+            "outputs": dict(
+                zip(
+                    ["rgb", *cache_output_names],
+                    [(1, 3, 9, height, width), *cache_shapes],
+                    strict=True,
+                )
+            ),
+        },
+        "steady": {
+            "path": steady_fp16_path,
+            "inputs": dict(
+                zip(
+                    ["latent", *cache_input_names],
+                    [tuple(latent_chunks[1].shape), *cache_shapes],
+                    strict=True,
+                )
+            ),
+            "outputs": dict(
+                zip(
+                    ["rgb", *cache_output_names],
+                    [(1, 3, 12, height, width), *cache_shapes],
+                    strict=True,
+                )
+            ),
+        },
+    }
+    reuse_fp16_onnx = resume and all(
+        contract["path"].is_file() for contract in fp16_onnx_contracts.values()
     )
-    _export_onnx(
-        wrapper=steady_wrapper,
-        arguments=(latent_chunks[1], *initial_cache_tensors),
-        input_names=["latent", *cache_input_names],
-        output_names=["rgb", *cache_output_names],
-        output_shapes=[(1, 3, 12, height, width), *cache_shapes],
-        path=steady_fp16_path,
-    )
+    if reuse_fp16_onnx:
+        try:
+            for contract in fp16_onnx_contracts.values():
+                existing_model = onnx.load(
+                    str(contract["path"]),
+                    load_external_data=True,
+                )
+                onnx.checker.check_model(existing_model, full_check=True)
+                _validate_onnx_fp16_io_contract(
+                    model=existing_model,
+                    path=contract["path"],
+                    expected_input_shapes=contract["inputs"],
+                    expected_output_shapes=contract["outputs"],
+                )
+        except (OSError, RuntimeError, ValueError) as error:
+            print(f"Existing FP16 ONNX cannot be reused: {error}")
+            reuse_fp16_onnx = False
+    if reuse_fp16_onnx:
+        print(f"Reusing validated FP16 ONNX files in {root}")
+    else:
+        _export_onnx(
+            wrapper=initial_wrapper,
+            arguments=(latent_chunks[0],),
+            input_names=["latent"],
+            output_names=["rgb", *cache_output_names],
+            output_shapes=[(1, 3, 9, height, width), *cache_shapes],
+            path=initial_fp16_path,
+        )
+        _export_onnx(
+            wrapper=steady_wrapper,
+            arguments=(latent_chunks[1], *initial_cache_tensors),
+            input_names=["latent", *cache_input_names],
+            output_names=["rgb", *cache_output_names],
+            output_shapes=[(1, 3, 12, height, width), *cache_shapes],
+            path=steady_fp16_path,
+        )
 
     initial_int8_path = root / "initial_int8_qdq.onnx"
     steady_int8_path = root / "steady_int8_qdq.onnx"
@@ -1052,69 +1339,212 @@ def build_engines(
         "int8": {"initial": initial_int8_path, "steady": steady_int8_path},
     }
     engines: dict[str, dict[str, Any]] = {"fp16": {}, "int8": {}}
+
+    def _load_or_build_stage(
+        *,
+        stage: str,
+        source_path: Path,
+        plan_path: Path,
+        verbosity: str,
+        allow_untracked_adoption: bool,
+    ) -> tuple[list[dict[str, Any]], str]:
+        source_sha256 = _sha256_file(source_path)
+        can_reuse = resume and _stage_is_current(
+            state=state,
+            stage=stage,
+            source_sha256=source_sha256,
+            output_path=plan_path,
+            profiling_verbosity=verbosity,
+        )
+        if can_reuse:
+            try:
+                io_contract, inspector_json = _load_plan(
+                    trt=trt,
+                    plan_path=plan_path,
+                )
+                print(f"Resuming completed stage {stage}: {plan_path}")
+                return io_contract, inspector_json
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"Completed stage {stage} is not reusable: {error}")
+        if resume and allow_untracked_adoption and plan_path.is_file():
+            try:
+                io_contract, inspector_json = _load_plan(
+                    trt=trt,
+                    plan_path=plan_path,
+                )
+                _record_stage(
+                    state_path=state_path,
+                    state=state,
+                    stage=stage,
+                    source_sha256=source_sha256,
+                    output_path=plan_path,
+                    profiling_verbosity=verbosity,
+                    extra={"adopted_existing_plan": True},
+                )
+                print(f"Adopted existing validated plan for {stage}: {plan_path}")
+                return io_contract, inspector_json
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"Existing plan for {stage} is not reusable: {error}")
+        plan, io_contract, inspector_json = _build_engine_bytes(
+            trt=trt,
+            onnx_path=source_path,
+            workspace_gib=workspace_gib,
+            profiling_verbosity=verbosity,
+            timing_cache_path=resolved_timing_cache_path,
+        )
+        _write_bytes(plan_path, plan)
+        _record_stage(
+            state_path=state_path,
+            state=state,
+            stage=stage,
+            source_sha256=source_sha256,
+            output_path=plan_path,
+            profiling_verbosity=verbosity,
+        )
+        return io_contract, inspector_json
+
+    structural_audit = {
+        kind: {
+            key: value
+            for key, value in report.items()
+            if key not in {"weight_scales", "activation_scales"}
+        }
+        for kind, report in qdq_reports.items()
+    }
     tactic_audits: dict[str, Any] = {}
+    probe_path = root / "int8_conv3d_probe.onnx"
+    probe_call_site = _write_int8_conv3d_probe(probe_path)
+    probe_plan_path = root / "int8_conv3d_probe_detailed.plan"
+    _probe_io, probe_inspector = _load_or_build_stage(
+        stage="int8_probe_detailed",
+        source_path=probe_path,
+        plan_path=probe_plan_path,
+        verbosity="detailed",
+        allow_untracked_adoption=False,
+    )
+    del _probe_io
+    _write_json(
+        root / "int8_conv3d_probe_inspector.json",
+        json.loads(probe_inspector),
+    )
+    probe_audit = _audit_tensorrt_tactics(
+        graph_kind="probe",
+        call_site_names=[probe_call_site],
+        inspector_json=probe_inspector,
+        expected_call_sites=1,
+    )
+    _write_json(root / "int8_conv3d_probe_audit.json", probe_audit)
+    if not probe_audit["passed"]:
+        failed_audit = {
+            "schema_version": QDQ_SCHEMA_VERSION,
+            "passed": False,
+            "errors": [f"probe: {error}" for error in probe_audit["errors"]],
+            "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
+            "structural": structural_audit,
+            "probe": probe_audit,
+            "tactics": {},
+        }
+        _write_json(root / "int8_audit.json", failed_audit)
+        raise RuntimeError(
+            "TensorRT INT8 Conv3d capability probe failed; "
+            f"see {root / 'int8_conv3d_probe_audit.json'}"
+        )
+
+    for kind in ("initial", "steady"):
+        detailed_plan_path = root / f"{kind}_int8_detailed.plan"
+        _detailed_io, detailed_inspector = _load_or_build_stage(
+            stage=f"{kind}_int8_detailed",
+            source_path=onnx_paths["int8"][kind],
+            plan_path=detailed_plan_path,
+            verbosity="detailed",
+            allow_untracked_adoption=False,
+        )
+        del _detailed_io
+        _write_json(
+            root / f"{kind}_int8_inspector.json",
+            json.loads(detailed_inspector),
+        )
+        tactic_audits[kind] = _audit_tensorrt_tactics(
+            graph_kind=kind,
+            call_site_names=qdq_reports[kind]["call_site_names"],
+            inspector_json=detailed_inspector,
+        )
+        audit_errors = [f"probe: {error}" for error in probe_audit["errors"]] + [
+            f"{audit_kind}: {error}"
+            for audit_kind, audit in tactic_audits.items()
+            for error in audit["errors"]
+        ]
+        int8_audit = {
+            "schema_version": QDQ_SCHEMA_VERSION,
+            "passed": not audit_errors and set(tactic_audits) == {"initial", "steady"},
+            "errors": audit_errors,
+            "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
+            "structural": structural_audit,
+            "probe": probe_audit,
+            "tactics": tactic_audits,
+        }
+        _write_json(root / "int8_audit.json", int8_audit)
+        if not tactic_audits[kind]["passed"]:
+            raise RuntimeError(
+                f"TensorRT {kind} INT8 tactic audit failed; "
+                f"see {root / 'int8_audit.json'}"
+            )
+
+    int8_audit = {
+        "schema_version": QDQ_SCHEMA_VERSION,
+        "passed": True,
+        "errors": [],
+        "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
+        "structural": structural_audit,
+        "probe": probe_audit,
+        "tactics": tactic_audits,
+    }
+    _write_json(root / "int8_audit.json", int8_audit)
+
     for precision in ("fp16", "int8"):
         for kind in ("initial", "steady"):
-            plan, io_contract, inspector_json = _build_engine_bytes(
-                trt=trt,
-                onnx_path=onnx_paths[precision][kind],
-                workspace_gib=workspace_gib,
-                profiling_verbosity=profiling_verbosity,
-            )
             plan_path = root / f"{kind}_{precision}.plan"
-            plan_path.write_bytes(plan)
+            source_path = onnx_paths[precision][kind]
+            stage = f"{kind}_{precision}_performance"
+            if precision == "int8" and profiling_verbosity == "detailed":
+                detailed_plan_path = root / f"{kind}_int8_detailed.plan"
+                source_sha256 = _sha256_file(source_path)
+                if not _stage_is_current(
+                    state=state,
+                    stage=stage,
+                    source_sha256=source_sha256,
+                    output_path=plan_path,
+                    profiling_verbosity=profiling_verbosity,
+                ):
+                    _write_bytes(plan_path, detailed_plan_path.read_bytes())
+                    _record_stage(
+                        state_path=state_path,
+                        state=state,
+                        stage=stage,
+                        source_sha256=source_sha256,
+                        output_path=plan_path,
+                        profiling_verbosity=profiling_verbosity,
+                        extra={"copied_from": detailed_plan_path.name},
+                    )
+                io_contract, _inspector = _load_plan(
+                    trt=trt,
+                    plan_path=plan_path,
+                )
+            else:
+                io_contract, _inspector = _load_or_build_stage(
+                    stage=stage,
+                    source_path=source_path,
+                    plan_path=plan_path,
+                    verbosity=profiling_verbosity,
+                    allow_untracked_adoption=precision == "fp16",
+                )
+            del _inspector
             engines[precision][kind] = _engine_record(
                 output_dir=root,
                 plan_path=plan_path,
                 io_contract=io_contract,
                 rgb_frames=9 if kind == "initial" else 12,
             )
-            if precision != "int8":
-                continue
-            detailed_inspector = inspector_json
-            if profiling_verbosity != "detailed":
-                _audit_plan, _audit_io, detailed_inspector = _build_engine_bytes(
-                    trt=trt,
-                    onnx_path=onnx_paths[precision][kind],
-                    workspace_gib=workspace_gib,
-                    profiling_verbosity="detailed",
-                )
-                del _audit_plan, _audit_io
-            tactic_audits[kind] = _audit_tensorrt_tactics(
-                graph_kind=kind,
-                call_site_names=qdq_reports[kind]["call_site_names"],
-                inspector_json=detailed_inspector,
-            )
-
-    audit_errors = [
-        error
-        for kind in ("initial", "steady")
-        for error in tactic_audits[kind]["errors"]
-    ]
-    int8_audit = {
-        "passed": not audit_errors,
-        "errors": audit_errors,
-        "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
-        "structural": {
-            kind: {
-                key: value
-                for key, value in report.items()
-                if key
-                not in {
-                    "weight_scales",
-                    "activation_scales",
-                }
-            }
-            for kind, report in qdq_reports.items()
-        },
-        "tactics": tactic_audits,
-    }
-    _write_json(root / "int8_audit.json", int8_audit)
-    if not int8_audit["passed"]:
-        raise RuntimeError(
-            "TensorRT built the graph but the INT8 tactic audit failed; "
-            f"see {root / 'int8_audit.json'}"
-        )
 
     manifest = {
         "schema_version": TRT_VAE_MANIFEST_SCHEMA_VERSION,
@@ -1148,6 +1578,8 @@ def build_engines(
         "engines": engines,
         "quantization": {
             "scheme": "explicit_qdq_signed_int8",
+            "qdq_schema_version": QDQ_SCHEMA_VERSION,
+            "onnx_opset": QDQ_OPSET,
             "target_module_names": list(targets),
             "logical_conv_count": EXPECTED_LOGICAL_CONVS,
             "call_sites_per_graph": EXPECTED_CALL_SITES,
@@ -1171,6 +1603,9 @@ def build_engines(
             "onnx_version": str(onnx.__version__),
             "workspace_gib": workspace_gib,
             "profiling_verbosity": profiling_verbosity,
+            "resume_enabled": resume,
+            "state_file": state_path.name,
+            "timing_cache_file": str(resolved_timing_cache_path),
             "source_onnx_sha256": {
                 kind: {
                     precision: _sha256_file(onnx_paths[precision][kind])
@@ -1186,8 +1621,6 @@ def build_engines(
             "report_sha256": _sha256_file(root / "int8_audit.json"),
         },
     }
-    if manifest["build"]["compute_capability"] != [8, 7]:
-        raise ValueError("TensorRT SFWan VAE plans must be built on Jetson Orin SM87")
     _write_json(root / "manifest.json", manifest)
     return manifest
 
@@ -1206,6 +1639,15 @@ def _parse_args() -> argparse.Namespace:
         default="none",
     )
     parser.add_argument("--device-index", type=int, default=0)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="reuse validated ONNX/plans and completed build_state.json stages",
+    )
+    parser.add_argument(
+        "--timing-cache",
+        help="persistent TensorRT timing cache (default: OUTPUT_DIR/tensorrt_timing.cache)",
+    )
     return parser.parse_args()
 
 
@@ -1220,6 +1662,8 @@ def main() -> None:
         workspace_gib=args.workspace_gib,
         profiling_verbosity=args.profiling_verbosity,
         device_index=args.device_index,
+        resume=args.resume,
+        timing_cache_path=args.timing_cache,
     )
     print(
         json.dumps(

@@ -34,7 +34,7 @@
 |---|---|---|
 | [`protocol.py`](protocol.py) | 请求/响应 schema、帧数和 shape 校验、safetensors 编解码、SHM descriptor | 不加载模型，不管理 queue |
 | [`model.py`](model.py) | FastVideo 对齐的 prompt、DMD、clean-KV、causal VAE 低层调用 | 不接 HTTP，不决定 FCFS |
-| [`vae_trt_build.py`](vae_trt_build.py) | 在目标 Orin 上捕获原生 Wan VAE、收集 dummy scale、导出 initial/steady ONNX 并构建四个 TensorRT plan | 不进入 server 热路径，不实现新的 decoder 数学 |
+| [`vae_trt_build.py`](vae_trt_build.py) | 在目标 Orin 上捕获原生 Wan VAE、收集 dummy scale、导出 initial/steady ONNX，先做 INT8 probe/detailed audit，再断点构建四个正式 plan | 不进入 server 热路径，不实现新的 decoder 数学 |
 | [`vae_trt_qdq.py`](vae_trt_qdq.py) | 对 ONNX 中 28 个 residual Conv3d 的 84 个展开 call site 插入显式 INT8 Q/DQ并做结构审计 | 不加载 Torch、TensorRT 或模型权重 |
 | [`vae_trt_runtime.py`](vae_trt_runtime.py) | 校验 manifest/plan，绑定 PyTorch CUDA tensor，执行 initial/steady context 并管理双 cache bank | 不接 HTTP，不执行 latent 传输，不提供动态 shape |
 | [`engine.py`](engine.py) | request-level FCFS、job 状态、HTTP DiT→VAE sender | 不做模型 forward |
@@ -1036,12 +1036,13 @@ flowchart TD
     Trace["run real post_quant_conv + decoder<br/>capture 32 active caches"]
     Export["export initial_fp16.onnx<br/>export steady_fp16.onnx"]
     QDQ["vae_trt_qdq rewrite + structural audit"]
-    Build["TensorRT build four plans"]
-    Tactic["detailed Engine Inspector tactic audit"]
+    Probe["small SM87 INT8 Conv3d probe"]
+    Detailed["initial then steady detailed plans<br/>audit immediately"]
+    Build["build/reuse four performance plans"]
     Manifest["manifest + scales + audit"]
 
     CLI --> Load --> Targets --> Dummy --> Scales --> Trace --> Export
-    Export --> QDQ --> Build --> Tactic --> Manifest
+    Export --> QDQ --> Probe --> Detailed --> Build --> Manifest
 ```
 
 关键点：
@@ -1068,30 +1069,41 @@ flowchart TD
 
 ```text
 FP16 activation
-  -> Cast(FP32)
-  -> QuantizeLinear(INT8, scalar FP32 scale, int8 zero)
-  -> DequantizeLinear(FP32)
+  -> QuantizeLinear(INT8, scalar FP16 scale, int8 zero)
+  -> DequantizeLinear(FP16)
   -> Conv(
-       Dequantized activation,
-       Dequantized per-output-channel INT8 weight,
-       FP32 bias
+       FP16 dequantized activation,
+       FP16 dequantized per-output-channel INT8 weight,
+       FP16 bias
      )
-  -> Cast(FP16)
 ```
 
 它不会生成 `QLinearConv` 或 `ConvInteger`。构建成功必须同时满足：
 
-- ONNX opset 恰为 17，checker 与 shape inference 通过；
+- ONNX opset 恰为 19，checker 与 shape inference 通过；
+- target Q/DQ 路径没有 FP32 Cast，activation/weight scale 和 bias 均为
+  FP16；
 - 28 个 logical weight、84 个 target Conv、84 条 activation Q/DQ、
   28 条共享 weight DQ；
 - 每个 logical module 的 call index 恰为 `0,1,2`；
 - TensorRT detailed inspector 能把每个唯一节点名
   `int8/{initial|steady}/{module}/call_i` 映射到 layer/tactic；
-- 映射出的 format/datatype/precision/tactic 字段含 INT8/IMMA 证据。
+- 映射出的 format/datatype/precision/tactic 字段含 INT8/IMMA 证据，且不含
+  `f32f32`/TF32 fallback 证据。
 
-任何一个 call site 无法映射或回退 FP16/FP32，`int8_audit.json` 写出失败
-原因后构建抛错；runtime 又会二次要求 manifest 的 audit 为通过状态。因此
-“生成了 plan”不等于“宣称 INT8 成功”。
+完整图之前先构建一个真实 shape 的单 Conv3d Q/DQ probe。probe 失败不会进入
+耗时的 full-engine build。随后先构建并保留 `initial_int8_detailed.plan`；其
+84 个 call site 任一个无法映射或回退 Float/TF32，立即写出
+`int8_audit.json` 并停止，不再构建 steady 或 performance plan。initial
+通过后才审计 steady；两者都通过后才生成正式 plan。runtime 又会二次要求
+manifest 的 audit 为通过状态。因此“生成了 plan”不等于“宣称 INT8 成功”。
+
+构建状态写在 `build_state.json`。每个 stage 记录源 ONNX SHA256、输出 plan
+SHA256、Q/DQ schema 和 profiling verbosity；plan 与 JSON 均使用临时文件后
+原子替换。`--resume` 只重用全部字段匹配且能反序列化的 stage。旧 FP16
+ONNX/plan 可在 shape、dtype 和 I/O 验证后接管；旧 INT8 plan 不接管，因为
+它可能来自 FP32 Q/DQ schema。`tensorrt_timing.cache` 在成功 build 后持久化，
+后续 detailed/performance stage 共享 tactic timing 结果。
 
 ### 14.4 Manifest 与启动校验
 

@@ -177,13 +177,32 @@ python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build \
   --width 832 \
   --seed 1024 \
   --workspace-gib 8 \
-  --profiling-verbosity none
+  --profiling-verbosity none \
+  --resume \
+  --timing-cache "$SFWAN_TRT_DIR/tensorrt_timing.cache"
 ```
 
 The command reuses the loaded SGLang Wan VAE to collect one deterministic
-speed-only scale set, exports ONNX opset 17, inserts explicit signed INT8 Q/DQ
-around only the 28 residual-block 3x3x3 Conv3d modules, and builds FP16 and
-INT8 initial/steady plans. A build is accepted only if:
+speed-only scale set, exports ONNX opset 19, and inserts explicit signed INT8
+Q/DQ around only the 28 residual-block 3x3x3 Conv3d modules. The Q/DQ scale,
+dequantized activation/weight, and Conv bias all use FP16; this prevents a
+Float/TF32 Conv fallback caused by FP32 Q/DQ boundaries.
+
+The fail-closed build order is:
+
+1. validate or export the two FP16 ONNX graphs;
+2. build a small representative SM87 INT8 Conv3d capability probe;
+3. build and retain `initial_int8_detailed.plan`, audit all 84 target calls,
+   and stop immediately if any call falls back;
+4. repeat the detailed audit for `steady`;
+5. only after both audits pass, build/reuse the four performance plans.
+
+`--resume` records each completed plan atomically in `build_state.json`. A
+restart verifies the source ONNX hash, plan hash, Q/DQ schema, and profiling
+verbosity before reusing a stage. Existing validated FP16 ONNX/plans from an
+older failed run are adopted, but old INT8 plans are never adopted because
+their Q/DQ graph may differ. The persistent timing cache is updated only after
+a successful TensorRT build. A build is accepted only if:
 
 - each graph has 28 logical weights and 84 unrolled target Conv call sites;
 - every target activation and weight is connected through Q/DQ;
@@ -195,6 +214,9 @@ Inspect the fail-closed audit:
 jq '{
   passed,
   errors,
+  probe: .probe | {
+    passed, mapped_count, unmapped_call_sites, non_int8_call_sites
+  },
   initial: .tactics.initial | {
     passed, mapped_count, unmapped_call_sites, non_int8_call_sites
   },
@@ -206,28 +228,17 @@ jq '{
 sha256sum "$SFWAN_TRT_DIR"/*.plan
 ```
 
-For a separately retained detailed-inspector build, use another directory so
-it cannot replace the performance plans:
+Detailed audit plans and Inspector JSON are retained in the same directory;
+there is no second full rebuild:
 
 ```bash
-export SFWAN_TRT_AUDIT_DIR=/workspace/engines/sfwan-vae-trt-sm87-detailed
-
-python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build \
-  --model-path "$SFWAN_MODEL" \
-  --output-dir "$SFWAN_TRT_AUDIT_DIR" \
-  --height 480 \
-  --width 832 \
-  --seed 1024 \
-  --workspace-gib 8 \
-  --profiling-verbosity detailed
-
 /usr/src/tensorrt/bin/trtexec \
-  --loadEngine="$SFWAN_TRT_AUDIT_DIR/initial_int8.plan" \
+  --loadEngine="$SFWAN_TRT_DIR/initial_int8_detailed.plan" \
   --dumpLayerInfo \
   --profilingVerbosity=detailed
 
 /usr/src/tensorrt/bin/trtexec \
-  --loadEngine="$SFWAN_TRT_AUDIT_DIR/steady_int8.plan" \
+  --loadEngine="$SFWAN_TRT_DIR/steady_int8_detailed.plan" \
   --dumpLayerInfo \
   --profilingVerbosity=detailed
 ```

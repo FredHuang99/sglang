@@ -85,11 +85,19 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
     _shared_memory_header,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
+    _audit_tensorrt_tactics,
     _make_export_wrappers,
     _normalize_export_cache_tensors,
+    _parse_args as _parse_trt_build_args,
     _portable_conv3d_layout_for_export,
     _portable_nearest_upsample_for_export,
+    _record_stage,
+    _stage_is_current,
     _validate_onnx_fp16_io_contract,
+)
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
+    QDQ_OPSET,
+    QDQ_SCHEMA_VERSION,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
@@ -3755,6 +3763,109 @@ class TestSfWanModeIsolation(CustomTestCase):
 
 
 class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
+    def test_trt_qdq_v2_uses_opset_19(self):
+        self.assertEqual(QDQ_SCHEMA_VERSION, 2)
+        self.assertEqual(QDQ_OPSET, 19)
+
+    def test_trt_tactic_audit_requires_int8_convolution_evidence(self):
+        call_site = "int8/initial/decoder.block.conv1/call_0"
+        int8_inspector = json.dumps(
+            {
+                "Layers": [
+                    {
+                        "Name": call_site,
+                        "LayerType": "CaskConvolution",
+                        "InputDataType": "Int8",
+                        "OutputDataType": "Half",
+                        "TacticName": "sm87_xmma_fprop_implicit_gemm_i8i8_i32",
+                    }
+                ]
+            }
+        )
+        passed = _audit_tensorrt_tactics(
+            graph_kind="initial",
+            call_site_names=[call_site],
+            inspector_json=int8_inspector,
+            expected_call_sites=1,
+        )
+        self.assertTrue(passed["passed"])
+
+        tf32_inspector = json.dumps(
+            {
+                "Layers": [
+                    {
+                        "Name": call_site,
+                        "LayerType": "CaskConvolution",
+                        "InputDataType": "Float",
+                        "OutputDataType": "Float",
+                        "TacticName": "sm80_xmma_fprop_f32f32_tf32f32",
+                    }
+                ]
+            }
+        )
+        failed = _audit_tensorrt_tactics(
+            graph_kind="initial",
+            call_site_names=[call_site],
+            inspector_json=tf32_inspector,
+            expected_call_sites=1,
+        )
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["non_int8_call_sites"], [call_site])
+
+    def test_trt_build_stage_resume_requires_matching_source_and_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_path = root / "build_state.json"
+            source_path = root / "graph.onnx"
+            output_path = root / "engine.plan"
+            source_path.write_bytes(b"graph-v2")
+            output_path.write_bytes(b"plan-v2")
+            source_hash = hashlib.sha256(source_path.read_bytes()).hexdigest()
+            state = {"identity": {"schema_version": 1}, "stages": {}}
+            _record_stage(
+                state_path=state_path,
+                state=state,
+                stage="initial_int8_detailed",
+                source_sha256=source_hash,
+                output_path=output_path,
+                profiling_verbosity="detailed",
+            )
+            self.assertTrue(
+                _stage_is_current(
+                    state=state,
+                    stage="initial_int8_detailed",
+                    source_sha256=source_hash,
+                    output_path=output_path,
+                    profiling_verbosity="detailed",
+                )
+            )
+            output_path.write_bytes(b"corrupted")
+            self.assertFalse(
+                _stage_is_current(
+                    state=state,
+                    stage="initial_int8_detailed",
+                    source_sha256=source_hash,
+                    output_path=output_path,
+                    profiling_verbosity="detailed",
+                )
+            )
+
+    def test_trt_build_parser_exposes_resume_and_timing_cache(self):
+        argv = [
+            "vae_trt_build",
+            "--model-path",
+            "model",
+            "--output-dir",
+            "/engines",
+            "--resume",
+            "--timing-cache",
+            "/engines/timing.cache",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            args = _parse_trt_build_args()
+        self.assertTrue(args.resume)
+        self.assertEqual(args.timing_cache, "/engines/timing.cache")
+
     def test_trt_export_cache_boundary_normalizes_fp16(self):
         active_indices = tuple(range(32))
         reference = torch.zeros(1, dtype=torch.float16)
