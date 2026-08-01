@@ -1102,6 +1102,9 @@ quantization 的标准表达；真正的验收点是 builder 是否将 constant�
 - 每个 logical module 的 call index 恰为 `0,1,2`；
 - 每个 call site 保存 input/weight/output shape、kernel、padding、stride、
   dilation、groups，并生成稳定的 `signature_id`。
+- target Conv 的 input/output shape 来自真实 initial/steady dummy forward
+  的 hook 捕获（input 包含原生 causal padding）；ONNX shape inference 若也给出
+  对应 shape，则必须与捕获值一致。内部 `value_info` 缺失本身不再误判失败。
 
 builder 合并 initial/steady 共 168 个 call site 的 signature；每种唯一
 signature 用和正式图相同的 helper 生成一个独立 v3 probe，逐个构建并审计。

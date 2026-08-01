@@ -209,6 +209,10 @@ output is shared across calls. The activation path also has 84 independent
 Q/DQ pairs. FP16 scales are legal TensorRT explicit-quantization inputs, while
 the constant-to-Q-to-DQ weight topology lets TensorRT fold a static INT8
 filter instead of importing a DQ-only weight as a dynamic Half filter.
+Conv input/output shapes for the preflight signatures are captured from the
+real initial and steady dummy decoder forwards, including causal padding. If
+ONNX shape inference also provides a target shape, the two sources must match;
+missing internal ONNX `value_info` alone is not treated as a model error.
 
 Q/DQ rewriting accepts only a graph that was genuinely exported as opset 19;
 it never changes an older graph's `opset_import` label. On `--resume`, legacy

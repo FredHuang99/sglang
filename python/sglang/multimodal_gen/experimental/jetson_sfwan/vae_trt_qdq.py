@@ -129,6 +129,67 @@ def _tensor_shape_map(model: Any) -> dict[str, list[int]]:
     return shapes
 
 
+def _normalize_rank5_shape(value: Any) -> list[int] | None:
+    if not isinstance(value, (list, tuple)) or len(value) != 5:
+        return None
+    if any(
+        isinstance(dimension, bool) or not isinstance(dimension, int)
+        for dimension in value
+    ):
+        return None
+    normalized = [int(dimension) for dimension in value]
+    return normalized if all(dimension > 0 for dimension in normalized) else None
+
+
+def _normalize_call_site_shape_contracts(
+    *,
+    contracts: dict[str, list[dict[str, list[int]]]] | None,
+    target_module_names: tuple[str, ...],
+) -> dict[str, list[dict[str, list[int]]]] | None:
+    if contracts is None:
+        return None
+    if set(contracts) != set(target_module_names):
+        missing = sorted(set(target_module_names) - set(contracts))
+        extra = sorted(set(contracts) - set(target_module_names))
+        raise ValueError(
+            "Conv shape contract keys do not match targets; "
+            f"missing={missing}, extra={extra}"
+        )
+
+    normalized: dict[str, list[dict[str, list[int]]]] = {}
+    for module_name in target_module_names:
+        call_contracts = contracts[module_name]
+        if not isinstance(call_contracts, list) or len(call_contracts) != 3:
+            raise ValueError(
+                f"Conv shape contract for {module_name!r} must contain three calls"
+            )
+        normalized_calls: list[dict[str, list[int]]] = []
+        for call_index, contract in enumerate(call_contracts):
+            if not isinstance(contract, dict) or set(contract) != {
+                "input_shape",
+                "output_shape",
+            }:
+                raise ValueError(
+                    f"Conv shape contract for {module_name!r} call {call_index} "
+                    "must contain only input_shape and output_shape"
+                )
+            input_shape = _normalize_rank5_shape(contract["input_shape"])
+            output_shape = _normalize_rank5_shape(contract["output_shape"])
+            if input_shape is None or output_shape is None:
+                raise ValueError(
+                    f"Conv shape contract for {module_name!r} call {call_index} "
+                    "must contain positive rank-5 integer shapes"
+                )
+            normalized_calls.append(
+                {
+                    "input_shape": input_shape,
+                    "output_shape": output_shape,
+                }
+            )
+        normalized[module_name] = normalized_calls
+    return normalized
+
+
 def _canonical_signature(signature: dict[str, Any]) -> dict[str, Any]:
     return {
         key: signature[key]
@@ -277,6 +338,7 @@ def audit_qdq_model(
     *,
     graph_kind: str,
     target_module_names: tuple[str, ...],
+    shape_overrides: dict[str, dict[str, list[int]]] | None = None,
 ) -> dict[str, Any]:
     """Validate the complete v3 structural INT8 contract after rewriting."""
 
@@ -365,6 +427,14 @@ def audit_qdq_model(
         errors.append(f"unsupported quantized Conv operators exist: {qlinear_convs}")
     if target_casts:
         errors.append(f"target Q/DQ paths contain Cast nodes: {target_casts}")
+    target_conv_names = {node.name for node in target_convs}
+    if shape_overrides is not None and set(shape_overrides) != target_conv_names:
+        missing = sorted(target_conv_names - set(shape_overrides))
+        extra = sorted(set(shape_overrides) - target_conv_names)
+        errors.append(
+            "captured Conv shape call sites do not match rewritten targets; "
+            f"missing={missing}, extra={extra}"
+        )
 
     invalid_bindings: list[str] = []
     weight_sources: set[str] = set()
@@ -374,6 +444,7 @@ def audit_qdq_model(
     activation_dq_outputs: set[str] = set()
     bias_sources: set[str] = set()
     signatures: list[dict[str, Any]] = []
+    shape_sources: dict[str, str] = {}
 
     for conv in target_convs:
         if len(conv.input) < 3 or not conv.input[2]:
@@ -480,11 +551,51 @@ def audit_qdq_model(
             continue
 
         attributes = _attribute_map(conv, helper)
-        input_shape = shapes.get(activation_quantize.input[0])
-        output_shape = shapes.get(conv.output[0])
+        inferred_input_shape = shapes.get(activation_quantize.input[0])
+        inferred_output_shape = shapes.get(conv.output[0])
+        override = (
+            shape_overrides.get(conv.name) if shape_overrides is not None else None
+        )
+        captured_input_shape = (
+            _normalize_rank5_shape(override.get("input_shape"))
+            if isinstance(override, dict)
+            else None
+        )
+        captured_output_shape = (
+            _normalize_rank5_shape(override.get("output_shape"))
+            if isinstance(override, dict)
+            else None
+        )
+        if override is not None and (
+            captured_input_shape is None or captured_output_shape is None
+        ):
+            invalid_bindings.append(f"{conv.name}:captured_shape_invalid")
+        if (
+            inferred_input_shape is not None
+            and captured_input_shape is not None
+            and inferred_input_shape != captured_input_shape
+        ):
+            invalid_bindings.append(
+                f"{conv.name}:input_shape_mismatch:"
+                f"onnx={inferred_input_shape}:captured={captured_input_shape}"
+            )
+        if (
+            inferred_output_shape is not None
+            and captured_output_shape is not None
+            and inferred_output_shape != captured_output_shape
+        ):
+            invalid_bindings.append(
+                f"{conv.name}:output_shape_mismatch:"
+                f"onnx={inferred_output_shape}:captured={captured_output_shape}"
+            )
+        input_shape = captured_input_shape or inferred_input_shape
+        output_shape = captured_output_shape or inferred_output_shape
         if input_shape is None or output_shape is None:
             invalid_bindings.append(f"{conv.name}:static_shape_missing")
             continue
+        shape_sources[conv.name] = (
+            "captured" if captured_input_shape is not None else "onnx_inferred"
+        )
         signature = {
             "call_site": conv.name,
             "input_shape": input_shape,
@@ -540,6 +651,7 @@ def audit_qdq_model(
         "call_sites_per_logical_conv": per_module_counts,
         "call_site_names": [node.name for node in target_convs],
         "conv_signatures": signatures,
+        "shape_sources": shape_sources,
         "signature_ids": sorted({value["signature_id"] for value in signatures}),
         "unsupported_quantized_conv_nodes": qlinear_convs,
         "target_cast_nodes": target_casts,
@@ -554,6 +666,7 @@ def rewrite_onnx_with_int8_qdq(
     graph_kind: str,
     target_module_names: tuple[str, ...],
     activation_scales: dict[str, float],
+    call_site_shape_contracts: dict[str, list[dict[str, list[int]]]] | None = None,
 ) -> dict[str, Any]:
     """Rewrite selected Conv3d call sites with independent explicit INT8 Q/DQ."""
 
@@ -572,6 +685,10 @@ def rewrite_onnx_with_int8_qdq(
         raise ValueError(
             f"activation scale keys do not match targets; missing={missing}, extra={extra}"
         )
+    normalized_shape_contracts = _normalize_call_site_shape_contracts(
+        contracts=call_site_shape_contracts,
+        target_module_names=target_module_names,
+    )
 
     onnx, np, _TensorProto, helpers = _lazy_onnx()
     helper, numpy_helper = helpers
@@ -624,6 +741,7 @@ def rewrite_onnx_with_int8_qdq(
     new_nodes: list[Any] = []
     new_initializers: list[Any] = []
     weight_qdq_paths: dict[str, dict[str, str]] = {}
+    shape_overrides: dict[str, dict[str, list[int]]] = {}
     for node in model.graph.node:
         if node.op_type != "Conv" or len(node.input) < 2:
             new_nodes.append(copy.deepcopy(node))
@@ -679,6 +797,10 @@ def rewrite_onnx_with_int8_qdq(
         rewritten.name = f"int8/{graph_kind}/{module_name}/call_{call_index}"
         new_nodes.append(rewritten)
         weight_qdq_paths[rewritten.name] = names
+        if normalized_shape_contracts is not None:
+            shape_overrides[rewritten.name] = copy.deepcopy(
+                normalized_shape_contracts[module_name][call_index]
+            )
 
     invalid_counts = {
         module_name: count
@@ -707,6 +829,7 @@ def rewrite_onnx_with_int8_qdq(
         model,
         graph_kind=graph_kind,
         target_module_names=target_module_names,
+        shape_overrides=shape_overrides or None,
     )
     if not audit["passed"]:
         raise ValueError(f"explicit Q/DQ structural audit failed: {audit['errors']}")

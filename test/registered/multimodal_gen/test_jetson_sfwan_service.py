@@ -89,6 +89,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _audit_tensorrt_tactics,
     _build_engine_bytes,
     _candidate_timing_cache_bytes,
+    _capture_target_conv_call_shapes,
     _commit_timing_cache,
     _load_validated_fp16_onnx,
     _mark_stage_audit,
@@ -3774,6 +3775,42 @@ class TestSfWanModeIsolation(CustomTestCase):
 
 
 class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
+    def test_trt_shape_capture_includes_causal_padding(self):
+        class _FakeCausalConv(torch.nn.Module):
+            _padding = (1, 1, 2, 2, 3, 0)
+
+            def forward(self, value):
+                return torch.empty(
+                    value.shape[0],
+                    8,
+                    value.shape[2],
+                    value.shape[3],
+                    value.shape[4],
+                )
+
+        class _FakeVae(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = _FakeCausalConv()
+
+        vae = _FakeVae()
+        value = torch.empty(1, 4, 1, 5, 6)
+        with _capture_target_conv_call_shapes(
+            vae=vae,
+            target_module_names=("conv",),
+        ) as (select_graph, records):
+            for graph_kind in ("initial", "steady"):
+                select_graph(graph_kind)
+                for _ in range(3):
+                    vae.conv(value)
+
+        expected = {
+            "input_shape": [1, 4, 4, 9, 8],
+            "output_shape": [1, 8, 1, 5, 6],
+        }
+        self.assertEqual(records["initial"]["conv"], [expected] * 3)
+        self.assertEqual(records["steady"]["conv"], [expected] * 3)
+
     def test_trt_qdq_v3_uses_opset_19(self):
         self.assertEqual(QDQ_SCHEMA_VERSION, 3)
         self.assertEqual(QDQ_OPSET, 19)
@@ -3845,6 +3882,16 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 graph_kind="initial",
                 target_module_names=targets,
                 activation_scales={name: 1.0 for name in targets},
+                call_site_shape_contracts={
+                    name: [
+                        {
+                            "input_shape": [1, 1, 1, 1, 1],
+                            "output_shape": [1, 1, 1, 1, 1],
+                        }
+                        for _ in range(3)
+                    ]
+                    for name in targets
+                },
             )
             self.assertEqual(report["activation_quantize_count"], 84)
             self.assertEqual(report["weight_quantize_count"], 84)
@@ -3852,6 +3899,45 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             self.assertEqual(report["unique_weight_source_count"], 84)
             self.assertEqual(report["unique_bias_count"], 84)
             self.assertEqual(len(report["conv_signatures"]), 84)
+            self.assertEqual(set(report["shape_sources"].values()), {"captured"})
+
+            shape_overrides = {
+                signature["call_site"]: {
+                    "input_shape": signature["input_shape"],
+                    "output_shape": signature["output_shape"],
+                }
+                for signature in report["conv_signatures"]
+            }
+            missing_value_info = onnx.load(destination)
+            del missing_value_info.graph.value_info[:]
+            captured_report = audit_qdq_model(
+                missing_value_info,
+                graph_kind="initial",
+                target_module_names=targets,
+                shape_overrides=shape_overrides,
+            )
+            self.assertTrue(captured_report["passed"], captured_report["errors"])
+            self.assertEqual(
+                set(captured_report["shape_sources"].values()),
+                {"captured"},
+            )
+
+            mismatched_shapes = json.loads(json.dumps(shape_overrides))
+            first_call_site = report["conv_signatures"][0]["call_site"]
+            mismatched_shapes[first_call_site]["input_shape"][-1] = 2
+            mismatch_report = audit_qdq_model(
+                missing_value_info,
+                graph_kind="initial",
+                target_module_names=targets,
+                shape_overrides=mismatched_shapes,
+            )
+            self.assertFalse(mismatch_report["passed"])
+            self.assertTrue(
+                any(
+                    "input_shape_mismatch" in error
+                    for error in mismatch_report["invalid_bindings"]
+                )
+            )
 
             rewritten = onnx.load(destination)
             weight_q = [

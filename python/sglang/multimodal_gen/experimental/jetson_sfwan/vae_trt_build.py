@@ -521,6 +521,95 @@ def _collect_activation_scales(
     return scales
 
 
+@contextmanager
+def _capture_target_conv_call_shapes(
+    *,
+    vae: Any,
+    target_module_names: tuple[str, ...],
+) -> Any:
+    """Capture the real rank-5 Conv input/output shapes used by each graph."""
+
+    import torch
+
+    module_map = dict(vae.named_modules())
+    records: dict[str, dict[str, list[dict[str, list[int]]]]] = {
+        graph_kind: {name: [] for name in target_module_names}
+        for graph_kind in ("initial", "steady")
+    }
+    current_graph: list[str | None] = [None]
+    handles = []
+
+    def _select_graph(graph_kind: str) -> None:
+        if graph_kind not in records:
+            raise ValueError(f"unsupported TensorRT VAE graph kind: {graph_kind}")
+        current_graph[0] = graph_kind
+
+    def _make_hook(module_name: str) -> Any:
+        def _hook(_module: Any, args: tuple[Any, ...], output: Any) -> None:
+            graph_kind = current_graph[0]
+            if graph_kind is None:
+                raise RuntimeError("Conv shape capture graph kind is not selected")
+            if not args or not isinstance(args[0], torch.Tensor):
+                raise TypeError(f"{module_name} did not receive a tensor input")
+            if not isinstance(output, torch.Tensor):
+                raise TypeError(f"{module_name} did not return a tensor output")
+            module_input_shape = [int(value) for value in args[0].shape]
+            padding = [int(value) for value in _module._padding]
+            if len(module_input_shape) != 5 or len(padding) != 6:
+                raise ValueError(
+                    f"{module_name} has an invalid causal Conv input/padding "
+                    f"contract: input={module_input_shape}, padding={padding}"
+                )
+            input_shape = [
+                module_input_shape[0],
+                module_input_shape[1],
+                module_input_shape[2] + padding[4] + padding[5],
+                module_input_shape[3] + padding[2] + padding[3],
+                module_input_shape[4] + padding[0] + padding[1],
+            ]
+            output_shape = [int(value) for value in output.shape]
+            if len(input_shape) != 5 or len(output_shape) != 5:
+                raise ValueError(
+                    f"{module_name} must use rank-5 Conv tensors, got "
+                    f"input={input_shape}, output={output_shape}"
+                )
+            records[graph_kind][module_name].append(
+                {
+                    "input_shape": input_shape,
+                    "output_shape": output_shape,
+                }
+            )
+
+        return _hook
+
+    for module_name in target_module_names:
+        module = module_map.get(module_name)
+        if module is None:
+            raise ValueError(f"VAE module {module_name!r} does not exist")
+        handles.append(module.register_forward_hook(_make_hook(module_name)))
+
+    body_completed = False
+    try:
+        yield _select_graph, records
+        body_completed = True
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    if body_completed:
+        invalid = {
+            f"{graph_kind}:{module_name}": len(call_shapes)
+            for graph_kind, graph_records in records.items()
+            for module_name, call_shapes in graph_records.items()
+            if len(call_shapes) != 3
+        }
+        if invalid:
+            raise ValueError(
+                "TensorRT VAE Conv shape capture expected three calls per graph: "
+                f"{invalid}"
+            )
+
+
 def _validate_model_contract(vae: Any) -> None:
     if not bool(vae.use_feature_cache):
         raise ValueError("TensorRT SFWan VAE requires feature cache")
@@ -1367,61 +1456,75 @@ def build_engines(
             cache_slot_count=cache_slot_count,
         )
 
-    with (
-        torch.inference_mode(),
-        torch.autocast(
-            device_type="cuda",
-            dtype=torch.float16,
-        ),
-        _portable_causal_pad_for_export(),
-    ):
-        initial_cache: list[Any] = [None] * cache_slot_count
-        initial_rgb = _run_decoder_chunk(
-            post_quant_conv=vae.post_quant_conv,
-            decoder=vae.decoder,
-            patch_size=vae.config.patch_size,
-            latent=latent_chunks[0],
-            cache=initial_cache,
-            first_request_chunk=True,
-        )
-        active_indices = _active_cache_indices(initial_cache)
-        initial_cache_tensors = _normalize_export_cache_tensors(
-            cache=initial_cache,
-            active_cache_indices=active_indices,
-            reference_tensor=latent_chunks[0],
-        )
-        cache_shapes = [tuple(tensor.shape) for tensor in initial_cache_tensors]
-        cache_elements = sum(math.prod(shape) for shape in cache_shapes)
-        if cache_elements != TRT_VAE_CACHE_TOTAL_ELEMENTS:
-            raise ValueError(
-                f"SFWan steady cache has {cache_elements} elements, "
-                f"expected {TRT_VAE_CACHE_TOTAL_ELEMENTS}"
+    with _capture_target_conv_call_shapes(
+        vae=vae,
+        target_module_names=targets,
+    ) as (select_shape_graph, conv_call_shapes):
+        with (
+            torch.inference_mode(),
+            torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+            ),
+            _portable_causal_pad_for_export(),
+        ):
+            select_shape_graph("initial")
+            initial_cache: list[Any] = [None] * cache_slot_count
+            initial_rgb = _run_decoder_chunk(
+                post_quant_conv=vae.post_quant_conv,
+                decoder=vae.decoder,
+                patch_size=vae.config.patch_size,
+                latent=latent_chunks[0],
+                cache=initial_cache,
+                first_request_chunk=True,
             )
-        if tuple(initial_rgb.shape) != (1, 3, 9, height, width):
-            raise ValueError(f"initial VAE output shape is {tuple(initial_rgb.shape)}")
+            active_indices = _active_cache_indices(initial_cache)
+            initial_cache_tensors = _normalize_export_cache_tensors(
+                cache=initial_cache,
+                active_cache_indices=active_indices,
+                reference_tensor=latent_chunks[0],
+            )
+            cache_shapes = [tuple(tensor.shape) for tensor in initial_cache_tensors]
+            cache_elements = sum(math.prod(shape) for shape in cache_shapes)
+            if cache_elements != TRT_VAE_CACHE_TOTAL_ELEMENTS:
+                raise ValueError(
+                    f"SFWan steady cache has {cache_elements} elements, "
+                    f"expected {TRT_VAE_CACHE_TOTAL_ELEMENTS}"
+                )
+            if tuple(initial_rgb.shape) != (1, 3, 9, height, width):
+                raise ValueError(
+                    f"initial VAE output shape is {tuple(initial_rgb.shape)}"
+                )
 
-        steady_cache: list[Any] = [None] * cache_slot_count
-        for index, tensor in zip(active_indices, initial_cache_tensors, strict=True):
-            steady_cache[index] = tensor
-        steady_rgb = _run_decoder_chunk(
-            post_quant_conv=vae.post_quant_conv,
-            decoder=vae.decoder,
-            patch_size=vae.config.patch_size,
-            latent=latent_chunks[1],
-            cache=steady_cache,
-            first_request_chunk=False,
-        )
-        steady_indices = _active_cache_indices(steady_cache)
-        steady_cache_tensors = _normalize_export_cache_tensors(
-            cache=steady_cache,
-            active_cache_indices=steady_indices,
-            reference_tensor=latent_chunks[1],
-        )
-        steady_shapes = [tuple(tensor.shape) for tensor in steady_cache_tensors]
-        if steady_indices != active_indices or steady_shapes != cache_shapes:
-            raise ValueError("initial and steady VAE cache contracts do not match")
-        if tuple(steady_rgb.shape) != (1, 3, 12, height, width):
-            raise ValueError(f"steady VAE output shape is {tuple(steady_rgb.shape)}")
+            select_shape_graph("steady")
+            steady_cache: list[Any] = [None] * cache_slot_count
+            for index, tensor in zip(
+                active_indices,
+                initial_cache_tensors,
+                strict=True,
+            ):
+                steady_cache[index] = tensor
+            steady_rgb = _run_decoder_chunk(
+                post_quant_conv=vae.post_quant_conv,
+                decoder=vae.decoder,
+                patch_size=vae.config.patch_size,
+                latent=latent_chunks[1],
+                cache=steady_cache,
+                first_request_chunk=False,
+            )
+            steady_indices = _active_cache_indices(steady_cache)
+            steady_cache_tensors = _normalize_export_cache_tensors(
+                cache=steady_cache,
+                active_cache_indices=steady_indices,
+                reference_tensor=latent_chunks[1],
+            )
+            steady_shapes = [tuple(tensor.shape) for tensor in steady_cache_tensors]
+            if steady_indices != active_indices or steady_shapes != cache_shapes:
+                raise ValueError("initial and steady VAE cache contracts do not match")
+            if tuple(steady_rgb.shape) != (1, 3, 12, height, width):
+                raise ValueError(
+                    f"steady VAE output shape is {tuple(steady_rgb.shape)}"
+                )
 
     initial_wrapper, steady_wrapper = _make_export_wrappers(
         vae=vae,
@@ -1566,6 +1669,7 @@ def build_engines(
             graph_kind="initial",
             target_module_names=targets,
             activation_scales=activation_scales["initial"],
+            call_site_shape_contracts=conv_call_shapes["initial"],
         ),
         "steady": rewrite_onnx_with_int8_qdq(
             source_path=qdq_source_paths["steady"],
@@ -1573,6 +1677,7 @@ def build_engines(
             graph_kind="steady",
             target_module_names=targets,
             activation_scales=activation_scales["steady"],
+            call_site_shape_contracts=conv_call_shapes["steady"],
         ),
     }
     for kind, report in qdq_reports.items():
