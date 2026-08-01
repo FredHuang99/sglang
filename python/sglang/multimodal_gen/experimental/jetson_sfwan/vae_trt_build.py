@@ -616,6 +616,39 @@ def _validate_onnx_fp16_io_contract(
     return materialized
 
 
+def _onnx_default_opset_version(model: Any) -> int:
+    for opset in model.opset_import:
+        if opset.domain in {"", "ai.onnx"}:
+            return int(opset.version)
+    raise ValueError("ONNX graph has no default-domain opset")
+
+
+def _load_validated_fp16_onnx(
+    *,
+    path: Path,
+    expected_input_shapes: dict[str, tuple[int, ...]],
+    expected_output_shapes: dict[str, tuple[int, ...]],
+    required_opset: int | None = None,
+) -> tuple[Any, int]:
+    import onnx
+
+    model = onnx.load(str(path), load_external_data=True)
+    onnx.checker.check_model(model, full_check=True)
+    opset = _onnx_default_opset_version(model)
+    if required_opset is not None and opset != required_opset:
+        raise ValueError(
+            f"{path.name} uses ONNX opset {opset}, but Q/DQ requires a "
+            f"real opset {required_opset} export"
+        )
+    _validate_onnx_fp16_io_contract(
+        model=model,
+        path=path,
+        expected_input_shapes=expected_input_shapes,
+        expected_output_shapes=expected_output_shapes,
+    )
+    return model, opset
+
+
 def _export_onnx(
     *,
     wrapper: Any,
@@ -650,6 +683,7 @@ def _export_onnx(
         if not argument.is_contiguous():
             raise ValueError(f"ONNX export input {name!r} must be contiguous")
 
+    temporary = path.with_name(f"{path.name}.partial")
     with (
         torch.inference_mode(),
         _portable_causal_pad_for_export(),
@@ -659,7 +693,7 @@ def _export_onnx(
         torch.onnx.export(
             wrapper,
             arguments,
-            str(path),
+            str(temporary),
             export_params=True,
             opset_version=QDQ_OPSET,
             do_constant_folding=True,
@@ -668,8 +702,13 @@ def _export_onnx(
             keep_initializers_as_inputs=False,
             dynamo=False,
         )
-    model = onnx.load(str(path), load_external_data=True)
+    model = onnx.load(str(temporary), load_external_data=True)
     onnx.checker.check_model(model, full_check=True)
+    exported_opset = _onnx_default_opset_version(model)
+    if exported_opset != QDQ_OPSET:
+        raise ValueError(
+            f"PyTorch exported ONNX opset {exported_opset}, expected {QDQ_OPSET}"
+        )
     expected_input_shapes = {
         name: tuple(int(dimension) for dimension in argument.shape)
         for name, argument in zip(input_names, arguments, strict=True)
@@ -677,21 +716,22 @@ def _export_onnx(
     expected_output_shapes = dict(zip(output_names, output_shapes, strict=True))
     materialized = _validate_onnx_fp16_io_contract(
         model=model,
-        path=path,
+        path=temporary,
         expected_input_shapes=expected_input_shapes,
         expected_output_shapes=expected_output_shapes,
         materialize_symbolic_shapes=True,
     )
     if materialized:
-        onnx.save(model, str(path))
-        model = onnx.load(str(path), load_external_data=True)
+        onnx.save(model, str(temporary))
+        model = onnx.load(str(temporary), load_external_data=True)
         onnx.checker.check_model(model, full_check=True)
     _validate_onnx_fp16_io_contract(
         model=model,
-        path=path,
+        path=temporary,
         expected_input_shapes=expected_input_shapes,
         expected_output_shapes=expected_output_shapes,
     )
+    temporary.replace(path)
 
 
 def _trt_logger(trt: Any) -> Any:
@@ -1233,11 +1273,16 @@ def build_engines(
     )
     cache_input_names = [f"cache_in_{index:03d}" for index in range(32)]
     cache_output_names = [f"cache_out_{index:03d}" for index in range(32)]
-    initial_fp16_path = root / "initial_fp16.onnx"
-    steady_fp16_path = root / "steady_fp16.onnx"
+    legacy_fp16_paths = {
+        "initial": root / "initial_fp16.onnx",
+        "steady": root / "steady_fp16.onnx",
+    }
+    qdq_source_paths = {
+        "initial": root / f"initial_fp16_opset{QDQ_OPSET}.onnx",
+        "steady": root / f"steady_fp16_opset{QDQ_OPSET}.onnx",
+    }
     fp16_onnx_contracts = {
         "initial": {
-            "path": initial_fp16_path,
             "inputs": {"latent": tuple(latent_chunks[0].shape)},
             "outputs": dict(
                 zip(
@@ -1248,7 +1293,6 @@ def build_engines(
             ),
         },
         "steady": {
-            "path": steady_fp16_path,
             "inputs": dict(
                 zip(
                     ["latent", *cache_input_names],
@@ -1265,36 +1309,81 @@ def build_engines(
             ),
         },
     }
-    reuse_fp16_onnx = resume and all(
-        contract["path"].is_file() for contract in fp16_onnx_contracts.values()
-    )
-    if reuse_fp16_onnx:
-        try:
-            for contract in fp16_onnx_contracts.values():
-                existing_model = onnx.load(
-                    str(contract["path"]),
-                    load_external_data=True,
-                )
-                onnx.checker.check_model(existing_model, full_check=True)
-                _validate_onnx_fp16_io_contract(
-                    model=existing_model,
-                    path=contract["path"],
+
+    fp16_performance_paths: dict[str, Path] = {}
+    if resume:
+        for kind, legacy_path in legacy_fp16_paths.items():
+            if not legacy_path.is_file():
+                continue
+            contract = fp16_onnx_contracts[kind]
+            try:
+                _model, legacy_opset = _load_validated_fp16_onnx(
+                    path=legacy_path,
                     expected_input_shapes=contract["inputs"],
                     expected_output_shapes=contract["outputs"],
                 )
+                del _model
+                fp16_performance_paths[kind] = legacy_path
+                print(
+                    f"Preserving validated legacy FP16 ONNX for {kind} "
+                    f"performance plan reuse: {legacy_path} (opset {legacy_opset})"
+                )
+            except (OSError, RuntimeError, ValueError) as error:
+                print(f"Legacy FP16 ONNX {legacy_path} cannot be reused: {error}")
+
+    reuse_qdq_sources = resume and all(
+        path.is_file() for path in qdq_source_paths.values()
+    )
+    if reuse_qdq_sources:
+        try:
+            for kind, source_path in qdq_source_paths.items():
+                contract = fp16_onnx_contracts[kind]
+                _model, source_opset = _load_validated_fp16_onnx(
+                    path=source_path,
+                    expected_input_shapes=contract["inputs"],
+                    expected_output_shapes=contract["outputs"],
+                    required_opset=QDQ_OPSET,
+                )
+                del _model
+                if source_opset != QDQ_OPSET:  # defensive; helper already checks
+                    raise ValueError(f"unexpected ONNX opset {source_opset}")
         except (OSError, RuntimeError, ValueError) as error:
-            print(f"Existing FP16 ONNX cannot be reused: {error}")
-            reuse_fp16_onnx = False
-    if reuse_fp16_onnx:
-        print(f"Reusing validated FP16 ONNX files in {root}")
+            print(f"Existing Q/DQ source ONNX cannot be reused: {error}")
+            reuse_qdq_sources = False
+    if reuse_qdq_sources:
+        print(f"Reusing validated opset {QDQ_OPSET} Q/DQ source ONNX files")
     else:
+        for kind, legacy_path in legacy_fp16_paths.items():
+            if legacy_path.is_file():
+                try:
+                    legacy_model = onnx.load(
+                        str(legacy_path),
+                        load_external_data=True,
+                    )
+                    legacy_opset = _onnx_default_opset_version(legacy_model)
+                    if legacy_opset != QDQ_OPSET:
+                        print(
+                            f"Legacy {legacy_path.name} is opset {legacy_opset}; "
+                            f"it will be preserved, and a real opset {QDQ_OPSET} "
+                            f"Q/DQ source will be exported to {qdq_source_paths[kind].name}"
+                        )
+                except (OSError, RuntimeError, ValueError) as error:
+                    print(f"Could not inspect legacy {legacy_path}: {error}")
+        print(
+            f"Exporting real opset {QDQ_OPSET} initial Q/DQ source to "
+            f"{qdq_source_paths['initial']}"
+        )
         _export_onnx(
             wrapper=initial_wrapper,
             arguments=(latent_chunks[0],),
             input_names=["latent"],
             output_names=["rgb", *cache_output_names],
             output_shapes=[(1, 3, 9, height, width), *cache_shapes],
-            path=initial_fp16_path,
+            path=qdq_source_paths["initial"],
+        )
+        print(
+            f"Exporting real opset {QDQ_OPSET} steady Q/DQ source to "
+            f"{qdq_source_paths['steady']}"
         )
         _export_onnx(
             wrapper=steady_wrapper,
@@ -1302,21 +1391,25 @@ def build_engines(
             input_names=["latent", *cache_input_names],
             output_names=["rgb", *cache_output_names],
             output_shapes=[(1, 3, 12, height, width), *cache_shapes],
-            path=steady_fp16_path,
+            path=qdq_source_paths["steady"],
         )
+        print(f"Validated both real opset {QDQ_OPSET} Q/DQ source ONNX files")
+
+    for kind, source_path in qdq_source_paths.items():
+        fp16_performance_paths.setdefault(kind, source_path)
 
     initial_int8_path = root / "initial_int8_qdq.onnx"
     steady_int8_path = root / "steady_int8_qdq.onnx"
     qdq_reports = {
         "initial": rewrite_onnx_with_int8_qdq(
-            source_path=initial_fp16_path,
+            source_path=qdq_source_paths["initial"],
             destination_path=initial_int8_path,
             graph_kind="initial",
             target_module_names=targets,
             activation_scales=activation_scales["initial"],
         ),
         "steady": rewrite_onnx_with_int8_qdq(
-            source_path=steady_fp16_path,
+            source_path=qdq_source_paths["steady"],
             destination_path=steady_int8_path,
             graph_kind="steady",
             target_module_names=targets,
@@ -1335,7 +1428,7 @@ def build_engines(
     )
 
     onnx_paths = {
-        "fp16": {"initial": initial_fp16_path, "steady": steady_fp16_path},
+        "fp16": fp16_performance_paths,
         "int8": {"initial": initial_int8_path, "steady": steady_int8_path},
     }
     engines: dict[str, dict[str, Any]] = {"fp16": {}, "int8": {}}
@@ -1610,6 +1703,14 @@ def build_engines(
                 kind: {
                     precision: _sha256_file(onnx_paths[precision][kind])
                     for precision in ("fp16", "int8")
+                }
+                for kind in ("initial", "steady")
+            },
+            "qdq_source_onnx": {
+                kind: {
+                    "file": qdq_source_paths[kind].name,
+                    "opset": QDQ_OPSET,
+                    "sha256": _sha256_file(qdq_source_paths[kind]),
                 }
                 for kind in ("initial", "steady")
             },

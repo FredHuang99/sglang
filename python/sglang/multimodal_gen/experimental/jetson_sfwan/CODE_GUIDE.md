@@ -1034,7 +1034,7 @@ flowchart TD
     Dummy["seeded 21-frame dummy latent"]
     Scales["chunk 0 initial scales<br/>chunks 1..6 steady max scales"]
     Trace["run real post_quant_conv + decoder<br/>capture 32 active caches"]
-    Export["export initial_fp16.onnx<br/>export steady_fp16.onnx"]
+    Export["export real opset-19 Q/DQ sources<br/>initial/steady_fp16_opset19.onnx"]
     QDQ["vae_trt_qdq rewrite + structural audit"]
     Probe["small SM87 INT8 Conv3d probe"]
     Detailed["initial then steady detailed plans<br/>audit immediately"]
@@ -1081,6 +1081,8 @@ FP16 activation
 它不会生成 `QLinearConv` 或 `ConvInteger`。构建成功必须同时满足：
 
 - ONNX opset 恰为 19，checker 与 shape inference 通过；
+- Q/DQ rewriter 只接受真正以 opset 19 导出的图，绝不会只修改旧图的
+  `opset_import` 版本号；
 - target Q/DQ 路径没有 FP32 Cast，activation/weight scale 和 bias 均为
   FP16；
 - 28 个 logical weight、84 个 target Conv、84 条 activation Q/DQ、
@@ -1101,7 +1103,11 @@ manifest 的 audit 为通过状态。因此“生成了 plan”不等于“宣�
 构建状态写在 `build_state.json`。每个 stage 记录源 ONNX SHA256、输出 plan
 SHA256、Q/DQ schema 和 profiling verbosity；plan 与 JSON 均使用临时文件后
 原子替换。`--resume` 只重用全部字段匹配且能反序列化的 stage。旧 FP16
-ONNX/plan 可在 shape、dtype 和 I/O 验证后接管；旧 INT8 plan 不接管，因为
+opset 图和既有 FP16 plan 会保持原样配对使用；若旧图不是 opset 19，构建器
+会另行原子导出 `initial_fp16_opset19.onnx` 与
+`steady_fp16_opset19.onnx`，仅将它们用于 Q/DQ/INT8 构建。旧图不会被覆盖、
+伪升级或送入 Q/DQ rewriter。旧 FP16 ONNX/plan 可在 shape、dtype 和 I/O
+验证后接管；旧 INT8 plan 不接管，因为
 它可能来自 FP32 Q/DQ schema。`tensorrt_timing.cache` 在成功 build 后持久化，
 后续 detailed/performance stage 共享 tactic timing 结果。
 

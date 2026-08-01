@@ -90,14 +90,6 @@ def _opset_version(model: Any) -> int:
     raise ValueError("ONNX graph has no default-domain opset")
 
 
-def _set_default_opset_version(model: Any, version: int) -> None:
-    for opset in model.opset_import:
-        if opset.domain in {"", "ai.onnx"}:
-            opset.version = int(version)
-            return
-    raise ValueError("ONNX graph has no default-domain opset")
-
-
 def _as_positive_scale(value: Any, *, module_name: str) -> float:
     try:
         scale = float(value)
@@ -282,12 +274,12 @@ def rewrite_onnx_with_int8_qdq(
     destination = Path(destination_path)
     model = onnx.load(str(source), load_external_data=True)
     source_opset = _opset_version(model)
-    if source_opset > QDQ_OPSET:
+    if source_opset != QDQ_OPSET:
         raise ValueError(
-            f"explicit Q/DQ rewrite supports source ONNX opset <= {QDQ_OPSET}, "
-            f"got {source_opset}"
+            f"explicit Q/DQ rewrite requires a real ONNX opset {QDQ_OPSET} "
+            f"source graph, got opset {source_opset}; re-export the FP16 graph "
+            "instead of changing only its opset_import version"
         )
-    _set_default_opset_version(model, QDQ_OPSET)
 
     initializers = _initializer_map(model)
     resolved_weights = _resolve_weight_names(

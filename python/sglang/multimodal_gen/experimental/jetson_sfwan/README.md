@@ -188,9 +188,18 @@ Q/DQ around only the 28 residual-block 3x3x3 Conv3d modules. The Q/DQ scale,
 dequantized activation/weight, and Conv bias all use FP16; this prevents a
 Float/TF32 Conv fallback caused by FP32 Q/DQ boundaries.
 
+Q/DQ rewriting accepts only a graph that was genuinely exported as opset 19;
+it never changes an older graph's `opset_import` label. On `--resume`, legacy
+`initial_fp16.onnx` and `steady_fp16.onnx` files remain available for their
+already-built FP16 plans. If they use an older opset, the builder preserves
+them and atomically exports `initial_fp16_opset19.onnx` and
+`steady_fp16_opset19.onnx` as the separate Q/DQ sources. A failed export leaves
+only a `.partial` file and cannot replace a previously validated source.
+
 The fail-closed build order is:
 
-1. validate or export the two FP16 ONNX graphs;
+1. preserve any validated legacy FP16 graphs and validate or atomically export
+   the two real-opset-19 Q/DQ source graphs;
 2. build a small representative SM87 INT8 Conv3d capability probe;
 3. build and retain `initial_int8_detailed.plan`, audit all 84 target calls,
    and stop immediately if any call falls back;
@@ -199,10 +208,11 @@ The fail-closed build order is:
 
 `--resume` records each completed plan atomically in `build_state.json`. A
 restart verifies the source ONNX hash, plan hash, Q/DQ schema, and profiling
-verbosity before reusing a stage. Existing validated FP16 ONNX/plans from an
-older failed run are adopted, but old INT8 plans are never adopted because
-their Q/DQ graph may differ. The persistent timing cache is updated only after
-a successful TensorRT build. A build is accepted only if:
+verbosity before reusing a stage. Existing validated legacy FP16 ONNX/plans
+from an older failed run remain paired and reusable; they are not relabelled or
+used as Q/DQ input. Old INT8 plans are never adopted because their Q/DQ graph
+may differ. The persistent timing cache is updated only after a successful
+TensorRT build. A build is accepted only if:
 
 - each graph has 28 logical weights and 84 unrolled target Conv call sites;
 - every target activation and weight is connected through Q/DQ;

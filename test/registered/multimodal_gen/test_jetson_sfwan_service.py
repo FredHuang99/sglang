@@ -86,8 +86,10 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _audit_tensorrt_tactics,
+    _load_validated_fp16_onnx,
     _make_export_wrappers,
     _normalize_export_cache_tensors,
+    _onnx_default_opset_version,
     _parse_args as _parse_trt_build_args,
     _portable_conv3d_layout_for_export,
     _portable_nearest_upsample_for_export,
@@ -96,8 +98,10 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _validate_onnx_fp16_io_contract,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
+    EXPECTED_LOGICAL_CONVS,
     QDQ_OPSET,
     QDQ_SCHEMA_VERSION,
+    rewrite_onnx_with_int8_qdq,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
@@ -3766,6 +3770,64 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
     def test_trt_qdq_v2_uses_opset_19(self):
         self.assertEqual(QDQ_SCHEMA_VERSION, 2)
         self.assertEqual(QDQ_OPSET, 19)
+
+    def test_trt_qdq_rejects_relabelled_legacy_opset(self):
+        legacy_model = SimpleNamespace(
+            opset_import=[SimpleNamespace(domain="", version=17)]
+        )
+        fake_onnx = SimpleNamespace(load=mock.Mock(return_value=legacy_model))
+        targets = tuple(
+            f"decoder.residual.{index}.conv1" for index in range(EXPECTED_LOGICAL_CONVS)
+        )
+
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan."
+                "vae_trt_qdq._lazy_onnx",
+                return_value=(fake_onnx, object(), object(), (object(), object())),
+            ),
+            self.assertRaisesRegex(
+                ValueError,
+                "requires a real ONNX opset 19 source graph, got opset 17",
+            ),
+        ):
+            rewrite_onnx_with_int8_qdq(
+                source_path=Path("legacy_opset17.onnx"),
+                destination_path=Path("invalid_qdq.onnx"),
+                graph_kind="initial",
+                target_module_names=targets,
+                activation_scales={name: 1.0 for name in targets},
+            )
+
+        self.assertEqual(legacy_model.opset_import[0].version, 17)
+
+    def test_trt_qdq_source_reuse_requires_exact_opset(self):
+        legacy_model = SimpleNamespace(
+            opset_import=[SimpleNamespace(domain="ai.onnx", version=17)]
+        )
+        fake_onnx = ModuleType("onnx")
+        fake_onnx.load = mock.Mock(return_value=legacy_model)
+        fake_onnx.checker = SimpleNamespace(check_model=mock.Mock())
+
+        with (
+            mock.patch.dict(sys.modules, {"onnx": fake_onnx}),
+            self.assertRaisesRegex(
+                ValueError,
+                "uses ONNX opset 17, but Q/DQ requires a real opset 19 export",
+            ),
+        ):
+            _load_validated_fp16_onnx(
+                path=Path("initial_fp16.onnx"),
+                expected_input_shapes={},
+                expected_output_shapes={},
+                required_opset=QDQ_OPSET,
+            )
+
+        self.assertEqual(_onnx_default_opset_version(legacy_model), 17)
+        fake_onnx.checker.check_model.assert_called_once_with(
+            legacy_model,
+            full_check=True,
+        )
 
     def test_trt_tactic_audit_requires_int8_convolution_evidence(self):
         call_site = "int8/initial/decoder.block.conv1/call_0"
