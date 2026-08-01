@@ -8,7 +8,14 @@ import math
 from pathlib import Path
 from typing import Any, Literal
 
-from .vae_trt_qdq import EXPECTED_CALL_SITES, QDQ_SCHEMA_VERSION, QDQ_TOPOLOGY
+from .vae_trt_qdq import (
+    EXPECTED_CALL_SITES,
+    EXPECTED_CONV_SIGNATURES,
+    QDQ_SCHEMA_VERSION,
+    QDQ_TOPOLOGY,
+    WEIGHT_ENCODINGS,
+    WEIGHT_ENCODING_FP32_QDQ,
+)
 
 TRT_VAE_MANIFEST_SCHEMA_VERSION = 1
 TRT_VAE_HEIGHT = 480
@@ -224,6 +231,9 @@ def validate_trt_vae_manifest(
             raise ValueError(
                 f"INT8 TensorRT VAE requires Q/DQ schema {QDQ_SCHEMA_VERSION}"
             )
+        weight_encoding = quantization.get("weight_encoding")
+        if weight_encoding not in WEIGHT_ENCODINGS:
+            raise ValueError("INT8 TensorRT VAE weight encoding is invalid")
         audit = manifest.get("int8_audit")
         if not isinstance(audit, dict) or audit.get("passed") is not True:
             raise ValueError(
@@ -231,6 +241,10 @@ def validate_trt_vae_manifest(
             )
         if audit.get("schema_version") != QDQ_SCHEMA_VERSION:
             raise ValueError("INT8 TensorRT VAE manifest audit schema is invalid")
+        if audit.get("weight_encoding") != weight_encoding:
+            raise ValueError(
+                "INT8 TensorRT VAE manifest weight encoding is inconsistent"
+            )
         if audit.get("preflight_passed") is not True:
             raise ValueError("INT8 TensorRT VAE signature preflight did not pass")
         if audit.get("target_conv_call_sites_per_graph") != EXPECTED_CALL_SITES:
@@ -269,6 +283,7 @@ def validate_trt_vae_manifest(
             raise ValueError("TensorRT VAE INT8 audit report did not pass")
         if (
             report.get("schema_version") != QDQ_SCHEMA_VERSION
+            or report.get("weight_encoding") != weight_encoding
             or report.get("preflight_passed") is not True
             or report.get("complete") is not True
             or report.get("errors") != []
@@ -283,6 +298,8 @@ def validate_trt_vae_manifest(
             raise ValueError("TensorRT VAE INT8 signature probe suite did not pass")
         if (
             probe_suite.get("schema_version") != QDQ_SCHEMA_VERSION
+            or probe_suite.get("selected_weight_encoding") != weight_encoding
+            or probe_suite.get("weight_encoding") != weight_encoding
             or probe_suite.get("errors") != []
         ):
             raise ValueError("TensorRT VAE INT8 probe schema is invalid")
@@ -299,6 +316,7 @@ def validate_trt_vae_manifest(
             "unmapped_call_sites",
             "non_int8_call_sites",
             "activation_not_int8_call_sites",
+            "output_not_int8_call_sites",
             "static_weight_not_int8_call_sites",
             "dynamic_filter_call_sites",
             "fp16_fallback_call_sites",
@@ -307,7 +325,7 @@ def validate_trt_vae_manifest(
         if (
             isinstance(signature_count, bool)
             or not isinstance(signature_count, int)
-            or signature_count <= 0
+            or signature_count != EXPECTED_CONV_SIGNATURES
             or probed_signature_count != signature_count
             or not isinstance(signatures, dict)
             or len(signatures) != signature_count
@@ -321,6 +339,7 @@ def validate_trt_vae_manifest(
                 or probe.get("passed") is not True
                 or probe.get("mapped_count") != 1
                 or probe.get("errors") != []
+                or probe.get("weight_encoding") != weight_encoding
                 or any(probe.get(key) != [] for key in probe_empty_lists)
             ):
                 raise ValueError(
@@ -337,6 +356,7 @@ def validate_trt_vae_manifest(
                 not isinstance(probe_evidence, dict)
                 or probe_evidence.get("passed") is not True
                 or probe_evidence.get("activation_int8") is not True
+                or probe_evidence.get("output_int8") is not True
                 or probe_evidence.get("static_weight_int8") is not True
                 or probe_evidence.get("dynamic_filter") is True
                 or probe_evidence.get("int8_tactic") is not True
@@ -376,28 +396,65 @@ def validate_trt_vae_manifest(
         structural = report.get("structural")
         if not isinstance(structural, dict):
             raise ValueError("TensorRT VAE INT8 structural audits are missing")
+        expected_weight_quantize_count = (
+            EXPECTED_CALL_SITES if weight_encoding == WEIGHT_ENCODING_FP32_QDQ else 0
+        )
         for kind in ("initial", "steady"):
             graph_audit = structural.get(kind)
             if (
                 not isinstance(graph_audit, dict)
                 or graph_audit.get("schema_version") != QDQ_SCHEMA_VERSION
                 or graph_audit.get("qdq_topology") != QDQ_TOPOLOGY
+                or graph_audit.get("weight_encoding") != weight_encoding
                 or graph_audit.get("passed") is not True
                 or graph_audit.get("errors") != []
                 or graph_audit.get("target_conv_call_site_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("activation_cast_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("activation_quantize_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("activation_dequantize_count") != EXPECTED_CALL_SITES
-                or graph_audit.get("weight_quantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("weight_quantize_count")
+                != expected_weight_quantize_count
                 or graph_audit.get("weight_dequantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("output_quantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("output_dequantize_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("output_cast_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("unique_weight_source_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("unique_weight_quantize_output_count")
+                != expected_weight_quantize_count
+                or graph_audit.get("unique_weight_dequantize_output_count")
+                != EXPECTED_CALL_SITES
+                or graph_audit.get("unique_output_quantize_output_count")
+                != EXPECTED_CALL_SITES
+                or graph_audit.get("unique_output_dequantize_output_count")
+                != EXPECTED_CALL_SITES
                 or graph_audit.get("unique_bias_count") != EXPECTED_CALL_SITES
                 or graph_audit.get("unexpected_target_cast_nodes") != []
             ):
                 raise ValueError(
                     f"TensorRT VAE INT8 {kind} structural audit is invalid"
                 )
+
+        feature_cache = report.get("feature_cache")
+        expected_cache_counts = {
+            "initial": {"inputs": 0, "outputs": TRT_VAE_CACHE_COUNT},
+            "steady": {
+                "inputs": TRT_VAE_CACHE_COUNT,
+                "outputs": TRT_VAE_CACHE_COUNT,
+            },
+        }
+        if (
+            not isinstance(feature_cache, dict)
+            or feature_cache.get("passed") is not True
+            or feature_cache.get("errors") != []
+            or feature_cache.get("dtype") != "float16"
+            or feature_cache.get("tensor_count") != TRT_VAE_CACHE_COUNT
+            or feature_cache.get("binding_counts") != expected_cache_counts
+            or feature_cache.get("single_bank_bytes") != TRT_VAE_CACHE_BANK_BYTES
+            or feature_cache.get("double_bank_bytes") != TRT_VAE_CACHE_BANK_BYTES * 2
+            or feature_cache.get("quantized_bindings") != []
+            or feature_cache.get("physical_engine_io_checked") is not True
+        ):
+            raise ValueError("TensorRT VAE INT8 feature-cache audit is invalid")
 
         tactics = report.get("tactics")
         audit_plan_sha = audit.get("plan_sha256")
@@ -420,6 +477,7 @@ def validate_trt_vae_manifest(
                 "unmapped_call_sites",
                 "non_int8_call_sites",
                 "activation_not_int8_call_sites",
+                "output_not_int8_call_sites",
                 "static_weight_not_int8_call_sites",
                 "dynamic_filter_call_sites",
                 "fp16_fallback_call_sites",
@@ -440,6 +498,7 @@ def validate_trt_vae_manifest(
                     or not isinstance(evidence, dict)
                     or evidence.get("passed") is not True
                     or evidence.get("activation_int8") is not True
+                    or evidence.get("output_int8") is not True
                     or evidence.get("static_weight_int8") is not True
                     or evidence.get("dynamic_filter") is True
                     or evidence.get("int8_tactic") is not True
@@ -453,6 +512,10 @@ def validate_trt_vae_manifest(
             if tactic.get("build_profiling_verbosity") != "detailed":
                 raise ValueError(
                     f"TensorRT VAE INT8 {kind} plan was not built as detailed"
+                )
+            if tactic.get("weight_encoding") != weight_encoding:
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} weight encoding is inconsistent"
                 )
             if validated_engines[kind].get("profiling_verbosity") != "detailed":
                 raise ValueError(

@@ -35,7 +35,7 @@
 | [`protocol.py`](protocol.py) | 请求/响应 schema、帧数和 shape 校验、safetensors 编解码、SHM descriptor | 不加载模型，不管理 queue |
 | [`model.py`](model.py) | FastVideo 对齐的 prompt、DMD、clean-KV、causal VAE 低层调用 | 不接 HTTP，不决定 FCFS |
 | [`vae_trt_build.py`](vae_trt_build.py) | 在目标 Orin 上捕获原生 Wan VAE、收集 dummy scale、导出 initial/steady ONNX，执行全 signature preflight、事务式 timing cache、full-plan tactic audit 与断点恢复 | 不进入 server 热路径，不实现新的 decoder 数学 |
-| [`vae_trt_qdq.py`](vae_trt_qdq.py) | 对 ONNX 中 28 个 residual Conv3d 的 84 个展开 call site 分别插入独立 constant-weight Q/DQ，做结构审计并提取真实 Conv signature | 不加载 Torch、TensorRT 或模型权重 |
+| [`vae_trt_qdq.py`](vae_trt_qdq.py) | 对 ONNX 中 28 个 residual Conv3d 的 84 个展开 call site 分别插入 input/output Q/DQ，并支持独立 FP32-weight Q/DQ 或预量化 INT8-weight DQ，做结构审计并提取真实 Conv signature | 不加载 Torch、TensorRT 或模型权重 |
 | [`vae_trt_runtime.py`](vae_trt_runtime.py) | 校验 manifest/plan，绑定 PyTorch CUDA tensor，执行 initial/steady context 并管理双 cache bank | 不接 HTTP，不执行 latent 传输，不提供动态 shape |
 | [`engine.py`](engine.py) | request-level FCFS、job 状态、HTTP DiT→VAE sender | 不做模型 forward |
 | [`transport.py`](transport.py) | pinned H2D、POSIX SHM、CUDA host registration、SHM sender | 不决定请求顺序 |
@@ -1032,20 +1032,25 @@ flowchart TD
     Load["_ComponentSet loads native FP16 VAE"]
     Targets["find 14 residual blocks / 28 Conv3d"]
     Dummy["seeded 21-frame dummy latent"]
-    Scales["chunk 0 initial scales<br/>chunks 1..6 steady max scales"]
+    Scales["chunk 0 initial input/output scales<br/>chunks 1..6 steady input/output max scales"]
     Trace["run real post_quant_conv + decoder<br/>capture 32 active caches"]
     Export["export real opset-19 Q/DQ sources<br/>initial/steady_fp16_opset19.onnx"]
     QDQ["vae_trt_qdq rewrite + structural audit"]
-    Probe["deduplicate all real Conv signatures<br/>one v4 probe per signature"]
+    Probe["deduplicate exactly 9 real Conv signatures<br/>one full v5 probe per signature"]
+    WeightGate{"FP32-weight Q/DQ<br/>static INT8 weight?"}
+    Retry["retry all 9 signatures<br/>prequantized INT8-weight DQ"]
     Gate{"all probes pass?"}
     Detailed["build initial/steady once as DETAILED<br/>audit before cache commit"]
     Build["reuse audited INT8 plans directly<br/>build/adopt only FP16 controls"]
     Manifest["manifest + scales + audit"]
 
     CLI --> Load --> Targets --> Dummy --> Scales --> Trace --> Export
-    Export --> QDQ --> Probe --> Gate
+    Export --> QDQ --> Probe --> WeightGate
+    WeightGate -->|yes| Gate
+    WeightGate -->|weight-only failure| Retry --> Gate
+    WeightGate -->|other failure| Stop
     Gate -->|yes| Detailed --> Build --> Manifest
-    Gate -->|no| Stop["write v4 audit and stop"]
+    Gate -->|no| Stop["write v5 audit and stop"]
 ```
 
 关键点：
@@ -1059,13 +1064,16 @@ flowchart TD
    不能仅凭 33 个 causal-conv module 类型推断。
 4. initial wrapper 固定展开 `first_chunk=True/False/False` 三次 latent
    decode；steady wrapper 固定展开三次 `first_chunk=False`。
-5. dummy latent 先整体生成 FP32，再整体转 BF16；chunk 0 的三个 call
-   共享每个 logical Conv 的 initial 最大 absmax，chunk 1–6 的十八个 call
-   共享 steady 最大 absmax。
-6. initial/steady ONNX 各自包含 84 个展开 Conv call site。activation scale
-   仍按 logical Conv 汇总，但每个 call site 都复制独立的 FP32 weight、
-   per-output-channel FP32 scale、INT8 zero point、weight Q/DQ 与 FP32 bias；
-   图中不共享 weight initializer 或 weight DQ 输出。
+5. dummy latent 先整体生成 FP32，再整体转 BF16；hook 同时收集每个目标 Conv
+   的 input/output absmax。chunk 0 的三个 call 共享 initial 最大值，chunk
+   1–6 的十八个 call 共享 steady 最大值；scale 为
+   `max(absmax/127, 1e-8)`。
+6. initial/steady ONNX 各自包含 84 个展开 Conv call site。scale 数值按 logical
+   Conv 汇总，但每个 call site 都复制独立 input/output scale、zero point、
+   weight、weight scale 和 bias；图中不共享这些 initializer 或 Q/DQ 输出。
+7. 主 weight topology 是独立 FP32 constant→Q→DQ；若已映射的静态 filter
+   仍未成为 INT8，builder 才会用独立 INT8 constant→DQ 重跑全部九种
+   signature。initial/steady 必须选择同一种 encoding。
 
 ### 14.3 Q/DQ 重写与 fail-closed audit
 
@@ -1084,26 +1092,30 @@ FP16 activation
          -> DequantizeLinear(FP32),
        independent FP32 bias
      )
+  -> QuantizeLinear(INT8, output scalar FP32 scale, int8 zero)
+  -> DequantizeLinear(FP32)
   -> Cast(FP16)
 ```
 
 TensorRT 10.3 [release
 notes](https://docs.nvidia.com/deeplearning/tensorrt/archives/tensorrt-1030/pdf/TensorRT-Release-Notes.pdf)
-记录的限制是 Q/DQ data 与 scale 只支持 FP32；v3 的 FP16 Q/DQ 因此被保留为
-Half reformat，并最终选择 `f16f16` Conv tactic。v4 只在每个目标 Conv 的局部
-边界升到 FP32，DQ 直接连接 Conv，Conv 后立即降回 FP16，外围 VAE 图与 cache
-契约不变。真正的验收点仍是 builder 是否将 constant→Q→DQ 折叠成静态 INT8
-filter，并选择 INT8 tactic。它不会生成 `QLinearConv` 或
-`ConvInteger`。结构审计必须同时满足：
+记录的限制是 Q/DQ data 与 scale 只支持 FP32；因此所有 local Q/DQ 语义均为
+FP32，外围图再通过 Cast 保持 FP16。v4 只有输入/weight Q/DQ，Conv 输出没有
+trailing Q；实际 Inspector 因而显示 Float activation、Float weight、Float
+output 和 `f32f32_tf32f32` tactic。v5 在 Conv 后直接增加 output Q/DQ，使
+TensorRT 有机会融合 INT8 input、静态 INT8 weight 和 INT8 output。它不会生成
+`QLinearConv` 或 `ConvInteger`。结构审计必须同时满足：
 
 - ONNX opset 恰为 19，checker 与 shape inference 通过；
 - Q/DQ rewriter 只接受真正以 opset 19 导出的图，绝不会只修改旧图的
   `opset_import` 版本号；
-- 每个 target activation 必须恰有一个 FP16→FP32 Cast，每个 Conv 输出必须
-  恰有一个 FP32→FP16 Cast，且不存在其他 target Cast；activation/weight
-  scale、weight source 和 bias 均为 FP32，zero point 必须是全零 INT8；
-- 每个图恰有 84 个 target Conv、84 条 activation Q/DQ、84 条 weight
-  Q/DQ、84 个互不共享的 rank-5 FP32 weight source 和 84 个独立 bias；
+- 每个 target activation 必须恰有一个 FP16→FP32 Cast；Conv 输出必须直接
+  进入 output Q→DQ，再由唯一 FP32→FP16 Cast恢复原 tensor 名称；
+- input/output/weight scale 和 bias 均为 FP32，zero point 必须是全零 INT8；
+- 每个图恰有 84 个 target Conv、84 条 input Q/DQ、84 条 output Q/DQ 和
+  84 个独立 bias；weight 路径只能全为 84 条 FP32 Q/DQ，或全为 84 条
+  prequantized INT8 DQ，禁止混用；
+- FP32 weight source 或预量化 INT8 weight source 必须互不共享且 rank 5；
 - weight scale 必须为正且 finite，长度等于 output channel，Q/DQ axis
   均为 0；
 - 每个 logical module 的 call index 恰为 `0,1,2`；
@@ -1113,8 +1125,9 @@ filter，并选择 INT8 tactic。它不会生成 `QLinearConv` 或
   的 hook 捕获（input 包含原生 causal padding）；ONNX shape inference 若也给出
   对应 shape，则必须与捕获值一致。内部 `value_info` 缺失本身不再误判失败。
 
-builder 合并 initial/steady 共 168 个 call site 的 signature；每种唯一
-signature 用和正式图相同的 helper 生成一个独立 v4 probe，逐个构建并审计。
+builder 合并 initial/steady 共 168 个 call site，并严格要求得到九种唯一
+signature；每种 signature 用和正式图相同的 helper 生成一个独立 v5 probe，
+逐个构建并审计。
 `--preflight-only` 在所有 probe 通过后返回 0，不构建完整 VAE plan。任一
 signature 失败都会记录它覆盖的 initial/steady call site 并立即停止，不能据此
 泛化宣称“Orin 不支持所有 INT8 Conv3d”。
@@ -1123,6 +1136,7 @@ Inspector 映射同时搜索 `Name` 和 `Metadata`，兼容融合 layer。每个
 full-plan target Conv 必须同时证明：
 
 - activation engine input 的 `Format/Datatype` 为 INT8；
+- Conv engine output 的 `Format/Datatype` 为 INT8；
 - 不存在 dynamic filter（Inspector 通常报告 `HasDynamicFilter=0`；字段缺失时，
   必须有非空静态 INT8 `Weights` 作为等价证据）；
 - `Weights.Count>0` 且 `Weights.Type=Int8`；
@@ -1134,7 +1148,7 @@ full-plan target Conv 必须同时证明：
 DETAILED 构建，各审计 84 个 call site，审计通过的同一份 plan直接成为 runtime
 plan，不再另建无法审核的 `profiling_verbosity=none` 副本。
 
-构建状态写在 `build_state_v4.json`，stage 明确区分 `built`、
+构建状态写在 `build_state_v5.json`，stage 明确区分 `built`、
 `audit_failed`、`audit_passed`。每个 stage 记录源 ONNX SHA256、输出 plan
 SHA256、Q/DQ schema、profiling verbosity 和 audit SHA；plan 与 JSON 均使用
 临时文件后原子替换。`--resume` 可对已经 built/failed 的 plan重新审计，不必
@@ -1143,11 +1157,12 @@ opset 图和既有 FP16 plan 会保持原样配对使用；若旧图不是 opset
 会另行原子导出 `initial_fp16_opset19.onnx` 与
 `steady_fp16_opset19.onnx`，仅将它们用于 Q/DQ/INT8 构建。旧图不会被覆盖、
 伪升级或送入 Q/DQ rewriter。旧 FP16 ONNX/plan 可在 shape、dtype 和 I/O
-验证后接管；v2/v3 INT8 ONNX/plan/state/audit/timing cache 永不接管或覆盖。
-v4 使用 `initial_int8_qdq_v4.onnx/plan`、
-`steady_int8_qdq_v4.onnx/plan`、`quant_scales_v4.json`、
-`int8_audit_v4.json` 与 `tensorrt_timing_qdq_v4.cache`。只有构建 identity
-完全匹配时，才复用 v3 activation scales 与未量化的 opset-19 source ONNX。
+验证后接管；v2/v3/v4 INT8 ONNX/plan/state/audit/timing cache 永不接管或
+覆盖。v5 使用 `initial_int8_qdq_v5.onnx/plan`、
+`steady_int8_qdq_v5.onnx/plan`、`quant_scales_v5.json`、
+`int8_audit_v5.json` 与 `tensorrt_timing_qdq_v5.cache`。只有构建 identity
+完全匹配时，才可复用 v4 input activation scales 与未量化的 opset-19 source
+ONNX；output activation scales必须重新收集。
 
 timing cache 通过
 `IBuilderConfig.create_timing_cache/set_timing_cache/get_timing_cache` 管理。
@@ -1164,9 +1179,12 @@ build 失败、dynamic filter、FP16/FP32/TF32 fallback 均不会污染稳定 ca
 - initial/steady RGB shape；
 - 所选 precision 的两个 plan 路径位于 engine directory 内；
 - plan SHA256；
-- `int8_trt` 额外要求 Q/DQ/audit schema 4、probe suite 全通过、initial 与
-  steady 各映射 84 个 call site，所有 unmapped/non-INT8/dynamic-filter/
+- `int8_trt` 额外要求 Q/DQ/audit schema 5、weight encoding 三方一致、九种
+  signature probe 全通过、initial 与 steady 各映射 84 个 call site，所有
+  unmapped/non-INT8/input-not-INT8/output-not-INT8/dynamic-filter/
   FP16/FP32/TF32 fallback 列表为空；
+- physical engine I/O audit 证明 initial 的 32 个 cache output 以及 steady
+  的 32 input/32 output 全为 FP16；任何 INT8 cache binding 都拒绝启动；
 - audit、manifest engine record、磁盘 plan 三方 SHA256 完全一致，且 INT8
   plan 的 build verbosity 为 detailed。
 
@@ -1261,17 +1279,21 @@ profile 关闭时，kind/precision 仍作为低成本状态存在，但三个 `*
 - [ ] build 是否在实际执行 plan 的 SM87 Orin 上完成？
 - [ ] initial/steady cache 是否都是 32 个且共 944,286,720 elements？
 - [ ] initial/steady RGB 是否分别为 9/12 帧？
-- [ ] 两个 Q/DQ graph 是否各有 84 个 activation FP32 Cast/Q/DQ、84 个独立
-  FP32 weight Q/DQ、84 个独立 FP32 bias、84 个 output FP16 Cast，且没有
-  共享 weight source/DQ output？
-- [ ] `int8_probe_suite_v4.json` 是否覆盖 initial/steady 各 84 个 call site，
-  每种唯一 signature 是否都通过？
-- [ ] `int8_audit_v4.json.passed` 是否为 true，unmapped/non-int8/dynamic
-  filter/FP16/FP32/TF32 fallback 是否全部为空？
+- [ ] 两个 Q/DQ graph 是否各有 84 个 input Q/DQ、84 个 output Q/DQ、84 个
+  独立 FP32 bias、84 个 output FP16 Cast，且没有共享 scale/weight/Q/DQ？
+- [ ] weight encoding 是否全图统一为 `fp32_qdq` 或
+  `prequantized_int8_dq`，且 manifest/probe/structural/tactic audit一致？
+- [ ] `int8_probe_suite_v5.json` 是否覆盖 initial/steady 各 84 个 call site，
+  signature 是否严格为 9/9 并全部通过？
+- [ ] `int8_audit_v5.json.passed` 是否为 true，unmapped/non-int8/
+  input-not-INT8/output-not-INT8/dynamic-filter/FP16/FP32/TF32 fallback 是否
+  全部为空？
+- [ ] initial 32 个 cache output、steady 32 input/32 output 是否均为 FP16，
+  `quantized_bindings` 是否为空？
 - [ ] initial/steady INT8 plan 是否就是经过 detailed audit 的同一份 runtime
   plan，而非另建的 NONE plan？
 - [ ] audit、manifest 与磁盘 plan 的 SHA256 是否三方一致？
-- [ ] failed audit 是否保持 `tensorrt_timing_qdq_v4.cache` 原值不变？
+- [ ] failed audit 是否保持 `tensorrt_timing_qdq_v5.cache` 原值不变？
 - [ ] manifest 的四个 plan digest 是否匹配？
 - [ ] `GET /v1/engine` 是否显示 `vae_backend=tensorrt`、正确 precision/SM/TRT？
 - [ ] `vae_runtime_nvtx_verbosity` 是否与 `--enable-nvtx` 一致？

@@ -3,6 +3,7 @@
 import ast
 import asyncio
 import builtins
+import copy
 import contextvars
 import hashlib
 import importlib.util
@@ -89,6 +90,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _audit_tensorrt_tactics,
     _build_engine_bytes,
     _candidate_timing_cache_bytes,
+    _audit_feature_cache_engine_io,
     _capture_target_conv_call_shapes,
     _commit_timing_cache,
     _load_validated_fp16_onnx,
@@ -99,15 +101,19 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _parse_args as _parse_trt_build_args,
     _portable_conv3d_layout_for_export,
     _portable_nearest_upsample_for_export,
+    _probe_suite_supports_prequantized_weight_fallback,
     _record_stage,
     _stage_is_current,
     _validate_onnx_fp16_io_contract,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
+    EXPECTED_CONV_SIGNATURES,
     EXPECTED_LOGICAL_CONVS,
     QDQ_OPSET,
     QDQ_SCHEMA_VERSION,
     QDQ_TOPOLOGY,
+    WEIGHT_ENCODING_FP32_QDQ,
+    WEIGHT_ENCODING_PREQUANTIZED_INT8_DQ,
     audit_qdq_model,
     rewrite_onnx_with_int8_qdq,
 )
@@ -3812,16 +3818,17 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
         self.assertEqual(records["initial"]["conv"], [expected] * 3)
         self.assertEqual(records["steady"]["conv"], [expected] * 3)
 
-    def test_trt_qdq_v4_uses_opset_19(self):
-        self.assertEqual(QDQ_SCHEMA_VERSION, 4)
+    def test_trt_qdq_v5_uses_opset_19(self):
+        self.assertEqual(QDQ_SCHEMA_VERSION, 5)
         self.assertEqual(QDQ_OPSET, 19)
+        self.assertEqual(EXPECTED_CONV_SIGNATURES, 9)
         self.assertEqual(
             QDQ_TOPOLOGY,
-            "fp16_cast_fp32_qdq_fp32_conv_cast_fp16",
+            "fp16_cast_fp32_input_qdq_fp32_conv_output_qdq_fp32_cast_fp16",
         )
 
     @unittest.skipUnless(importlib.util.find_spec("onnx"), "onnx is not installed")
-    def test_trt_qdq_v4_uses_fp32_qdq_and_clones_every_call_site(self):
+    def test_trt_qdq_v5_quantizes_input_weight_and_output_per_call_site(self):
         import numpy as np
         import onnx
         from onnx import TensorProto, helper, numpy_helper
@@ -3858,7 +3865,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 )
         graph = helper.make_graph(
             nodes,
-            "qdq-v4-test",
+            "qdq-v5-test",
             [
                 helper.make_tensor_value_info(
                     "input", TensorProto.FLOAT16, [1, 1, 1, 1, 1]
@@ -3886,7 +3893,8 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 destination_path=destination,
                 graph_kind="initial",
                 target_module_names=targets,
-                activation_scales={name: 1.0 for name in targets},
+                activation_input_scales={name: 1.0 for name in targets},
+                activation_output_scales={name: 1.0 for name in targets},
                 call_site_shape_contracts={
                     name: [
                         {
@@ -3902,6 +3910,8 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             self.assertEqual(report["activation_quantize_count"], 84)
             self.assertEqual(report["weight_quantize_count"], 84)
             self.assertEqual(report["weight_dequantize_count"], 84)
+            self.assertEqual(report["output_quantize_count"], 84)
+            self.assertEqual(report["output_dequantize_count"], 84)
             self.assertEqual(report["output_cast_count"], 84)
             self.assertEqual(report["unique_weight_source_count"], 84)
             self.assertEqual(report["unique_bias_count"], 84)
@@ -3977,7 +3987,11 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 self.assertEqual(activation_q.op_type, "QuantizeLinear")
                 self.assertEqual(activation_cast.op_type, "Cast")
                 self.assertEqual(len(consumers[conv.output[0]]), 1)
-                self.assertEqual(consumers[conv.output[0]][0].op_type, "Cast")
+                output_q = consumers[conv.output[0]][0]
+                self.assertEqual(output_q.op_type, "QuantizeLinear")
+                output_dq = consumers[output_q.output[0]][0]
+                self.assertEqual(output_dq.op_type, "DequantizeLinear")
+                self.assertEqual(consumers[output_dq.output[0]][0].op_type, "Cast")
                 bias = initializer_by_name[conv.input[2]]
                 self.assertEqual(bias.data_type, TensorProto.FLOAT)
             for q_node in (
@@ -3995,6 +4009,48 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             ):
                 source_weight = initializer_by_name[weight_q_node.input[0]]
                 self.assertEqual(source_weight.data_type, TensorProto.FLOAT)
+
+            prequantized_destination = Path(directory) / "qdq-prequantized.onnx"
+            prequantized_report = rewrite_onnx_with_int8_qdq(
+                source_path=source,
+                destination_path=prequantized_destination,
+                graph_kind="initial",
+                target_module_names=targets,
+                activation_input_scales={name: 1.0 for name in targets},
+                activation_output_scales={name: 1.0 for name in targets},
+                weight_encoding=WEIGHT_ENCODING_PREQUANTIZED_INT8_DQ,
+                call_site_shape_contracts={
+                    name: [
+                        {
+                            "input_shape": [1, 1, 1, 1, 1],
+                            "output_shape": [1, 1, 1, 1, 1],
+                        }
+                        for _ in range(3)
+                    ]
+                    for name in targets
+                },
+            )
+            self.assertEqual(prequantized_report["weight_quantize_count"], 0)
+            self.assertEqual(prequantized_report["weight_dequantize_count"], 84)
+            self.assertEqual(
+                prequantized_report["weight_encoding"],
+                WEIGHT_ENCODING_PREQUANTIZED_INT8_DQ,
+            )
+            prequantized_model = onnx.load(prequantized_destination)
+            prequantized_initializers = {
+                initializer.name: initializer
+                for initializer in prequantized_model.graph.initializer
+            }
+            for weight_dq_node in (
+                node
+                for node in prequantized_model.graph.node
+                if node.op_type == "DequantizeLinear"
+                and node.name.startswith("qdq/initial/weight/")
+            ):
+                self.assertEqual(
+                    prequantized_initializers[weight_dq_node.input[0]].data_type,
+                    TensorProto.INT8,
+                )
 
             shape_overrides = {
                 signature["call_site"]: {
@@ -4160,6 +4216,37 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 )
             )
 
+            invalid_output_scale = onnx.load(destination)
+            output_q = next(
+                node
+                for node in invalid_output_scale.graph.node
+                if node.op_type == "QuantizeLinear"
+                and node.name.startswith("qdq/initial/output/")
+            )
+            invalid_output_initializers = {
+                initializer.name: initializer
+                for initializer in invalid_output_scale.graph.initializer
+            }
+            output_scale = invalid_output_initializers[output_q.input[1]]
+            output_scale.CopyFrom(
+                numpy_helper.from_array(
+                    np.asarray(float("nan"), dtype=np.float32),
+                    name=output_scale.name,
+                )
+            )
+            invalid_output_report = audit_qdq_model(
+                invalid_output_scale,
+                graph_kind="initial",
+                target_module_names=targets,
+            )
+            self.assertFalse(invalid_output_report["passed"])
+            self.assertTrue(
+                any(
+                    "output_scale_invalid" in error
+                    for error in invalid_output_report["invalid_bindings"]
+                )
+            )
+
             malformed_qdq = onnx.load(destination)
             malformed_activation_q = next(
                 node
@@ -4206,7 +4293,8 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 destination_path=Path("invalid_qdq.onnx"),
                 graph_kind="initial",
                 target_module_names=targets,
-                activation_scales={name: 1.0 for name in targets},
+                activation_input_scales={name: 1.0 for name in targets},
+                activation_output_scales={name: 1.0 for name in targets},
             )
 
         self.assertEqual(legacy_model.opset_import[0].version, 17)
@@ -4249,6 +4337,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                         "LayerType": "CaskConvolution",
                         "HasDynamicFilter": 0,
                         "Inputs": [{"Format/Datatype": "Int8"}],
+                        "Outputs": [{"Format/Datatype": "Int8"}],
                         "Weights": {"Count": 4096, "Type": "Int8"},
                         "TacticName": "sm87_xmma_fprop_implicit_gemm_i8i8_i32",
                     }
@@ -4272,6 +4361,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                         "LayerType": "CaskConvolution",
                         "HasDynamicFilter": 1,
                         "Inputs": [{"Format/Datatype": "Half"}],
+                        "Outputs": [{"Format/Datatype": "Half"}],
                         "Weights": {"Count": 0, "Type": "Half"},
                         "TacticName": (
                             "sm80_xmma_fprop_implicit_gemm_f16f16_f16f16_f16"
@@ -4301,10 +4391,11 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                         "Metadata": f"[ONNX Layer: {call_site}]",
                         "LayerType": "CaskConvolution",
                         "HasDynamicFilter": 0,
-                        "Inputs": [{"Format/Datatype": "Half"}],
-                        "Weights": {"Count": 3981312, "Type": "Half"},
+                        "Inputs": [{"Format/Datatype": "Float"}],
+                        "Outputs": [{"Format/Datatype": "Float"}],
+                        "Weights": {"Count": 3981312, "Type": "Float"},
                         "TacticName": (
-                            "sm80_xmma_fprop_implicit_gemm_f16f16_f16f16_f16"
+                            "sm80_xmma_fprop_implicit_gemm_f32f32_tf32f32_f32"
                         ),
                     }
                 ]
@@ -4323,7 +4414,8 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             static_half["static_weight_not_int8_call_sites"],
             [call_site],
         )
-        self.assertEqual(static_half["fp16_fallback_call_sites"], [call_site])
+        self.assertEqual(static_half["output_not_int8_call_sites"], [call_site])
+        self.assertEqual(static_half["fp32_or_tf32_fallback_call_sites"], [call_site])
 
         deceptive_inspector = json.dumps(
             {
@@ -4333,6 +4425,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                         "LayerType": "CaskConvolution",
                         "HasDynamicFilter": 0,
                         "Inputs": [{"Format/Datatype": "Int8"}],
+                        "Outputs": [{"Format/Datatype": "Int8"}],
                         "Weights": {"Count": 4096, "Type": "Int8"},
                         "TacticName": "sm80_xmma_fprop_f16f16_f16f16_f16",
                     }
@@ -4349,6 +4442,84 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
         self.assertTrue(deceptive["matches"][call_site]["activation_int8"])
         self.assertTrue(deceptive["matches"][call_site]["static_weight_int8"])
         self.assertTrue(deceptive["matches"][call_site]["fp16_fallback"])
+
+        mixed_output_inspector = json.dumps(
+            {
+                "Layers": [
+                    {
+                        "Name": call_site,
+                        "LayerType": "CaskConvolution",
+                        "HasDynamicFilter": 0,
+                        "Inputs": [{"Format/Datatype": "Int8"}],
+                        "Outputs": [{"Format/Datatype": "Float"}],
+                        "Weights": {"Count": 4096, "Type": "Int8"},
+                        "TacticName": "sm87_xmma_fprop_implicit_gemm_i8i8_i32",
+                    }
+                ]
+            }
+        )
+        mixed = _audit_tensorrt_tactics(
+            graph_kind="initial",
+            call_site_names=[call_site],
+            inspector_json=mixed_output_inspector,
+            expected_call_sites=1,
+        )
+        self.assertFalse(mixed["passed"])
+        self.assertEqual(mixed["output_not_int8_call_sites"], [call_site])
+
+    def test_trt_weight_fallback_requires_static_mapped_weight_failure(self):
+        eligible = {
+            "signatures": {
+                "signature": {
+                    "passed": False,
+                    "mapped_count": 1,
+                    "unmapped_call_sites": [],
+                    "dynamic_filter_call_sites": [],
+                    "static_weight_not_int8_call_sites": ["conv"],
+                }
+            }
+        }
+        self.assertTrue(_probe_suite_supports_prequantized_weight_fallback(eligible))
+        dynamic = copy.deepcopy(eligible)
+        dynamic["signatures"]["signature"]["dynamic_filter_call_sites"] = ["conv"]
+        self.assertFalse(_probe_suite_supports_prequantized_weight_fallback(dynamic))
+
+    def test_trt_feature_cache_audit_rejects_int8_binding(self):
+        initial = [
+            {
+                "name": f"cache_out_{index:03d}",
+                "dtype": "float16",
+                "mode": "output",
+            }
+            for index in range(32)
+        ]
+        steady = [
+            {
+                "name": f"cache_in_{index:03d}",
+                "dtype": "float16",
+                "mode": "input",
+            }
+            for index in range(32)
+        ] + [
+            {
+                "name": f"cache_out_{index:03d}",
+                "dtype": "float16",
+                "mode": "output",
+            }
+            for index in range(32)
+        ]
+        passed = _audit_feature_cache_engine_io(
+            initial_io=initial,
+            steady_io=steady,
+        )
+        self.assertTrue(passed["passed"])
+        steady[0]["dtype"] = "int8"
+        failed = _audit_feature_cache_engine_io(
+            initial_io=initial,
+            steady_io=steady,
+        )
+        self.assertFalse(failed["passed"])
+        self.assertEqual(failed["quantized_bindings"], ["cache_in_000"])
 
     def test_trt_build_stage_resume_requires_matching_source_and_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4952,6 +5123,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 "unmapped_call_sites": [],
                 "non_int8_call_sites": [],
                 "activation_not_int8_call_sites": [],
+                "output_not_int8_call_sites": [],
                 "static_weight_not_int8_call_sites": [],
                 "dynamic_filter_call_sites": [],
                 "fp16_fallback_call_sites": [],
@@ -4963,33 +5135,39 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             }
             audit_report = {
                 "schema_version": QDQ_SCHEMA_VERSION,
+                "weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
                 "passed": True,
                 "preflight_passed": True,
                 "complete": True,
                 "target_conv_call_sites_per_graph": 84,
                 "probe_suite": {
                     "schema_version": QDQ_SCHEMA_VERSION,
+                    "weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
+                    "selected_weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
                     "passed": True,
-                    "signature_count": 1,
-                    "probed_signature_count": 1,
+                    "signature_count": EXPECTED_CONV_SIGNATURES,
+                    "probed_signature_count": EXPECTED_CONV_SIGNATURES,
                     "source_call_site_counts": {"initial": 84, "steady": 84},
                     "errors": [],
                     "signatures": {
-                        "signature": {
-                            "signature_id": "signature",
+                        f"signature-{signature_index}": {
+                            "signature_id": f"signature-{signature_index}",
                             "passed": True,
                             "mapped_count": 1,
                             "errors": [],
+                            "weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
                             "source_call_sites": {
                                 kind: [
-                                    f"int8/{kind}/call_{index}" for index in range(84)
+                                    f"int8/{kind}/call_{index}"
+                                    for index in range(signature_index, 84, 9)
                                 ]
                                 for kind in ("initial", "steady")
                             },
                             "matches": {
-                                "int8/probe/call_0": {
+                                f"int8/probe/{signature_index}/call_0": {
                                     "passed": True,
                                     "activation_int8": True,
+                                    "output_int8": True,
                                     "static_weight_int8": True,
                                     "dynamic_filter": False,
                                     "int8_tactic": True,
@@ -4999,12 +5177,14 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                             },
                             **empty_tactic_lists,
                         }
+                        for signature_index in range(EXPECTED_CONV_SIGNATURES)
                     },
                 },
                 "structural": {
                     kind: {
                         "schema_version": QDQ_SCHEMA_VERSION,
                         "qdq_topology": QDQ_TOPOLOGY,
+                        "weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
                         "passed": True,
                         "errors": [],
                         "target_conv_call_site_count": 84,
@@ -5013,12 +5193,32 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                         "activation_dequantize_count": 84,
                         "weight_quantize_count": 84,
                         "weight_dequantize_count": 84,
+                        "output_quantize_count": 84,
+                        "output_dequantize_count": 84,
                         "output_cast_count": 84,
                         "unique_weight_source_count": 84,
+                        "unique_weight_quantize_output_count": 84,
+                        "unique_weight_dequantize_output_count": 84,
+                        "unique_output_quantize_output_count": 84,
+                        "unique_output_dequantize_output_count": 84,
                         "unique_bias_count": 84,
                         "unexpected_target_cast_nodes": [],
                     }
                     for kind in ("initial", "steady")
+                },
+                "feature_cache": {
+                    "passed": True,
+                    "errors": [],
+                    "dtype": "float16",
+                    "tensor_count": 32,
+                    "binding_counts": {
+                        "initial": {"inputs": 0, "outputs": 32},
+                        "steady": {"inputs": 32, "outputs": 32},
+                    },
+                    "single_bank_bytes": TRT_VAE_CACHE_BANK_BYTES,
+                    "double_bank_bytes": TRT_VAE_CACHE_BANK_BYTES * 2,
+                    "quantized_bindings": [],
+                    "physical_engine_io_checked": True,
                 },
                 "tactics": {
                     kind: {
@@ -5027,10 +5227,12 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                         "mapped_count": 84,
                         "build_profiling_verbosity": "detailed",
                         "plan_sha256": plan_sha[kind],
+                        "weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
                         "matches": {
                             f"int8/{kind}/call_{index}": {
                                 "passed": True,
                                 "activation_int8": True,
+                                "output_int8": True,
                                 "static_weight_int8": True,
                                 "dynamic_filter": False,
                                 "int8_tactic": True,
@@ -5046,7 +5248,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 "plan_sha256": plan_sha,
             }
             audit_payload = json.dumps(audit_report, sort_keys=True).encode()
-            (root / "int8_audit_v4.json").write_bytes(audit_payload)
+            (root / "int8_audit_v5.json").write_bytes(audit_payload)
             audit_digest = hashlib.sha256(audit_payload).hexdigest()
 
             cache_shapes = [[1, 1, 1, 1, TRT_VAE_CACHE_TOTAL_ELEMENTS - 31]]
@@ -5062,6 +5264,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 "quantization": {
                     "qdq_schema_version": QDQ_SCHEMA_VERSION,
                     "topology": QDQ_TOPOLOGY,
+                    "weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
                 },
                 "cache": {
                     "allocated_slot_count": 33,
@@ -5106,9 +5309,10 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 "int8_audit": {
                     "passed": True,
                     "schema_version": QDQ_SCHEMA_VERSION,
+                    "weight_encoding": WEIGHT_ENCODING_FP32_QDQ,
                     "preflight_passed": True,
                     "target_conv_call_sites_per_graph": 84,
-                    "report_file": "int8_audit_v4.json",
+                    "report_file": "int8_audit_v5.json",
                     "report_sha256": audit_digest,
                     "plan_sha256": plan_sha,
                 },
@@ -5128,7 +5332,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             )
             first_initial_evidence["fp16_fallback"] = True
             deceptive_payload = json.dumps(audit_report, sort_keys=True).encode()
-            (root / "int8_audit_v4.json").write_bytes(deceptive_payload)
+            (root / "int8_audit_v5.json").write_bytes(deceptive_payload)
             manifest["int8_audit"]["report_sha256"] = hashlib.sha256(
                 deceptive_payload
             ).hexdigest()
@@ -5142,12 +5346,12 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 )
             first_initial_evidence["fp16_fallback"] = False
             audit_payload = json.dumps(audit_report, sort_keys=True).encode()
-            (root / "int8_audit_v4.json").write_bytes(audit_payload)
+            (root / "int8_audit_v5.json").write_bytes(audit_payload)
             manifest["int8_audit"]["report_sha256"] = hashlib.sha256(
                 audit_payload
             ).hexdigest()
 
-            manifest["quantization"]["qdq_schema_version"] = 2
+            manifest["quantization"]["qdq_schema_version"] = 4
             with self.assertRaisesRegex(
                 ValueError, f"Q/DQ schema {QDQ_SCHEMA_VERSION}"
             ):
@@ -5193,7 +5397,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             manifest["engines"]["int8"]["steady"]["sha256"] = digest_by_file[
                 "steady_int8.plan"
             ]
-            (root / "int8_audit_v4.json").write_text("{}", encoding="utf-8")
+            (root / "int8_audit_v5.json").write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "audit digest"):
                 validate_trt_vae_manifest(
                     manifest,
