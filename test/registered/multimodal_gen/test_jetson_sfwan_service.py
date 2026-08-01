@@ -85,7 +85,9 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.transport import (
     _shared_memory_header,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
+    _attach_timing_cache,
     _audit_tensorrt_tactics,
+    _build_engine_bytes,
     _load_validated_fp16_onnx,
     _make_export_wrappers,
     _normalize_export_cache_tensors,
@@ -93,6 +95,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _parse_args as _parse_trt_build_args,
     _portable_conv3d_layout_for_export,
     _portable_nearest_upsample_for_export,
+    _persist_timing_cache,
     _record_stage,
     _stage_is_current,
     _validate_onnx_fp16_io_contract,
@@ -3927,6 +3930,134 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             args = _parse_trt_build_args()
         self.assertTrue(args.resume)
         self.assertEqual(args.timing_cache, "/engines/timing.cache")
+
+    def test_trt_timing_cache_uses_builder_config_api(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "timing.cache"
+            cache_path.write_bytes(b"existing-cache")
+            timing_cache = object()
+            config = SimpleNamespace(
+                create_timing_cache=mock.Mock(return_value=timing_cache),
+                set_timing_cache=mock.Mock(return_value=True),
+                get_timing_cache=mock.Mock(),
+            )
+            trt = SimpleNamespace(__version__="10.3.0")
+
+            attached = _attach_timing_cache(
+                trt=trt,
+                config=config,
+                timing_cache_path=cache_path,
+            )
+
+            self.assertIs(attached, timing_cache)
+            config.create_timing_cache.assert_called_once_with(b"existing-cache")
+            config.set_timing_cache.assert_called_once_with(
+                timing_cache,
+                ignore_mismatch=False,
+            )
+            self.assertIsNone(
+                _attach_timing_cache(
+                    trt=trt,
+                    config=SimpleNamespace(),
+                    timing_cache_path=None,
+                )
+            )
+
+    def test_trt_timing_cache_fails_closed_on_incompatible_api_or_cache(self):
+        trt = SimpleNamespace(__version__="10.3.0")
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "IBuilderConfig is missing timing-cache APIs",
+        ):
+            _attach_timing_cache(
+                trt=trt,
+                config=SimpleNamespace(),
+                timing_cache_path=Path("timing.cache"),
+            )
+
+        config = SimpleNamespace(
+            create_timing_cache=mock.Mock(return_value=object()),
+            set_timing_cache=mock.Mock(return_value=False),
+            get_timing_cache=mock.Mock(),
+        )
+        with self.assertRaisesRegex(RuntimeError, "rejected timing cache"):
+            _attach_timing_cache(
+                trt=trt,
+                config=config,
+                timing_cache_path=Path("timing.cache"),
+            )
+
+    def test_trt_timing_cache_is_persisted_atomically(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "timing.cache"
+            timing_cache = SimpleNamespace(
+                serialize=mock.Mock(return_value=b"new-cache")
+            )
+            config = SimpleNamespace(
+                get_timing_cache=mock.Mock(return_value=timing_cache)
+            )
+
+            _persist_timing_cache(
+                config=config,
+                timing_cache_path=cache_path,
+            )
+
+            self.assertEqual(cache_path.read_bytes(), b"new-cache")
+            self.assertFalse(cache_path.with_name("timing.cache.partial").exists())
+
+    def test_trt_failed_build_does_not_persist_timing_cache(self):
+        config = SimpleNamespace(
+            set_memory_pool_limit=mock.Mock(),
+            profiling_verbosity=None,
+        )
+        parser = SimpleNamespace(parse_from_file=mock.Mock(return_value=True))
+        builder = SimpleNamespace(
+            create_network=mock.Mock(return_value=object()),
+            create_builder_config=mock.Mock(return_value=config),
+            build_serialized_network=mock.Mock(return_value=None),
+        )
+        trt = SimpleNamespace(
+            Builder=mock.Mock(return_value=builder),
+            OnnxParser=mock.Mock(return_value=parser),
+            MemoryPoolType=SimpleNamespace(WORKSPACE=object()),
+        )
+
+        with (
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan."
+                "vae_trt_build._trt_logger",
+                return_value=object(),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan."
+                "vae_trt_build._network_flags",
+                return_value=0,
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan."
+                "vae_trt_build._profiling_verbosity",
+                return_value=object(),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan."
+                "vae_trt_build._attach_timing_cache",
+                return_value=object(),
+            ),
+            mock.patch(
+                "sglang.multimodal_gen.experimental.jetson_sfwan."
+                "vae_trt_build._persist_timing_cache"
+            ) as persist,
+            self.assertRaisesRegex(RuntimeError, "could not build"),
+        ):
+            _build_engine_bytes(
+                trt=trt,
+                onnx_path=Path("probe.onnx"),
+                workspace_gib=1,
+                profiling_verbosity="none",
+                timing_cache_path=Path("timing.cache"),
+            )
+
+        persist.assert_not_called()
 
     def test_trt_export_cache_boundary_normalizes_fp16(self):
         active_indices = tuple(range(32))

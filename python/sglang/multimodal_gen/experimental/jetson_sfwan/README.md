@@ -212,7 +212,12 @@ verbosity before reusing a stage. Existing validated legacy FP16 ONNX/plans
 from an older failed run remain paired and reusable; they are not relabelled or
 used as Q/DQ input. Old INT8 plans are never adopted because their Q/DQ graph
 may differ. The persistent timing cache is updated only after a successful
-TensorRT build. A build is accepted only if:
+TensorRT build. The optional persistent timing cache is created, attached, and retrieved
+through TensorRT's `IBuilderConfig` API. It is loaded with strict device/version
+matching and atomically updated only after a successful engine build; a failed
+probe or plan build leaves the previous cache untouched.
+
+A build is accepted only if:
 
 - each graph has 28 logical weights and 84 unrolled target Conv call sites;
 - every target activation and weight is connected through Q/DQ;

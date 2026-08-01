@@ -770,6 +770,61 @@ def _engine_io_contract(engine: Any) -> list[dict[str, Any]]:
     return records
 
 
+def _attach_timing_cache(
+    *,
+    trt: Any,
+    config: Any,
+    timing_cache_path: Path | None,
+) -> Any | None:
+    if timing_cache_path is None:
+        return None
+    required_methods = (
+        "create_timing_cache",
+        "set_timing_cache",
+        "get_timing_cache",
+    )
+    missing = [
+        name for name in required_methods if not callable(getattr(config, name, None))
+    ]
+    if missing:
+        version = getattr(trt, "__version__", "unknown")
+        raise RuntimeError(
+            f"TensorRT {version} IBuilderConfig is missing timing-cache APIs: "
+            f"{missing}; omit --timing-cache or use a compatible TensorRT build"
+        )
+    cache_data = timing_cache_path.read_bytes() if timing_cache_path.is_file() else b""
+    action = "Loading" if cache_data else "Creating"
+    print(
+        f"{action} TensorRT timing cache {timing_cache_path} ({len(cache_data)} bytes)"
+    )
+    timing_cache = config.create_timing_cache(cache_data)
+    if timing_cache is None:
+        raise RuntimeError(
+            f"TensorRT could not create timing cache from {timing_cache_path}"
+        )
+    attached = config.set_timing_cache(timing_cache, ignore_mismatch=False)
+    if not attached:
+        raise RuntimeError(
+            f"TensorRT rejected timing cache {timing_cache_path}; it may belong "
+            "to a different CUDA, TensorRT, or GPU environment"
+        )
+    return timing_cache
+
+
+def _persist_timing_cache(*, config: Any, timing_cache_path: Path | None) -> None:
+    if timing_cache_path is None:
+        return
+    timing_cache = config.get_timing_cache()
+    if timing_cache is None:
+        raise RuntimeError("TensorRT returned no timing cache after a successful build")
+    serialized_cache = timing_cache.serialize()
+    cache_bytes = bytes(serialized_cache)
+    _write_bytes(timing_cache_path, cache_bytes)
+    print(
+        f"Updated TensorRT timing cache {timing_cache_path} ({len(cache_bytes)} bytes)"
+    )
+
+
 def _build_engine_bytes(
     *,
     trt: Any,
@@ -793,18 +848,19 @@ def _build_engine_bytes(
         int(workspace_gib * 1024**3),
     )
     config.profiling_verbosity = _profiling_verbosity(trt, profiling_verbosity)
-    if timing_cache_path is not None and hasattr(config, "set_timing_cache"):
-        cache_data = (
-            timing_cache_path.read_bytes() if timing_cache_path.is_file() else b""
-        )
-        timing_cache = builder.create_timing_cache(cache_data)
-        config.set_timing_cache(timing_cache, ignore_mismatch=False)
+    timing_cache = _attach_timing_cache(
+        trt=trt,
+        config=config,
+        timing_cache_path=timing_cache_path,
+    )
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError(f"TensorRT could not build {onnx_path}")
-    if timing_cache_path is not None and hasattr(config, "get_timing_cache"):
-        serialized_cache = config.get_timing_cache().serialize()
-        _write_bytes(timing_cache_path, bytes(serialized_cache))
+    _persist_timing_cache(
+        config=config,
+        timing_cache_path=timing_cache_path,
+    )
+    del timing_cache
     plan = bytes(serialized)
     runtime = trt.Runtime(logger)
     engine = runtime.deserialize_cuda_engine(plan)

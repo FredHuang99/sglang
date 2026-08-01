@@ -1109,7 +1109,9 @@ opset 图和既有 FP16 plan 会保持原样配对使用；若旧图不是 opset
 伪升级或送入 Q/DQ rewriter。旧 FP16 ONNX/plan 可在 shape、dtype 和 I/O
 验证后接管；旧 INT8 plan 不接管，因为
 它可能来自 FP32 Q/DQ schema。`tensorrt_timing.cache` 在成功 build 后持久化，
-后续 detailed/performance stage 共享 tactic timing 结果。
+后续 detailed/performance stage 共享 tactic timing 结果。timing cache 通过
+`IBuilderConfig.create_timing_cache/set_timing_cache/get_timing_cache` 管理，
+严格校验当前 GPU/CUDA/TensorRT 环境，并且只在 engine 成功后原子更新。
 
 ### 14.4 Manifest 与启动校验
 
