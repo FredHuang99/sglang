@@ -8,6 +8,8 @@ import math
 from pathlib import Path
 from typing import Any, Literal
 
+from .vae_trt_qdq import EXPECTED_CALL_SITES, QDQ_SCHEMA_VERSION
+
 TRT_VAE_MANIFEST_SCHEMA_VERSION = 1
 TRT_VAE_HEIGHT = 480
 TRT_VAE_WIDTH = 832
@@ -38,6 +40,33 @@ def _version_prefix(version: str, fields: int = 2) -> tuple[int, ...]:
         if len(values) == fields:
             break
     return tuple(values)
+
+
+def _configure_context_nvtx(
+    *, context: Any, trt: Any, precision: TrtVaePrecision, enable_nvtx: bool
+) -> str:
+    if precision != "int8":
+        effective = getattr(context, "nvtx_verbosity", None)
+        return (
+            str(effective).split(".")[-1].lower()
+            if effective is not None
+            else "unavailable"
+        )
+    requested = (
+        trt.ProfilingVerbosity.DETAILED if enable_nvtx else trt.ProfilingVerbosity.NONE
+    )
+    try:
+        context.nvtx_verbosity = requested
+        effective = context.nvtx_verbosity
+    except (AttributeError, RuntimeError, TypeError) as exc:
+        raise RuntimeError(
+            "TensorRT INT8 VAE could not set execution-context NVTX verbosity"
+        ) from exc
+    if effective != requested:
+        raise RuntimeError(
+            f"TensorRT context NVTX verbosity is {effective}, expected {requested}"
+        )
+    return str(effective).split(".")[-1].lower()
 
 
 def load_trt_vae_manifest(engine_dir: str | Path) -> dict[str, Any]:
@@ -186,12 +215,24 @@ def validate_trt_vae_manifest(
         validated_engines[kind] = {**record, "path": str(plan_path)}
 
     if precision == "int8":
+        quantization = manifest.get("quantization")
+        if (
+            not isinstance(quantization, dict)
+            or quantization.get("qdq_schema_version") != QDQ_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                f"INT8 TensorRT VAE requires Q/DQ schema {QDQ_SCHEMA_VERSION}"
+            )
         audit = manifest.get("int8_audit")
         if not isinstance(audit, dict) or audit.get("passed") is not True:
             raise ValueError(
                 "INT8 TensorRT VAE requires a passing structural and tactic audit"
             )
-        if audit.get("target_conv_call_sites_per_graph") != 84:
+        if audit.get("schema_version") != QDQ_SCHEMA_VERSION:
+            raise ValueError("INT8 TensorRT VAE manifest audit schema is invalid")
+        if audit.get("preflight_passed") is not True:
+            raise ValueError("INT8 TensorRT VAE signature preflight did not pass")
+        if audit.get("target_conv_call_sites_per_graph") != EXPECTED_CALL_SITES:
             raise ValueError("INT8 TensorRT VAE audit call-site count is invalid")
         report_file = audit.get("report_file")
         if not isinstance(report_file, str) or not report_file:
@@ -225,10 +266,205 @@ def validate_trt_vae_manifest(
             ) from exc
         if not isinstance(report, dict) or report.get("passed") is not True:
             raise ValueError("TensorRT VAE INT8 audit report did not pass")
-        if report.get("target_conv_call_sites_per_graph") != 84:
+        if (
+            report.get("schema_version") != QDQ_SCHEMA_VERSION
+            or report.get("preflight_passed") is not True
+            or report.get("complete") is not True
+            or report.get("errors") != []
+        ):
+            raise ValueError("TensorRT VAE INT8 audit report is incomplete")
+        if report.get("target_conv_call_sites_per_graph") != EXPECTED_CALL_SITES:
             raise ValueError(
                 "TensorRT VAE INT8 audit report call-site count is invalid"
             )
+        probe_suite = report.get("probe_suite")
+        if not isinstance(probe_suite, dict) or probe_suite.get("passed") is not True:
+            raise ValueError("TensorRT VAE INT8 signature probe suite did not pass")
+        if (
+            probe_suite.get("schema_version") != QDQ_SCHEMA_VERSION
+            or probe_suite.get("errors") != []
+        ):
+            raise ValueError("TensorRT VAE INT8 probe schema is invalid")
+        source_counts = probe_suite.get("source_call_site_counts")
+        if source_counts != {
+            "initial": EXPECTED_CALL_SITES,
+            "steady": EXPECTED_CALL_SITES,
+        }:
+            raise ValueError("TensorRT VAE INT8 probe coverage is incomplete")
+        signatures = probe_suite.get("signatures")
+        signature_count = probe_suite.get("signature_count")
+        probed_signature_count = probe_suite.get("probed_signature_count")
+        probe_empty_lists = (
+            "unmapped_call_sites",
+            "non_int8_call_sites",
+            "activation_not_int8_call_sites",
+            "static_weight_not_int8_call_sites",
+            "dynamic_filter_call_sites",
+            "fp16_fallback_call_sites",
+            "fp32_or_tf32_fallback_call_sites",
+        )
+        if (
+            isinstance(signature_count, bool)
+            or not isinstance(signature_count, int)
+            or signature_count <= 0
+            or probed_signature_count != signature_count
+            or not isinstance(signatures, dict)
+            or len(signatures) != signature_count
+        ):
+            raise ValueError("TensorRT VAE INT8 signature probe records are invalid")
+        probed_source_call_sites = {"initial": [], "steady": []}
+        for signature_id, probe in signatures.items():
+            if (
+                not isinstance(probe, dict)
+                or probe.get("signature_id") != signature_id
+                or probe.get("passed") is not True
+                or probe.get("mapped_count") != 1
+                or probe.get("errors") != []
+                or any(probe.get(key) != [] for key in probe_empty_lists)
+            ):
+                raise ValueError(
+                    f"TensorRT VAE INT8 signature probe is invalid: {signature_id}"
+                )
+            probe_matches = probe.get("matches")
+            if not isinstance(probe_matches, dict) or len(probe_matches) != 1:
+                raise ValueError(
+                    f"TensorRT VAE INT8 signature probe evidence is invalid: "
+                    f"{signature_id}"
+                )
+            probe_evidence = next(iter(probe_matches.values()))
+            if (
+                not isinstance(probe_evidence, dict)
+                or probe_evidence.get("passed") is not True
+                or probe_evidence.get("activation_int8") is not True
+                or probe_evidence.get("static_weight_int8") is not True
+                or probe_evidence.get("dynamic_filter") is True
+                or probe_evidence.get("int8_tactic") is not True
+                or probe_evidence.get("fp16_fallback") is not False
+                or probe_evidence.get("fp32_or_tf32_fallback") is not False
+            ):
+                raise ValueError(
+                    f"TensorRT VAE INT8 signature probe tactic is invalid: "
+                    f"{signature_id}"
+                )
+            source_call_sites = probe.get("source_call_sites")
+            if not isinstance(source_call_sites, dict):
+                raise ValueError(
+                    f"TensorRT VAE INT8 signature coverage is invalid: {signature_id}"
+                )
+            for kind in ("initial", "steady"):
+                call_sites = source_call_sites.get(kind)
+                if not isinstance(call_sites, list) or any(
+                    not isinstance(call_site, str) or not call_site
+                    for call_site in call_sites
+                ):
+                    raise ValueError(
+                        "TensorRT VAE INT8 signature source call sites are invalid: "
+                        f"{signature_id}/{kind}"
+                    )
+                probed_source_call_sites[kind].extend(call_sites)
+        for kind in ("initial", "steady"):
+            call_sites = probed_source_call_sites[kind]
+            if (
+                len(call_sites) != EXPECTED_CALL_SITES
+                or len(set(call_sites)) != EXPECTED_CALL_SITES
+            ):
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} signature coverage is invalid"
+                )
+
+        structural = report.get("structural")
+        if not isinstance(structural, dict):
+            raise ValueError("TensorRT VAE INT8 structural audits are missing")
+        for kind in ("initial", "steady"):
+            graph_audit = structural.get(kind)
+            if (
+                not isinstance(graph_audit, dict)
+                or graph_audit.get("schema_version") != QDQ_SCHEMA_VERSION
+                or graph_audit.get("passed") is not True
+                or graph_audit.get("errors") != []
+                or graph_audit.get("target_conv_call_site_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("activation_quantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("activation_dequantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("weight_quantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("weight_dequantize_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("unique_weight_source_count") != EXPECTED_CALL_SITES
+                or graph_audit.get("unique_bias_count") != EXPECTED_CALL_SITES
+            ):
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} structural audit is invalid"
+                )
+
+        tactics = report.get("tactics")
+        audit_plan_sha = audit.get("plan_sha256")
+        report_plan_sha = report.get("plan_sha256")
+        if not isinstance(tactics, dict):
+            raise ValueError("TensorRT VAE INT8 tactic audits are missing")
+        for kind in ("initial", "steady"):
+            tactic = tactics.get(kind)
+            plan_sha256 = validated_engines[kind]["sha256"]
+            if not isinstance(tactic, dict) or tactic.get("passed") is not True:
+                raise ValueError(f"TensorRT VAE INT8 {kind} tactic audit did not pass")
+            if (
+                tactic.get("mapped_count") != EXPECTED_CALL_SITES
+                or tactic.get("errors") != []
+            ):
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} tactic coverage is incomplete"
+                )
+            for key in (
+                "unmapped_call_sites",
+                "non_int8_call_sites",
+                "activation_not_int8_call_sites",
+                "static_weight_not_int8_call_sites",
+                "dynamic_filter_call_sites",
+                "fp16_fallback_call_sites",
+                "fp32_or_tf32_fallback_call_sites",
+            ):
+                if tactic.get(key) != []:
+                    raise ValueError(
+                        f"TensorRT VAE INT8 {kind} audit has non-empty {key}"
+                    )
+            matches = tactic.get("matches")
+            if not isinstance(matches, dict) or len(matches) != EXPECTED_CALL_SITES:
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} tactic records are incomplete"
+                )
+            for call_site, evidence in matches.items():
+                if (
+                    not isinstance(call_site, str)
+                    or not isinstance(evidence, dict)
+                    or evidence.get("passed") is not True
+                    or evidence.get("activation_int8") is not True
+                    or evidence.get("static_weight_int8") is not True
+                    or evidence.get("dynamic_filter") is True
+                    or evidence.get("int8_tactic") is not True
+                    or evidence.get("fp16_fallback") is not False
+                    or evidence.get("fp32_or_tf32_fallback") is not False
+                ):
+                    raise ValueError(
+                        f"TensorRT VAE INT8 {kind} tactic evidence is invalid: "
+                        f"{call_site}"
+                    )
+            if tactic.get("build_profiling_verbosity") != "detailed":
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} plan was not built as detailed"
+                )
+            if validated_engines[kind].get("profiling_verbosity") != "detailed":
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} manifest verbosity is invalid"
+                )
+            if validated_engines[kind].get("audit_passed") is not True:
+                raise ValueError(
+                    f"TensorRT VAE INT8 {kind} manifest is not audit-passed"
+                )
+            if (
+                tactic.get("plan_sha256") != plan_sha256
+                or not isinstance(audit_plan_sha, dict)
+                or audit_plan_sha.get(kind) != plan_sha256
+                or not isinstance(report_plan_sha, dict)
+                or report_plan_sha.get(kind) != plan_sha256
+            ):
+                raise ValueError(f"TensorRT VAE INT8 {kind} plan/audit digest mismatch")
 
     return {
         "cache_shapes": shapes,
@@ -278,6 +514,7 @@ class TensorRTVaeRuntime:
         self._cache_shapes: list[tuple[int, ...]] = validated["cache_shapes"]
         self._engines: dict[str, Any] = {}
         self._contexts: dict[str, Any] = {}
+        self._context_nvtx_verbosity: dict[str, str] = {}
         for kind in ("initial", "steady"):
             plan_path = Path(validated["engines"][kind]["path"])
             engine = self._trt_runtime.deserialize_cuda_engine(plan_path.read_bytes())
@@ -289,6 +526,12 @@ class TensorRTVaeRuntime:
                 raise RuntimeError(
                     f"could not create TensorRT execution context: {plan_path}"
                 )
+            self._context_nvtx_verbosity[kind] = _configure_context_nvtx(
+                context=context,
+                trt=trt,
+                precision=precision,
+                enable_nvtx=enable_nvtx,
+            )
             self._engines[kind] = engine
             self._contexts[kind] = context
         self._cache_banks = [
@@ -398,6 +641,7 @@ class TensorRTVaeRuntime:
             "vae_int8_audit_passed": bool(
                 self.manifest.get("int8_audit", {}).get("passed", False)
             ),
+            "vae_runtime_nvtx_verbosity": dict(self._context_nvtx_verbosity),
             "vae_cache_tensor_count": TRT_VAE_CACHE_COUNT,
             "vae_cache_bank_bytes": TRT_VAE_CACHE_BANK_BYTES,
             "vae_cache_double_bank_bytes": TRT_VAE_CACHE_BANK_BYTES * 2,

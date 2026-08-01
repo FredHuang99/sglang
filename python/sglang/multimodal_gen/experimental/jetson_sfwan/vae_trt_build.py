@@ -20,6 +20,7 @@ from .vae_trt_qdq import (
     QDQ_OPSET,
     QDQ_SCHEMA_VERSION,
     rewrite_onnx_with_int8_qdq,
+    write_int8_conv3d_probe,
 )
 from .vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
@@ -811,17 +812,27 @@ def _attach_timing_cache(
     return timing_cache
 
 
-def _persist_timing_cache(*, config: Any, timing_cache_path: Path | None) -> None:
+def _candidate_timing_cache_bytes(
+    *, config: Any, timing_cache_path: Path | None
+) -> bytes | None:
     if timing_cache_path is None:
-        return
+        return None
     timing_cache = config.get_timing_cache()
     if timing_cache is None:
         raise RuntimeError("TensorRT returned no timing cache after a successful build")
-    serialized_cache = timing_cache.serialize()
-    cache_bytes = bytes(serialized_cache)
+    return bytes(timing_cache.serialize())
+
+
+def _commit_timing_cache(
+    *, timing_cache_path: Path | None, candidate: bytes | None
+) -> None:
+    if timing_cache_path is None or candidate is None:
+        return
+    cache_bytes = bytes(candidate)
     _write_bytes(timing_cache_path, cache_bytes)
     print(
-        f"Updated TensorRT timing cache {timing_cache_path} ({len(cache_bytes)} bytes)"
+        f"Committed TensorRT timing cache {timing_cache_path} "
+        f"({len(cache_bytes)} bytes)"
     )
 
 
@@ -832,7 +843,7 @@ def _build_engine_bytes(
     workspace_gib: float,
     profiling_verbosity: str,
     timing_cache_path: Path | None = None,
-) -> tuple[bytes, list[dict[str, Any]], str]:
+) -> tuple[bytes, list[dict[str, Any]], str, bytes | None]:
     logger = _trt_logger(trt)
     builder = trt.Builder(logger)
     network = builder.create_network(_network_flags(trt))
@@ -856,7 +867,7 @@ def _build_engine_bytes(
     serialized = builder.build_serialized_network(network, config)
     if serialized is None:
         raise RuntimeError(f"TensorRT could not build {onnx_path}")
-    _persist_timing_cache(
+    candidate_timing_cache = _candidate_timing_cache_bytes(
         config=config,
         timing_cache_path=timing_cache_path,
     )
@@ -870,7 +881,12 @@ def _build_engine_bytes(
         )
     inspector = engine.create_engine_inspector()
     inspector_json = inspector.get_engine_information(trt.LayerInformationFormat.JSON)
-    return plan, _engine_io_contract(engine), inspector_json
+    return (
+        plan,
+        _engine_io_contract(engine),
+        inspector_json,
+        candidate_timing_cache,
+    )
 
 
 def _load_plan(
@@ -916,27 +932,97 @@ def _inspector_layer_type(record: dict[str, Any]) -> str:
     return ""
 
 
-def _precision_evidence(record: dict[str, Any]) -> str:
-    evidence: list[str] = []
+def _inspector_metadata(record: dict[str, Any]) -> str:
+    for key in ("Metadata", "metadata"):
+        value = record.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
 
-    def _visit(value: Any, key: str = "") -> None:
-        normalized_key = key.lower().replace("_", "")
-        if isinstance(value, dict):
-            for child_key, child_value in value.items():
-                _visit(child_value, str(child_key))
-            return
-        if isinstance(value, list):
-            for child in value:
-                _visit(child, key)
-            return
-        if any(
-            marker in normalized_key
-            for marker in ("format", "datatype", "precision", "tactic")
-        ):
-            evidence.append(str(value))
 
-    _visit(record)
-    return " ".join(evidence).lower()
+def _case_insensitive_value(record: dict[str, Any], key: str) -> Any:
+    normalized = key.lower().replace("_", "")
+    for candidate, value in record.items():
+        if candidate.lower().replace("_", "") == normalized:
+            return value
+    return None
+
+
+def _format_datatype(value: Any) -> str:
+    if not isinstance(value, dict):
+        return ""
+    result = _case_insensitive_value(value, "Format/Datatype")
+    return str(result).lower() if result is not None else ""
+
+
+def _as_inspector_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes"}:
+            return True
+        if normalized in {"0", "false", "no"}:
+            return False
+    return None
+
+
+def _conv_tactic_evidence(record: dict[str, Any]) -> dict[str, Any]:
+    inputs = _case_insensitive_value(record, "Inputs")
+    activation_datatype = (
+        _format_datatype(inputs[0])
+        if isinstance(inputs, list) and inputs and isinstance(inputs[0], dict)
+        else ""
+    )
+    dynamic_filter = _as_inspector_bool(
+        _case_insensitive_value(record, "HasDynamicFilter")
+    )
+    weights = _case_insensitive_value(record, "Weights")
+    weight_count = 0
+    weight_type = ""
+    if isinstance(weights, dict):
+        raw_count = _case_insensitive_value(weights, "Count")
+        try:
+            weight_count = int(raw_count)
+        except (TypeError, ValueError):
+            weight_count = 0
+        raw_type = _case_insensitive_value(weights, "Type")
+        weight_type = str(raw_type).lower() if raw_type is not None else ""
+    tactic_value = _case_insensitive_value(record, "TacticName")
+    tactic_name = str(tactic_value) if tactic_value is not None else ""
+    tactic_lower = tactic_name.lower()
+    activation_int8 = "int8" in activation_datatype
+    static_weight_int8 = (
+        dynamic_filter is not True and weight_count > 0 and "int8" in weight_type
+    )
+    int8_tactic = any(
+        marker in tactic_lower
+        for marker in ("int8", "imma", "i8i8", "s8s8", "_i8", "i8_")
+    )
+    fp16_fallback = "f16f16" in tactic_lower
+    fp32_or_tf32_fallback = any(marker in tactic_lower for marker in ("f32f32", "tf32"))
+    passed = (
+        activation_int8
+        and static_weight_int8
+        and int8_tactic
+        and not fp16_fallback
+        and not fp32_or_tf32_fallback
+    )
+    return {
+        "activation_datatype": activation_datatype,
+        "activation_int8": activation_int8,
+        "static_weight_int8": static_weight_int8,
+        "dynamic_filter": dynamic_filter,
+        "weight_count": weight_count,
+        "weight_type": weight_type,
+        "tactic_name": tactic_name,
+        "int8_tactic": int8_tactic,
+        "fp16_fallback": fp16_fallback,
+        "fp32_or_tf32_fallback": fp32_or_tf32_fallback,
+        "passed": passed,
+    }
 
 
 def _audit_tensorrt_tactics(
@@ -954,31 +1040,49 @@ def _audit_tensorrt_tactics(
     matches: dict[str, Any] = {}
     unmapped: list[str] = []
     non_int8: list[str] = []
+    activation_not_int8: list[str] = []
+    static_weight_not_int8: list[str] = []
+    dynamic_filter_call_sites: list[str] = []
+    fp16_fallback_call_sites: list[str] = []
+    fp32_or_tf32_fallback_call_sites: list[str] = []
     for call_site in call_site_names:
         matched = [
             layer
             for layer in layers
-            if call_site in _inspector_layer_name(layer)
-            and "convolution" in _inspector_layer_type(layer).lower()
+            if call_site
+            in f"{_inspector_layer_name(layer)} {_inspector_metadata(layer)}"
+            and "convolution"
+            in (
+                f"{_inspector_layer_type(layer)} "
+                f"{_case_insensitive_value(layer, 'ParameterType')}"
+            ).lower()
         ]
         if not matched:
             unmapped.append(call_site)
             continue
-        evidence = [_precision_evidence(layer) for layer in matched]
-        has_int8 = any(
-            "int8" in value or "kint8" in value or "imma" in value for value in evidence
+        candidates = [_conv_tactic_evidence(layer) for layer in matched]
+        selected = next(
+            (candidate for candidate in candidates if candidate["passed"]),
+            candidates[0],
         )
-        has_float_fallback = any(
-            "f32f32" in value or "tf32" in value for value in evidence
-        )
-        if not has_int8 or has_float_fallback:
+        if not selected["passed"]:
             non_int8.append(call_site)
+        if not selected["activation_int8"]:
+            activation_not_int8.append(call_site)
+        if not selected["static_weight_int8"]:
+            static_weight_not_int8.append(call_site)
+        if selected["dynamic_filter"] is True:
+            dynamic_filter_call_sites.append(call_site)
+        if selected["fp16_fallback"]:
+            fp16_fallback_call_sites.append(call_site)
+        if selected["fp32_or_tf32_fallback"]:
+            fp32_or_tf32_fallback_call_sites.append(call_site)
         matches[call_site] = {
             "layer_names": [_inspector_layer_name(layer) for layer in matched],
             "layer_types": [_inspector_layer_type(layer) for layer in matched],
-            "precision_evidence": evidence,
-            "int8_evidence": has_int8 and not has_float_fallback,
-            "float_fallback_evidence": has_float_fallback,
+            "metadata": [_inspector_metadata(layer) for layer in matched],
+            **selected,
+            "candidates": candidates,
         }
     errors = []
     if len(call_site_names) != expected_call_sites:
@@ -991,96 +1095,21 @@ def _audit_tensorrt_tactics(
     if non_int8:
         errors.append(f"{len(non_int8)} call sites have no INT8 tactic evidence")
     return {
+        "schema_version": QDQ_SCHEMA_VERSION,
         "graph_kind": graph_kind,
         "passed": not errors,
         "errors": errors,
         "mapped_count": len(matches),
         "unmapped_call_sites": unmapped,
         "non_int8_call_sites": non_int8,
+        "activation_not_int8_call_sites": activation_not_int8,
+        "static_weight_not_int8_call_sites": static_weight_not_int8,
+        "dynamic_filter_call_sites": dynamic_filter_call_sites,
+        "fp16_fallback_call_sites": fp16_fallback_call_sites,
+        "fp32_or_tf32_fallback_call_sites": fp32_or_tf32_fallback_call_sites,
         "matches": matches,
         "inspector": decoded,
     }
-
-
-def _write_int8_conv3d_probe(path: Path) -> str:
-    """Write one real-shape FP16-Q/DQ Conv3d graph before full engine builds."""
-
-    import numpy as np
-    import onnx
-    from onnx import TensorProto, helper, numpy_helper
-
-    call_site = "int8/probe/conv/call_0"
-    activation_shape = (1, 192, 3, 122, 210)
-    weight_shape = (384, 192, 3, 3, 3)
-    output_shape = (1, 384, 1, 120, 208)
-    activation_scale = np.asarray(1.0 / 127.0, dtype=np.float16)
-    weight_scale = np.full((weight_shape[0],), 1.0 / 127.0, dtype=np.float16)
-    graph = helper.make_graph(
-        [
-            helper.make_node(
-                "QuantizeLinear",
-                ["activation", "activation_scale", "activation_zero"],
-                ["activation_int8"],
-                name="qdq/probe/activation/quantize",
-            ),
-            helper.make_node(
-                "DequantizeLinear",
-                ["activation_int8", "activation_scale", "activation_zero"],
-                ["activation_fp16"],
-                name="qdq/probe/activation/dequantize",
-            ),
-            helper.make_node(
-                "DequantizeLinear",
-                ["weight_int8", "weight_scale", "weight_zero"],
-                ["weight_fp16"],
-                name="qdq/probe/weight/dequantize",
-                axis=0,
-            ),
-            helper.make_node(
-                "Conv",
-                ["activation_fp16", "weight_fp16", "bias_fp16"],
-                ["output"],
-                name=call_site,
-                kernel_shape=[3, 3, 3],
-                strides=[1, 1, 1],
-            ),
-        ],
-        "sfwan_int8_conv3d_probe",
-        [
-            helper.make_tensor_value_info(
-                "activation", TensorProto.FLOAT16, activation_shape
-            )
-        ],
-        [helper.make_tensor_value_info("output", TensorProto.FLOAT16, output_shape)],
-        initializer=[
-            numpy_helper.from_array(activation_scale, name="activation_scale"),
-            numpy_helper.from_array(
-                np.asarray(0, dtype=np.int8), name="activation_zero"
-            ),
-            numpy_helper.from_array(
-                np.ones(weight_shape, dtype=np.int8), name="weight_int8"
-            ),
-            numpy_helper.from_array(weight_scale, name="weight_scale"),
-            numpy_helper.from_array(
-                np.zeros(weight_scale.shape, dtype=np.int8),
-                name="weight_zero",
-            ),
-            numpy_helper.from_array(
-                np.zeros((weight_shape[0],), dtype=np.float16),
-                name="bias_fp16",
-            ),
-        ],
-    )
-    model = helper.make_model(
-        graph,
-        opset_imports=[helper.make_opsetid("", QDQ_OPSET)],
-        producer_name="sglang-jetson-sfwan-probe",
-    )
-    onnx.checker.check_model(model, full_check=True)
-    temporary = path.with_name(f"{path.name}.partial")
-    onnx.save(model, str(temporary))
-    temporary.replace(path)
-    return call_site
 
 
 def _engine_record(
@@ -1118,6 +1147,7 @@ def _stage_is_current(
     record = state.get("stages", {}).get(stage)
     return bool(
         isinstance(record, dict)
+        and record.get("status") in {"built", "audit_failed", "audit_passed"}
         and output_path.is_file()
         and record.get("source_sha256") == source_sha256
         and record.get("output_sha256") == _sha256_file(output_path)
@@ -1134,10 +1164,13 @@ def _record_stage(
     source_sha256: str,
     output_path: Path,
     profiling_verbosity: str,
+    status: str = "built",
     extra: dict[str, Any] | None = None,
 ) -> None:
+    if status not in {"built", "audit_failed", "audit_passed"}:
+        raise ValueError(f"invalid TensorRT build stage status: {status}")
     state.setdefault("stages", {})[stage] = {
-        "status": "completed",
+        "status": status,
         "source_sha256": source_sha256,
         "output": output_path.name,
         "output_sha256": _sha256_file(output_path),
@@ -1145,6 +1178,23 @@ def _record_stage(
         "qdq_schema_version": QDQ_SCHEMA_VERSION,
         **(extra or {}),
     }
+    _write_json(state_path, state)
+
+
+def _mark_stage_audit(
+    *,
+    state_path: Path,
+    state: dict[str, Any],
+    stage: str,
+    passed: bool,
+    audit_path: Path,
+) -> None:
+    record = state.get("stages", {}).get(stage)
+    if not isinstance(record, dict):
+        raise ValueError(f"cannot audit unknown TensorRT build stage {stage!r}")
+    record["status"] = "audit_passed" if passed else "audit_failed"
+    record["audit_file"] = audit_path.name
+    record["audit_sha256"] = _sha256_file(audit_path)
     _write_json(state_path, state)
 
 
@@ -1160,6 +1210,7 @@ def build_engines(
     device_index: int,
     resume: bool = False,
     timing_cache_path: str | Path | None = None,
+    preflight_only: bool = False,
 ) -> dict[str, Any]:
     if (height, width) != (TRT_VAE_HEIGHT, TRT_VAE_WIDTH):
         raise ValueError("TensorRT SFWan VAE V1 supports only 480x832")
@@ -1174,11 +1225,11 @@ def build_engines(
 
     root = Path(output_dir).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    state_path = root / "build_state.json"
+    state_path = root / "build_state_v3.json"
     resolved_timing_cache_path = (
         Path(timing_cache_path).expanduser().resolve()
         if timing_cache_path is not None
-        else root / "tensorrt_timing.cache"
+        else root / "tensorrt_timing_qdq_v3.cache"
     )
     resolved_timing_cache_path.parent.mkdir(parents=True, exist_ok=True)
     load_config = ModelLoadConfig(
@@ -1213,7 +1264,7 @@ def build_engines(
         )
 
     build_identity = {
-        "schema_version": 1,
+        "schema_version": QDQ_SCHEMA_VERSION,
         "model_path": model_path,
         "resolved_model_path": str(components.model_path),
         "height": height,
@@ -1230,6 +1281,7 @@ def build_engines(
     if build_identity["compute_capability"] != [8, 7]:
         raise ValueError("TensorRT SFWan VAE plans must be built on Jetson Orin SM87")
     state = _load_json(state_path) if resume else {}
+    had_v3_state = bool(state)
     if state and state.get("identity") != build_identity:
         raise ValueError(
             f"{state_path} belongs to a different build configuration; "
@@ -1238,26 +1290,75 @@ def build_engines(
     if not state:
         state = {"identity": build_identity, "stages": {}}
     _write_json(state_path, state)
+    legacy_state_path = root / "build_state.json"
+    legacy_state = _load_json(legacy_state_path) if resume else {}
+    legacy_identity = legacy_state.get("identity", {})
+    legacy_identity_matches = bool(
+        isinstance(legacy_identity, dict)
+        and legacy_identity.get("model_path") == model_path
+        and legacy_identity.get("resolved_model_path") == str(components.model_path)
+        and legacy_identity.get("height") == height
+        and legacy_identity.get("width") == width
+        and legacy_identity.get("seed") == seed
+    )
 
     latent_chunks = _dummy_denormalized_chunks(
         vae=vae,
         device=components.device,
         seed=seed,
     )
-    existing_quant_scales = _load_json(root / "quant_scales.json") if resume else {}
+    quant_scales_path = root / "quant_scales_v3.json"
+    quant_scale_identity = {
+        "model_path": model_path,
+        "resolved_model_path": str(components.model_path),
+        "height": height,
+        "width": width,
+        "seed": seed,
+        "target_module_names": list(targets),
+    }
+    existing_quant_scales = _load_json(quant_scales_path) if resume else {}
     existing_activation_scales = existing_quant_scales.get("activation")
-    can_reuse_activation_scales = bool(
-        existing_quant_scales.get("seed") == seed
-        and isinstance(existing_activation_scales, dict)
-        and all(
-            isinstance(existing_activation_scales.get(kind), dict)
-            and set(existing_activation_scales[kind]) == set(targets)
-            for kind in ("initial", "steady")
+
+    def _valid_activation_scales(value: Any) -> bool:
+        return bool(
+            isinstance(value, dict)
+            and all(
+                isinstance(value.get(kind), dict)
+                and set(value[kind]) == set(targets)
+                and all(
+                    not isinstance(scale, bool)
+                    and isinstance(scale, (int, float))
+                    and math.isfinite(float(scale))
+                    and float(scale) > 0
+                    for scale in value[kind].values()
+                )
+                for kind in ("initial", "steady")
+            )
         )
+
+    can_reuse_activation_scales = bool(
+        existing_quant_scales.get("identity") == quant_scale_identity
+        and _valid_activation_scales(existing_activation_scales)
     )
+    if not can_reuse_activation_scales and resume:
+        legacy_scales_path = root / "quant_scales.json"
+        legacy_scales = _load_json(legacy_scales_path)
+        legacy_activation = legacy_scales.get("activation")
+        legacy_matches = bool(
+            legacy_identity_matches
+            and legacy_scales.get("seed") == seed
+            and _valid_activation_scales(legacy_activation)
+        )
+        if legacy_matches:
+            existing_activation_scales = legacy_activation
+            can_reuse_activation_scales = True
+            print(
+                "Adopting validated legacy activation scales into Q/DQ v3: "
+                f"{legacy_scales_path}"
+            )
     if can_reuse_activation_scales:
         activation_scales = existing_activation_scales
-        print(f"Reusing activation scales from {root / 'quant_scales.json'}")
+        print(f"Reusing activation scales for {quant_scales_path}")
     else:
         activation_scales = _collect_activation_scales(
             vae=vae,
@@ -1367,7 +1468,7 @@ def build_engines(
     }
 
     fp16_performance_paths: dict[str, Path] = {}
-    if resume:
+    if resume and legacy_identity_matches:
         for kind, legacy_path in legacy_fp16_paths.items():
             if not legacy_path.is_file():
                 continue
@@ -1387,8 +1488,10 @@ def build_engines(
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"Legacy FP16 ONNX {legacy_path} cannot be reused: {error}")
 
-    reuse_qdq_sources = resume and all(
-        path.is_file() for path in qdq_source_paths.values()
+    reuse_qdq_sources = (
+        resume
+        and (had_v3_state or legacy_identity_matches)
+        and all(path.is_file() for path in qdq_source_paths.values())
     )
     if reuse_qdq_sources:
         try:
@@ -1454,8 +1557,8 @@ def build_engines(
     for kind, source_path in qdq_source_paths.items():
         fp16_performance_paths.setdefault(kind, source_path)
 
-    initial_int8_path = root / "initial_int8_qdq.onnx"
-    steady_int8_path = root / "steady_int8_qdq.onnx"
+    initial_int8_path = root / "initial_int8_qdq_v3.onnx"
+    steady_int8_path = root / "steady_int8_qdq_v3.onnx"
     qdq_reports = {
         "initial": rewrite_onnx_with_int8_qdq(
             source_path=qdq_source_paths["initial"],
@@ -1472,9 +1575,13 @@ def build_engines(
             activation_scales=activation_scales["steady"],
         ),
     }
+    for kind, report in qdq_reports.items():
+        _write_json(root / f"{kind}_int8_qdq_v3_report.json", report)
     _write_json(
-        root / "quant_scales.json",
+        quant_scales_path,
         {
+            "schema_version": QDQ_SCHEMA_VERSION,
+            "identity": quant_scale_identity,
             "seed": seed,
             "activation": activation_scales,
             "weight": {
@@ -1483,9 +1590,9 @@ def build_engines(
         },
     )
 
-    onnx_paths = {
-        "fp16": fp16_performance_paths,
-        "int8": {"initial": initial_int8_path, "steady": steady_int8_path},
+    int8_onnx_paths = {
+        "initial": initial_int8_path,
+        "steady": steady_int8_path,
     }
     engines: dict[str, dict[str, Any]] = {"fp16": {}, "int8": {}}
 
@@ -1496,7 +1603,7 @@ def build_engines(
         plan_path: Path,
         verbosity: str,
         allow_untracked_adoption: bool,
-    ) -> tuple[list[dict[str, Any]], str]:
+    ) -> tuple[list[dict[str, Any]], str, bytes | None]:
         source_sha256 = _sha256_file(source_path)
         can_reuse = resume and _stage_is_current(
             state=state,
@@ -1512,7 +1619,7 @@ def build_engines(
                     plan_path=plan_path,
                 )
                 print(f"Resuming completed stage {stage}: {plan_path}")
-                return io_contract, inspector_json
+                return io_contract, inspector_json, None
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"Completed stage {stage} is not reusable: {error}")
         if resume and allow_untracked_adoption and plan_path.is_file():
@@ -1531,10 +1638,10 @@ def build_engines(
                     extra={"adopted_existing_plan": True},
                 )
                 print(f"Adopted existing validated plan for {stage}: {plan_path}")
-                return io_contract, inspector_json
+                return io_contract, inspector_json, None
             except (OSError, RuntimeError, ValueError) as error:
                 print(f"Existing plan for {stage} is not reusable: {error}")
-        plan, io_contract, inspector_json = _build_engine_bytes(
+        plan, io_contract, inspector_json, candidate_timing_cache = _build_engine_bytes(
             trt=trt,
             onnx_path=source_path,
             workspace_gib=workspace_gib,
@@ -1550,150 +1657,274 @@ def build_engines(
             output_path=plan_path,
             profiling_verbosity=verbosity,
         )
-        return io_contract, inspector_json
+        return io_contract, inspector_json, candidate_timing_cache
 
     structural_audit = {
         kind: {
             key: value
             for key, value in report.items()
-            if key not in {"weight_scales", "activation_scales"}
+            if key not in {"weight_scales", "activation_scales", "weight_qdq_paths"}
         }
         for kind, report in qdq_reports.items()
     }
-    tactic_audits: dict[str, Any] = {}
-    probe_path = root / "int8_conv3d_probe.onnx"
-    probe_call_site = _write_int8_conv3d_probe(probe_path)
-    probe_plan_path = root / "int8_conv3d_probe_detailed.plan"
-    _probe_io, probe_inspector = _load_or_build_stage(
-        stage="int8_probe_detailed",
-        source_path=probe_path,
-        plan_path=probe_plan_path,
-        verbosity="detailed",
-        allow_untracked_adoption=False,
-    )
-    del _probe_io
-    _write_json(
-        root / "int8_conv3d_probe_inspector.json",
-        json.loads(probe_inspector),
-    )
-    probe_audit = _audit_tensorrt_tactics(
-        graph_kind="probe",
-        call_site_names=[probe_call_site],
-        inspector_json=probe_inspector,
-        expected_call_sites=1,
-    )
-    _write_json(root / "int8_conv3d_probe_audit.json", probe_audit)
-    if not probe_audit["passed"]:
-        failed_audit = {
-            "schema_version": QDQ_SCHEMA_VERSION,
-            "passed": False,
-            "errors": [f"probe: {error}" for error in probe_audit["errors"]],
-            "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
-            "structural": structural_audit,
-            "probe": probe_audit,
-            "tactics": {},
-        }
-        _write_json(root / "int8_audit.json", failed_audit)
-        raise RuntimeError(
-            "TensorRT INT8 Conv3d capability probe failed; "
-            f"see {root / 'int8_conv3d_probe_audit.json'}"
-        )
+    signature_suite: dict[str, dict[str, Any]] = {}
+    for kind, report in qdq_reports.items():
+        for signature in report["conv_signatures"]:
+            signature_id = signature["signature_id"]
+            canonical = {
+                key: value
+                for key, value in signature.items()
+                if key not in {"call_site", "signature_id"}
+            }
+            record = signature_suite.setdefault(
+                signature_id,
+                {
+                    "signature": canonical,
+                    "call_sites": {"initial": [], "steady": []},
+                },
+            )
+            if record["signature"] != canonical:
+                raise ValueError(f"Conv signature hash collision: {signature_id}")
+            record["call_sites"][kind].append(signature["call_site"])
 
-    for kind in ("initial", "steady"):
-        detailed_plan_path = root / f"{kind}_int8_detailed.plan"
-        _detailed_io, detailed_inspector = _load_or_build_stage(
-            stage=f"{kind}_int8_detailed",
-            source_path=onnx_paths["int8"][kind],
-            plan_path=detailed_plan_path,
+    audit_path = root / "int8_audit_v3.json"
+    probe_audits: dict[str, Any] = {}
+    probe_errors: list[str] = []
+    for signature_id in sorted(signature_suite):
+        suite_record = signature_suite[signature_id]
+        probe_path = root / f"int8_probe_v3_{signature_id}.onnx"
+        probe_call_site = write_int8_conv3d_probe(
+            path=probe_path,
+            signature=suite_record["signature"],
+            signature_id=signature_id,
+        )
+        probe_plan_path = root / f"int8_probe_v3_{signature_id}.plan"
+        stage = f"int8_probe_v3_{signature_id}"
+        _probe_io, probe_inspector, candidate_cache = _load_or_build_stage(
+            stage=stage,
+            source_path=probe_path,
+            plan_path=probe_plan_path,
             verbosity="detailed",
             allow_untracked_adoption=False,
         )
-        del _detailed_io
-        _write_json(
-            root / f"{kind}_int8_inspector.json",
-            json.loads(detailed_inspector),
+        del _probe_io
+        inspector_path = root / f"int8_probe_v3_{signature_id}_inspector.json"
+        _write_json(inspector_path, json.loads(probe_inspector))
+        probe_audit = _audit_tensorrt_tactics(
+            graph_kind=f"probe:{signature_id}",
+            call_site_names=[probe_call_site],
+            inspector_json=probe_inspector,
+            expected_call_sites=1,
         )
-        tactic_audits[kind] = _audit_tensorrt_tactics(
+        probe_audit.update(
+            {
+                "signature_id": signature_id,
+                "signature": suite_record["signature"],
+                "source_call_sites": suite_record["call_sites"],
+                "plan_file": probe_plan_path.name,
+                "plan_sha256": _sha256_file(probe_plan_path),
+            }
+        )
+        probe_audit_path = root / f"int8_probe_v3_{signature_id}_audit.json"
+        _write_json(probe_audit_path, probe_audit)
+        _mark_stage_audit(
+            state_path=state_path,
+            state=state,
+            stage=stage,
+            passed=bool(probe_audit["passed"]),
+            audit_path=probe_audit_path,
+        )
+        if probe_audit["passed"]:
+            _commit_timing_cache(
+                timing_cache_path=resolved_timing_cache_path,
+                candidate=candidate_cache,
+            )
+        else:
+            probe_errors.extend(
+                f"signature {signature_id}: {error}" for error in probe_audit["errors"]
+            )
+        probe_audits[signature_id] = probe_audit
+        if probe_errors:
+            break
+
+    probe_suite = {
+        "schema_version": QDQ_SCHEMA_VERSION,
+        "passed": not probe_errors and len(probe_audits) == len(signature_suite),
+        "errors": probe_errors,
+        "signature_count": len(signature_suite),
+        "probed_signature_count": len(probe_audits),
+        "source_call_site_counts": {
+            kind: sum(
+                len(record["call_sites"][kind]) for record in signature_suite.values()
+            )
+            for kind in ("initial", "steady")
+        },
+        "signatures": probe_audits,
+    }
+    _write_json(root / "int8_probe_suite_v3.json", probe_suite)
+    if not probe_suite["passed"]:
+        failed_audit = {
+            "schema_version": QDQ_SCHEMA_VERSION,
+            "passed": False,
+            "preflight_passed": False,
+            "complete": False,
+            "errors": probe_errors,
+            "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
+            "structural": structural_audit,
+            "probe_suite": probe_suite,
+            "tactics": {},
+        }
+        _write_json(audit_path, failed_audit)
+        failed_signature = next(
+            (
+                signature_id
+                for signature_id, audit in probe_audits.items()
+                if not audit["passed"]
+            ),
+            "unknown",
+        )
+        raise RuntimeError(
+            "TensorRT INT8 Conv3d signature preflight failed for "
+            f"{failed_signature}; see {audit_path}"
+        )
+
+    preflight_audit = {
+        "schema_version": QDQ_SCHEMA_VERSION,
+        "passed": False,
+        "preflight_passed": True,
+        "complete": False,
+        "errors": [],
+        "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
+        "structural": structural_audit,
+        "probe_suite": probe_suite,
+        "tactics": {},
+    }
+    _write_json(audit_path, preflight_audit)
+    if preflight_only:
+        return {
+            "schema_version": TRT_VAE_MANIFEST_SCHEMA_VERSION,
+            "preflight_only": True,
+            "preflight_passed": True,
+            "engine_dir": str(root),
+            "int8_audit": preflight_audit,
+        }
+
+    tactic_audits: dict[str, Any] = {}
+    int8_plan_io: dict[str, list[dict[str, Any]]] = {}
+    for kind in ("initial", "steady"):
+        plan_path = root / f"{kind}_int8_qdq_v3.plan"
+        stage = f"{kind}_int8_qdq_v3"
+        io_contract, inspector_json, candidate_cache = _load_or_build_stage(
+            stage=stage,
+            source_path=int8_onnx_paths[kind],
+            plan_path=plan_path,
+            verbosity="detailed",
+            allow_untracked_adoption=False,
+        )
+        inspector_path = root / f"{kind}_int8_qdq_v3_inspector.json"
+        _write_json(inspector_path, json.loads(inspector_json))
+        tactic_audit = _audit_tensorrt_tactics(
             graph_kind=kind,
             call_site_names=qdq_reports[kind]["call_site_names"],
-            inspector_json=detailed_inspector,
+            inspector_json=inspector_json,
         )
-        audit_errors = [f"probe: {error}" for error in probe_audit["errors"]] + [
+        tactic_audit.update(
+            {
+                "plan_file": plan_path.name,
+                "plan_sha256": _sha256_file(plan_path),
+                "build_profiling_verbosity": "detailed",
+            }
+        )
+        tactic_audit_path = root / f"{kind}_int8_qdq_v3_audit.json"
+        _write_json(tactic_audit_path, tactic_audit)
+        _mark_stage_audit(
+            state_path=state_path,
+            state=state,
+            stage=stage,
+            passed=bool(tactic_audit["passed"]),
+            audit_path=tactic_audit_path,
+        )
+        tactic_audits[kind] = tactic_audit
+        current_errors = [
             f"{audit_kind}: {error}"
             for audit_kind, audit in tactic_audits.items()
             for error in audit["errors"]
         ]
-        int8_audit = {
+        current_audit = {
             "schema_version": QDQ_SCHEMA_VERSION,
-            "passed": not audit_errors and set(tactic_audits) == {"initial", "steady"},
-            "errors": audit_errors,
+            "passed": False,
+            "preflight_passed": True,
+            "complete": False,
+            "errors": current_errors,
             "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
             "structural": structural_audit,
-            "probe": probe_audit,
+            "probe_suite": probe_suite,
             "tactics": tactic_audits,
         }
-        _write_json(root / "int8_audit.json", int8_audit)
-        if not tactic_audits[kind]["passed"]:
+        _write_json(audit_path, current_audit)
+        if not tactic_audit["passed"]:
             raise RuntimeError(
-                f"TensorRT {kind} INT8 tactic audit failed; "
-                f"see {root / 'int8_audit.json'}"
+                f"TensorRT {kind} INT8 tactic audit failed; see {audit_path}"
             )
+        _commit_timing_cache(
+            timing_cache_path=resolved_timing_cache_path,
+            candidate=candidate_cache,
+        )
+        int8_plan_io[kind] = io_contract
 
     int8_audit = {
         "schema_version": QDQ_SCHEMA_VERSION,
         "passed": True,
+        "preflight_passed": True,
+        "complete": True,
         "errors": [],
         "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
         "structural": structural_audit,
-        "probe": probe_audit,
+        "probe_suite": probe_suite,
         "tactics": tactic_audits,
+        "plan_sha256": {
+            kind: tactic_audits[kind]["plan_sha256"] for kind in ("initial", "steady")
+        },
     }
-    _write_json(root / "int8_audit.json", int8_audit)
+    _write_json(audit_path, int8_audit)
 
-    for precision in ("fp16", "int8"):
-        for kind in ("initial", "steady"):
-            plan_path = root / f"{kind}_{precision}.plan"
-            source_path = onnx_paths[precision][kind]
-            stage = f"{kind}_{precision}_performance"
-            if precision == "int8" and profiling_verbosity == "detailed":
-                detailed_plan_path = root / f"{kind}_int8_detailed.plan"
-                source_sha256 = _sha256_file(source_path)
-                if not _stage_is_current(
-                    state=state,
-                    stage=stage,
-                    source_sha256=source_sha256,
-                    output_path=plan_path,
-                    profiling_verbosity=profiling_verbosity,
-                ):
-                    _write_bytes(plan_path, detailed_plan_path.read_bytes())
-                    _record_stage(
-                        state_path=state_path,
-                        state=state,
-                        stage=stage,
-                        source_sha256=source_sha256,
-                        output_path=plan_path,
-                        profiling_verbosity=profiling_verbosity,
-                        extra={"copied_from": detailed_plan_path.name},
-                    )
-                io_contract, _inspector = _load_plan(
-                    trt=trt,
-                    plan_path=plan_path,
-                )
-            else:
-                io_contract, _inspector = _load_or_build_stage(
-                    stage=stage,
-                    source_path=source_path,
-                    plan_path=plan_path,
-                    verbosity=profiling_verbosity,
-                    allow_untracked_adoption=precision == "fp16",
-                )
-            del _inspector
-            engines[precision][kind] = _engine_record(
+    for kind in ("initial", "steady"):
+        plan_path = root / f"{kind}_int8_qdq_v3.plan"
+        engines["int8"][kind] = {
+            **_engine_record(
+                output_dir=root,
+                plan_path=plan_path,
+                io_contract=int8_plan_io[kind],
+                rgb_frames=9 if kind == "initial" else 12,
+            ),
+            "profiling_verbosity": "detailed",
+            "audit_passed": True,
+        }
+
+    for kind in ("initial", "steady"):
+        source_path = fp16_performance_paths[kind]
+        plan_path = root / f"{kind}_fp16.plan"
+        io_contract, _inspector, candidate_cache = _load_or_build_stage(
+            stage=f"{kind}_fp16_performance_v3",
+            source_path=source_path,
+            plan_path=plan_path,
+            verbosity=profiling_verbosity,
+            allow_untracked_adoption=legacy_identity_matches,
+        )
+        del _inspector
+        _commit_timing_cache(
+            timing_cache_path=resolved_timing_cache_path,
+            candidate=candidate_cache,
+        )
+        engines["fp16"][kind] = {
+            **_engine_record(
                 output_dir=root,
                 plan_path=plan_path,
                 io_contract=io_contract,
                 rgb_frames=9 if kind == "initial" else 12,
-            )
+            ),
+            "profiling_verbosity": profiling_verbosity,
+        }
 
     manifest = {
         "schema_version": TRT_VAE_MANIFEST_SCHEMA_VERSION,
@@ -1733,7 +1964,10 @@ def build_engines(
             "logical_conv_count": EXPECTED_LOGICAL_CONVS,
             "call_sites_per_graph": EXPECTED_CALL_SITES,
             "activation": "per_tensor_symmetric_static",
-            "weight": "per_output_channel_symmetric_axis_0",
+            "weight": (
+                "per_call_site_independent_fp16_constant_qdq_"
+                "per_output_channel_symmetric_axis_0"
+            ),
             "calibration": {
                 "kind": "deterministic_dummy_speed_only",
                 "seed": seed,
@@ -1752,13 +1986,15 @@ def build_engines(
             "onnx_version": str(onnx.__version__),
             "workspace_gib": workspace_gib,
             "profiling_verbosity": profiling_verbosity,
+            "fp16_profiling_verbosity": profiling_verbosity,
+            "int8_profiling_verbosity": "detailed",
             "resume_enabled": resume,
             "state_file": state_path.name,
             "timing_cache_file": str(resolved_timing_cache_path),
             "source_onnx_sha256": {
                 kind: {
-                    precision: _sha256_file(onnx_paths[precision][kind])
-                    for precision in ("fp16", "int8")
+                    "fp16": _sha256_file(fp16_performance_paths[kind]),
+                    "int8": _sha256_file(int8_onnx_paths[kind]),
                 }
                 for kind in ("initial", "steady")
             },
@@ -1773,9 +2009,12 @@ def build_engines(
         },
         "int8_audit": {
             "passed": True,
+            "schema_version": QDQ_SCHEMA_VERSION,
+            "preflight_passed": True,
             "target_conv_call_sites_per_graph": EXPECTED_CALL_SITES,
-            "report_file": "int8_audit.json",
-            "report_sha256": _sha256_file(root / "int8_audit.json"),
+            "report_file": audit_path.name,
+            "report_sha256": _sha256_file(audit_path),
+            "plan_sha256": int8_audit["plan_sha256"],
         },
     }
     _write_json(root / "manifest.json", manifest)
@@ -1794,16 +2033,28 @@ def _parse_args() -> argparse.Namespace:
         "--profiling-verbosity",
         choices=("none", "detailed"),
         default="none",
+        help="FP16 plan verbosity; audited INT8 v3 plans are always detailed",
     )
     parser.add_argument("--device-index", type=int, default=0)
     parser.add_argument(
         "--resume",
         action="store_true",
-        help="reuse validated ONNX/plans and completed build_state.json stages",
+        help="reuse validated ONNX/plans and build_state_v3.json stages",
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "rewrite/audit Q/DQ v3 and prove every unique Conv signature has an "
+            "INT8 tactic, then exit before full VAE plan builds"
+        ),
     )
     parser.add_argument(
         "--timing-cache",
-        help="persistent TensorRT timing cache (default: OUTPUT_DIR/tensorrt_timing.cache)",
+        help=(
+            "transactional TensorRT timing cache "
+            "(default: OUTPUT_DIR/tensorrt_timing_qdq_v3.cache)"
+        ),
     )
     return parser.parse_args()
 
@@ -1821,7 +2072,21 @@ def main() -> None:
         device_index=args.device_index,
         resume=args.resume,
         timing_cache_path=args.timing_cache,
+        preflight_only=args.preflight_only,
     )
+    if manifest.get("preflight_only"):
+        print(
+            json.dumps(
+                {
+                    "engine_dir": str(Path(args.output_dir).expanduser().resolve()),
+                    "preflight_only": True,
+                    "preflight_passed": manifest["preflight_passed"],
+                    "int8_audit": "int8_audit_v3.json",
+                },
+                indent=2,
+            )
+        )
+        return
     print(
         json.dumps(
             {

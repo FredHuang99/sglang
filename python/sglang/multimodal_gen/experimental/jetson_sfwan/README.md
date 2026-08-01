@@ -164,7 +164,8 @@ The runtime owns two FP16 cache banks and alternates `A -> B -> A`. One bank is
 They are allocated once when the server starts and are reused across requests.
 TensorRT VAE mode does not permit `--vae-cpu-offload`.
 
-Build the four performance plans on the Orin:
+Run the fail-fast signature preflight on the Orin before starting the long
+initial/steady builds:
 
 ```bash
 export SFWAN_MODEL=wlsaidhi/SFWan2.1-T2V-1.3B-Diffusers
@@ -179,14 +180,35 @@ python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build \
   --workspace-gib 8 \
   --profiling-verbosity none \
   --resume \
-  --timing-cache "$SFWAN_TRT_DIR/tensorrt_timing.cache"
+  --preflight-only \
+  --timing-cache "$SFWAN_TRT_DIR/tensorrt_timing_qdq_v3.cache"
+```
+
+Only after that command returns `preflight_passed: true`, run the full build
+with the same identity and `--resume`:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build \
+  --model-path "$SFWAN_MODEL" \
+  --output-dir "$SFWAN_TRT_DIR" \
+  --height 480 \
+  --width 832 \
+  --seed 1024 \
+  --workspace-gib 8 \
+  --profiling-verbosity none \
+  --resume \
+  --timing-cache "$SFWAN_TRT_DIR/tensorrt_timing_qdq_v3.cache"
 ```
 
 The command reuses the loaded SGLang Wan VAE to collect one deterministic
 speed-only scale set, exports ONNX opset 19, and inserts explicit signed INT8
-Q/DQ around only the 28 residual-block 3x3x3 Conv3d modules. The Q/DQ scale,
-dequantized activation/weight, and Conv bias all use FP16; this prevents a
-Float/TF32 Conv fallback caused by FP32 Q/DQ boundaries.
+Q/DQ around only the 28 residual-block 3x3x3 Conv3d modules. Each graph has 84
+unrolled calls. Q/DQ v3 gives every call its own FP16 weight constant,
+per-channel scale, INT8 zero point, weight Q/DQ, and FP16 bias; no weight/DQ
+output is shared across calls. The activation path also has 84 independent
+Q/DQ pairs. FP16 scales are legal TensorRT explicit-quantization inputs, while
+the constant-to-Q-to-DQ weight topology lets TensorRT fold a static INT8
+filter instead of importing a DQ-only weight as a dynamic Half filter.
 
 Q/DQ rewriting accepts only a graph that was genuinely exported as opset 19;
 it never changes an older graph's `opset_import` label. On `--resume`, legacy
@@ -200,28 +222,39 @@ The fail-closed build order is:
 
 1. preserve any validated legacy FP16 graphs and validate or atomically export
    the two real-opset-19 Q/DQ source graphs;
-2. build a small representative SM87 INT8 Conv3d capability probe;
-3. build and retain `initial_int8_detailed.plan`, audit all 84 target calls,
-   and stop immediately if any call falls back;
-4. repeat the detailed audit for `steady`;
-5. only after both audits pass, build/reuse the four performance plans.
+2. extract every unique Conv signature from all 168 initial/steady call sites
+   and build one v3 Q/DQ probe per signature;
+3. stop before any full VAE plan if one signature lacks a static INT8 tactic;
+4. build `initial_int8_qdq_v3.plan` with detailed Inspector data and audit all
+   84 target calls;
+5. repeat for `steady_int8_qdq_v3.plan`;
+6. use those same audited detailed plans at runtime, and build/reuse only the
+   two FP16 control plans. INT8 is never rebuilt as an unauditable NONE plan.
 
-`--resume` records each completed plan atomically in `build_state.json`. A
-restart verifies the source ONNX hash, plan hash, Q/DQ schema, and profiling
-verbosity before reusing a stage. Existing validated legacy FP16 ONNX/plans
-from an older failed run remain paired and reusable; they are not relabelled or
-used as Q/DQ input. Old INT8 plans are never adopted because their Q/DQ graph
-may differ. The persistent timing cache is updated only after a successful
-TensorRT build. The optional persistent timing cache is created, attached, and retrieved
-through TensorRT's `IBuilderConfig` API. It is loaded with strict device/version
-matching and atomically updated only after a successful engine build; a failed
-probe or plan build leaves the previous cache untouched.
+`--resume` records `built`, `audit_failed`, and `audit_passed` separately in
+`build_state_v3.json`. A restart verifies the source ONNX hash, plan hash, Q/DQ
+schema, and profiling verbosity before re-auditing or reusing a stage. Existing
+legacy FP16 ONNX/plans are reused only when their legacy build identity matches
+the model path, resolved checkpoint, shape, and seed; they are not relabelled
+or used as Q/DQ input. Old INT8 plans are never adopted because their Q/DQ graph
+may differ. V3 INT8 ONNX, plans, state, audit, scales, probes, and timing cache
+all use new names and never overwrite v2 artifacts. A build returns only a
+candidate timing cache. The candidate is atomically committed through
+TensorRT's `IBuilderConfig` API only after that probe or full plan passes tactic
+audit; a failed build or FP16/dynamic-filter audit leaves the stable cache
+untouched.
 
 A build is accepted only if:
 
-- each graph has 28 logical weights and 84 unrolled target Conv call sites;
-- every target activation and weight is connected through Q/DQ;
-- TensorRT Inspector maps every target call site to INT8 tactic evidence.
+- each graph has 28 logical modules, 84 Conv calls, 84 activation Q/DQ pairs,
+  and 84 independent constant-weight Q/DQ pairs;
+- all Q/DQ axes, FP16 scale/bias dtypes, rank-5 weight shapes, positive scales,
+  zero points, call-site shapes, and Conv attributes pass structural audit;
+- every unique initial/steady Conv signature passes preflight;
+- every full-plan call maps through Inspector `Name` or `Metadata` and proves
+  INT8 activation, no dynamic filter (`HasDynamicFilter` is normally `0`),
+  non-empty static INT8 weights, and an
+  INT8/IMMA/i8 tactic with no `f16f16`, FP32, or TF32 fallback.
 
 Inspect the fail-closed audit:
 
@@ -229,16 +262,19 @@ Inspect the fail-closed audit:
 jq '{
   passed,
   errors,
-  probe: .probe | {
-    passed, mapped_count, unmapped_call_sites, non_int8_call_sites
+  probe_suite: .probe_suite | {
+    passed, signature_count, probed_signature_count,
+    source_call_site_counts
   },
   initial: .tactics.initial | {
-    passed, mapped_count, unmapped_call_sites, non_int8_call_sites
+    passed, mapped_count, unmapped_call_sites, non_int8_call_sites,
+    dynamic_filter_call_sites, fp16_fallback_call_sites, plan_sha256
   },
   steady: .tactics.steady | {
-    passed, mapped_count, unmapped_call_sites, non_int8_call_sites
+    passed, mapped_count, unmapped_call_sites, non_int8_call_sites,
+    dynamic_filter_call_sites, fp16_fallback_call_sites, plan_sha256
   }
-}' "$SFWAN_TRT_DIR/int8_audit.json"
+}' "$SFWAN_TRT_DIR/int8_audit_v3.json"
 
 sha256sum "$SFWAN_TRT_DIR"/*.plan
 ```
@@ -248,15 +284,20 @@ there is no second full rebuild:
 
 ```bash
 /usr/src/tensorrt/bin/trtexec \
-  --loadEngine="$SFWAN_TRT_DIR/initial_int8_detailed.plan" \
+  --loadEngine="$SFWAN_TRT_DIR/initial_int8_qdq_v3.plan" \
   --dumpLayerInfo \
   --profilingVerbosity=detailed
 
 /usr/src/tensorrt/bin/trtexec \
-  --loadEngine="$SFWAN_TRT_DIR/steady_int8_detailed.plan" \
+  --loadEngine="$SFWAN_TRT_DIR/steady_int8_qdq_v3.plan" \
   --dumpLayerInfo \
   --profilingVerbosity=detailed
 ```
+
+The INT8 plans retain detailed Inspector metadata, but the runtime lowers each
+execution context to NVTX `NONE` unless the server is started with
+`--enable-nvtx`. `/v1/engine` reports the effective value in
+`vae_runtime_nvtx_verbosity`.
 
 Start a VAE-only TensorRT server by choosing one of the plan precisions:
 

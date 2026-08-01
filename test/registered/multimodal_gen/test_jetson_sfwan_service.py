@@ -88,14 +88,16 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _attach_timing_cache,
     _audit_tensorrt_tactics,
     _build_engine_bytes,
+    _candidate_timing_cache_bytes,
+    _commit_timing_cache,
     _load_validated_fp16_onnx,
+    _mark_stage_audit,
     _make_export_wrappers,
     _normalize_export_cache_tensors,
     _onnx_default_opset_version,
     _parse_args as _parse_trt_build_args,
     _portable_conv3d_layout_for_export,
     _portable_nearest_upsample_for_export,
-    _persist_timing_cache,
     _record_stage,
     _stage_is_current,
     _validate_onnx_fp16_io_contract,
@@ -104,6 +106,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
     EXPECTED_LOGICAL_CONVS,
     QDQ_OPSET,
     QDQ_SCHEMA_VERSION,
+    audit_qdq_model,
     rewrite_onnx_with_int8_qdq,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
@@ -111,6 +114,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_CACHE_TOTAL_ELEMENTS,
     TRT_VAE_LATENT_SHAPE,
     TensorRTVaeRuntime,
+    _configure_context_nvtx,
     validate_trt_vae_manifest,
 )
 from sglang.multimodal_gen.runtime.distributed import parallel_state
@@ -3770,9 +3774,185 @@ class TestSfWanModeIsolation(CustomTestCase):
 
 
 class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
-    def test_trt_qdq_v2_uses_opset_19(self):
-        self.assertEqual(QDQ_SCHEMA_VERSION, 2)
+    def test_trt_qdq_v3_uses_opset_19(self):
+        self.assertEqual(QDQ_SCHEMA_VERSION, 3)
         self.assertEqual(QDQ_OPSET, 19)
+
+    @unittest.skipUnless(importlib.util.find_spec("onnx"), "onnx is not installed")
+    def test_trt_qdq_v3_clones_weight_qdq_for_every_call_site(self):
+        import numpy as np
+        import onnx
+        from onnx import TensorProto, helper, numpy_helper
+
+        targets = tuple(
+            f"decoder.residual.{index}.conv1" for index in range(EXPECTED_LOGICAL_CONVS)
+        )
+        nodes = []
+        initializers = []
+        for module_name in targets:
+            weight_name = f"{module_name}.weight"
+            bias_name = f"{module_name}.bias"
+            initializers.extend(
+                [
+                    numpy_helper.from_array(
+                        np.ones((1, 1, 1, 1, 1), dtype=np.float16),
+                        name=weight_name,
+                    ),
+                    numpy_helper.from_array(
+                        np.zeros((1,), dtype=np.float16),
+                        name=bias_name,
+                    ),
+                ]
+            )
+            for call_index in range(3):
+                nodes.append(
+                    helper.make_node(
+                        "Conv",
+                        ["input", weight_name, bias_name],
+                        [f"{module_name}.output.{call_index}"],
+                        name=f"source/{module_name}/{call_index}",
+                        kernel_shape=[1, 1, 1],
+                    )
+                )
+        graph = helper.make_graph(
+            nodes,
+            "qdq-v3-test",
+            [
+                helper.make_tensor_value_info(
+                    "input", TensorProto.FLOAT16, [1, 1, 1, 1, 1]
+                )
+            ],
+            [
+                helper.make_tensor_value_info(
+                    f"{targets[-1]}.output.2",
+                    TensorProto.FLOAT16,
+                    [1, 1, 1, 1, 1],
+                )
+            ],
+            initializer=initializers,
+        )
+        model = helper.make_model(
+            graph,
+            opset_imports=[helper.make_opsetid("", QDQ_OPSET)],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.onnx"
+            destination = Path(directory) / "qdq.onnx"
+            onnx.save(model, source)
+            report = rewrite_onnx_with_int8_qdq(
+                source_path=source,
+                destination_path=destination,
+                graph_kind="initial",
+                target_module_names=targets,
+                activation_scales={name: 1.0 for name in targets},
+            )
+            self.assertEqual(report["activation_quantize_count"], 84)
+            self.assertEqual(report["weight_quantize_count"], 84)
+            self.assertEqual(report["weight_dequantize_count"], 84)
+            self.assertEqual(report["unique_weight_source_count"], 84)
+            self.assertEqual(report["unique_bias_count"], 84)
+            self.assertEqual(len(report["conv_signatures"]), 84)
+
+            rewritten = onnx.load(destination)
+            weight_q = [
+                node
+                for node in rewritten.graph.node
+                if node.op_type == "QuantizeLinear"
+                and node.name.startswith("qdq/initial/weight/")
+            ]
+            weight_q[1].input[0] = weight_q[0].input[0]
+            failed = audit_qdq_model(
+                rewritten,
+                graph_kind="initial",
+                target_module_names=targets,
+            )
+            self.assertFalse(failed["passed"])
+            self.assertTrue(
+                any("weight sources are shared" in error for error in failed["errors"])
+            )
+
+            dq_only = onnx.load(destination)
+            dq_only_weight_q = next(
+                node
+                for node in dq_only.graph.node
+                if node.op_type == "QuantizeLinear"
+                and node.name.startswith("qdq/initial/weight/")
+            )
+            dq_only_weight_dq = next(
+                node
+                for node in dq_only.graph.node
+                if node.op_type == "DequantizeLinear"
+                and node.name.startswith("qdq/initial/weight/")
+            )
+            dq_only_weight_dq.input[0] = dq_only_weight_q.input[2]
+            dq_only_report = audit_qdq_model(
+                dq_only,
+                graph_kind="initial",
+                target_module_names=targets,
+            )
+            self.assertFalse(dq_only_report["passed"])
+            self.assertTrue(
+                any(
+                    "weight_missing_q" in error
+                    for error in dq_only_report["invalid_bindings"]
+                )
+            )
+
+            wrong_axis = onnx.load(destination)
+            wrong_axis_weight_q = next(
+                node
+                for node in wrong_axis.graph.node
+                if node.op_type == "QuantizeLinear"
+                and node.name.startswith("qdq/initial/weight/")
+            )
+            next(
+                attribute
+                for attribute in wrong_axis_weight_q.attribute
+                if attribute.name == "axis"
+            ).i = 1
+            wrong_axis_report = audit_qdq_model(
+                wrong_axis,
+                graph_kind="initial",
+                target_module_names=targets,
+            )
+            self.assertFalse(wrong_axis_report["passed"])
+            self.assertTrue(
+                any(
+                    "weight_axis_not_zero" in error
+                    for error in wrong_axis_report["invalid_bindings"]
+                )
+            )
+
+            nonzero_zero_point = onnx.load(destination)
+            nonzero_weight_q = next(
+                node
+                for node in nonzero_zero_point.graph.node
+                if node.op_type == "QuantizeLinear"
+                and node.name.startswith("qdq/initial/weight/")
+            )
+            initializer_by_name = {
+                initializer.name: initializer
+                for initializer in nonzero_zero_point.graph.initializer
+            }
+            zero_initializer = initializer_by_name[nonzero_weight_q.input[2]]
+            zero_initializer.CopyFrom(
+                numpy_helper.from_array(
+                    np.ones(tuple(zero_initializer.dims), dtype=np.int8),
+                    name=zero_initializer.name,
+                )
+            )
+            nonzero_report = audit_qdq_model(
+                nonzero_zero_point,
+                graph_kind="initial",
+                target_module_names=targets,
+            )
+            self.assertFalse(nonzero_report["passed"])
+            self.assertTrue(
+                any(
+                    "weight_zero_invalid" in error
+                    for error in nonzero_report["invalid_bindings"]
+                )
+            )
 
     def test_trt_qdq_rejects_relabelled_legacy_opset(self):
         legacy_model = SimpleNamespace(
@@ -3840,8 +4020,9 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                     {
                         "Name": call_site,
                         "LayerType": "CaskConvolution",
-                        "InputDataType": "Int8",
-                        "OutputDataType": "Half",
+                        "HasDynamicFilter": 0,
+                        "Inputs": [{"Format/Datatype": "Int8"}],
+                        "Weights": {"Count": 4096, "Type": "Int8"},
                         "TacticName": "sm87_xmma_fprop_implicit_gemm_i8i8_i32",
                     }
                 ]
@@ -3859,11 +4040,15 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             {
                 "Layers": [
                     {
-                        "Name": call_site,
+                        "Name": "fused_conv",
+                        "Metadata": f"[ONNX Layer: {call_site}]",
                         "LayerType": "CaskConvolution",
-                        "InputDataType": "Float",
-                        "OutputDataType": "Float",
-                        "TacticName": "sm80_xmma_fprop_f32f32_tf32f32",
+                        "HasDynamicFilter": 1,
+                        "Inputs": [{"Format/Datatype": "Half"}],
+                        "Weights": {"Count": 0, "Type": "Half"},
+                        "TacticName": (
+                            "sm80_xmma_fprop_implicit_gemm_f16f16_f16f16_f16"
+                        ),
                     }
                 ]
             }
@@ -3876,6 +4061,35 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
         )
         self.assertFalse(failed["passed"])
         self.assertEqual(failed["non_int8_call_sites"], [call_site])
+        self.assertEqual(failed["dynamic_filter_call_sites"], [call_site])
+        self.assertEqual(failed["fp16_fallback_call_sites"], [call_site])
+        self.assertFalse(failed["matches"][call_site]["activation_int8"])
+        self.assertFalse(failed["matches"][call_site]["static_weight_int8"])
+
+        deceptive_inspector = json.dumps(
+            {
+                "Layers": [
+                    {
+                        "Name": call_site,
+                        "LayerType": "CaskConvolution",
+                        "HasDynamicFilter": 0,
+                        "Inputs": [{"Format/Datatype": "Int8"}],
+                        "Weights": {"Count": 4096, "Type": "Int8"},
+                        "TacticName": "sm80_xmma_fprop_f16f16_f16f16_f16",
+                    }
+                ]
+            }
+        )
+        deceptive = _audit_tensorrt_tactics(
+            graph_kind="initial",
+            call_site_names=[call_site],
+            inspector_json=deceptive_inspector,
+            expected_call_sites=1,
+        )
+        self.assertFalse(deceptive["passed"])
+        self.assertTrue(deceptive["matches"][call_site]["activation_int8"])
+        self.assertTrue(deceptive["matches"][call_site]["static_weight_int8"])
+        self.assertTrue(deceptive["matches"][call_site]["fp16_fallback"])
 
     def test_trt_build_stage_resume_requires_matching_source_and_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3894,6 +4108,28 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 source_sha256=source_hash,
                 output_path=output_path,
                 profiling_verbosity="detailed",
+            )
+            self.assertTrue(
+                _stage_is_current(
+                    state=state,
+                    stage="initial_int8_detailed",
+                    source_sha256=source_hash,
+                    output_path=output_path,
+                    profiling_verbosity="detailed",
+                )
+            )
+            audit_path = root / "audit.json"
+            audit_path.write_text('{"passed": false}', encoding="utf-8")
+            _mark_stage_audit(
+                state_path=state_path,
+                state=state,
+                stage="initial_int8_detailed",
+                passed=False,
+                audit_path=audit_path,
+            )
+            self.assertEqual(
+                state["stages"]["initial_int8_detailed"]["status"],
+                "audit_failed",
             )
             self.assertTrue(
                 _stage_is_current(
@@ -3923,12 +4159,14 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             "--output-dir",
             "/engines",
             "--resume",
+            "--preflight-only",
             "--timing-cache",
             "/engines/timing.cache",
         ]
         with mock.patch.object(sys, "argv", argv):
             args = _parse_trt_build_args()
         self.assertTrue(args.resume)
+        self.assertTrue(args.preflight_only)
         self.assertEqual(args.timing_cache, "/engines/timing.cache")
 
     def test_trt_timing_cache_uses_builder_config_api(self):
@@ -3987,7 +4225,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 timing_cache_path=Path("timing.cache"),
             )
 
-    def test_trt_timing_cache_is_persisted_atomically(self):
+    def test_trt_timing_cache_is_committed_atomically(self):
         with tempfile.TemporaryDirectory() as directory:
             cache_path = Path(directory) / "timing.cache"
             timing_cache = SimpleNamespace(
@@ -3997,9 +4235,15 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 get_timing_cache=mock.Mock(return_value=timing_cache)
             )
 
-            _persist_timing_cache(
+            candidate = _candidate_timing_cache_bytes(
                 config=config,
                 timing_cache_path=cache_path,
+            )
+            self.assertEqual(candidate, b"new-cache")
+            self.assertFalse(cache_path.exists())
+            _commit_timing_cache(
+                timing_cache_path=cache_path,
+                candidate=candidate,
             )
 
             self.assertEqual(cache_path.read_bytes(), b"new-cache")
@@ -4045,8 +4289,8 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             ),
             mock.patch(
                 "sglang.multimodal_gen.experimental.jetson_sfwan."
-                "vae_trt_build._persist_timing_cache"
-            ) as persist,
+                "vae_trt_build._candidate_timing_cache_bytes"
+            ) as candidate,
             self.assertRaisesRegex(RuntimeError, "could not build"),
         ):
             _build_engine_bytes(
@@ -4057,7 +4301,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 timing_cache_path=Path("timing.cache"),
             )
 
-        persist.assert_not_called()
+        candidate.assert_not_called()
 
     def test_trt_export_cache_boundary_normalizes_fp16(self):
         active_indices = tuple(range(32))
@@ -4445,14 +4689,101 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                     payload = f"{precision}-{kind}".encode()
                     (root / name).write_bytes(payload)
                     digest_by_file[name] = hashlib.sha256(payload).hexdigest()
-            audit_payload = json.dumps(
-                {
+            empty_tactic_lists = {
+                "unmapped_call_sites": [],
+                "non_int8_call_sites": [],
+                "activation_not_int8_call_sites": [],
+                "static_weight_not_int8_call_sites": [],
+                "dynamic_filter_call_sites": [],
+                "fp16_fallback_call_sites": [],
+                "fp32_or_tf32_fallback_call_sites": [],
+            }
+            plan_sha = {
+                kind: digest_by_file[f"{kind}_int8.plan"]
+                for kind in ("initial", "steady")
+            }
+            audit_report = {
+                "schema_version": 3,
+                "passed": True,
+                "preflight_passed": True,
+                "complete": True,
+                "target_conv_call_sites_per_graph": 84,
+                "probe_suite": {
+                    "schema_version": 3,
                     "passed": True,
-                    "target_conv_call_sites_per_graph": 84,
+                    "signature_count": 1,
+                    "probed_signature_count": 1,
+                    "source_call_site_counts": {"initial": 84, "steady": 84},
+                    "errors": [],
+                    "signatures": {
+                        "signature": {
+                            "signature_id": "signature",
+                            "passed": True,
+                            "mapped_count": 1,
+                            "errors": [],
+                            "source_call_sites": {
+                                kind: [
+                                    f"int8/{kind}/call_{index}" for index in range(84)
+                                ]
+                                for kind in ("initial", "steady")
+                            },
+                            "matches": {
+                                "int8/probe/call_0": {
+                                    "passed": True,
+                                    "activation_int8": True,
+                                    "static_weight_int8": True,
+                                    "dynamic_filter": False,
+                                    "int8_tactic": True,
+                                    "fp16_fallback": False,
+                                    "fp32_or_tf32_fallback": False,
+                                }
+                            },
+                            **empty_tactic_lists,
+                        }
+                    },
                 },
-                sort_keys=True,
-            ).encode()
-            (root / "int8_audit.json").write_bytes(audit_payload)
+                "structural": {
+                    kind: {
+                        "schema_version": 3,
+                        "passed": True,
+                        "errors": [],
+                        "target_conv_call_site_count": 84,
+                        "activation_quantize_count": 84,
+                        "activation_dequantize_count": 84,
+                        "weight_quantize_count": 84,
+                        "weight_dequantize_count": 84,
+                        "unique_weight_source_count": 84,
+                        "unique_bias_count": 84,
+                    }
+                    for kind in ("initial", "steady")
+                },
+                "tactics": {
+                    kind: {
+                        "passed": True,
+                        "errors": [],
+                        "mapped_count": 84,
+                        "build_profiling_verbosity": "detailed",
+                        "plan_sha256": plan_sha[kind],
+                        "matches": {
+                            f"int8/{kind}/call_{index}": {
+                                "passed": True,
+                                "activation_int8": True,
+                                "static_weight_int8": True,
+                                "dynamic_filter": False,
+                                "int8_tactic": True,
+                                "fp16_fallback": False,
+                                "fp32_or_tf32_fallback": False,
+                            }
+                            for index in range(84)
+                        },
+                        **empty_tactic_lists,
+                    }
+                    for kind in ("initial", "steady")
+                },
+                "plan_sha256": plan_sha,
+            }
+            audit_payload = json.dumps(audit_report, sort_keys=True).encode()
+            (root / "int8_audit_v3.json").write_bytes(audit_payload)
             audit_digest = hashlib.sha256(audit_payload).hexdigest()
 
             cache_shapes = [[1, 1, 1, 1, TRT_VAE_CACHE_TOTAL_ELEMENTS - 31]]
@@ -4465,6 +4796,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 "width": 832,
                 "latent_shape": list(TRT_VAE_LATENT_SHAPE),
                 "latent_dtype": "float16",
+                "quantization": {"qdq_schema_version": 3},
                 "cache": {
                     "allocated_slot_count": 33,
                     "active_slot_indices": list(range(32)),
@@ -4492,6 +4824,14 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                                 480,
                                 832,
                             ],
+                            **(
+                                {
+                                    "profiling_verbosity": "detailed",
+                                    "audit_passed": True,
+                                }
+                                if precision == "int8"
+                                else {}
+                            ),
                         }
                         for kind in ("initial", "steady")
                     }
@@ -4499,9 +4839,12 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                 },
                 "int8_audit": {
                     "passed": True,
+                    "schema_version": 3,
+                    "preflight_passed": True,
                     "target_conv_call_sites_per_graph": 84,
-                    "report_file": "int8_audit.json",
+                    "report_file": "int8_audit_v3.json",
                     "report_sha256": audit_digest,
+                    "plan_sha256": plan_sha,
                 },
             }
             validated = validate_trt_vae_manifest(
@@ -4513,6 +4856,49 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             )
             self.assertEqual(len(validated["cache_shapes"]), 32)
             self.assertEqual(set(validated["engines"]), {"initial", "steady"})
+
+            first_initial_evidence = next(
+                iter(audit_report["tactics"]["initial"]["matches"].values())
+            )
+            first_initial_evidence["fp16_fallback"] = True
+            deceptive_payload = json.dumps(audit_report, sort_keys=True).encode()
+            (root / "int8_audit_v3.json").write_bytes(deceptive_payload)
+            manifest["int8_audit"]["report_sha256"] = hashlib.sha256(
+                deceptive_payload
+            ).hexdigest()
+            with self.assertRaisesRegex(ValueError, "tactic evidence"):
+                validate_trt_vae_manifest(
+                    manifest,
+                    engine_dir=root,
+                    precision="int8",
+                    model_path="model",
+                    verify_plan_hashes=True,
+                )
+            first_initial_evidence["fp16_fallback"] = False
+            audit_payload = json.dumps(audit_report, sort_keys=True).encode()
+            (root / "int8_audit_v3.json").write_bytes(audit_payload)
+            manifest["int8_audit"]["report_sha256"] = hashlib.sha256(
+                audit_payload
+            ).hexdigest()
+
+            manifest["quantization"]["qdq_schema_version"] = 2
+            with self.assertRaisesRegex(ValueError, "Q/DQ schema 3"):
+                validate_trt_vae_manifest(
+                    manifest,
+                    engine_dir=root,
+                    precision="int8",
+                    model_path="model",
+                    verify_plan_hashes=True,
+                )
+            validated_fp16 = validate_trt_vae_manifest(
+                manifest,
+                engine_dir=root,
+                precision="fp16",
+                model_path="model",
+                verify_plan_hashes=True,
+            )
+            self.assertEqual(set(validated_fp16["engines"]), {"initial", "steady"})
+            manifest["quantization"]["qdq_schema_version"] = 3
 
             manifest["engines"]["int8"]["steady"]["sha256"] = "0" * 64
             with self.assertRaisesRegex(ValueError, "digest"):
@@ -4526,7 +4912,7 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             manifest["engines"]["int8"]["steady"]["sha256"] = digest_by_file[
                 "steady_int8.plan"
             ]
-            (root / "int8_audit.json").write_text("{}", encoding="utf-8")
+            (root / "int8_audit_v3.json").write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "audit digest"):
                 validate_trt_vae_manifest(
                     manifest,
@@ -4535,6 +4921,34 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
                     model_path="model",
                     verify_plan_hashes=True,
                 )
+
+    def test_trt_runtime_lowers_int8_nvtx_unless_explicitly_enabled(self):
+        class _FakeContext:
+            nvtx_verbosity = "detailed"
+
+        trt = SimpleNamespace(
+            ProfilingVerbosity=SimpleNamespace(NONE="none", DETAILED="detailed")
+        )
+        context = _FakeContext()
+        self.assertEqual(
+            _configure_context_nvtx(
+                context=context,
+                trt=trt,
+                precision="int8",
+                enable_nvtx=False,
+            ),
+            "none",
+        )
+        self.assertEqual(context.nvtx_verbosity, "none")
+        self.assertEqual(
+            _configure_context_nvtx(
+                context=context,
+                trt=trt,
+                precision="int8",
+                enable_nvtx=True,
+            ),
+            "detailed",
+        )
 
     def test_trt_runtime_enforces_initial_then_steady_and_reset(self):
         class _FakeTensor:
