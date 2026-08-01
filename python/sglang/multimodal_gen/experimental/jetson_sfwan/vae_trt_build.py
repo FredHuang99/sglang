@@ -532,8 +532,11 @@ def _validate_onnx_fp16_io_contract(
     path: Path,
     expected_input_shapes: dict[str, tuple[int, ...]],
     expected_output_shapes: dict[str, tuple[int, ...]],
-) -> None:
+    materialize_symbolic_shapes: bool = False,
+) -> bool:
     import onnx
+
+    materialized = False
 
     def _validate_values(
         *,
@@ -541,6 +544,8 @@ def _validate_onnx_fp16_io_contract(
         expected_shapes: dict[str, tuple[int, ...]],
         kind: str,
     ) -> None:
+        nonlocal materialized
+
         actual_names = [value.name for value in values]
         expected_names = list(expected_shapes)
         if actual_names != expected_names:
@@ -556,21 +561,38 @@ def _validate_onnx_fp16_io_contract(
                     f"got elem_type={tensor_type.elem_type}"
                 )
             dimensions = tensor_type.shape.dim
-            if any(
-                bool(dimension.dim_param) or int(dimension.dim_value) <= 0
-                for dimension in dimensions
-            ):
-                raise ValueError(
-                    f"{path.name} ONNX {kind} {value.name!r} must have a "
-                    "fully static positive shape"
-                )
-            actual_shape = tuple(int(dimension.dim_value) for dimension in dimensions)
             expected_shape = expected_shapes[value.name]
-            if actual_shape != expected_shape:
+            if len(dimensions) != len(expected_shape):
                 raise ValueError(
-                    f"{path.name} ONNX {kind} {value.name!r} shape is "
-                    f"{actual_shape}, expected {expected_shape}"
+                    f"{path.name} ONNX {kind} {value.name!r} rank is "
+                    f"{len(dimensions)}, expected {len(expected_shape)}"
                 )
+            for dimension, expected_dimension in zip(
+                dimensions,
+                expected_shape,
+                strict=True,
+            ):
+                is_symbolic = bool(dimension.dim_param)
+                dimension_value = int(dimension.dim_value)
+                if is_symbolic or dimension_value <= 0:
+                    if not materialize_symbolic_shapes:
+                        raise ValueError(
+                            f"{path.name} ONNX {kind} {value.name!r} must have "
+                            "a fully static positive shape"
+                        )
+                    clear_field = getattr(dimension, "ClearField", None)
+                    if clear_field is not None:
+                        clear_field("dim_param")
+                    else:
+                        dimension.dim_param = ""
+                    dimension.dim_value = int(expected_dimension)
+                    materialized = True
+                elif dimension_value != int(expected_dimension):
+                    actual_shape = tuple(int(item.dim_value) for item in dimensions)
+                    raise ValueError(
+                        f"{path.name} ONNX {kind} {value.name!r} shape is "
+                        f"{actual_shape}, expected {expected_shape}"
+                    )
 
     _validate_values(
         values=model.graph.input,
@@ -582,6 +604,7 @@ def _validate_onnx_fp16_io_contract(
         expected_shapes=expected_output_shapes,
         kind="output",
     )
+    return materialized
 
 
 def _export_onnx(
@@ -638,14 +661,27 @@ def _export_onnx(
         )
     model = onnx.load(str(path), load_external_data=True)
     onnx.checker.check_model(model, full_check=True)
+    expected_input_shapes = {
+        name: tuple(int(dimension) for dimension in argument.shape)
+        for name, argument in zip(input_names, arguments, strict=True)
+    }
+    expected_output_shapes = dict(zip(output_names, output_shapes, strict=True))
+    materialized = _validate_onnx_fp16_io_contract(
+        model=model,
+        path=path,
+        expected_input_shapes=expected_input_shapes,
+        expected_output_shapes=expected_output_shapes,
+        materialize_symbolic_shapes=True,
+    )
+    if materialized:
+        onnx.save(model, str(path))
+        model = onnx.load(str(path), load_external_data=True)
+        onnx.checker.check_model(model, full_check=True)
     _validate_onnx_fp16_io_contract(
         model=model,
         path=path,
-        expected_input_shapes={
-            name: tuple(int(dimension) for dimension in argument.shape)
-            for name, argument in zip(input_names, arguments, strict=True)
-        },
-        expected_output_shapes=dict(zip(output_names, output_shapes, strict=True)),
+        expected_input_shapes=expected_input_shapes,
+        expected_output_shapes=expected_output_shapes,
     )
 
 

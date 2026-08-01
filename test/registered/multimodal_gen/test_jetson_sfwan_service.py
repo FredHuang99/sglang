@@ -3888,12 +3888,81 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             )
         )
         with mock.patch.dict(sys.modules, {"onnx": fake_onnx}):
-            _validate_onnx_fp16_io_contract(
-                model=valid_model,
-                path=Path("initial_fp16.onnx"),
-                expected_input_shapes=expected_inputs,
-                expected_output_shapes=expected_outputs,
+            self.assertFalse(
+                _validate_onnx_fp16_io_contract(
+                    model=valid_model,
+                    path=Path("initial_fp16.onnx"),
+                    expected_input_shapes=expected_inputs,
+                    expected_output_shapes=expected_outputs,
+                )
             )
+
+            symbolic_model = SimpleNamespace(
+                graph=SimpleNamespace(
+                    input=valid_model.graph.input,
+                    output=[
+                        _value_info("rgb", 10, (0, 0, 0, 0, 0)),
+                        valid_model.graph.output[1],
+                    ],
+                )
+            )
+            for dimension in symbolic_model.graph.output[0].type.tensor_type.shape.dim:
+                dimension.dim_param = "legacy_export_symbol"
+            self.assertTrue(
+                _validate_onnx_fp16_io_contract(
+                    model=symbolic_model,
+                    path=Path("initial_fp16.onnx"),
+                    expected_input_shapes=expected_inputs,
+                    expected_output_shapes=expected_outputs,
+                    materialize_symbolic_shapes=True,
+                )
+            )
+            self.assertEqual(
+                tuple(
+                    dimension.dim_value
+                    for dimension in symbolic_model.graph.output[
+                        0
+                    ].type.tensor_type.shape.dim
+                ),
+                expected_outputs["rgb"],
+            )
+            self.assertTrue(
+                all(
+                    not dimension.dim_param
+                    for dimension in symbolic_model.graph.output[
+                        0
+                    ].type.tensor_type.shape.dim
+                )
+            )
+            self.assertFalse(
+                _validate_onnx_fp16_io_contract(
+                    model=symbolic_model,
+                    path=Path("initial_fp16.onnx"),
+                    expected_input_shapes=expected_inputs,
+                    expected_output_shapes=expected_outputs,
+                )
+            )
+
+            concrete_mismatch = SimpleNamespace(
+                graph=SimpleNamespace(
+                    input=valid_model.graph.input,
+                    output=[
+                        _value_info("rgb", 10, (1, 3, 8, 16, 16)),
+                        valid_model.graph.output[1],
+                    ],
+                )
+            )
+            with self.assertRaisesRegex(
+                ValueError,
+                r"shape is \(1, 3, 8, 16, 16\)",
+            ):
+                _validate_onnx_fp16_io_contract(
+                    model=concrete_mismatch,
+                    path=Path("initial_fp16.onnx"),
+                    expected_input_shapes=expected_inputs,
+                    expected_output_shapes=expected_outputs,
+                    materialize_symbolic_shapes=True,
+                )
 
             invalid_model = SimpleNamespace(
                 graph=SimpleNamespace(
