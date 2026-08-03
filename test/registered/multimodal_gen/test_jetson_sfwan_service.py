@@ -107,6 +107,20 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _stage_is_current,
     _validate_onnx_fp16_io_contract,
 )
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion import (
+    FUSION_VARIANT,
+    _ordered_causal_concat_inputs,
+    _require_only_consumers,
+    _require_removable_subgraph,
+)
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build import (
+    _analysis_signature as _fusion_analysis_signature,
+    _selected_call_sites as _fusion_selected_call_sites,
+)
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_perf_compare import (
+    compare_profile_summaries,
+    render_markdown as render_trt_perf_markdown,
+)
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
     EXPECTED_CALL_SITES,
     EXPECTED_CONV_SIGNATURES,
@@ -121,6 +135,8 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_profile import (
     PROFILE_CATEGORIES,
+    SUPPORTED_TRT_LAYER_PROFILE_SCHEMA_VERSIONS,
+    TRT_LAYER_PROFILE_SCHEMA_VERSION,
     TrtLayerProfileCapture,
     aggregate_trt_layer_profile_iterations,
     build_physical_layer_catalog,
@@ -6276,6 +6292,372 @@ class TestSfWanTensorRTLayerProfile(CustomTestCase):
                 runtime._transfer_executor.shutdown(wait=True)
 
         asyncio.run(_scenario())
+
+
+class TestSfWanTensorRTFusionExperiment(CustomTestCase):
+    """Protect fusion-v1 isolation, evidence, and comparison contracts."""
+
+    @staticmethod
+    def _production_summary(
+        *,
+        backend: str,
+        precision: str,
+        variant: str,
+        base_chunk_ms: float,
+    ) -> dict:
+        measured = []
+        for iteration in range(2):
+            chunks = []
+            for chunk_index in range(7):
+                elapsed = base_chunk_ms + chunk_index + iteration
+                chunk = {
+                    "chunk_index": chunk_index,
+                    "chunk_execution_cuda_ms": elapsed,
+                }
+                if backend == "tensorrt":
+                    chunk["trt_engine_cuda_ms"] = elapsed - 1.0
+                chunks.append(chunk)
+            measured.append(
+                {
+                    "iteration": iteration + 1,
+                    "warmup": False,
+                    "request_id": f"request-{iteration}",
+                    "state": "completed",
+                    "error": None,
+                    "profile_execution": {
+                        "chunks": chunks,
+                        "vae_execution_cuda_ms": sum(
+                            chunk["chunk_execution_cuda_ms"] for chunk in chunks
+                        ),
+                    },
+                }
+            )
+        server = {
+            "role": "vae",
+            "profile_enabled": True,
+            "trt_layer_profile_enabled": False,
+            "vae_backend": backend,
+            "vae_engine_precision": precision,
+            "vae_trt_variant": variant,
+            "vae_runtime_gpu_name": "Orin",
+            "vae_runtime_compute_capability": [8, 7],
+            "vae_runtime_cuda_version": "12.9",
+            "vae_engine_sm": [8, 7] if backend == "tensorrt" else None,
+            "vae_engine_tensorrt_version": (
+                "10.3.0" if backend == "tensorrt" else None
+            ),
+            "vae_engine_plan_sha256": (
+                {"initial": "a" * 64, "steady": "b" * 64}
+                if backend == "tensorrt"
+                else None
+            ),
+            "vae_trt_plugin_sha256": "c" * 64 if variant == FUSION_VARIANT else None,
+        }
+        return {
+            "mode": "profile-vae",
+            "warmup": 1,
+            "repeat": 2,
+            "measurement_context": {
+                "schema_version": 1,
+                "request": {
+                    "height": 480,
+                    "width": 832,
+                    "num_frames": 81,
+                    "fps": 16,
+                    "seed": 1024,
+                    "latent_frames": 21,
+                    "latent_frames_per_chunk": 3,
+                    "total_chunks": 7,
+                },
+                "run": {
+                    "warmup": 1,
+                    "repeat": 2,
+                    "measured_iterations": 2,
+                },
+                "server": server,
+            },
+            "measured": measured,
+            # A deliberately absurd warmup proves the comparison consumes
+            # only the client's measured view.
+            "all_iterations": [
+                {
+                    "iteration": 0,
+                    "warmup": True,
+                    "profile_execution": {"vae_execution_cuda_ms": 10**9},
+                },
+                *measured,
+            ],
+        }
+
+    def test_server_cli_and_validation_keep_fusion_opt_in(self):
+        argv = [
+            "server",
+            "--role",
+            "vae",
+            "--vae-precision",
+            "int8_trt",
+            "--vae-engine-dir",
+            "/workspace/engines",
+            "--vae-trt-variant",
+            "fusion_v1",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            config = _parse_args()
+        self.assertEqual(config.vae_trt_variant, "fusion_v1")
+
+        with self.assertRaisesRegex(ValueError, "requires --vae-precision int8_trt"):
+            SfWanRuntime(
+                config=ServerConfig(
+                    role="vae",
+                    vae_precision="fp16_trt",
+                    vae_engine_dir="/engines",
+                    vae_trt_variant="fusion_v1",
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "valid only for VAE execution"):
+            SfWanRuntime(
+                config=ServerConfig(
+                    role="dit",
+                    vae_precision="int8_trt",
+                    vae_engine_dir="/engines",
+                    vae_trt_variant="fusion_v1",
+                )
+            )
+
+    def test_graph_rewrite_helpers_reject_shared_consumers_and_public_outputs(self):
+        first = SimpleNamespace(name="first", output=["middle"])
+        allowed = SimpleNamespace(name="allowed", output=["final"])
+        unexpected = SimpleNamespace(name="unexpected", output=["side"])
+        consumers = {"middle": [allowed, unexpected], "final": []}
+        with self.assertRaisesRegex(ValueError, "shared consumers"):
+            _require_only_consumers(
+                tensor="middle",
+                consumers=consumers,
+                allowed_node_names={"allowed"},
+            )
+        with self.assertRaisesRegex(ValueError, "shared consumers"):
+            _require_removable_subgraph(
+                nodes=[first, allowed],
+                replacement_output="final",
+                consumers=consumers,
+                graph_outputs=set(),
+            )
+        with self.assertRaisesRegex(ValueError, "public graph output"):
+            _require_removable_subgraph(
+                nodes=[first],
+                replacement_output="different",
+                consumers={"middle": []},
+                graph_outputs={"middle"},
+            )
+
+    def test_probe_selection_requires_every_focused_call_site(self):
+        call_sites = {
+            "initial": "int8/initial/decoder.up_blocks.3.block.conv1/call_0",
+            "steady": "int8/steady/decoder.up_blocks.3.block.conv1/call_0",
+        }
+        analysis = {
+            "graphs": {
+                kind: {"call_sites": [{"call_site": value, "focused": True}]}
+                for kind, value in call_sites.items()
+            }
+        }
+        probe = {
+            "signatures": {
+                "signature": {
+                    "passed": True,
+                    "selected_cache_update_mode": "dual",
+                    "call_sites": {kind: [value] for kind, value in call_sites.items()},
+                }
+            }
+        }
+        selected, modes = _fusion_selected_call_sites(analysis=analysis, probe=probe)
+        self.assertEqual(
+            selected, {kind: {value} for kind, value in call_sites.items()}
+        )
+        self.assertEqual(
+            modes,
+            {kind: {value: "dual"} for kind, value in call_sites.items()},
+        )
+        probe["signatures"]["signature"]["call_sites"]["steady"] = []
+        with self.assertRaisesRegex(RuntimeError, "every focused steady"):
+            _fusion_selected_call_sites(analysis=analysis, probe=probe)
+
+    def test_fusion_signature_is_stable_and_shape_sensitive(self):
+        record = {
+            "conv_kind": "conv1",
+            "current_shape": [1, 96, 1, 60, 104],
+            "cache_shape": [1, 96, 2, 60, 104],
+            "padded_shape": [1, 96, 3, 62, 106],
+            "pads": [0, 0, 0, 1, 1, 0, 0, 0, 1, 1],
+            "epilogue_output_shape": [1, 96, 1, 60, 104],
+        }
+        first = _fusion_analysis_signature(record)
+        self.assertEqual(first, _fusion_analysis_signature(copy.deepcopy(record)))
+        record["padded_shape"][-1] += 1
+        self.assertNotEqual(first, _fusion_analysis_signature(record))
+
+    def test_causal_concat_keeps_cache_first_for_four_frame_current(self):
+        cache, current = _ordered_causal_concat_inputs(
+            ["cache", "current"],
+            {
+                "cache": [1, 96, 2, 60, 104],
+                "current": [1, 96, 4, 60, 104],
+            },
+        )
+        self.assertEqual((cache, current), ("cache", "current"))
+        with self.assertRaisesRegex(ValueError, "1/2-frame cache"):
+            _ordered_causal_concat_inputs(
+                ["current", "cache"],
+                {
+                    "cache": [1, 96, 2, 60, 104],
+                    "current": [1, 96, 4, 60, 104],
+                },
+            )
+
+    def test_profile_schema_v2_classifies_each_fusion_plugin(self):
+        self.assertEqual(TRT_LAYER_PROFILE_SCHEMA_VERSION, 2)
+        self.assertEqual(SUPPORTED_TRT_LAYER_PROFILE_SCHEMA_VERSIONS, {1, 2})
+        expected = {
+            "fused_input_pack_quant",
+            "fused_cache_update",
+            "fused_conv1_norm_silu",
+            "fused_conv2_residual",
+        }
+        self.assertTrue(expected <= set(PROFILE_CATEGORIES))
+        catalog = build_physical_layer_catalog(
+            engine_kind="initial",
+            plan_sha256="a" * 64,
+            inspector={
+                "Layers": [
+                    {
+                        "Name": "fusion/input_pack_quant/call SfWanCausalPackQuantPlugin",
+                        "LayerType": "PluginV3",
+                    },
+                    {
+                        "Name": "fusion/cache_update/call SfWanCacheUpdatePlugin",
+                        "LayerType": "PluginV3",
+                    },
+                    {
+                        "Name": "fusion/conv1_norm_silu/call SfWanInt8EpiloguePlugin",
+                        "LayerType": "PluginV3",
+                    },
+                    {
+                        "Name": "fusion/conv2_residual/call SfWanInt8EpiloguePlugin",
+                        "LayerType": "PluginV3",
+                    },
+                ]
+            },
+            precision="fp16",
+        )
+        self.assertEqual({entry["category"] for entry in catalog["layers"]}, expected)
+
+        dual_catalog = build_physical_layer_catalog(
+            engine_kind="steady",
+            plan_sha256="b" * 64,
+            inspector={
+                "Layers": [
+                    {
+                        "Name": (
+                            "fusion/input_pack_quant_cache/call "
+                            "SfWanCausalPackQuantPlugin"
+                        ),
+                        "LayerType": "PluginV3",
+                    }
+                ]
+            },
+            precision="fp16",
+        )
+        self.assertEqual(
+            dual_catalog["layers"][0]["category"], "fused_input_pack_quant"
+        )
+
+    def test_plugin_sources_pin_sm87_int8_chw32_and_fp16_cache(self):
+        root = Path(__file__).resolve().parents[3]
+        source_root = (
+            root
+            / "python"
+            / "sglang"
+            / "multimodal_gen"
+            / "experimental"
+            / "jetson_sfwan"
+            / "trt_plugins"
+        )
+        cmake = (source_root / "CMakeLists.txt").read_text(encoding="utf-8")
+        plugin = (source_root / "sfwan_vae_plugin.cpp").read_text(encoding="utf-8")
+        kernels = (source_root / "sfwan_vae_kernels.cu").read_text(encoding="utf-8")
+        self.assertIn('SFWAN_CUDA_ARCHITECTURES "87"', cmake)
+        self.assertIn("TensorFormat::kCDHW32", plugin)
+        self.assertIn("DataType::kINT8", plugin)
+        self.assertIn("DataType::kHALF", plugin)
+        self.assertIn("emit_cache", plugin)
+        self.assertIn("mEmitCache != 0 ? 2 : 1", plugin)
+        self.assertIn("SfWanCacheUpdatePlugin", plugin)
+        self.assertIn("quantizeSigned", kernels)
+        self.assertIn("cacheUpdateKernel", kernels)
+        self.assertIn("normSiluEpilogueKernel", kernels)
+
+    def test_production_compare_excludes_warmup_and_rejects_mismatches(self):
+        summaries = {
+            "fp32": self._production_summary(
+                backend="pytorch",
+                precision="fp32",
+                variant="baseline",
+                base_chunk_ms=100.0,
+            ),
+            "fp16_trt": self._production_summary(
+                backend="tensorrt",
+                precision="fp16",
+                variant="baseline",
+                base_chunk_ms=50.0,
+            ),
+            "int8_v5": self._production_summary(
+                backend="tensorrt",
+                precision="int8",
+                variant="baseline",
+                base_chunk_ms=40.0,
+            ),
+            "int8_fusion_v1": self._production_summary(
+                backend="tensorrt",
+                precision="int8",
+                variant="fusion_v1",
+                base_chunk_ms=30.0,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = {}
+            for label, summary in summaries.items():
+                path = root / f"{label}.json"
+                path.write_text(json.dumps(summary), encoding="utf-8")
+                inputs[label] = (path, summary)
+            result = compare_profile_summaries(
+                inputs,
+                expected_warmup=1,
+                expected_repeat=2,
+            )
+        self.assertEqual(result["results"]["fp32"]["whole_request"]["sample_count"], 2)
+        self.assertLess(result["results"]["fp32"]["whole_request"]["mean_ms"], 10**9)
+        self.assertGreater(
+            result["results"]["int8_fusion_v1"]["speedup_vs_fp16_trt"], 1.0
+        )
+        self.assertIn("int8_fusion_v1", render_trt_perf_markdown(result))
+
+        summaries["int8_v5"]["measurement_context"]["server"][
+            "trt_layer_profile_enabled"
+        ] = True
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            inputs = {}
+            for label, summary in summaries.items():
+                path = root / f"{label}.json"
+                path.write_text(json.dumps(summary), encoding="utf-8")
+                inputs[label] = (path, summary)
+            with self.assertRaisesRegex(ValueError, "must be disabled"):
+                compare_profile_summaries(
+                    inputs,
+                    expected_warmup=1,
+                    expected_repeat=2,
+                )
 
 
 if __name__ == "__main__":

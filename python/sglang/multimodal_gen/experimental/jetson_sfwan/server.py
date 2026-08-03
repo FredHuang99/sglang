@@ -33,6 +33,7 @@ from .model import (
     SfWanMonolithicModel,
     SfWanVaeModel,
     VaePrecision,
+    VaeTrtVariant,
     _uses_trt_vae,
 )
 from .protocol import (
@@ -83,6 +84,7 @@ class ServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     device_index: int = 0
     vae_precision: VaePrecision = "fp32"
     vae_engine_dir: str | None = None
+    vae_trt_variant: VaeTrtVariant = "baseline"
     text_encoder_cpu_offload: bool = True
     dit_cpu_offload: bool = False
     vae_cpu_offload: bool = False
@@ -160,6 +162,19 @@ class SfWanRuntime:
                 raise ValueError(
                     "--vae-engine-dir is valid only with fp16_trt or int8_trt"
                 )
+        if config.vae_trt_variant == "fusion_v1":
+            if config.vae_precision != "int8_trt":
+                raise ValueError(
+                    "--vae-trt-variant fusion_v1 requires --vae-precision int8_trt"
+                )
+            if config.role not in {"monolithic", "vae"}:
+                raise ValueError(
+                    "--vae-trt-variant fusion_v1 is valid only for VAE execution"
+                )
+        elif config.vae_trt_variant != "baseline":
+            raise ValueError(
+                f"unsupported TensorRT VAE variant: {config.vae_trt_variant}"
+            )
         if (
             config.role == "vae"
             and config.latent_transport == "shm"
@@ -200,6 +215,7 @@ class SfWanRuntime:
             device_index=self.config.device_index,
             vae_precision=self.config.vae_precision,
             vae_engine_dir=self.config.vae_engine_dir,
+            vae_trt_variant=self.config.vae_trt_variant,
             text_encoder_cpu_offload=self.config.text_encoder_cpu_offload,
             dit_cpu_offload=self.config.dit_cpu_offload,
             vae_cpu_offload=self.config.vae_cpu_offload,
@@ -1362,6 +1378,12 @@ def _parse_args() -> ServerConfig:
     )
     parser.add_argument("--vae-engine-dir")
     parser.add_argument(
+        "--vae-trt-variant",
+        choices=("baseline", "fusion_v1"),
+        default="baseline",
+        help="isolated TensorRT VAE experiment variant; baseline is unchanged",
+    )
+    parser.add_argument(
         "--text-encoder-cpu-offload",
         action=StoreBoolean,
         default=True,
@@ -1401,6 +1423,7 @@ def _parse_args() -> ServerConfig:
         device_index=args.device_index,
         vae_precision=args.vae_precision,
         vae_engine_dir=args.vae_engine_dir,
+        vae_trt_variant=args.vae_trt_variant,
         text_encoder_cpu_offload=args.text_encoder_cpu_offload,
         dit_cpu_offload=args.dit_cpu_offload,
         vae_cpu_offload=args.vae_cpu_offload,

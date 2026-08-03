@@ -601,6 +601,180 @@ warmup/repeat matrix before reporting FP16-vs-INT8 latency. Layer-profile time
 and uninstrumented `trt_engine_cuda_ms` answer different questions and must not
 be put in the same latency table.
 
+## Experimental INT8 boundary fusion (`fusion_v1`)
+
+The complete Jetson command sequence, including production baselines, plugin
+build, foreground probes, resumable nohup build, artifact audit, layer profile,
+and final comparison, is in [FUSION_V1_JETSON_RUNBOOK.md](FUSION_V1_JETSON_RUNBOOK.md).
+
+`fusion_v1` is an opt-in Orin experiment. The default remains
+`--vae-trt-variant baseline`; that branch neither imports the fusion helpers,
+reads `fusion_v1/`, nor loads a plugin shared library. The experiment preserves
+the Q/DQ-v5 INT8 Conv tactics and the external 32-binding FP16 feature-cache
+ABI, while replacing expensive boundary work around probe-approved call sites:
+
+```text
+FP16 current + optional FP16 history
+  -> SfWanCausalPackQuantPlugin
+       causal concat + pad + INT8 quantize + CDHW32 pack
+       optional second FP16 output: cache update
+  -> existing audited INT8 Conv3d
+  -> SfWanInt8EpiloguePlugin
+       conv1: dequantize + RMSNorm + SiLU -> FP16
+       conv2: dequantize + residual add -> FP16
+
+If TensorRT rejects the mixed INT8/FP16 outputs:
+  FP16 current + optional FP16 history
+    -> SfWanCacheUpdatePlugin -> unchanged FP16 cache_out binding
+```
+
+The probe tries the dual-output pack/cache plugin first and independently tests
+the split cache-update plugin as a TensorRT 10.3 fallback. It selects the
+fastest candidate that passes correctness and tactic checks for each signature.
+With the dual-output form, cache work is co-resident in the physical pack layer,
+and one CUDA kernel writes both outputs. The layer profiler therefore
+attributes that time to `fused_input_pack_quant` rather
+than counting it twice as `fused_cache_update`. Cache storage remains FP16 and
+the two runtime banks still alternate `A -> B -> A`. No new Conv is quantized.
+
+### Isolated artifacts and fail-closed stages
+
+All experimental files live under `$SFWAN_TRT_DIR/fusion_v1/`; v5 ONNX, plans,
+audit, manifest, build state, and timing cache are never overwritten:
+
+```text
+fusion_v1/
+  libsfwan_vae_trt_fusion.so
+  plugin_manifest.json
+  fusion_analysis_v1.json
+  fusion_probe_v1.json
+  initial_int8_fusion_v1.onnx
+  steady_int8_fusion_v1.onnx
+  initial_int8_fusion_v1.plan
+  steady_int8_fusion_v1.plan
+  initial_int8_fusion_v1_inspector.json
+  steady_int8_fusion_v1_inspector.json
+  fusion_audit_v1.json
+  fusion_manifest.json
+  fusion_build_state.json
+  fusion_timing.cache
+```
+
+The builder exposes `analyze`, `probe`, and `build`. It requires every
+`decoder.up_blocks.3` signature to pass. Other signatures are fused only when
+their probe passes; otherwise they retain the v5 boundary. The six probe
+schemes compare the same final Conv, epilogue, and cache-update outputs:
+
+1. Q/DQ-v5 baseline;
+2. input concat/pad/quantize/CDHW32 pack fusion;
+3. input fusion with a mixed INT8/FP16 dual cache output;
+4. input fusion plus a separate cache-update plugin fallback;
+5. full input/cache/epilogue fusion using the dual-output plugin;
+6. full input/cache/epilogue fusion using the split fallback.
+
+Each signature must retain a static INT8 weight and a real INT8/IMMA tactic,
+must have no Reformat between pack and Conv or Conv and epilogue, and must
+preserve the FP16 cache update exactly. Input and input+cache candidates must
+be at least 10% faster than the baseline; the epilogue must add at least 5%
+relative improvement. A failed required probe prevents a full build.
+
+Build the SM87 plugin inside the Jetson container:
+
+```bash
+export SGLANG_SRC=/workspace/sglang
+export SFWAN_TRT_DIR=/workspace/engines/sfwan-vae-trt-sm87-iofix
+export SFWAN_FUSION_DIR="$SFWAN_TRT_DIR/fusion_v1"
+export SFWAN_FUSION_BUILD=/workspace/build/sfwan-vae-trt-fusion-sm87
+
+cmake \
+  -S "$SGLANG_SRC/python/sglang/multimodal_gen/experimental/jetson_sfwan/trt_plugins" \
+  -B "$SFWAN_FUSION_BUILD" \
+  -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSFWAN_CUDA_ARCHITECTURES=87 \
+  -DCMAKE_INSTALL_PREFIX="$SFWAN_FUSION_DIR"
+cmake --build "$SFWAN_FUSION_BUILD" --parallel 4
+cmake --install "$SFWAN_FUSION_BUILD"
+```
+
+Run graph analysis and the required on-device micro-probes in the foreground:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \
+  --engine-dir "$SFWAN_TRT_DIR" \
+  --stage analyze \
+  --focus-module-prefix decoder.up_blocks.3 \
+  --resume
+
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \
+  --engine-dir "$SFWAN_TRT_DIR" \
+  --stage probe \
+  --focus-module-prefix decoder.up_blocks.3 \
+  --probe-warmup 20 \
+  --probe-repeat 100 \
+  --workspace-gib 8 \
+  --resume \
+  --preflight-only
+```
+
+Only after `fusion_probe_v1.json` reports `passed: true`, run the expensive
+initial/steady build. `--resume` uses SHA-bound stage state; the stable timing
+cache is atomically replaced only after both full-plan audits pass:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \
+  --engine-dir "$SFWAN_TRT_DIR" \
+  --stage build \
+  --focus-module-prefix decoder.up_blocks.3 \
+  --probe-warmup 20 \
+  --probe-repeat 100 \
+  --workspace-gib 8 \
+  --resume
+```
+
+Start the experiment only by adding `--vae-trt-variant fusion_v1`:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.server \
+  --role vae \
+  --model-path "$SFWAN_MODEL" \
+  --vae-precision int8_trt \
+  --vae-engine-dir "$SFWAN_TRT_DIR" \
+  --vae-trt-variant fusion_v1 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --enable-profile
+```
+
+`GET /v1/engine` reports the variant, plugin SHA, plan SHAs, per-engine fusion
+counts, cache-bank bytes, and fusion-audit state. Missing or mismatched plugin,
+creator, plan, ONNX, Inspector, probe, audit, timing-cache, or manifest hashes
+cause startup to fail; there is no silent baseline fallback.
+
+### Production comparison
+
+Every `profile-vae` summary now contains `measurement_context`: shape, seed,
+warmup/repeat, measured count, precision/variant, plan and plugin SHA, layer
+profile state, GPU/SM, CUDA, TensorRT, and Torch versions. The offline tool
+rejects different requests, devices, TensorRT stacks, diagnostic-profile runs,
+or mislabeled backends:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_perf_compare \
+  --fp32-json /workspace/results/fp32-production.json \
+  --fp16-trt-json /workspace/results/fp16-trt-production.json \
+  --int8-v5-json /workspace/results/int8-v5-production.json \
+  --int8-fusion-v1-json /workspace/results/int8-fusion-v1-production.json \
+  --output-json /workspace/results/vae-production-comparison.json \
+  --output-markdown /workspace/results/vae-production-comparison.md
+```
+
+Fine-grained profile schema v2 adds `fused_input_pack_quant`,
+`fused_cache_update`, `fused_conv1_norm_silu`, and
+`fused_conv2_residual`. The profiler accepts the already-audited fusion plan;
+it does not build another INT8 plan. As before, layer callbacks are diagnostic.
+Restart without `--enable-trt-layer-profile` for production latency.
+
 ## 5090 monolithic
 
 ```bash

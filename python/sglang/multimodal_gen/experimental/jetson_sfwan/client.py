@@ -439,6 +439,58 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 "--trt-layer-profile-json requires a VAE server started with "
                 "--enable-trt-layer-profile"
             )
+        latent_frames = latent_frame_count(args.num_frames)
+        if latent_frames % 3 != 0:
+            raise ValueError("VAE profile latent-frame count must be divisible by 3")
+        measurement_context = {
+            "schema_version": 1,
+            "request": {
+                "height": args.height,
+                "width": args.width,
+                "num_frames": args.num_frames,
+                "fps": args.fps,
+                "seed": args.seed,
+                "latent_frames": latent_frames,
+                "latent_frames_per_chunk": 3,
+                "total_chunks": latent_frames // 3,
+            },
+            "run": {
+                "warmup": args.warmup,
+                "repeat": args.repeat,
+                "measured_iterations": args.repeat,
+            },
+            "server": {
+                "role": engine_status.get("role"),
+                "model_loaded": engine_status.get("model_loaded"),
+                "profile_enabled": bool(engine_contract.get("profile_enabled", False)),
+                "trt_layer_profile_enabled": layer_profile_enabled,
+                "vae_backend": engine_contract.get("vae_backend"),
+                "vae_engine_precision": engine_contract.get("vae_engine_precision"),
+                "vae_trt_variant": engine_contract.get("vae_trt_variant", "baseline"),
+                "vae_engine_schema_version": engine_contract.get(
+                    "vae_engine_schema_version"
+                ),
+                "vae_engine_sm": engine_contract.get("vae_engine_sm"),
+                "vae_engine_tensorrt_version": engine_contract.get(
+                    "vae_engine_tensorrt_version"
+                ),
+                "vae_engine_cuda_version": engine_contract.get(
+                    "vae_engine_cuda_version"
+                ),
+                "vae_runtime_gpu_name": engine_contract.get("vae_runtime_gpu_name"),
+                "vae_runtime_compute_capability": engine_contract.get(
+                    "vae_runtime_compute_capability"
+                ),
+                "vae_runtime_cuda_version": engine_contract.get(
+                    "vae_runtime_cuda_version"
+                ),
+                "vae_runtime_torch_version": engine_contract.get(
+                    "vae_runtime_torch_version"
+                ),
+                "vae_engine_plan_sha256": engine_contract.get("vae_engine_plan_sha256"),
+                "vae_trt_plugin_sha256": engine_contract.get("vae_trt_plugin_sha256"),
+            },
+        }
         for index in range(args.warmup + args.repeat):
             iterations.append(
                 await _run_profile_iteration(
@@ -454,6 +506,7 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
         "mode": "profile-vae",
         "warmup": args.warmup,
         "repeat": args.repeat,
+        "measurement_context": measurement_context,
         "measured": [
             iteration for iteration in measurements if not iteration["warmup"]
         ],

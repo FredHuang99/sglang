@@ -17,7 +17,8 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .vae_trt_qdq import EXPECTED_CALL_SITES, QDQ_SCHEMA_VERSION
 
-TRT_LAYER_PROFILE_SCHEMA_VERSION = 1
+TRT_LAYER_PROFILE_SCHEMA_VERSION = 2
+SUPPORTED_TRT_LAYER_PROFILE_SCHEMA_VERSIONS = frozenset({1, 2})
 TRT_LAYER_PROFILE_MANIFEST_FILE = "trt_layer_profile_manifest.json"
 TRT_LAYER_PROFILE_SCOPE = "vae_profile_only"
 
@@ -29,7 +30,14 @@ PROFILE_CATEGORIES = (
     "upsample_resample",
     "norm_activation_residual",
     "cache_layout_copy",
+    "fused_input_pack_quant",
+    "fused_cache_update",
+    "fused_conv1_norm_silu",
+    "fused_conv2_residual",
     "other",
+)
+LEGACY_PROFILE_CATEGORIES = tuple(
+    category for category in PROFILE_CATEGORIES if not category.startswith("fused_")
 )
 
 # Layer callbacks and the outer CUDA event are different instrumentation
@@ -122,7 +130,9 @@ def validate_trt_layer_profile_manifest(
 
     if not isinstance(manifest, Mapping):
         raise ValueError("TensorRT layer-profile manifest must be an object")
-    if manifest.get("schema_version") != TRT_LAYER_PROFILE_SCHEMA_VERSION:
+    if manifest.get("schema_version") not in (
+        SUPPORTED_TRT_LAYER_PROFILE_SCHEMA_VERSIONS
+    ):
         raise ValueError(
             "unsupported TensorRT layer-profile manifest schema: "
             f"{manifest.get('schema_version')!r}"
@@ -610,6 +620,21 @@ def _classify_layer(
 ) -> tuple[str, str]:
     haystack = " ".join((name, layer_type, metadata, parameter_type)).lower()
     type_text = " ".join((layer_type, parameter_type)).lower()
+    if (
+        "sfwancausalpackquant" in haystack
+        or "sfwan_causal_pack_quant" in haystack
+        or "fusion/input_pack_quant/" in haystack
+        or "fusion/input_pack_quant_cache/" in haystack
+    ):
+        return "fused_input_pack_quant", "fusion_v1_plugin"
+    if "sfwancacheupdate" in haystack or "sfwan_cache_update" in haystack:
+        return "fused_cache_update", "fusion_v1_plugin"
+    if "sfwanint8epilogue" in haystack or "sfwan_int8_epilogue" in haystack:
+        if any(marker in haystack for marker in ("conv1", "norm_silu", "normsilu")):
+            return "fused_conv1_norm_silu", "fusion_v1_plugin"
+        if any(marker in haystack for marker in ("conv2", "residual")):
+            return "fused_conv2_residual", "fusion_v1_plugin"
+        return "other", "fusion_v1_plugin_unresolved"
     # A v5 audit mapping is stronger evidence than a fused TensorRT layer type:
     # fusion may rename the physical layer so it no longer says "Convolution".
     if logical_call_sites:
@@ -796,14 +821,26 @@ def build_physical_layer_catalog(
         raise ValueError("FP16 source target map cannot be used with an INT8 plan")
     plan_sha256 = _validate_digest(plan_sha256, label="TensorRT profile plan")
     if precision == "int8":
+        fusion_audit = (
+            isinstance(int8_audit, Mapping) and int8_audit.get("variant") == "fusion_v1"
+        )
+        valid_schema = (
+            int8_audit.get("schema_version") == 1
+            and int8_audit.get("qdq_schema_version") == QDQ_SCHEMA_VERSION
+            if fusion_audit
+            else isinstance(int8_audit, Mapping)
+            and int8_audit.get("schema_version") == QDQ_SCHEMA_VERSION
+        )
         if (
             not isinstance(int8_audit, Mapping)
-            or int8_audit.get("schema_version") != QDQ_SCHEMA_VERSION
+            or not valid_schema
             or int8_audit.get("passed") is not True
             or int8_audit.get("complete") is not True
             or int8_audit.get("errors") != []
         ):
-            raise ValueError("INT8 physical-layer catalog requires a passing v5 audit")
+            raise ValueError(
+                "INT8 physical-layer catalog requires a passing v5 or fusion-v1 audit"
+            )
         audit_plan_sha = int8_audit.get("plan_sha256")
         if (
             not isinstance(audit_plan_sha, Mapping)
@@ -849,7 +886,15 @@ def build_physical_layer_catalog(
         if int8_audit is not None and metadata:
             all_audited = set().union(*audit_names.values(), *audit_metadata.values())
             call_sites.update(site for site in all_audited if site in metadata)
-        mapping_source = "v5_audit" if call_sites else None
+        mapping_source = (
+            "fusion_v1_audit"
+            if call_sites
+            and isinstance(int8_audit, Mapping)
+            and int8_audit.get("variant") == "fusion_v1"
+            else "v5_audit"
+            if call_sites
+            else None
+        )
         if fp16_targets and _is_convolution_record(
             layer_type=layer_type,
             parameter_type=parameter_type,
@@ -1153,7 +1198,7 @@ def validate_compact_layer_profile_metrics(
 ) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError("TensorRT compact layer profile must be an object")
-    if value.get("schema_version") != TRT_LAYER_PROFILE_SCHEMA_VERSION:
+    if value.get("schema_version") not in (SUPPORTED_TRT_LAYER_PROFILE_SCHEMA_VERSIONS):
         raise ValueError("TensorRT compact layer profile schema is invalid")
     rebuilt = make_compact_layer_profile_metrics(
         catalog=catalog,
@@ -1176,11 +1221,16 @@ def validate_compact_layer_profile_metrics(
         elif not math.isclose(float(left), float(right), rel_tol=1e-9, abs_tol=1e-6):
             raise ValueError(f"TensorRT compact layer profile {key} mismatch")
     category = value.get("category_totals_ms")
-    if not isinstance(category, Mapping) or set(category) != set(PROFILE_CATEGORIES):
+    category_keys = set(category) if isinstance(category, Mapping) else set()
+    if not isinstance(category, Mapping) or category_keys not in (
+        set(PROFILE_CATEGORIES),
+        set(LEGACY_PROFILE_CATEGORIES),
+    ):
         raise ValueError("TensorRT compact profile categories are incomplete")
     for name in PROFILE_CATEGORIES:
+        legacy_value = category.get(name, 0.0)
         if not math.isclose(
-            float(category[name]),
+            float(legacy_value),
             rebuilt["category_totals_ms"][name],
             rel_tol=1e-9,
             abs_tol=1e-6,
@@ -1527,6 +1577,14 @@ def aggregate_trt_layer_profile_iterations(
             "target_qdq_cast_reformat"
         ],
         "cache_percentage": category_percentages["cache_layout_copy"],
+        "fused_input_pack_quant_percentage": category_percentages[
+            "fused_input_pack_quant"
+        ],
+        "fused_cache_update_percentage": category_percentages["fused_cache_update"],
+        "fused_conv1_norm_silu_percentage": category_percentages[
+            "fused_conv1_norm_silu"
+        ],
+        "fused_conv2_residual_percentage": category_percentages["fused_conv2_residual"],
         "other_percentage": category_percentages["other"],
         **validation,
     }

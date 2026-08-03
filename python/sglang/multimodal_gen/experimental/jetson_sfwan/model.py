@@ -27,6 +27,7 @@ from .protocol import (
 )
 
 VaePrecision = Literal["fp32", "fp16", "fp16_trt", "int8_trt"]
+VaeTrtVariant = Literal["baseline", "fusion_v1"]
 TRT_VAE_PRECISIONS = frozenset({"fp16_trt", "int8_trt"})
 
 
@@ -35,6 +36,7 @@ class ModelLoadConfig(msgspec.Struct, frozen=True, kw_only=True):
     device_index: int = 0
     vae_precision: VaePrecision = "fp32"
     vae_engine_dir: str | None = None
+    vae_trt_variant: VaeTrtVariant = "baseline"
     text_encoder_cpu_offload: bool = True
     dit_cpu_offload: bool = False
     vae_cpu_offload: bool = False
@@ -1224,6 +1226,16 @@ class SfWanVaeModel:
             "vae_engine_schema_version": None,
             "vae_engine_sm": None,
             "vae_engine_tensorrt_version": None,
+            "vae_engine_cuda_version": None,
+            "vae_runtime_gpu_name": str(torch.cuda.get_device_name(self.device)),
+            "vae_runtime_compute_capability": list(
+                torch.cuda.get_device_capability(self.device)
+            ),
+            "vae_runtime_cuda_version": str(torch.version.cuda),
+            "vae_runtime_torch_version": str(torch.__version__),
+            "vae_trt_variant": "baseline",
+            "vae_engine_plan_sha256": None,
+            "vae_trt_plugin_sha256": None,
             "vae_int8_audit_passed": False,
             "vae_cache_tensor_count": 32,
             "vae_cache_bank_bytes": None,
@@ -1276,6 +1288,7 @@ class SfWanVaeModel:
             enable_profile=load_config.enable_profile,
             enable_trt_layer_profile=load_config.enable_trt_layer_profile,
             enable_nvtx=load_config.enable_nvtx,
+            variant=load_config.vae_trt_variant,
         )
         manifest = self._trt_runtime.manifest
         latents_mean = manifest.get("latents_mean")

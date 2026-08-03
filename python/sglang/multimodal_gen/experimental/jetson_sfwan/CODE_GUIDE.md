@@ -1658,3 +1658,248 @@ shape、seed 分别重测 FP16/INT8 `trt_engine_cuda_ms`。细粒度结果决定
 - [ ] summary 引用的绝对路径和 SHA256 是否与 detailed 文件一致？
 - [ ] warmup 是否保留但排除于所有 measured 统计？
 - [ ] 最终性能结论是否来自关闭细粒度开关后的真实性能重测？
+
+## 16. TensorRT INT8 边界融合实验（`fusion_v1`）
+
+### 16.1 定位与修改边界
+
+`fusion_v1` 是完全隔离的性能摸高实验，不替换 Q/DQ v5，也不改变 PyTorch
+VAE、HTTP/SHM、FCFS 或 feature-cache ABI。默认
+`--vae-trt-variant baseline` 不读取融合 manifest、不加载插件动态库，也不导入融合构建代码。
+
+新增文件及职责：
+
+| 文件 | 职责 | 是否进入 baseline runtime |
+|---|---|---|
+| `vae_trt_fusion.py` | 分析 v5 ONNX 图、证明可安全移除的子图、插入 plugin 节点、校验 fusion artifact | 否 |
+| `vae_trt_fusion_build.py` | `analyze → probe → build → audit` 状态机、断点恢复、micro-probe 和完整 plan 构建 | 否 |
+| `vae_trt_perf_compare.py` | 对 production summary 做可比性检查，并输出 JSON/Markdown | 否 |
+| `trt_plugins/sfwan_vae_plugin.cpp` | TensorRT 10.3 `IPluginV3` creator、shape/type/format 契约和序列化 | 仅 `fusion_v1` |
+| `trt_plugins/sfwan_vae_kernels.cu` | SM87 input pack/quant、cache update、INT8 epilogue CUDA kernel | 仅 `fusion_v1` |
+| `trt_plugins/CMakeLists.txt` | 固定 C++17、CUDA 12.9、TensorRT 10.3 和 SM87 的插件构建 | 不适用 |
+
+已有文件的窄修改：
+
+- `server.py` 只新增 `--vae-trt-variant baseline|fusion_v1` 及组合校验。
+- `model.py` 只把 variant 传给 `TensorRTVaeRuntime`。
+- `vae_trt_runtime.py` 在 `fusion_v1` 分支验证并加载插件，再反序列化独立 plan。
+- `vae_trt_profile.py` 把 schema 提升到 2，并增加四个融合类别；仍可读取 v1。
+- `client.py` 给 production summary 增加只读 `measurement_context`。
+
+### 16.2 从 v5 到 fusion-v1 的图变换
+
+v5 每个目标 Conv 周围的物理开销来自 cache/layout、input Q/DQ/Cast/Reformat、
+output DQ/Cast 以及后继 Norm/SiLU/Add。融合实验保持 Conv 本体仍由 TensorRT 选择
+已经审计通过的 INT8/IMMA tactic，只替换外围边界：
+
+```mermaid
+flowchart TB
+    A["FP16 current activation"]
+    H["optional FP16 history cache"]
+    S["static input scale"]
+    P["SfWanCausalPackQuantPlugin\ncat/pad + quant + CDHW32 pack\noptional FP16 cache output"]
+    C["TensorRT INT8 Conv3d\nstatic INT8 weight"]
+    E1["SfWanInt8EpiloguePlugin\nmode=norm_silu"]
+    E2["SfWanInt8EpiloguePlugin\nmode=residual_add"]
+    U["SfWanCacheUpdatePlugin"]
+    CO["updated FP16 cache"]
+    O["FP16 downstream activation"]
+
+    A --> P
+    H --> P
+    S --> P
+    P -->|"INT8 CDHW32; logical DQ is fused"| C
+    P -.->|"dual-output candidate"| CO
+    A --> U
+    H --> U
+    U -.->|"split fallback"| CO
+    C --> E1
+    C --> E2
+    E1 --> O
+    E2 --> O
+```
+
+六个 micro-probe 方案具有相同输入数据和最终输出语义：
+
+1. `baseline`：原 v5 Q/DQ 边界。
+2. `input_pack_quant`：融合 cat/pad、量化和 CDHW32 pack。
+3. `input_pack_quant_cache_dual`：pack plugin 同时输出 INT8 activation 和 FP16
+   cache update，测试 TensorRT 10.3 的混合输出格式。
+4. `input_pack_quant_cache_split`：输入融合不变，cache update 由独立 plugin
+   完成；这是 dual-output 不可用时的 fail-closed fallback。
+5. `full_boundary_dual`：在 3 的基础上加入输出 epilogue。
+6. `full_boundary_split`：在 4 的基础上加入输出 epilogue。
+
+每种 signature 会在 dual 与 split 中选择通过 correctness/tactic 检查且更快的
+完整方案。完整图允许不同 signature 选择不同 cache mode，选择记录在 probe、
+rewrite result、audit 和 manifest 中。dual 模式只有一个物理 pack plugin layer；
+其 cache 更新时间不会再次计入 `fused_cache_update`，避免 profiler 重复归因。
+
+只有 graph analyzer 已经证明目标子图没有共享消费者、不是公开 graph output，并且所有
+需要删除的 node 都只服务于该 call site 时，rewriter 才允许替换。任何共享 consumer 都会
+fail closed，避免删除另一路仍在使用的值。
+
+### 16.3 Plugin ABI 与数值职责
+
+#### `SfWanCausalPackQuantPlugin`
+
+输入：当前 FP16 activation、可选 FP16 history cache、静态 FP32 scale。主输出是
+INT8 `kCDHW32` tensor；dual mode 还输出更新后的 FP16 cache。kernel 完成 causal
+concat/pad、除 scale、round、clip 到 `[-127, 127]` 和 layout pack。缺失历史与
+padding 直接写 INT8 零。dual 的两类输出分别声明为 INT8/CDHW32 与 FP16/LINEAR；
+同一个 CUDA kernel 在一次遍历中写两类输出。如果 TensorRT 10.3 拒绝这种混合
+格式，该 signature 必须改走 split fallback。
+
+该 plugin 不执行 Conv，也不读取权重。它的 INT8 输出后仍保留逻辑 DQ，
+让 TensorRT 知道量化 scale；Inspector 必须证明 DQ 已融合进 INT8 Conv，且 plugin 与
+Conv 之间不存在独立 Reformat。
+
+#### `SfWanCacheUpdatePlugin`
+
+输入当前 activation 和旧 FP16 cache，输出新的 FP16 cache slice。它保持原 causal
+语义：initial 可为 T=0，随后为 T=1/T=2，steady 始终保留下一次卷积所需的最后两帧。
+外部 32 个 binding、shape、顺序和双 bank 字节数不变。
+
+#### `SfWanInt8EpiloguePlugin`
+
+静态模式 `norm_silu`：
+
+```text
+INT8 Conv output
+→ FP32 dequant
+→ channel RMS reduction
+→ normalize × sqrt(C) × gamma
+→ SiLU
+→ FP16
+```
+
+静态模式 `residual_add`：
+
+```text
+INT8 Conv output
+→ FP32 dequant
+→ + FP16 shortcut
+→ FP16
+```
+
+插件 format/type/shape 检查不接受隐式广播、错误 scale、空指针、非 SM87 构建或不匹配
+的 auxiliary tensor。RMS reduction 使用 FP32；cache 和最终 activation 均为 FP16。
+
+### 16.4 构建阶段、断点和 artifact 所有权
+
+构建调用链：
+
+```mermaid
+flowchart LR
+    V["audited Q/DQ v5 directory"] --> A["analyze"]
+    A --> P["probe all real signatures"]
+    P --> G{"required up_blocks.3\nthresholds pass?"}
+    G -->|"no"| F["probe_failed; stop"]
+    G -->|"yes"| B["rewrite initial/steady"]
+    B --> T["build DETAILED plan"]
+    T --> I["Inspector/tactic/cache ABI audit"]
+    I -->|"fail"| X["audit_failed; keep evidence"]
+    I -->|"pass"| M["atomic manifest + timing cache commit"]
+```
+
+`fusion_build_state.json` 记录 source ONNX、plugin、分析、probe、rewritten ONNX、plan 和
+audit 的 SHA。`--resume` 只复用 SHA 完全匹配且状态成功的 stage；源码、plugin 或构建
+参数改变后对应 stage 必须重做。临时 plan 与候选 timing-cache 可在失败后保留诊断，
+但稳定 `fusion_timing.cache` 只有 initial/steady audit 都通过后才原子提交。
+
+probe 门槛：
+
+- 每个 required `decoder.up_blocks.3` signature 都必须保留 INT8 input/output、静态
+  INT8 weight 和 INT8/IMMA tactic。
+- plugin→Conv、Conv→epilogue 间不得出现独立 Reformat。
+- cache 输出必须逐元素等于原 FP16 slice/concat 路径，shape/dtype/order 一致。
+- input 融合相对 v5 signature baseline 至少快 10%。
+- output epilogue 在 input+cache 方案之上至少再快 5%。
+- 任一 required signature 失败时，不允许构建完整 engine。
+
+完整 plan 最终还必须满足：initial/steady 各84个目标 Conv 都仍为真实 INT8 tactic，
+32个 cache binding 全是 FP16，RGB shape 分别为9/12帧；manifest 中的 plugin、ONNX、
+plan、Inspector、audit SHA 必须与磁盘一致。
+
+### 16.5 Runtime 隔离与请求生命周期
+
+baseline：
+
+```text
+validate v5 manifest/audit
+→ deserialize v5 plan
+→ execute existing cache-bank state machine
+```
+
+fusion-v1：
+
+```text
+validate base v5 identity
+→ validate fusion manifest + every SHA + cache ABI
+→ ctypes.CDLL(plugin, RTLD_GLOBAL)
+→ initSfWanVaeTrtFusionPlugins()
+→ verify all three IPluginV3 creators
+→ deserialize fusion plan
+→ execute the same initial/steady cache-bank state machine
+```
+
+顺序不能改变：插件 creator 必须在 plan 反序列化前注册。缺少 `.so`、SHA 不一致、creator
+未注册、SM/TRT/CUDA 不匹配、fusion audit 失败时启动立即失败，不回退 baseline。
+
+请求仍为：chunk 0 使用 initial plan 并写 bank A；chunk 1 使用 steady A→B；此后
+B→A 交替。`finish_request()`/异常清理与 baseline 相同。插件库 handle 活到 runtime
+关闭，不能在 execution context 仍存活时卸载。
+
+### 16.6 Layer profile schema v2
+
+schema v2 在原类别外增加：
+
+| 类别 | 物理含义 |
+|---|---|
+| `fused_input_pack_quant` | input pack/quant plugin |
+| `fused_cache_update` | FP16 cache-update plugin |
+| `fused_conv1_norm_silu` | conv1 INT8 epilogue plugin |
+| `fused_conv2_residual` | conv2 residual epilogue plugin |
+
+v1 artifact 读取时四项按零处理。fusion catalog 只能根据 Inspector plugin type/name和
+`fusion_audit_v1.json` 映射，不允许仅凭包含 `int8` 的字符串推断。融合物理层即使关联
+多个 logical node，时间也只累计一次。
+
+细粒度 profile 仍只回答“时间花在哪里”；production latency 必须关闭
+`--enable-trt-layer-profile` 后重测。默认 baseline 开关关闭时不会读取 layer-profile 或
+fusion artifact。
+
+### 16.7 Production 可比性与 `measurement_context`
+
+`profile-vae` summary 中的 `measurement_context` 绑定：480×832、81帧、7 chunks、
+seed、warmup/repeat、server precision/backend/variant、plan SHA、plugin SHA、GPU/SM、
+TensorRT/CUDA/Torch 和 layer-profile 状态。
+
+`vae_trt_perf_compare` 只读取 measured iteration，并拒绝以下情况：
+
+- shape、seed、chunk 数、warmup/repeat 不一致；
+- GPU、SM、TensorRT 或 CUDA 不一致；
+- 任一 production 输入开启了 layer profile；
+- label 与 server precision/backend/variant 不一致；
+- TRT plan SHA 或 fusion plugin identity 缺失；
+- measured iteration 数量不是 repeat。
+
+输出同时包含机器可读 JSON 与 Markdown，逐项给出 chunk 0–6、initial、steady pooled、
+完整7-chunk请求的 mean、population stddev、min/max 和相对 FP32/FP16/INT8-v5 加速比。
+
+### 16.8 Fusion-v1 审核清单
+
+- [ ] baseline 是否完全不导入/加载 fusion plugin 或 manifest？
+- [ ] source ONNX、plugin、构建参数改变后 `--resume` 是否使相关 stage 失效？
+- [ ] analyzer 是否拒绝 shared consumer、公开 graph output 和不完整 pattern？
+- [ ] probe 是否使用真实 signature、相同输入和独立 warmup/measured 统计？
+- [ ] `up_blocks.3` 的每个 required signature 是否通过10%/5%门槛？
+- [ ] Conv 是否仍为 INT8 input/output、静态 INT8 weight 和 INT8/IMMA tactic？
+- [ ] plugin 与 Conv/epilogue 之间是否没有额外 Reformat？
+- [ ] 32个 cache binding 和双 bank 是否保持 FP16、shape/order/bytes不变？
+- [ ] initial/steady 是否各有84个目标 INT8 Conv，且 fused count 与 manifest 精确相等？
+- [ ] timing cache 是否只在两个完整 plan 审计都通过后提交？
+- [ ] runtime 是否先验证/注册 plugin creator，再反序列化 plan？
+- [ ] layer-profile v2 category totals 是否闭合且 catalog/plan SHA 匹配？
+- [ ] production summary 是否记录完整 measurement context 且 layer profile 为关闭？
+- [ ] 最终是否同时保留细粒度归因和无插桩 production latency 两套结论？

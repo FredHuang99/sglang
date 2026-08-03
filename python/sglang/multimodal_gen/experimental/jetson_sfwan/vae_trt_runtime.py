@@ -27,6 +27,7 @@ TRT_VAE_CACHE_BANK_BYTES = TRT_VAE_CACHE_TOTAL_ELEMENTS * 2
 
 TrtVaePrecision = Literal["fp16", "int8"]
 TrtVaeEngineKind = Literal["initial", "steady"]
+TrtVaeVariant = Literal["baseline", "fusion_v1"]
 
 
 def _sha256_file(path: Path) -> str:
@@ -47,6 +48,58 @@ def _version_prefix(version: str, fields: int = 2) -> tuple[int, ...]:
         if len(values) == fields:
             break
     return tuple(values)
+
+
+def _load_fusion_plugin_library(
+    *,
+    trt: Any,
+    plugin_path: str | Path,
+    creator_names: tuple[str, ...],
+    plugin_version: str,
+    plugin_namespace: str,
+) -> Any:
+    """Load and verify fusion creators before deserializing a plugin plan."""
+
+    import ctypes
+
+    path = Path(plugin_path)
+    mode = getattr(ctypes, "RTLD_GLOBAL", 0)
+    try:
+        library = ctypes.CDLL(str(path), mode=mode)
+    except OSError as exc:
+        raise RuntimeError(
+            f"could not load TensorRT VAE fusion plugin: {path}"
+        ) from exc
+    try:
+        initialize = library.initSfWanVaeTrtFusionPlugins
+    except AttributeError as exc:
+        raise RuntimeError(
+            "TensorRT VAE fusion plugin has no initSfWanVaeTrtFusionPlugins"
+        ) from exc
+    initialize.argtypes = []
+    initialize.restype = ctypes.c_bool
+    if not initialize():
+        raise RuntimeError("TensorRT VAE fusion plugin registration failed")
+    registry = trt.get_plugin_registry()
+    if registry is None:
+        raise RuntimeError("TensorRT plugin registry is unavailable")
+    missing: list[str] = []
+    for name in creator_names:
+        creator = None
+        getter = getattr(registry, "get_plugin_creator", None)
+        if callable(getter):
+            creator = getter(name, plugin_version, plugin_namespace)
+        if creator is None:
+            getter = getattr(registry, "get_creator", None)
+            if callable(getter):
+                creator = getter(name, plugin_version, plugin_namespace)
+        if creator is None:
+            missing.append(name)
+    if missing:
+        raise RuntimeError(
+            f"TensorRT VAE fusion plugin creators were not registered: {missing}"
+        )
+    return library
 
 
 def _configure_context_nvtx(
@@ -558,6 +611,7 @@ class TensorRTVaeRuntime:
         enable_profile: bool,
         enable_nvtx: bool,
         enable_trt_layer_profile: bool = False,
+        variant: TrtVaeVariant = "baseline",
     ) -> None:
         try:
             import tensorrt as trt
@@ -573,6 +627,11 @@ class TensorRTVaeRuntime:
         self.enable_profile = enable_profile
         self.enable_trt_layer_profile = enable_trt_layer_profile
         self.enable_nvtx = enable_nvtx
+        self.variant = variant
+        if variant not in {"baseline", "fusion_v1"}:
+            raise ValueError(f"unsupported TensorRT VAE variant: {variant}")
+        if variant == "fusion_v1" and precision != "int8":
+            raise ValueError("fusion_v1 requires TensorRT INT8 VAE precision")
         if enable_trt_layer_profile and not enable_profile:
             raise ValueError(
                 "TensorRT layer profiling requires the regular profile timer"
@@ -585,6 +644,37 @@ class TensorRTVaeRuntime:
             model_path=model_path,
             verify_plan_hashes=True,
         )
+        fusion_validated = None
+        self._fusion_manifest: dict[str, Any] | None = None
+        self._fusion_validated: dict[str, Any] | None = None
+        self._fusion_plugin_library: Any | None = None
+        if variant == "fusion_v1":
+            # Deliberately delayed: the baseline path never imports fusion
+            # helpers, reads fusion artifacts, or loads a plugin library.
+            from .vae_trt_fusion import (
+                PLUGIN_CREATORS,
+                PLUGIN_NAMESPACE,
+                PLUGIN_VERSION,
+                load_fusion_manifest,
+                validate_fusion_manifest,
+            )
+
+            fusion_manifest = load_fusion_manifest(self.engine_dir)
+            fusion_validated = validate_fusion_manifest(
+                fusion_manifest,
+                engine_dir=self.engine_dir,
+                base_manifest=self.manifest,
+                verify_hashes=True,
+            )
+            self._fusion_manifest = fusion_manifest
+            self._fusion_validated = fusion_validated
+            self._fusion_plugin_library = _load_fusion_plugin_library(
+                trt=trt,
+                plugin_path=fusion_validated["plugin_path"],
+                creator_names=PLUGIN_CREATORS,
+                plugin_version=PLUGIN_VERSION,
+                plugin_namespace=PLUGIN_NAMESPACE,
+            )
         layer_profile_validated = None
         if enable_trt_layer_profile:
             # This import is intentionally gated.  Production runtime startup
@@ -594,15 +684,29 @@ class TensorRTVaeRuntime:
                 validate_trt_layer_profile_manifest,
             )
 
-            layer_profile_manifest = load_trt_layer_profile_manifest(self.engine_dir)
-            layer_profile_validated = validate_trt_layer_profile_manifest(
-                layer_profile_manifest,
-                engine_dir=self.engine_dir,
-                precision=precision,
-                production_manifest=self.manifest,
-                verify_hashes=True,
-            )
-            self._layer_profile_manifest = layer_profile_manifest
+            if fusion_validated is not None:
+                layer_profile_validated = {
+                    "schema_version": 2,
+                    "scope": "vae_profile_only",
+                    "precision": "int8",
+                    "plan_kind": "audited_int8_fusion_v1",
+                    "engines": fusion_validated["engines"],
+                    "int8_audit": fusion_validated["audit"],
+                    "build": dict(self._fusion_manifest.get("build", {})),
+                }
+                self._layer_profile_manifest = self._fusion_manifest
+            else:
+                layer_profile_manifest = load_trt_layer_profile_manifest(
+                    self.engine_dir
+                )
+                layer_profile_validated = validate_trt_layer_profile_manifest(
+                    layer_profile_manifest,
+                    engine_dir=self.engine_dir,
+                    precision=precision,
+                    production_manifest=self.manifest,
+                    verify_hashes=True,
+                )
+                self._layer_profile_manifest = layer_profile_manifest
         else:
             self._layer_profile_manifest = None
         self._validate_environment(torch=torch, trt=trt)
@@ -617,8 +721,14 @@ class TensorRTVaeRuntime:
         selected_engines = (
             layer_profile_validated["engines"]
             if layer_profile_validated is not None
+            else fusion_validated["engines"]
+            if fusion_validated is not None
             else validated["engines"]
         )
+        self._active_plan_sha256 = {
+            kind: str(selected_engines[kind]["sha256"])
+            for kind in ("initial", "steady")
+        }
         for kind in ("initial", "steady"):
             plan_path = Path(selected_engines[kind]["path"])
             engine = self._trt_runtime.deserialize_cuda_engine(plan_path.read_bytes())
@@ -635,7 +745,7 @@ class TensorRTVaeRuntime:
                 trt=trt,
                 precision=precision,
                 enable_nvtx=enable_nvtx,
-                detailed_plan=enable_trt_layer_profile,
+                detailed_plan=enable_trt_layer_profile or variant == "fusion_v1",
             )
             self._engines[kind] = engine
             self._contexts[kind] = context
@@ -659,7 +769,9 @@ class TensorRTVaeRuntime:
             )
             audit = layer_profile_validated.get("int8_audit")
             if isinstance(audit, dict):
-                self._layer_profile_qdq_schema_version = audit.get("schema_version")
+                self._layer_profile_qdq_schema_version = audit.get(
+                    "qdq_schema_version", audit.get("schema_version")
+                )
                 self._layer_profile_weight_encoding = audit.get("weight_encoding")
             for kind in ("initial", "steady"):
                 record = layer_profile_validated["engines"][kind]
@@ -778,6 +890,12 @@ class TensorRTVaeRuntime:
 
     @property
     def contract(self) -> dict[str, Any]:
+        fusion_validated = getattr(self, "_fusion_validated", None)
+        fusion_audit = (
+            fusion_validated.get("audit")
+            if isinstance(fusion_validated, dict)
+            else None
+        )
         contract = {
             "vae_backend": "tensorrt",
             "vae_engine_dir": self.engine_dir,
@@ -785,20 +903,49 @@ class TensorRTVaeRuntime:
             "vae_engine_schema_version": self.manifest["schema_version"],
             "vae_engine_sm": self.manifest["build"]["compute_capability"],
             "vae_engine_tensorrt_version": self.manifest["build"]["tensorrt_version"],
-            "vae_int8_audit_passed": bool(
-                self.manifest.get("int8_audit", {}).get("passed", False)
+            "vae_engine_cuda_version": self.manifest["build"]["cuda_version"],
+            "vae_runtime_gpu_name": str(self._torch.cuda.get_device_name(self.device)),
+            "vae_runtime_compute_capability": list(
+                self._torch.cuda.get_device_capability(self.device)
             ),
+            "vae_runtime_cuda_version": str(self._torch.version.cuda),
+            "vae_runtime_torch_version": str(self._torch.__version__),
+            "vae_int8_audit_passed": bool(
+                fusion_audit.get("passed", False)
+                if isinstance(fusion_audit, dict)
+                else self.manifest.get("int8_audit", {}).get("passed", False)
+            ),
+            "vae_trt_variant": self.variant,
+            "vae_engine_plan_sha256": dict(self._active_plan_sha256),
             "vae_runtime_nvtx_verbosity": dict(self._context_nvtx_verbosity),
             "vae_cache_tensor_count": TRT_VAE_CACHE_COUNT,
             "vae_cache_bank_bytes": TRT_VAE_CACHE_BANK_BYTES,
             "vae_cache_double_bank_bytes": TRT_VAE_CACHE_BANK_BYTES * 2,
         }
+        if self.variant == "fusion_v1":
+            plugin = self._fusion_manifest["plugin"]
+            contract.update(
+                {
+                    "vae_trt_plugin_sha256": plugin["sha256"],
+                    "vae_trt_fusion_audit_passed": bool(
+                        self._fusion_manifest["audit"]["passed"]
+                    ),
+                    "vae_trt_fusion_counts": dict(fusion_validated["fusion_counts"]),
+                    "vae_trt_fusion_per_engine_counts": dict(
+                        fusion_validated["per_engine_fusion_counts"]
+                    ),
+                }
+            )
         if self.enable_trt_layer_profile:
+            from .vae_trt_profile import TRT_LAYER_PROFILE_SCHEMA_VERSION
+
             contract.update(
                 {
                     "trt_layer_profile_enabled": True,
                     "trt_layer_profile_scope": "vae_profile_only",
-                    "trt_layer_profile_schema_version": 1,
+                    "trt_layer_profile_schema_version": (
+                        TRT_LAYER_PROFILE_SCHEMA_VERSION
+                    ),
                     "trt_layer_profile_plan_kind": self._layer_profile_plan_kind,
                     "trt_layer_profile_plan_sha256": dict(
                         self._layer_profile_plan_sha256
@@ -992,3 +1139,4 @@ class TensorRTVaeRuntime:
         self._engines.clear()
         self._cache_banks.clear()
         self._rgb_outputs.clear()
+        self._fusion_plugin_library = None
