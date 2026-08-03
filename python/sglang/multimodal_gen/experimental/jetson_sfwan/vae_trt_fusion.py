@@ -555,10 +555,272 @@ def _require_removable_subgraph(
 
 
 def _constant_array(
-    *, name: str, initializers: Mapping[str, Any], numpy_helper: Any
+    *,
+    name: str,
+    initializers: Mapping[str, Any],
+    numpy_helper: Any,
+    producer: Mapping[str, Any] | None = None,
+    helper: Any | None = None,
+    np_module: Any | None = None,
+    shapes: Mapping[str, list[int]] | None = None,
+    memo: dict[str, Any | None] | None = None,
+    visiting: set[str] | None = None,
 ) -> Any | None:
+    """Resolve a small, deterministic ONNX constant-expression subgraph.
+
+    The legacy Torch ONNX exporter commonly supplies ``Pad`` extents through
+    ``Constant -> Cast/Reshape/Slice`` nodes instead of graph initializers.
+    Those values are still compile-time constants.  Only metadata operators
+    with fully constant inputs are evaluated here; any dependency on a graph
+    input returns ``None`` so fusion analysis continues to fail closed for
+    genuinely dynamic padding.
+    """
+
+    if memo is None:
+        memo = {}
+    if name in memo:
+        return memo[name]
     initializer = initializers.get(name)
-    return None if initializer is None else numpy_helper.to_array(initializer)
+    if initializer is not None:
+        value = numpy_helper.to_array(initializer)
+        memo[name] = value
+        return value
+    if producer is None or helper is None or np_module is None:
+        memo[name] = None
+        return None
+    node = producer.get(name)
+    if node is None:
+        memo[name] = None
+        return None
+    if visiting is None:
+        visiting = set()
+    if name in visiting:
+        raise ValueError(f"constant-expression cycle at {name!r}")
+    visiting.add(name)
+
+    def resolve(input_name: str) -> Any | None:
+        if not input_name:
+            return None
+        return _constant_array(
+            name=input_name,
+            initializers=initializers,
+            numpy_helper=numpy_helper,
+            producer=producer,
+            helper=helper,
+            np_module=np_module,
+            shapes=shapes,
+            memo=memo,
+            visiting=visiting,
+        )
+
+    attributes = _attribute_map(node, helper)
+    result: Any | None = None
+    try:
+        if node.op_type == "Constant":
+            if "value" in attributes:
+                raw = attributes["value"]
+                try:
+                    result = numpy_helper.to_array(raw)
+                except (AttributeError, TypeError, ValueError):
+                    result = np_module.asarray(raw)
+            else:
+                for attribute_name in (
+                    "value_ints",
+                    "value_floats",
+                    "value_int",
+                    "value_float",
+                ):
+                    if attribute_name in attributes:
+                        result = np_module.asarray(attributes[attribute_name])
+                        break
+        elif node.op_type == "Identity" and len(node.input) == 1:
+            result = resolve(node.input[0])
+        elif node.op_type == "Cast" and len(node.input) == 1:
+            value = resolve(node.input[0])
+            to = attributes.get("to")
+            if value is not None and to is not None:
+                dtype = helper.tensor_dtype_to_np_dtype(int(to))
+                result = np_module.asarray(value).astype(dtype, copy=False)
+        elif node.op_type == "Concat" and node.input:
+            values = [resolve(input_name) for input_name in node.input]
+            if all(value is not None for value in values):
+                result = np_module.concatenate(
+                    [np_module.asarray(value) for value in values],
+                    axis=int(attributes.get("axis", 0)),
+                )
+        elif node.op_type == "Reshape" and len(node.input) >= 2:
+            value = resolve(node.input[0])
+            target = resolve(node.input[1])
+            if value is not None and target is not None:
+                source = np_module.asarray(value)
+                target_shape = [int(item) for item in np_module.asarray(target).flat]
+                if int(attributes.get("allowzero", 0)) == 0:
+                    target_shape = [
+                        source.shape[index] if dimension == 0 else dimension
+                        for index, dimension in enumerate(target_shape)
+                    ]
+                result = source.reshape(target_shape)
+        elif node.op_type == "Transpose" and len(node.input) == 1:
+            value = resolve(node.input[0])
+            if value is not None:
+                source = np_module.asarray(value)
+                permutation = attributes.get("perm")
+                result = source.transpose(
+                    None
+                    if permutation is None
+                    else tuple(int(item) for item in permutation)
+                )
+        elif node.op_type in {"Unsqueeze", "Squeeze"} and node.input:
+            value = resolve(node.input[0])
+            raw_axes = (
+                resolve(node.input[1])
+                if len(node.input) > 1 and node.input[1]
+                else attributes.get("axes")
+            )
+            if value is not None and raw_axes is not None:
+                axes = tuple(int(item) for item in np_module.asarray(raw_axes).flat)
+                source = np_module.asarray(value)
+                result = (
+                    np_module.expand_dims(source, axis=axes)
+                    if node.op_type == "Unsqueeze"
+                    else np_module.squeeze(source, axis=axes)
+                )
+        elif node.op_type == "Slice" and node.input:
+            value = resolve(node.input[0])
+            starts = (
+                resolve(node.input[1])
+                if len(node.input) > 1
+                else attributes.get("starts")
+            )
+            ends = (
+                resolve(node.input[2])
+                if len(node.input) > 2
+                else attributes.get("ends")
+            )
+            axes = (
+                resolve(node.input[3])
+                if len(node.input) > 3 and node.input[3]
+                else attributes.get("axes")
+            )
+            steps = (
+                resolve(node.input[4])
+                if len(node.input) > 4 and node.input[4]
+                else attributes.get("steps")
+            )
+            if value is not None and starts is not None and ends is not None:
+                source = np_module.asarray(value)
+                starts_list = [int(item) for item in np_module.asarray(starts).flat]
+                ends_list = [int(item) for item in np_module.asarray(ends).flat]
+                axes_list = (
+                    list(range(len(starts_list)))
+                    if axes is None
+                    else [int(item) for item in np_module.asarray(axes).flat]
+                )
+                steps_list = (
+                    [1] * len(starts_list)
+                    if steps is None
+                    else [int(item) for item in np_module.asarray(steps).flat]
+                )
+                if not (
+                    len(starts_list)
+                    == len(ends_list)
+                    == len(axes_list)
+                    == len(steps_list)
+                ):
+                    raise ValueError("constant Slice metadata lengths differ")
+                slices = [slice(None)] * source.ndim
+                for start, end, axis, step in zip(
+                    starts_list,
+                    ends_list,
+                    axes_list,
+                    steps_list,
+                    strict=True,
+                ):
+                    slices[axis] = slice(start, end, step)
+                result = source[tuple(slices)]
+        elif node.op_type == "ConstantOfShape" and len(node.input) == 1:
+            raw_shape = resolve(node.input[0])
+            if raw_shape is not None:
+                target_shape = tuple(
+                    int(item) for item in np_module.asarray(raw_shape).flat
+                )
+                fill = attributes.get("value")
+                if fill is None:
+                    result = np_module.zeros(target_shape, dtype=np_module.float32)
+                else:
+                    fill_array = numpy_helper.to_array(fill)
+                    result = np_module.full(
+                        target_shape,
+                        np_module.asarray(fill_array).reshape(-1)[0],
+                        dtype=np_module.asarray(fill_array).dtype,
+                    )
+        elif node.op_type == "Shape" and len(node.input) == 1:
+            source_shape = shapes.get(node.input[0]) if shapes is not None else None
+            if source_shape is None:
+                source = resolve(node.input[0])
+                if source is not None:
+                    source_shape = list(np_module.asarray(source).shape)
+            if source_shape is not None:
+                start = int(attributes.get("start", 0))
+                end = int(attributes.get("end", len(source_shape)))
+                result = np_module.asarray(
+                    source_shape[start:end], dtype=np_module.int64
+                )
+        elif node.op_type == "Size" and len(node.input) == 1:
+            value = resolve(node.input[0])
+            if value is not None:
+                result = np_module.asarray(
+                    np_module.asarray(value).size,
+                    dtype=np_module.int64,
+                )
+        elif (
+            node.op_type in {"Add", "Sub", "Mul", "Div", "Max", "Min"}
+            and len(node.input) == 2
+        ):
+            left = resolve(node.input[0])
+            right = resolve(node.input[1])
+            if left is not None and right is not None:
+                operation = {
+                    "Add": np_module.add,
+                    "Sub": np_module.subtract,
+                    "Mul": np_module.multiply,
+                    "Div": np_module.divide,
+                    "Max": np_module.maximum,
+                    "Min": np_module.minimum,
+                }[node.op_type]
+                result = operation(
+                    np_module.asarray(left),
+                    np_module.asarray(right),
+                )
+        elif node.op_type == "Neg" and len(node.input) == 1:
+            value = resolve(node.input[0])
+            if value is not None:
+                result = np_module.negative(np_module.asarray(value))
+        elif node.op_type == "Range" and len(node.input) == 3:
+            start = resolve(node.input[0])
+            limit = resolve(node.input[1])
+            delta = resolve(node.input[2])
+            if start is not None and limit is not None and delta is not None:
+                result = np_module.arange(
+                    np_module.asarray(start).reshape(-1)[0],
+                    np_module.asarray(limit).reshape(-1)[0],
+                    np_module.asarray(delta).reshape(-1)[0],
+                )
+        elif node.op_type == "Gather" and len(node.input) == 2:
+            data = resolve(node.input[0])
+            indices = resolve(node.input[1])
+            if data is not None and indices is not None:
+                result = np_module.take(
+                    np_module.asarray(data),
+                    np_module.asarray(indices),
+                    axis=int(attributes.get("axis", 0)),
+                )
+    except (IndexError, TypeError, ValueError):
+        result = None
+    finally:
+        visiting.remove(name)
+    memo[name] = result
+    return result
 
 
 def _tensor_depends_on(
@@ -729,6 +991,7 @@ def analyze_fusion_graph(
     nodes_by_name = {node.name: node for node in model.graph.node}
     shapes = _shape_map(model)
     initializers = {value.name: value for value in model.graph.initializer}
+    constant_memo: dict[str, Any | None] = {}
     graph_outputs = {value.name for value in model.graph.output}
     target_set = set(target_module_names)
     records: list[dict[str, Any]] = []
@@ -775,11 +1038,21 @@ def analyze_fusion_graph(
                 name=activation_q.input[1],
                 initializers=initializers,
                 numpy_helper=numpy_helper,
+                producer=producer,
+                helper=helper,
+                np_module=np,
+                shapes=shapes,
+                memo=constant_memo,
             )
             output_scale_array = _constant_array(
                 name=output_q.input[1],
                 initializers=initializers,
                 numpy_helper=numpy_helper,
+                producer=producer,
+                helper=helper,
+                np_module=np,
+                shapes=shapes,
+                memo=constant_memo,
             )
             if scale_array is None or np.asarray(scale_array).size != 1:
                 raise ValueError("activation quantization scale is not static scalar")
@@ -797,7 +1070,14 @@ def analyze_fusion_graph(
             if pad is None or pad.op_type != "Pad":
                 raise ValueError("activation Cast is not preceded by an explicit Pad")
             pads = _constant_array(
-                name=pad.input[1], initializers=initializers, numpy_helper=numpy_helper
+                name=pad.input[1],
+                initializers=initializers,
+                numpy_helper=numpy_helper,
+                producer=producer,
+                helper=helper,
+                np_module=np,
+                shapes=shapes,
+                memo=constant_memo,
             )
             if pads is None:
                 raise ValueError("Pad extents are not static")
@@ -810,6 +1090,11 @@ def analyze_fusion_graph(
                     name=pad.input[2],
                     initializers=initializers,
                     numpy_helper=numpy_helper,
+                    producer=producer,
+                    helper=helper,
+                    np_module=np,
+                    shapes=shapes,
+                    memo=constant_memo,
                 )
                 if raw_pad_value is None:
                     raise ValueError("Pad value is not static")
@@ -1002,6 +1287,11 @@ def analyze_fusion_graph(
                         name=name,
                         initializers=initializers,
                         numpy_helper=numpy_helper,
+                        producer=producer,
+                        helper=helper,
+                        np_module=np,
+                        shapes=shapes,
+                        memo=constant_memo,
                     )
                     if value is not None and int(np.asarray(value).size) == channels:
                         gamma_candidates.append(name)

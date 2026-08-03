@@ -20,6 +20,7 @@ from pathlib import Path
 from types import MethodType, ModuleType, SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import torch
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -109,6 +110,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion import (
     FUSION_VARIANT,
+    _constant_array,
     _ordered_causal_concat_inputs,
     _require_only_consumers,
     _require_removable_subgraph,
@@ -6513,6 +6515,151 @@ class TestSfWanTensorRTFusionExperiment(CustomTestCase):
                     "current": [1, 96, 4, 60, 104],
                 },
             )
+
+    def test_pad_metadata_constant_node_chain_is_static(self):
+        class FakeHelper:
+            @staticmethod
+            def get_attribute_value(attribute):
+                return attribute.value
+
+            @staticmethod
+            def tensor_dtype_to_np_dtype(value):
+                if value != 7:
+                    raise ValueError("unexpected fake ONNX dtype")
+                return np.int64
+
+        numpy_helper = SimpleNamespace(to_array=np.asarray)
+        producer = {
+            "pads_constant": SimpleNamespace(
+                op_type="Constant",
+                input=[],
+                attribute=[
+                    SimpleNamespace(
+                        name="value",
+                        value=np.asarray(
+                            [0, 0, 2, 1, 1, 0, 0, 0, 1, 1],
+                            dtype=np.int64,
+                        ),
+                    )
+                ],
+            ),
+            "pads_cast": SimpleNamespace(
+                op_type="Cast",
+                input=["pads_constant"],
+                attribute=[SimpleNamespace(name="to", value=7)],
+            ),
+        }
+        value = _constant_array(
+            name="pads_cast",
+            initializers={},
+            numpy_helper=numpy_helper,
+            producer=producer,
+            helper=FakeHelper,
+            np_module=np,
+            shapes={},
+        )
+        self.assertEqual(
+            np.asarray(value).tolist(),
+            [0, 0, 2, 1, 1, 0, 0, 0, 1, 1],
+        )
+
+        def constant(value):
+            return SimpleNamespace(
+                op_type="Constant",
+                input=[],
+                attribute=[SimpleNamespace(name="value", value=np.asarray(value))],
+            )
+
+        # This mirrors the legacy Torch exporter: extend the short PyTorch
+        # padding vector to 2*rank, reshape/flip/transpose it, then cast it to
+        # the INT64 vector consumed by ONNX Pad.
+        producer.update(
+            {
+                "raw": constant([1, 1, 2, 0, 0, 0]),
+                "raw_size": SimpleNamespace(
+                    op_type="Size", input=["raw"], attribute=[]
+                ),
+                "activation_shape": SimpleNamespace(
+                    op_type="Shape", input=["activation"], attribute=[]
+                ),
+                "rank": SimpleNamespace(
+                    op_type="Size", input=["activation_shape"], attribute=[]
+                ),
+                "two": constant(2),
+                "twice_rank": SimpleNamespace(
+                    op_type="Mul", input=["rank", "two"], attribute=[]
+                ),
+                "extension": SimpleNamespace(
+                    op_type="Sub",
+                    input=["twice_rank", "raw_size"],
+                    attribute=[],
+                ),
+                "axis": constant([0]),
+                "extension_vector": SimpleNamespace(
+                    op_type="Unsqueeze",
+                    input=["extension", "axis"],
+                    attribute=[],
+                ),
+                "zeros": SimpleNamespace(
+                    op_type="ConstantOfShape",
+                    input=["extension_vector"],
+                    attribute=[
+                        SimpleNamespace(
+                            name="value", value=np.asarray([0], dtype=np.int64)
+                        )
+                    ],
+                ),
+                "extended": SimpleNamespace(
+                    op_type="Concat",
+                    input=["raw", "zeros"],
+                    attribute=[SimpleNamespace(name="axis", value=0)],
+                ),
+                "matrix_shape": constant([5, 2]),
+                "matrix": SimpleNamespace(
+                    op_type="Reshape",
+                    input=["extended", "matrix_shape"],
+                    attribute=[],
+                ),
+                "reversed": SimpleNamespace(
+                    op_type="Transpose",
+                    input=["matrix"],
+                    attribute=[SimpleNamespace(name="perm", value=[1, 0])],
+                ),
+                "flat_shape": constant([-1]),
+                "flat": SimpleNamespace(
+                    op_type="Reshape",
+                    input=["reversed", "flat_shape"],
+                    attribute=[],
+                ),
+                "exported_pads": SimpleNamespace(
+                    op_type="Cast",
+                    input=["flat"],
+                    attribute=[SimpleNamespace(name="to", value=7)],
+                ),
+            }
+        )
+        exported = _constant_array(
+            name="exported_pads",
+            initializers={},
+            numpy_helper=numpy_helper,
+            producer=producer,
+            helper=FakeHelper,
+            np_module=np,
+            shapes={"activation": [1, 16, 3, 60, 104]},
+        )
+        self.assertEqual(np.asarray(exported).shape, (10,))
+        self.assertEqual(np.asarray(exported).dtype, np.dtype(np.int64))
+        self.assertIsNone(
+            _constant_array(
+                name="runtime_pads",
+                initializers={},
+                numpy_helper=numpy_helper,
+                producer={},
+                helper=FakeHelper,
+                np_module=np,
+                shapes={},
+            )
+        )
 
     def test_profile_schema_v2_classifies_each_fusion_plugin(self):
         self.assertEqual(TRT_LAYER_PROFILE_SCHEMA_VERSION, 2)
