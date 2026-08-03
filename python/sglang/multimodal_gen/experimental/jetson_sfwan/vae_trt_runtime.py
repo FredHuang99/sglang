@@ -50,6 +50,16 @@ def _version_prefix(version: str, fields: int = 2) -> tuple[int, ...]:
     return tuple(values)
 
 
+def _create_trt_execution_stream(*, torch: Any, device: Any) -> Any:
+    """Create the persistent non-default stream used by TensorRT execution."""
+
+    stream = torch.cuda.Stream(device=device)
+    default_stream = torch.cuda.default_stream(device=device)
+    if int(stream.cuda_stream) == int(default_stream.cuda_stream):
+        raise RuntimeError("TensorRT VAE did not receive a non-default CUDA stream")
+    return stream
+
+
 def _load_fusion_plugin_library(
     *,
     trt: Any,
@@ -812,6 +822,10 @@ class TensorRTVaeRuntime:
                 dtype=torch.float16,
             ),
         }
+        self._execution_stream = _create_trt_execution_stream(
+            torch=torch,
+            device=device,
+        )
         self._request_active = False
         self._next_chunk_index = 0
         self._read_bank_index: int | None = None
@@ -1019,17 +1033,34 @@ class TensorRTVaeRuntime:
         self._set_address(context, "rgb", rgb)
         for index, tensor in enumerate(output_bank):
             self._set_address(context, f"cache_out_{index:03d}", tensor)
-        stream = torch.cuda.current_stream(device=self.device)
+        caller_stream = torch.cuda.current_stream(device=self.device)
+        execution_stream = self._execution_stream
+        bound_tensors = [latent, rgb, *output_bank]
+        if kind == "steady":
+            bound_tensors.extend(self._cache_banks[self._read_bank_index])
         capture = getattr(self, "_layer_profile_captures", {}).get(kind)
         if capture is not None:
             if chunk_index is None:
                 raise RuntimeError("TensorRT layer profiling requires a chunk index")
             capture.begin_capture(chunk_index)
+        dependency_established = False
         try:
-            if not context.execute_async_v3(stream_handle=int(stream.cuda_stream)):
-                raise RuntimeError(f"TensorRT {kind} VAE execution returned failure")
-            if capture is not None:
-                capture.mark_enqueue_succeeded()
+            try:
+                execution_stream.wait_stream(caller_stream)
+                dependency_established = True
+                for tensor in bound_tensors:
+                    tensor.record_stream(execution_stream)
+                if not context.execute_async_v3(
+                    stream_handle=int(execution_stream.cuda_stream)
+                ):
+                    raise RuntimeError(
+                        f"TensorRT {kind} VAE execution returned failure"
+                    )
+                if capture is not None:
+                    capture.mark_enqueue_succeeded()
+            finally:
+                if dependency_established:
+                    caller_stream.wait_stream(execution_stream)
         except BaseException:
             if capture is not None:
                 capture.abort_capture()

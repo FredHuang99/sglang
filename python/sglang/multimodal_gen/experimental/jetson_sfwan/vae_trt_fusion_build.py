@@ -341,9 +341,7 @@ def _load_analysis_contracts(
             or not isinstance(shape, list)
             or len(shape) != 5
             or any(
-                isinstance(value, bool)
-                or not isinstance(value, int)
-                or value <= 0
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
                 for value in shape
             )
             or binding.get("dtype") != "float16"
@@ -656,6 +654,20 @@ def _conv_to_epilogue_has_reformat(*, inspector_json: str, call_site: str) -> bo
     )
 
 
+def _make_probe_stream(
+    *, torch: Any, device_index: int, tensors: Mapping[str, Any]
+) -> Any:
+    producer_stream = torch.cuda.current_stream(device=device_index)
+    default_stream = torch.cuda.default_stream(device=device_index)
+    probe_stream = torch.cuda.Stream(device=device_index)
+    if int(probe_stream.cuda_stream) == int(default_stream.cuda_stream):
+        raise RuntimeError("fusion micro-probe did not receive a non-default stream")
+    probe_stream.wait_stream(producer_stream)
+    for tensor in tensors.values():
+        tensor.record_stream(probe_stream)
+    return probe_stream
+
+
 def _run_plan_timing(
     *,
     trt: Any,
@@ -718,11 +730,14 @@ def _run_plan_timing(
         tensors[name] = tensor
         if not context.set_tensor_address(name, int(tensor.data_ptr())):
             raise RuntimeError(f"TensorRT rejected probe binding {name}")
-    stream = torch.cuda.current_stream(device=device_index)
+    stream = _make_probe_stream(
+        torch=torch,
+        device_index=device_index,
+        tensors=tensors,
+    )
     for _ in range(warmup):
         if not context.execute_async_v3(stream_handle=int(stream.cuda_stream)):
             raise RuntimeError("fusion micro-probe warmup failed")
-    torch.cuda.synchronize(device_index)
     samples = []
     for _ in range(repeat):
         start = torch.cuda.Event(enable_timing=True)
@@ -1494,12 +1509,10 @@ def build_fusion(
         if value.get("identity") != identity:
             raise ValueError("saved fusion analysis identity differs")
         if (
-            value.get("analysis_schema_version")
-            != FUSION_ANALYSIS_SCHEMA_VERSION
+            value.get("analysis_schema_version") != FUSION_ANALYSIS_SCHEMA_VERSION
             or value.get("analysis_contract_sha256")
             != analysis_contracts["contract_sha256"]
-            or value.get("int8_audit_sha256")
-            != analysis_contracts["int8_audit_sha256"]
+            or value.get("int8_audit_sha256") != analysis_contracts["int8_audit_sha256"]
         ):
             raise ValueError("saved fusion analysis provenance is invalid")
         graphs = value.get("graphs")

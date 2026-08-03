@@ -125,6 +125,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build import
     _ProbeInfrastructureError,
     _analysis_signature as _fusion_analysis_signature,
     _load_analysis_contracts,
+    _make_probe_stream,
     _probe_input_shapes,
     _run_probe_suite,
     _selected_call_sites as _fusion_selected_call_sites,
@@ -166,6 +167,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_LATENT_SHAPE,
     TensorRTVaeRuntime,
     _configure_context_nvtx,
+    _create_trt_execution_stream,
     validate_trt_vae_manifest,
 )
 from sglang.multimodal_gen.runtime.distributed import parallel_state
@@ -5524,6 +5526,22 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             )
 
     def test_trt_runtime_alternates_cache_banks_without_in_place_overwrite(self):
+        class _FakeStream:
+            def __init__(self, handle):
+                self.cuda_stream = handle
+                self.waited_for = []
+
+            def wait_stream(self, stream):
+                self.waited_for.append(stream)
+
+        class _FakeTensor:
+            def __init__(self, label):
+                self.label = label
+                self.recorded_streams = []
+
+            def record_stream(self, stream):
+                self.recorded_streams.append(stream)
+
         class _FakeContext:
             def __init__(self):
                 self.stream_handles = []
@@ -5534,22 +5552,23 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
 
         runtime = TensorRTVaeRuntime.__new__(TensorRTVaeRuntime)
         runtime.device = "cuda:0"
+        caller_stream = _FakeStream(17)
+        execution_stream = _FakeStream(23)
         runtime._torch = SimpleNamespace(
-            cuda=SimpleNamespace(
-                current_stream=lambda **_kwargs: SimpleNamespace(cuda_stream=17)
-            )
+            cuda=SimpleNamespace(current_stream=lambda **_kwargs: caller_stream)
         )
+        runtime._execution_stream = execution_stream
         runtime._contexts = {
             "initial": _FakeContext(),
             "steady": _FakeContext(),
         }
         runtime._cache_banks = [
-            [f"a-{index}" for index in range(32)],
-            [f"b-{index}" for index in range(32)],
+            [_FakeTensor(f"a-{index}") for index in range(32)],
+            [_FakeTensor(f"b-{index}") for index in range(32)],
         ]
         runtime._rgb_outputs = {
-            "initial": "rgb-initial",
-            "steady": "rgb-steady",
+            "initial": _FakeTensor("rgb-initial"),
+            "steady": _FakeTensor("rgb-steady"),
         }
         runtime._read_bank_index = None
         addresses = []
@@ -5558,26 +5577,111 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             addresses.append((context, name, tensor))
 
         runtime._set_address = MethodType(_set_address, runtime)
+        latent_0 = _FakeTensor("latent-0")
         self.assertEqual(
-            runtime._execute(kind="initial", latent="latent-0"),
+            runtime._execute(kind="initial", latent=latent_0).label,
             "rgb-initial",
         )
         self.assertEqual(runtime._read_bank_index, 0)
         first_steady_start = len(addresses)
+        latent_1 = _FakeTensor("latent-1")
         self.assertEqual(
-            runtime._execute(kind="steady", latent="latent-1"),
+            runtime._execute(kind="steady", latent=latent_1).label,
             "rgb-steady",
         )
         self.assertEqual(runtime._read_bank_index, 1)
         steady_addresses = {
             name: tensor for _context, name, tensor in addresses[first_steady_start:]
         }
-        self.assertEqual(steady_addresses["cache_in_000"], "a-0")
-        self.assertEqual(steady_addresses["cache_out_000"], "b-0")
+        self.assertEqual(steady_addresses["cache_in_000"].label, "a-0")
+        self.assertEqual(steady_addresses["cache_out_000"].label, "b-0")
         self.assertNotEqual(
             steady_addresses["cache_in_000"],
             steady_addresses["cache_out_000"],
         )
+        self.assertEqual(
+            runtime._contexts["initial"].stream_handles
+            + runtime._contexts["steady"].stream_handles,
+            [23, 23],
+        )
+        self.assertEqual(
+            execution_stream.waited_for,
+            [caller_stream, caller_stream],
+        )
+        self.assertEqual(
+            caller_stream.waited_for,
+            [execution_stream, execution_stream],
+        )
+        self.assertEqual(latent_0.recorded_streams, [execution_stream])
+        self.assertEqual(latent_1.recorded_streams, [execution_stream])
+
+    def test_trt_runtime_execution_stream_is_non_default_and_waits_on_failure(self):
+        order = []
+
+        class _FakeStream:
+            def __init__(self, handle, name):
+                self.cuda_stream = handle
+                self.name = name
+                self.waited_for = []
+
+            def wait_stream(self, stream):
+                self.waited_for.append(stream)
+                order.append((self.name, "wait_stream", stream.name))
+
+        default_stream = _FakeStream(0, "default")
+        execution_stream = _FakeStream(31, "execution")
+        cuda = SimpleNamespace(
+            Stream=mock.Mock(return_value=execution_stream),
+            default_stream=mock.Mock(return_value=default_stream),
+        )
+        self.assertIs(
+            _create_trt_execution_stream(
+                torch=SimpleNamespace(cuda=cuda),
+                device="cuda:0",
+            ),
+            execution_stream,
+        )
+        cuda.Stream.assert_called_once_with(device="cuda:0")
+
+        cuda.Stream.return_value = _FakeStream(0, "invalid")
+        with self.assertRaisesRegex(RuntimeError, "non-default CUDA stream"):
+            _create_trt_execution_stream(
+                torch=SimpleNamespace(cuda=cuda),
+                device="cuda:0",
+            )
+
+        class _FakeTensor:
+            def record_stream(self, _stream):
+                order.append(("tensor", "record_stream", _stream.name))
+
+        class _FailingContext:
+            def execute_async_v3(self, *, stream_handle):
+                self.stream_handle = stream_handle
+                order.append(("context", "enqueue", stream_handle))
+                return False
+
+        caller_stream = _FakeStream(17, "caller")
+        order.clear()
+        runtime = TensorRTVaeRuntime.__new__(TensorRTVaeRuntime)
+        runtime.device = "cuda:0"
+        runtime._torch = SimpleNamespace(
+            cuda=SimpleNamespace(current_stream=lambda **_kwargs: caller_stream)
+        )
+        runtime._execution_stream = execution_stream
+        runtime._contexts = {"initial": _FailingContext()}
+        runtime._cache_banks = [[_FakeTensor()], [_FakeTensor()]]
+        runtime._rgb_outputs = {"initial": _FakeTensor()}
+        runtime._read_bank_index = None
+        runtime._set_address = MethodType(lambda *_args, **_kwargs: None, runtime)
+
+        with self.assertRaisesRegex(RuntimeError, "execution returned failure"):
+            runtime._execute(kind="initial", latent=_FakeTensor())
+        self.assertEqual(execution_stream.waited_for[-1], caller_stream)
+        self.assertEqual(caller_stream.waited_for, [execution_stream])
+        self.assertEqual(order[0], ("execution", "wait_stream", "caller"))
+        self.assertEqual(order[-2], ("context", "enqueue", 31))
+        self.assertEqual(order[-1], ("caller", "wait_stream", "execution"))
+        self.assertIsNone(runtime._read_bank_index)
 
     def test_trt_monolithic_component_loader_skips_torch_vae(self):
         components = SimpleNamespace(
@@ -6572,6 +6676,53 @@ class TestSfWanTensorRTFusionExperiment(CustomTestCase):
                         weight_encoding="fp32_qdq",
                     )
         build.assert_called_once()
+
+    def test_fusion_probe_uses_non_default_cuda_stream(self):
+        class FakeStream:
+            def __init__(self, handle):
+                self.cuda_stream = handle
+                self.waited_for = []
+
+            def wait_stream(self, other):
+                self.waited_for.append(other)
+
+        class FakeTensor:
+            def __init__(self):
+                self.streams = []
+
+            def record_stream(self, stream):
+                self.streams.append(stream)
+
+        producer = FakeStream(11)
+        default = FakeStream(0)
+        dedicated = FakeStream(23)
+        cuda = SimpleNamespace(
+            current_stream=mock.Mock(return_value=producer),
+            default_stream=mock.Mock(return_value=default),
+            Stream=mock.Mock(return_value=dedicated),
+        )
+        tensors = {"input": FakeTensor(), "output": FakeTensor()}
+
+        selected = _make_probe_stream(
+            torch=SimpleNamespace(cuda=cuda),
+            device_index=0,
+            tensors=tensors,
+        )
+
+        self.assertIs(selected, dedicated)
+        self.assertEqual(dedicated.waited_for, [producer])
+        self.assertTrue(
+            all(tensor.streams == [dedicated] for tensor in tensors.values())
+        )
+        cuda.Stream.assert_called_once_with(device=0)
+
+        cuda.Stream.return_value = FakeStream(0)
+        with self.assertRaisesRegex(RuntimeError, "non-default stream"):
+            _make_probe_stream(
+                torch=SimpleNamespace(cuda=cuda),
+                device_index=0,
+                tensors=tensors,
+            )
 
     def test_causal_concat_keeps_cache_first_for_four_frame_current(self):
         cache, current = _ordered_causal_concat_inputs(
