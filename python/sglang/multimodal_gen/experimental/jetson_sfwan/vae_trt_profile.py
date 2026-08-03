@@ -643,16 +643,29 @@ def _classify_layer(
         for marker in ("upsample", "resample", "interpolate", "resize")
     ):
         return "upsample_resample", "name_rule"
-    if any(
-        marker in haystack
-        for marker in (
-            "rmsnorm",
-            "layernorm",
-            "normalization",
-            "silu",
-            "activation",
-            "residual",
+
+    # TensorRT 10.3 lowers the Wan RMSNorm path into ReduceL2/Reduce plus
+    # fused elementwise/kgen layers.  Those physical layers commonly retain
+    # only ``.../norm*/ReduceL2`` or ``.../nonlinearity*/Sigmoid`` in their
+    # Inspector names, rather than the generic words previously checked here.
+    # Attention is checked above so an attention reduction is not mislabeled
+    # as decoder normalization.
+    norm_or_activation = any(
+        marker in haystack for marker in ("/norm", "norm_", "reducel2")
+    ) or any(marker in haystack for marker in ("/nonlinearity", "sigmoid", "tanh"))
+    if (
+        any(
+            marker in haystack
+            for marker in (
+                "rmsnorm",
+                "layernorm",
+                "normalization",
+                "silu",
+                "activation",
+                "residual",
+            )
         )
+        or norm_or_activation
     ):
         return "norm_activation_residual", "name_rule"
     cache_scope = any(
@@ -680,6 +693,25 @@ def _classify_layer(
         )
     )
     if cache_scope and cache_operation:
+        return "cache_layout_copy", "name_rule"
+
+    # Exported Wan causal state updates are static Slice operations.  The
+    # TensorRT compiler may fuse a Slice and dtype/layout conversion into a
+    # generated ``SlicCast`` kernel and erase the original cache tensor name.
+    # Upsample/attention/norm paths were handled above; a remaining Slice or
+    # SlicCast in these fixed initial/steady graphs is therefore the physical
+    # feature-cache update/copy path.  Generic Reformat layers remain ``other``
+    # unless they carry explicit cache evidence, avoiding a false claim that
+    # every TensorRT layout conversion is feature-cache traffic.
+    causal_cache_slice = (
+        "slice" in type_text
+        or "sliccast" in haystack
+        or (
+            "slice" in haystack
+            and any(marker in type_text for marker in ("reformat", "shuffle", "kgen"))
+        )
+    )
+    if causal_cache_slice:
         return "cache_layout_copy", "name_rule"
     if any(marker in type_text for marker in ("convolution", "conv")):
         return "non_target_conv", "inspector"

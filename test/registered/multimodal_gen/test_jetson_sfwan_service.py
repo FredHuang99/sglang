@@ -5958,6 +5958,59 @@ class TestSfWanTensorRTLayerProfile(CustomTestCase):
             ["other", "cache_layout_copy"],
         )
 
+    def test_trt10_norm_and_causal_slice_layers_are_classified(self):
+        inspector = {
+            "Layers": [
+                {
+                    "Name": (
+                        "(Unnamed Layer* 123) [ElementWise] + "
+                        "/decoder/up_blocks.3/resnets.1/norm2_2/ReduceL2"
+                    ),
+                    "LayerType": "Reduce",
+                    "ParameterType": "Reduce",
+                    "Metadata": "",
+                },
+                {
+                    "Name": ("__myl_CastCastMaxMinDivMulTanhMulAddMulCast_myl808_0"),
+                    "LayerType": "kgen",
+                    "Metadata": "",
+                },
+                {
+                    "Name": "__myl_SlicCast_myl939_33",
+                    "LayerType": "kgen",
+                    "Metadata": "",
+                },
+                {
+                    "Name": "/decoder/up_blocks.3/resnets.1_1/Slice",
+                    "LayerType": "Slice",
+                    "ParameterType": "Slice",
+                    "Metadata": "",
+                },
+                {
+                    "Name": "unrelated layout conversion",
+                    "LayerType": "Reformat",
+                    "ParameterType": "Reformat",
+                    "Metadata": "",
+                },
+            ]
+        }
+        catalog = build_physical_layer_catalog(
+            engine_kind="steady",
+            plan_sha256="b" * 64,
+            inspector=inspector,
+            precision="fp16",
+        )
+        self.assertEqual(
+            [layer["category"] for layer in catalog["layers"]],
+            [
+                "norm_activation_residual",
+                "norm_activation_residual",
+                "cache_layout_copy",
+                "cache_layout_copy",
+                "other",
+            ],
+        )
+
     def test_fp16_catalog_maps_the_same_84_target_call_sites_exactly(self):
         target_map = []
         layers = []

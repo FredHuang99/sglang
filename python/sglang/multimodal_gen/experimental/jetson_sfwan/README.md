@@ -551,6 +551,13 @@ Physical layers are classified into these fixed categories:
 Classification uses Inspector `Name`, `Metadata`, layer type, the source-ONNX
 target map for FP16, and the v5 tactic audit for INT8. Node matching uses
 complete-name boundaries so names such as `Conv` and `Conv_1` cannot collide.
+A TensorRT 10.3 `ReduceL2`/`Reduce` or fused `Sigmoid`/`Tanh` layer under the
+decoder norm/nonlinearity path is classified as norm/activation.  After
+attention, upsample, and norm paths have been excluded, exported causal-state
+`Slice` and compiler-fused `SlicCast` layers are classified as cache/layout
+work.  A generic Reformat still remains `other` unless it has explicit cache
+evidence, so ordinary layout conversion is not mislabeled as feature-cache
+traffic.
 A fused physical layer is timed once even when it maps to several
 logical call sites; its time is never divided among those sites. Unreliable
 mappings remain `other` instead of being guessed from a name. Each catalog is

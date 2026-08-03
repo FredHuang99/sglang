@@ -1528,8 +1528,15 @@ catalog entry：
 | `attention` | spatial attention 的 Q/K/V、投影和融合 attention layer |
 | `upsample_resample` | temporal/spatial upsample、resize/resample |
 | `norm_activation_residual` | norm、SiLU、residual/add 及其融合 |
-| `cache_layout_copy` | Inspector name/Metadata 明确带 cache 语义的 concat/slice/copy/layout；普通 Shuffle/Reshape 不会被猜成 cache |
+| `cache_layout_copy` | Inspector name/Metadata 明确带 cache 语义的 concat/slice/copy/layout；以及排除 attention、upsample、norm 后，由 causal export 生成的 `Slice`/`SlicCast` 状态更新；普通 Reformat/Shuffle/Reshape 不会被猜成 cache |
 | `other` | 证据不足，拒绝只凭名字猜测 |
+
+TensorRT 10.3 会把 Wan RMSNorm 拆成 `ReduceL2`/`Reduce` 与 elementwise，
+并把部分 nonlinearity 编译成带 `Sigmoid`/`Tanh` 的 kgen 名称；这些物理层
+归入 `norm_activation_residual`。causal cache 更新在导出的静态图中表现为
+`Slice`，并可能进一步融合成 `SlicCast`。上述规则只用于已有 initial/steady
+固定图，且检查顺序先排除 attention、upsample 和 norm；不把所有 layout
+conversion 都宣称为 cache。
 
 FP16 映射不是靠 `Conv` 字符串猜测：profile builder 沿用 v5 的静态 weight
 initializer 解析得到 28 个逻辑模块和 84 个原始 ONNX node name，再以完整
