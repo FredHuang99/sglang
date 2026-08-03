@@ -225,10 +225,33 @@ file "$SFWAN_FUSION_DIR/libsfwan_vae_trt_fusion.so"
 
 ### 3.1 图分析
 
+分析器 v2 会使用 SHA 校验后的 `int8_audit_v5.json` 中真实 forward 捕获的
+Conv shape，以及 `manifest.json` 中 32 个 FP16 cache binding；ONNX shape
+inference 只负责补充信息。它不会重新编译或重新安装上一节的插件。
+
+如果已经运行过旧版分析器，先保留现场。第一次切换到分析器 v2 时不要传
+`--resume`，因为新的 identity 明确绑定 analysis schema、v5 audit 和 shape
+contract：
+
 ```bash
 source /workspace/sfwan_env.sh
 cd /workspace/sglang
 export SFWAN_TRT_DIR=/workspace/engines/sfwan-vae-trt-sm87-iofix
+export SFWAN_FUSION_DIR="$SFWAN_TRT_DIR/fusion_v1"
+
+stamp="$(date +%Y%m%d-%H%M%S)"
+for artifact in \
+  fusion_build_state.json \
+  fusion_analysis_v1.json \
+  fusion_analysis_v2.json \
+  fusion_probe_v1.json
+do
+  if test -f "$SFWAN_FUSION_DIR/$artifact"; then
+    cp -a \
+      "$SFWAN_FUSION_DIR/$artifact" \
+      "$SFWAN_FUSION_DIR/$artifact.pre-analysis-v2-$stamp"
+  fi
+done
 
 python3 -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \
   --engine-dir "$SFWAN_TRT_DIR" \
@@ -236,11 +259,57 @@ python3 -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build 
   --focus-module-prefix decoder.up_blocks.3 \
   --workspace-gib 8 \
   --probe-warmup 20 \
-  --probe-repeat 100 \
-  --resume
+  --probe-repeat 100
+```
+
+检查 v2 图分析结论。initial 和 steady 各应覆盖 `up_blocks.3` 的 18 个
+call site，且每个 call site 的 Pad、current/cache shape、cache update 和
+epilogue 都必须有证据：
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path(
+    "/workspace/engines/sfwan-vae-trt-sm87-iofix/"
+    "fusion_v1/fusion_analysis_v2.json"
+)
+report = json.loads(path.read_text())
+print("analysis schema:", report["analysis_schema_version"])
+print("passed:", report["passed"])
+print("errors:", report["errors"])
+print("contract SHA:", report["analysis_contract_sha256"])
+print("v5 audit SHA:", report["int8_audit_sha256"])
+
+assert report["analysis_schema_version"] == 2
+assert report["passed"] is True, report["errors"]
+for kind in ("initial", "steady"):
+    graph = report["graphs"][kind]
+    focused = [item for item in graph["call_sites"] if item["focused"]]
+    print(
+        kind,
+        "focused=", len(focused),
+        "shape inference warning=", graph.get("shape_inference_error"),
+    )
+    assert graph["analysis_schema_version"] == 2
+    assert graph["focused_complete"] is True, graph["errors"]
+    assert len(focused) == 18
+    for item in focused:
+        assert item["pad_resolution"]["resolved"] is True, item
+        assert item["eligible_input"] is True, item
+        assert item["eligible_cache_update"] is True, item
+        assert item["eligible_epilogue"] is True, item
+        assert len(item["current_shape"]) == 5, item
+        assert len(item["cache_update_shape"]) == 5, item
+
+print("fusion analysis v2: PASS")
+PY
 ```
 
 ### 3.2 必须前台通过的 micro-probe
+
+3.1 通过后，后续命令恢复使用 `--resume`；此时它只复用新的 v2 identity：
 
 ```bash
 python3 -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \

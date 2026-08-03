@@ -646,7 +646,7 @@ audit, manifest, build state, and timing cache are never overwritten:
 fusion_v1/
   libsfwan_vae_trt_fusion.so
   plugin_manifest.json
-  fusion_analysis_v1.json
+  fusion_analysis_v2.json
   fusion_probe_v1.json
   initial_int8_fusion_v1.onnx
   steady_int8_fusion_v1.onnx
@@ -660,7 +660,10 @@ fusion_v1/
   fusion_timing.cache
 ```
 
-The builder exposes `analyze`, `probe`, and `build`. It requires every
+The analysis-v2 identity is bound to the SHA-verified v5 audit's captured Conv
+shapes and the manifest's 32 FP16 cache bindings. ONNX shape inference is only
+an enrichment source; conflicting evidence fails closed. The builder exposes
+`analyze`, `probe`, and `build`. It requires every
 `decoder.up_blocks.3` signature to pass. Other signatures are fused only when
 their probe passes; otherwise they retain the v5 boundary. The six probe
 schemes compare the same final Conv, epilogue, and cache-update outputs:
@@ -703,8 +706,7 @@ Run graph analysis and the required on-device micro-probes in the foreground:
 python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \
   --engine-dir "$SFWAN_TRT_DIR" \
   --stage analyze \
-  --focus-module-prefix decoder.up_blocks.3 \
-  --resume
+  --focus-module-prefix decoder.up_blocks.3
 
 python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \
   --engine-dir "$SFWAN_TRT_DIR" \
@@ -716,6 +718,11 @@ python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build \
   --resume \
   --preflight-only
 ```
+
+The first analysis-v2 run intentionally omits `--resume`; archive an old
+`fusion_build_state.json` first if one exists. Subsequent `probe` and `build`
+runs use `--resume`. See `FUSION_V1_JETSON_RUNBOOK.md` section 3.1 for the
+exact non-destructive migration and evidence checks.
 
 Only after `fusion_probe_v1.json` reports `passed: true`, run the expensive
 initial/steady build. `--resume` uses SHA-bound stage state; the stable timing

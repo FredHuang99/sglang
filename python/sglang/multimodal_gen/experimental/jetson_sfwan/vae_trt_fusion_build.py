@@ -30,6 +30,7 @@ from .vae_trt_fusion import (
     EPILOGUE_PLUGIN,
     FUSION_AUDIT_FILE,
     FUSION_AUDIT_SCHEMA_VERSION,
+    FUSION_ANALYSIS_SCHEMA_VERSION,
     FUSION_BUILD_STATE_FILE,
     FUSION_ENGINE_FILES,
     FUSION_INSPECTOR_FILES,
@@ -66,7 +67,7 @@ _SOURCE_FILES = {
     "initial": "initial_int8_qdq_v5.onnx",
     "steady": "steady_int8_qdq_v5.onnx",
 }
-_ANALYSIS_FILE = "fusion_analysis_v1.json"
+_ANALYSIS_FILE = "fusion_analysis_v2.json"
 _PROBE_SUBDIRECTORY = "probes"
 _SCHEMES = (
     "baseline",
@@ -177,9 +178,12 @@ def _identity(
     workspace_gib: float,
     probe_warmup: int,
     probe_repeat: int,
+    int8_audit_sha256: str,
+    analysis_contract_sha256: str,
 ) -> dict[str, Any]:
     return {
         "schema_version": FUSION_SCHEMA_VERSION,
+        "analysis_schema_version": FUSION_ANALYSIS_SCHEMA_VERSION,
         "base_root": str(base_root),
         "base_manifest_sha256": sha256_file(base_manifest_path),
         "source_sha256": {kind: sha256_file(source_paths[kind]) for kind in _KINDS},
@@ -189,6 +193,8 @@ def _identity(
         "workspace_gib": float(workspace_gib),
         "probe_warmup": probe_warmup,
         "probe_repeat": probe_repeat,
+        "int8_audit_sha256": int8_audit_sha256,
+        "analysis_contract_sha256": analysis_contract_sha256,
     }
 
 
@@ -221,6 +227,147 @@ def _target_names(base_manifest: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _load_analysis_contracts(
+    *, base_root: Path, base_manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Load the SHA-bound v5 shapes that ONNX value_info may omit.
+
+    The v5 builder captured these Conv input/output shapes from the real Wan
+    forward before export.  They are more authoritative than best-effort ONNX
+    shape inference, while the manifest owns the public FP16 cache ABI.
+    """
+
+    audit_record = base_manifest.get("int8_audit")
+    if not isinstance(audit_record, Mapping):
+        raise ValueError("base manifest has no INT8 v5 audit record")
+    report_file = audit_record.get("report_file")
+    report_sha256 = audit_record.get("report_sha256")
+    if (
+        not isinstance(report_file, str)
+        or not report_file
+        or not isinstance(report_sha256, str)
+        or len(report_sha256) != 64
+    ):
+        raise ValueError("base manifest INT8 v5 audit reference is invalid")
+    report_path = (base_root / report_file).resolve()
+    try:
+        report_path.relative_to(base_root)
+    except ValueError as exc:
+        raise ValueError(
+            "base INT8 v5 audit path escapes the engine directory"
+        ) from exc
+    if not report_path.is_file() or sha256_file(report_path) != report_sha256:
+        raise ValueError("base INT8 v5 audit report SHA256 does not match")
+    report = _load_json(report_path, label="base INT8 v5 audit report")
+    if (
+        report.get("schema_version") != QDQ_SCHEMA_VERSION
+        or report.get("passed") is not True
+        or report.get("complete") is not True
+        or report.get("errors") != []
+    ):
+        raise ValueError("base INT8 v5 audit report is incomplete")
+
+    structural = report.get("structural")
+    if not isinstance(structural, Mapping):
+        raise ValueError("base INT8 v5 structural audits are missing")
+    graph_contracts: dict[str, dict[str, dict[str, Any]]] = {}
+    for kind in _KINDS:
+        graph = structural.get(kind)
+        signatures = (
+            graph.get("conv_signatures") if isinstance(graph, Mapping) else None
+        )
+        if not isinstance(signatures, list) or len(signatures) != EXPECTED_CALL_SITES:
+            raise ValueError(
+                f"base INT8 v5 {kind} audit has no complete Conv shape contracts"
+            )
+        contracts: dict[str, dict[str, Any]] = {}
+        expected_prefix = f"int8/{kind}/"
+        for signature in signatures:
+            if not isinstance(signature, Mapping):
+                raise ValueError(f"base INT8 v5 {kind} Conv contract is invalid")
+            call_site = signature.get("call_site")
+            input_shape = signature.get("input_shape")
+            output_shape = signature.get("output_shape")
+            if (
+                not isinstance(call_site, str)
+                or not call_site.startswith(expected_prefix)
+                or call_site in contracts
+            ):
+                raise ValueError(f"base INT8 v5 {kind} Conv call site is invalid")
+            for label, shape in (("input", input_shape), ("output", output_shape)):
+                if (
+                    not isinstance(shape, list)
+                    or len(shape) != 5
+                    or any(
+                        isinstance(value, bool)
+                        or not isinstance(value, int)
+                        or value <= 0
+                        for value in shape
+                    )
+                ):
+                    raise ValueError(
+                        f"base INT8 v5 {call_site} {label} shape is invalid: {shape}"
+                    )
+            contracts[call_site] = {
+                "input_shape": [int(value) for value in input_shape],
+                "output_shape": [int(value) for value in output_shape],
+            }
+        graph_contracts[kind] = contracts
+
+    cache = base_manifest.get("cache")
+    bindings = cache.get("bindings") if isinstance(cache, Mapping) else None
+    if not isinstance(bindings, list) or len(bindings) != TRT_VAE_CACHE_COUNT:
+        raise ValueError("base manifest has no complete feature-cache bindings")
+    cache_shapes = {kind: {} for kind in _KINDS}
+    seen_inputs: set[str] = set()
+    seen_outputs: set[str] = set()
+    for binding in bindings:
+        if not isinstance(binding, Mapping):
+            raise ValueError("base manifest feature-cache binding is invalid")
+        input_name = binding.get("input_name")
+        output_name = binding.get("output_name")
+        shape = binding.get("shape")
+        if (
+            not isinstance(input_name, str)
+            or not input_name
+            or input_name in seen_inputs
+            or not isinstance(output_name, str)
+            or not output_name
+            or output_name in seen_outputs
+            or not isinstance(shape, list)
+            or len(shape) != 5
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value <= 0
+                for value in shape
+            )
+            or binding.get("dtype") != "float16"
+        ):
+            raise ValueError("base manifest feature-cache binding contract is invalid")
+        seen_inputs.add(input_name)
+        seen_outputs.add(output_name)
+        normalized = [int(value) for value in shape]
+        cache_shapes["initial"][output_name] = normalized
+        cache_shapes["steady"][input_name] = normalized
+        cache_shapes["steady"][output_name] = normalized
+
+    payload = {
+        "analysis_schema_version": FUSION_ANALYSIS_SCHEMA_VERSION,
+        "int8_audit_sha256": report_sha256,
+        "graphs": graph_contracts,
+        "cache_shapes": cache_shapes,
+    }
+    contract_sha256 = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    return {
+        **payload,
+        "contract_sha256": contract_sha256,
+        "int8_audit_path": str(report_path),
+    }
+
+
 def _analysis_signature(record: Mapping[str, Any]) -> str:
     payload = {
         key: record.get(key)
@@ -243,6 +390,7 @@ def _run_analysis(
     source_paths: Mapping[str, Path],
     target_names: tuple[str, ...],
     focus_module_prefix: str,
+    analysis_contracts: Mapping[str, Any],
 ) -> dict[str, Any]:
     analyses = {
         kind: analyze_fusion_graph(
@@ -250,6 +398,8 @@ def _run_analysis(
             graph_kind=kind,
             target_module_names=target_names,
             focus_module_prefix=focus_module_prefix,
+            shape_contracts=analysis_contracts["graphs"][kind],
+            cache_shape_contracts=analysis_contracts["cache_shapes"][kind],
         )
         for kind in _KINDS
     }
@@ -285,6 +435,9 @@ def _run_analysis(
     ]
     return {
         "schema_version": FUSION_SCHEMA_VERSION,
+        "analysis_schema_version": FUSION_ANALYSIS_SCHEMA_VERSION,
+        "analysis_contract_sha256": analysis_contracts["contract_sha256"],
+        "int8_audit_sha256": analysis_contracts["int8_audit_sha256"],
         "focus_module_prefix": focus_module_prefix,
         "passed": not errors,
         "errors": errors,
@@ -1158,6 +1311,10 @@ def build_fusion(
         model_path=model_id,
         verify_plan_hashes=True,
     )
+    analysis_contracts = _load_analysis_contracts(
+        base_root=base_root,
+        base_manifest=base_manifest,
+    )
     source_paths = {kind: base_root / _SOURCE_FILES[kind] for kind in _KINDS}
     for kind, path in source_paths.items():
         if not path.is_file():
@@ -1197,6 +1354,8 @@ def build_fusion(
         workspace_gib=workspace_gib,
         probe_warmup=probe_warmup,
         probe_repeat=probe_repeat,
+        int8_audit_sha256=analysis_contracts["int8_audit_sha256"],
+        analysis_contract_sha256=analysis_contracts["contract_sha256"],
     )
     state_path = fusion_root / FUSION_BUILD_STATE_FILE
     state = (
@@ -1220,14 +1379,40 @@ def build_fusion(
 
     target_names = _target_names(base_manifest)
     analysis_path = fusion_root / _ANALYSIS_FILE
+
+    def _validate_analysis_provenance(value: Mapping[str, Any]) -> None:
+        if value.get("identity") != identity:
+            raise ValueError("saved fusion analysis identity differs")
+        if (
+            value.get("analysis_schema_version")
+            != FUSION_ANALYSIS_SCHEMA_VERSION
+            or value.get("analysis_contract_sha256")
+            != analysis_contracts["contract_sha256"]
+            or value.get("int8_audit_sha256")
+            != analysis_contracts["int8_audit_sha256"]
+        ):
+            raise ValueError("saved fusion analysis provenance is invalid")
+        graphs = value.get("graphs")
+        if not isinstance(graphs, Mapping) or set(graphs) != set(_KINDS):
+            raise ValueError("saved fusion analysis graph records are incomplete")
+        for kind in _KINDS:
+            graph = graphs[kind]
+            if (
+                not isinstance(graph, Mapping)
+                or graph.get("analysis_schema_version")
+                != FUSION_ANALYSIS_SCHEMA_VERSION
+            ):
+                raise ValueError(
+                    f"saved fusion {kind} graph analysis schema is invalid"
+                )
+
     analysis = None
     if (
         resume
         and state.get("stages", {}).get("analyze", {}).get("status") == "completed"
     ):
         analysis = _load_json(analysis_path, label="fusion analysis")
-        if analysis.get("identity") != identity:
-            raise ValueError("saved fusion analysis identity differs")
+        _validate_analysis_provenance(analysis)
     if analysis is None and stage in {"analyze", "probe", "all"}:
         _state_stage(
             state=state, state_path=state_path, name="analyze", status="running"
@@ -1237,8 +1422,10 @@ def build_fusion(
                 source_paths=source_paths,
                 target_names=target_names,
                 focus_module_prefix=focus_module_prefix,
+                analysis_contracts=analysis_contracts,
             )
             analysis["identity"] = identity
+            _validate_analysis_provenance(analysis)
             write_json_atomic(analysis_path, analysis)
             status = "completed" if analysis["passed"] else "analysis_failed"
             _state_stage(
@@ -1270,8 +1457,7 @@ def build_fusion(
         return {"stage": "analyze", "analysis": analysis, "state": str(state_path)}
     if analysis is None:
         analysis = _load_json(analysis_path, label="fusion analysis")
-    if analysis.get("identity") != identity:
-        raise ValueError("saved fusion analysis identity differs")
+    _validate_analysis_provenance(analysis)
     if analysis.get("passed") is not True:
         raise RuntimeError("fusion analysis did not pass")
 

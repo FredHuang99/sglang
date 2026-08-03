@@ -1739,6 +1739,14 @@ rewrite result、audit 和 manifest 中。dual 模式只有一个物理 pack plu
 需要删除的 node 都只服务于该 call site 时，rewriter 才允许替换。任何共享 consumer 都会
 fail closed，避免删除另一路仍在使用的值。
 
+图分析器 schema v2 不再把不完整的 ONNX `value_info` 当成唯一 shape 事实。它先验证
+`manifest.json → int8_audit_v5.json` 的 SHA 链，从 v5 的 real-forward
+`conv_signatures` 取得每个 call site 的 rank-5 Conv 输入/输出 shape，再从 manifest
+取得 32 个 FP16 cache binding shape。三个 per-latent call 按 `call_0 → call_1 → call_2`
+求解内部 cache，动态 Pad 表达式只需要 rank 时由已验证 rank 证据解析。任何 shape 冲突、
+Pad 解析失败或 cache update 依赖无法证明都会 fail closed；结果写入独立的
+`fusion_analysis_v2.json`，不接管旧 v1 state。
+
 ### 16.3 Plugin ABI 与数值职责
 
 #### `SfWanCausalPackQuantPlugin`

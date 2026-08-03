@@ -28,6 +28,7 @@ from .vae_trt_runtime import (
 FUSION_VARIANT = "fusion_v1"
 FUSION_SCHEMA_VERSION = 1
 FUSION_AUDIT_SCHEMA_VERSION = 1
+FUSION_ANALYSIS_SCHEMA_VERSION = 2
 FUSION_SUBDIRECTORY = "fusion_v1"
 FUSION_MANIFEST_FILE = "fusion_manifest.json"
 FUSION_AUDIT_FILE = "fusion_audit_v1.json"
@@ -483,6 +484,123 @@ def _shape_map(model: Any) -> dict[str, list[int]]:
             shape.append(int(dimension.dim_value))
         if valid:
             result[value.name] = shape
+    for initializer in model.graph.initializer:
+        shape = [int(dimension) for dimension in initializer.dims]
+        if all(dimension > 0 for dimension in shape):
+            result.setdefault(initializer.name, shape)
+    return result
+
+
+def _rank_map(model: Any) -> dict[str, int]:
+    result: dict[str, int] = {}
+    values = [*model.graph.input, *model.graph.output, *model.graph.value_info]
+    for value in values:
+        tensor_type = value.type.tensor_type
+        if tensor_type.HasField("shape"):
+            result[value.name] = len(tensor_type.shape.dim)
+    for initializer in model.graph.initializer:
+        result.setdefault(initializer.name, len(initializer.dims))
+    return result
+
+
+def _normalize_static_shape(value: Any, *, label: str) -> list[int]:
+    if (
+        not isinstance(value, (list, tuple))
+        or not value
+        or any(
+            isinstance(dimension, bool)
+            or not isinstance(dimension, int)
+            or dimension <= 0
+            for dimension in value
+        )
+    ):
+        raise ValueError(f"{label} is not a positive static shape: {value!r}")
+    return [int(dimension) for dimension in value]
+
+
+def _record_static_shape(
+    *,
+    shapes: dict[str, list[int]],
+    ranks: dict[str, int],
+    sources: dict[str, list[str]],
+    tensor: str,
+    shape: Any,
+    source: str,
+) -> list[int]:
+    normalized = _normalize_static_shape(shape, label=f"shape for {tensor!r}")
+    existing = shapes.get(tensor)
+    if existing is not None and existing != normalized:
+        raise ValueError(
+            f"static shape conflict for {tensor!r}: "
+            f"existing={existing}, {source}={normalized}"
+        )
+    existing_rank = ranks.get(tensor)
+    if existing_rank is not None and existing_rank != len(normalized):
+        raise ValueError(
+            f"static rank conflict for {tensor!r}: "
+            f"existing={existing_rank}, {source}={len(normalized)}"
+        )
+    shapes[tensor] = normalized
+    ranks[tensor] = len(normalized)
+    evidence = sources.setdefault(tensor, [])
+    if source not in evidence:
+        evidence.append(source)
+    return normalized
+
+
+def _unpad_shape(padded_shape: Any, pads: Any) -> list[int]:
+    padded = _normalize_static_shape(padded_shape, label="padded shape")
+    extents = [int(value) for value in pads]
+    rank = len(padded)
+    if len(extents) != rank * 2 or any(value < 0 for value in extents):
+        raise ValueError(f"invalid rank-{rank} Pad extents: {extents}")
+    result = [
+        padded[index] - extents[index] - extents[index + rank]
+        for index in range(rank)
+    ]
+    if any(dimension <= 0 for dimension in result):
+        raise ValueError(
+            f"Pad extents {extents} cannot produce {padded} from a positive input"
+        )
+    return result
+
+
+def _current_shape_from_prepad(
+    *, prepad_shape: Any, cache_shape: Any | None
+) -> list[int]:
+    prepad = _normalize_static_shape(prepad_shape, label="pre-Pad shape")
+    if len(prepad) != 5:
+        raise ValueError("causal Conv pre-Pad shape must have rank five")
+    if cache_shape is None:
+        return prepad
+    cache = _normalize_static_shape(cache_shape, label="feature-cache shape")
+    if len(cache) != 5:
+        raise ValueError("feature-cache shape must have rank five")
+    if any(cache[index] != prepad[index] for index in (0, 1, 3, 4)):
+        raise ValueError("causal concat cache/pre-Pad shapes are incompatible")
+    current = [*prepad]
+    current[2] -= cache[2]
+    if current[2] <= 0:
+        raise ValueError("causal concat leaves no current activation frames")
+    return current
+
+
+def _cache_update_shape(
+    *, current_shape: Any, cache_shape: Any | None
+) -> list[int]:
+    current = _normalize_static_shape(current_shape, label="current activation shape")
+    if len(current) != 5:
+        raise ValueError("current activation shape must have rank five")
+    if cache_shape is not None:
+        cache = _normalize_static_shape(cache_shape, label="feature-cache shape")
+        if len(cache) != 5 or any(
+            cache[index] != current[index] for index in (0, 1, 3, 4)
+        ):
+            raise ValueError("feature cache cannot update from the current activation")
+    result = [*current]
+    # Wan keeps the newest two frames.  When the current activation contains
+    # one frame, exactly the last frame of the previous cache is prepended.
+    result[2] = min(2, current[2] + (1 if cache_shape is not None else 0))
     return result
 
 
@@ -563,8 +681,10 @@ def _constant_array(
     helper: Any | None = None,
     np_module: Any | None = None,
     shapes: Mapping[str, list[int]] | None = None,
+    ranks: Mapping[str, int] | None = None,
     memo: dict[str, Any | None] | None = None,
     visiting: set[str] | None = None,
+    failures: dict[str, dict[str, Any]] | None = None,
 ) -> Any | None:
     """Resolve a small, deterministic ONNX constant-expression subgraph.
 
@@ -587,10 +707,30 @@ def _constant_array(
         return value
     if producer is None or helper is None or np_module is None:
         memo[name] = None
+        if failures is not None:
+            failures.setdefault(
+                name,
+                {
+                    "tensor": name,
+                    "producer_op": None,
+                    "reason": "constant_evaluator_unavailable",
+                    "inputs": [],
+                },
+            )
         return None
     node = producer.get(name)
     if node is None:
         memo[name] = None
+        if failures is not None:
+            failures.setdefault(
+                name,
+                {
+                    "tensor": name,
+                    "producer_op": None,
+                    "reason": "no_constant_producer",
+                    "inputs": [],
+                },
+            )
         return None
     if visiting is None:
         visiting = set()
@@ -609,8 +749,10 @@ def _constant_array(
             helper=helper,
             np_module=np_module,
             shapes=shapes,
+            ranks=ranks,
             memo=memo,
             visiting=visiting,
+            failures=failures,
         )
 
     attributes = _attribute_map(node, helper)
@@ -767,12 +909,28 @@ def _constant_array(
                     source_shape[start:end], dtype=np_module.int64
                 )
         elif node.op_type == "Size" and len(node.input) == 1:
-            value = resolve(node.input[0])
-            if value is not None:
+            size_input = node.input[0]
+            shape_node = producer.get(size_input)
+            shape_source = (
+                shape_node.input[0]
+                if shape_node is not None
+                and shape_node.op_type == "Shape"
+                and len(shape_node.input) == 1
+                else None
+            )
+            source_rank = ranks.get(shape_source) if ranks is not None else None
+            if source_rank is not None:
                 result = np_module.asarray(
-                    np_module.asarray(value).size,
+                    int(source_rank),
                     dtype=np_module.int64,
                 )
+            else:
+                value = resolve(size_input)
+                if value is not None:
+                    result = np_module.asarray(
+                        np_module.asarray(value).size,
+                        dtype=np_module.int64,
+                    )
         elif (
             node.op_type in {"Add", "Sub", "Mul", "Div", "Max", "Min"}
             and len(node.input) == 2
@@ -815,10 +973,34 @@ def _constant_array(
                     np_module.asarray(indices),
                     axis=int(attributes.get("axis", 0)),
                 )
-    except (IndexError, TypeError, ValueError):
+    except (IndexError, TypeError, ValueError) as exc:
         result = None
+        if failures is not None:
+            failures[name] = {
+                "tensor": name,
+                "producer_op": node.op_type,
+                "reason": "constant_evaluation_error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "inputs": [value for value in node.input if value],
+            }
     finally:
         visiting.remove(name)
+    if result is None and failures is not None:
+        unresolved_inputs = [
+            value
+            for value in node.input
+            if value and (memo.get(value) is None or value in failures)
+        ]
+        failures.setdefault(
+            name,
+            {
+                "tensor": name,
+                "producer_op": node.op_type,
+                "reason": "unsupported_or_unresolved_constant_expression",
+                "inputs": [value for value in node.input if value],
+                "unresolved_inputs": unresolved_inputs,
+            },
+        )
     memo[name] = result
     return result
 
@@ -895,18 +1077,50 @@ def _find_cache_output(
     current_shape = shapes.get(current)
     if current_shape is None or len(current_shape) != 5:
         return None
-    expected = [*current_shape]
-    expected[2] = min(
-        2, current_shape[2] + (shapes.get(cache, [0, 0, 0])[2] if cache else 0)
+    cache_shape = shapes.get(cache) if cache else None
+    expected = _cache_update_shape(
+        current_shape=current_shape,
+        cache_shape=cache_shape,
     )
+    needs_previous_frame = cache is not None and current_shape[2] < 2
     memo: dict[tuple[str, str], bool] = {}
+    cache_layout_ops = {
+        "Cast",
+        "Concat",
+        "Gather",
+        "Identity",
+        "Reshape",
+        "Slice",
+        "Squeeze",
+        "Unsqueeze",
+    }
     matches = []
     for output in graph_outputs:
         if shapes.get(output) != expected:
             continue
         if not _tensor_depends_on(output, current, producer, memo):
             continue
-        if cache is not None and not _tensor_depends_on(output, cache, producer, memo):
+        if needs_previous_frame and not _tensor_depends_on(
+            output, cache, producer, memo
+        ):
+            continue
+        try:
+            current_path = _collect_reverse_subgraph(
+                target=output,
+                source=current,
+                producer=producer,
+            )
+            if any(node.op_type not in cache_layout_ops for node in current_path):
+                continue
+            if needs_previous_frame:
+                cache_path = _collect_reverse_subgraph(
+                    target=output,
+                    source=cache,
+                    producer=producer,
+                )
+                if any(node.op_type not in cache_layout_ops for node in cache_path):
+                    continue
+        except ValueError:
             continue
         matches.append(output)
     return matches[0] if len(matches) == 1 else None
@@ -973,6 +1187,8 @@ def analyze_fusion_graph(
     graph_kind: str,
     target_module_names: tuple[str, ...],
     focus_module_prefix: str = "decoder.up_blocks.3",
+    shape_contracts: Mapping[str, Mapping[str, Any]] | None = None,
+    cache_shape_contracts: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Prove the exact v5 boundary patterns eligible for fusion.
 
@@ -987,13 +1203,37 @@ def analyze_fusion_graph(
     helper, numpy_helper = helpers
     model = onnx.load(str(source_path), load_external_data=True)
     onnx.checker.check_model(model, full_check=True)
+    shape_inference_error = None
+    inferred_model = model
+    try:
+        inferred_model = onnx.shape_inference.infer_shapes(
+            model,
+            check_type=True,
+            strict_mode=True,
+            data_prop=True,
+        )
+    except (RuntimeError, TypeError, ValueError) as exc:
+        # The v5 captured contracts below remain authoritative.  Shape
+        # inference is an enrichment pass, not permission to guess a shape.
+        shape_inference_error = f"{type(exc).__name__}: {exc}"
     producer, consumers = _node_maps(model)
     nodes_by_name = {node.name: node for node in model.graph.node}
-    shapes = _shape_map(model)
+    shapes = _shape_map(inferred_model)
+    ranks = _rank_map(inferred_model)
+    shape_sources = {name: ["onnx_inferred"] for name in shapes}
     initializers = {value.name: value for value in model.graph.initializer}
-    constant_memo: dict[str, Any | None] = {}
     graph_outputs = {value.name for value in model.graph.output}
     target_set = set(target_module_names)
+    contracts = dict(shape_contracts or {})
+    for tensor, shape in dict(cache_shape_contracts or {}).items():
+        _record_static_shape(
+            shapes=shapes,
+            ranks=ranks,
+            sources=shape_sources,
+            tensor=tensor,
+            shape=shape,
+            source="manifest_cache_binding",
+        )
     records: list[dict[str, Any]] = []
     errors: list[str] = []
 
@@ -1013,9 +1253,23 @@ def analyze_fusion_graph(
             "eligible_input": False,
             "eligible_cache_update": False,
             "eligible_epilogue": False,
+            "topology_resolved": False,
             "errors": [],
         }
         try:
+            contract = contracts.get(conv.name)
+            if not isinstance(contract, Mapping):
+                raise ValueError("v5 captured Conv shape contract is missing")
+            padded_shape = _normalize_static_shape(
+                contract.get("input_shape"),
+                label=f"{conv.name} captured input shape",
+            )
+            conv_output_shape = _normalize_static_shape(
+                contract.get("output_shape"),
+                label=f"{conv.name} captured output shape",
+            )
+            if len(padded_shape) != 5 or len(conv_output_shape) != 5:
+                raise ValueError("v5 captured Conv shapes must have rank five")
             activation_dq = _one_producer(producer, conv.input[0], "DequantizeLinear")
             activation_q = _one_producer(
                 producer, activation_dq.input[0], "QuantizeLinear"
@@ -1042,7 +1296,7 @@ def analyze_fusion_graph(
                 helper=helper,
                 np_module=np,
                 shapes=shapes,
-                memo=constant_memo,
+                ranks=ranks,
             )
             output_scale_array = _constant_array(
                 name=output_q.input[1],
@@ -1052,7 +1306,7 @@ def analyze_fusion_graph(
                 helper=helper,
                 np_module=np,
                 shapes=shapes,
-                memo=constant_memo,
+                ranks=ranks,
             )
             if scale_array is None or np.asarray(scale_array).size != 1:
                 raise ValueError("activation quantization scale is not static scalar")
@@ -1069,21 +1323,6 @@ def analyze_fusion_graph(
             pad = producer.get(padded)
             if pad is None or pad.op_type != "Pad":
                 raise ValueError("activation Cast is not preceded by an explicit Pad")
-            pads = _constant_array(
-                name=pad.input[1],
-                initializers=initializers,
-                numpy_helper=numpy_helper,
-                producer=producer,
-                helper=helper,
-                np_module=np,
-                shapes=shapes,
-                memo=constant_memo,
-            )
-            if pads is None:
-                raise ValueError("Pad extents are not static")
-            pads_list = [int(value) for value in np.asarray(pads).reshape(-1)]
-            if len(pads_list) != 10:
-                raise ValueError(f"rank-5 Pad has invalid extents: {pads_list}")
             pad_value = 0.0
             if len(pad.input) > 2 and pad.input[2]:
                 raw_pad_value = _constant_array(
@@ -1094,7 +1333,7 @@ def analyze_fusion_graph(
                     helper=helper,
                     np_module=np,
                     shapes=shapes,
-                    memo=constant_memo,
+                    ranks=ranks,
                 )
                 if raw_pad_value is None:
                     raise ValueError("Pad value is not static")
@@ -1112,21 +1351,50 @@ def analyze_fusion_graph(
                 concat_axis = int(attributes.get("axis", -1))
                 if concat_axis != 2 or len(cat.input) != 2:
                     raise ValueError("causal cache concat must have two inputs on T")
-                # ``causal_conv3d_cat_pad`` emits ``cat([cache_x, x], dim=2)``.
-                # The current activation is not necessarily one frame: after
-                # temporal upsampling (notably in up_blocks.3) it can contain
-                # four frames.  Inferring roles from T==1 would therefore
-                # reject the exact hotspot this experiment is meant to test.
-                cache, current = _ordered_causal_concat_inputs(cat.input, shapes)
-            current_shape = shapes.get(current)
-            cache_shape = shapes.get(cache) if cache else None
-            padded_shape = shapes.get(activation_dq.output[0]) or shapes.get(padded)
-            if current_shape is None or len(current_shape) != 5:
-                raise ValueError("current activation has no static rank-5 shape")
-            if cache is not None and (cache_shape is None or len(cache_shape) != 5):
-                raise ValueError("feature cache has no static rank-5 shape")
-            if padded_shape is None or len(padded_shape) != 5:
-                raise ValueError("padded activation has no static rank-5 shape")
+                # Wan emits cat([cache_x, x], dim=2).  Preserve that semantic
+                # ordering; shape solving happens after all three calls have
+                # been collected so an internal cache update can anchor the
+                # next call.
+                cache, current = list(cat.input)
+
+            for tensor in (
+                padded,
+                activation_cast.output[0],
+                activation_q.output[0],
+                activation_dq.output[0],
+                conv.input[0],
+            ):
+                _record_static_shape(
+                    shapes=shapes,
+                    ranks=ranks,
+                    sources=shape_sources,
+                    tensor=tensor,
+                    shape=padded_shape,
+                    source=f"v5_captured:{conv.name}:input",
+                )
+            for tensor in (
+                conv.output[0],
+                output_q.output[0],
+                output_dq.output[0],
+                output_cast.output[0],
+            ):
+                _record_static_shape(
+                    shapes=shapes,
+                    ranks=ranks,
+                    sources=shape_sources,
+                    tensor=tensor,
+                    shape=conv_output_shape,
+                    source=f"v5_captured:{conv.name}:output",
+                )
+            for tensor in (pad.input[0], current, cache):
+                if tensor:
+                    existing_rank = ranks.get(tensor)
+                    if existing_rank is not None and existing_rank != 5:
+                        raise ValueError(
+                            f"causal tensor {tensor!r} has rank {existing_rank}, "
+                            "expected 5"
+                        )
+                    ranks[tensor] = 5
             record.update(
                 {
                     "activation_dq_node": activation_dq.name,
@@ -1140,18 +1408,17 @@ def analyze_fusion_graph(
                     "output_scale_name": output_q.input[1],
                     "output_scale": output_scale,
                     "current_tensor": current,
-                    "current_shape": current_shape,
                     "cache_tensor": cache,
-                    "cache_shape": cache_shape,
                     "padded_tensor": padded,
                     "padded_shape": padded_shape,
+                    "conv_output_shape": conv_output_shape,
                     "pad_node": pad.name,
+                    "pad_extents_tensor": pad.input[1],
                     "concat_node": cat.name if cache is not None else None,
                     "concat_axis": concat_axis,
-                    "pads": pads_list,
                     "output_q_tensor": output_q.output[0],
                     "output_cast_tensor": output_cast.output[0],
-                    "eligible_input": True,
+                    "topology_resolved": True,
                 }
             )
         except (KeyError, StopIteration, TypeError, ValueError) as exc:
@@ -1168,27 +1435,131 @@ def analyze_fusion_graph(
                 record["errors"].append("module is not unrolled exactly three times")
             continue
         for index, record in enumerate(module_records):
-            if not record["eligible_input"]:
+            if not record["topology_resolved"]:
                 continue
-            target = (
-                module_records[index + 1].get("cache_tensor")
-                if index < 2
-                else _find_cache_output(
-                    current=record["current_tensor"],
-                    cache=record.get("cache_tensor"),
-                    graph_outputs=graph_outputs,
-                    shapes=shapes,
+            try:
+                pad_failures: dict[str, dict[str, Any]] = {}
+                pads = _constant_array(
+                    name=record["pad_extents_tensor"],
+                    initializers=initializers,
+                    numpy_helper=numpy_helper,
                     producer=producer,
+                    helper=helper,
+                    np_module=np,
+                    shapes=shapes,
+                    ranks=ranks,
+                    # A failed call must not poison the next fixed-point step.
+                    memo={},
+                    failures=pad_failures,
                 )
-            )
-            if isinstance(target, str) and target:
-                expected_shape = shapes.get(target)
-                if expected_shape is not None and len(expected_shape) == 5:
-                    record["cache_update_tensor"] = target
-                    record["cache_update_shape"] = expected_shape
-                    record["eligible_cache_update"] = True
-            if not record["eligible_cache_update"]:
-                record["errors"].append("cache_update:exact output was not proven")
+                if pads is None:
+                    record["pad_resolution"] = {
+                        "resolved": False,
+                        "tensor": record["pad_extents_tensor"],
+                        "failures": list(pad_failures.values()),
+                    }
+                    unresolved = pad_failures.get(record["pad_extents_tensor"], {})
+                    raise ValueError(
+                        "Pad extents are not static: "
+                        f"{unresolved.get('producer_op')}:{unresolved.get('reason')}"
+                    )
+                pads_list = [int(value) for value in np.asarray(pads).reshape(-1)]
+                if len(pads_list) != 10:
+                    raise ValueError(f"rank-5 Pad has invalid extents: {pads_list}")
+                prepad_shape = _unpad_shape(record["padded_shape"], pads_list)
+                cache = record.get("cache_tensor")
+                cache_shape = shapes.get(cache) if cache else None
+                if cache is not None and cache_shape is None:
+                    raise ValueError(
+                        f"feature cache {cache!r} has no static rank-5 shape"
+                    )
+                current_shape = _current_shape_from_prepad(
+                    prepad_shape=prepad_shape,
+                    cache_shape=cache_shape,
+                )
+                current = record["current_tensor"]
+                _record_static_shape(
+                    shapes=shapes,
+                    ranks=ranks,
+                    sources=shape_sources,
+                    tensor=current,
+                    shape=current_shape,
+                    source=f"causal_shape_solve:{record['call_site']}",
+                )
+                concat_node = record.get("concat_node")
+                if concat_node:
+                    concat = nodes_by_name[concat_node]
+                    _record_static_shape(
+                        shapes=shapes,
+                        ranks=ranks,
+                        sources=shape_sources,
+                        tensor=concat.output[0],
+                        shape=prepad_shape,
+                        source=f"causal_concat:{record['call_site']}",
+                    )
+                    _ordered_causal_concat_inputs(concat.input, shapes)
+                record.update(
+                    {
+                        "current_shape": current_shape,
+                        "current_shape_sources": shape_sources.get(current, []),
+                        "cache_shape": cache_shape,
+                        "cache_shape_sources": shape_sources.get(cache, [])
+                        if cache
+                        else [],
+                        "prepad_shape": prepad_shape,
+                        "pads": pads_list,
+                        "pad_resolution": {
+                            "resolved": True,
+                            "tensor": record["pad_extents_tensor"],
+                            "source": "onnx_static_expression",
+                            "failures": [],
+                        },
+                        "eligible_input": True,
+                    }
+                )
+
+                target = (
+                    module_records[index + 1].get("cache_tensor")
+                    if index < 2
+                    else _find_cache_output(
+                        current=current,
+                        cache=cache,
+                        graph_outputs=graph_outputs,
+                        shapes=shapes,
+                        producer=producer,
+                    )
+                )
+                if not isinstance(target, str) or not target:
+                    raise ValueError("exact cache-update tensor was not proven")
+                dependency_memo: dict[tuple[str, str], bool] = {}
+                if not _tensor_depends_on(target, current, producer, dependency_memo):
+                    raise ValueError(
+                        "cache update does not depend on current activation"
+                    )
+                if (
+                    cache is not None
+                    and current_shape[2] < 2
+                    and not _tensor_depends_on(target, cache, producer, dependency_memo)
+                ):
+                    raise ValueError("one-frame cache update ignores previous history")
+                expected_shape = _cache_update_shape(
+                    current_shape=current_shape,
+                    cache_shape=cache_shape,
+                )
+                _record_static_shape(
+                    shapes=shapes,
+                    ranks=ranks,
+                    sources=shape_sources,
+                    tensor=target,
+                    shape=expected_shape,
+                    source=f"causal_cache_update:{record['call_site']}",
+                )
+                record["cache_update_tensor"] = target
+                record["cache_update_shape"] = expected_shape
+                record["cache_update_shape_sources"] = shape_sources.get(target, [])
+                record["eligible_cache_update"] = True
+            except (KeyError, TypeError, ValueError) as exc:
+                record["errors"].append(f"input_boundary:{exc}")
 
     for record in records:
         if not record["eligible_input"]:
@@ -1209,11 +1580,31 @@ def analyze_fusion_graph(
                     for value in add.input
                     if value != (path[-1].output[0] if path else output_cast_tensor)
                 )
+                epilogue_output_shape = shapes.get(add.output[0])
+                if epilogue_output_shape is None:
+                    epilogue_output_shape = record["conv_output_shape"]
+                _record_static_shape(
+                    shapes=shapes,
+                    ranks=ranks,
+                    sources=shape_sources,
+                    tensor=add.output[0],
+                    shape=epilogue_output_shape,
+                    source=f"residual_add:{record['call_site']}",
+                )
+                residual_shape = shapes.get(residual)
+                if (
+                    residual_shape is not None
+                    and residual_shape != epilogue_output_shape
+                ):
+                    raise ValueError(
+                        "residual Add input shape differs from the Conv output: "
+                        f"residual={residual_shape}, conv={epilogue_output_shape}"
+                    )
                 record.update(
                     {
                         "epilogue_mode": "conv2_residual",
                         "epilogue_output_tensor": add.output[0],
-                        "epilogue_output_shape": shapes.get(add.output[0]),
+                        "epilogue_output_shape": epilogue_output_shape,
                         "epilogue_residual_tensor": residual,
                         "epilogue_remove_nodes": [node.name for node in [*path, add]],
                     }
@@ -1291,7 +1682,8 @@ def analyze_fusion_graph(
                         helper=helper,
                         np_module=np,
                         shapes=shapes,
-                        memo=constant_memo,
+                        ranks=ranks,
+                        memo={},
                     )
                     if value is not None and int(np.asarray(value).size) == channels:
                         gamma_candidates.append(name)
@@ -1332,6 +1724,7 @@ def analyze_fusion_graph(
             errors.append(f"{record['call_site']}: {record['errors']}")
     return {
         "schema_version": FUSION_SCHEMA_VERSION,
+        "analysis_schema_version": FUSION_ANALYSIS_SCHEMA_VERSION,
         "graph_kind": graph_kind,
         "source_file": str(Path(source_path).resolve()),
         "source_sha256": sha256_file(source_path),
@@ -1339,6 +1732,8 @@ def analyze_fusion_graph(
         "target_call_site_count": len(records),
         "focused_call_site_count": len(focused),
         "focused_complete": not errors,
+        "shape_inference_error": shape_inference_error,
+        "shape_evidence_tensor_count": len(shape_sources),
         "errors": errors,
         "call_sites": records,
     }
@@ -1667,6 +2062,7 @@ __all__ = [
     "EPILOGUE_PLUGIN",
     "FUSION_AUDIT_FILE",
     "FUSION_AUDIT_SCHEMA_VERSION",
+    "FUSION_ANALYSIS_SCHEMA_VERSION",
     "FUSION_BUILD_STATE_FILE",
     "FUSION_ENGINE_FILES",
     "FUSION_INSPECTOR_FILES",

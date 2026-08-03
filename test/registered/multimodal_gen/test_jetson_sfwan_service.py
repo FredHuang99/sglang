@@ -109,14 +109,21 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _validate_onnx_fp16_io_contract,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion import (
+    FUSION_ANALYSIS_SCHEMA_VERSION,
     FUSION_VARIANT,
+    _cache_update_shape,
     _constant_array,
+    _current_shape_from_prepad,
+    _find_cache_output,
     _ordered_causal_concat_inputs,
+    _record_static_shape,
     _require_only_consumers,
     _require_removable_subgraph,
+    _unpad_shape,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build import (
     _analysis_signature as _fusion_analysis_signature,
+    _load_analysis_contracts,
     _selected_call_sites as _fusion_selected_call_sites,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_perf_compare import (
@@ -6516,6 +6523,151 @@ class TestSfWanTensorRTFusionExperiment(CustomTestCase):
                 },
             )
 
+    def test_fusion_analysis_v2_solves_pad_current_and_cache_shapes(self):
+        self.assertEqual(FUSION_ANALYSIS_SCHEMA_VERSION, 2)
+        padded = [1, 96, 6, 62, 106]
+        pads = [0, 0, 1, 1, 1, 0, 0, 0, 1, 1]
+        prepad = _unpad_shape(padded, pads)
+        self.assertEqual(prepad, [1, 96, 5, 60, 104])
+        current = _current_shape_from_prepad(
+            prepad_shape=prepad,
+            cache_shape=[1, 96, 1, 60, 104],
+        )
+        self.assertEqual(current, [1, 96, 4, 60, 104])
+        self.assertEqual(
+            _cache_update_shape(current_shape=current, cache_shape=[1, 96, 1, 60, 104]),
+            [1, 96, 2, 60, 104],
+        )
+        self.assertEqual(
+            _cache_update_shape(
+                current_shape=[1, 96, 1, 60, 104],
+                cache_shape=[1, 96, 1, 60, 104],
+            ),
+            [1, 96, 2, 60, 104],
+        )
+
+        shapes: dict[str, list[int]] = {}
+        ranks: dict[str, int] = {}
+        sources: dict[str, list[str]] = {}
+        _record_static_shape(
+            shapes=shapes,
+            ranks=ranks,
+            sources=sources,
+            tensor="activation",
+            shape=current,
+            source="captured",
+        )
+        with self.assertRaisesRegex(ValueError, "static shape conflict"):
+            _record_static_shape(
+                shapes=shapes,
+                ranks=ranks,
+                sources=sources,
+                tensor="activation",
+                shape=[1, 96, 3, 60, 104],
+                source="manifest",
+            )
+
+    def test_final_cache_output_rejects_downstream_conv_dependencies(self):
+        exact = SimpleNamespace(
+            name="exact_slice",
+            op_type="Slice",
+            input=["current"],
+            output=["exact_cache"],
+        )
+        downstream_conv = SimpleNamespace(
+            name="downstream_conv",
+            op_type="Conv",
+            input=["current"],
+            output=["downstream_activation"],
+        )
+        downstream_slice = SimpleNamespace(
+            name="downstream_slice",
+            op_type="Slice",
+            input=["downstream_activation"],
+            output=["wrong_cache"],
+        )
+        producer = {
+            "exact_cache": exact,
+            "downstream_activation": downstream_conv,
+            "wrong_cache": downstream_slice,
+        }
+        result = _find_cache_output(
+            current="current",
+            cache=None,
+            graph_outputs={"exact_cache", "wrong_cache"},
+            shapes={
+                "current": [1, 96, 4, 60, 104],
+                "exact_cache": [1, 96, 2, 60, 104],
+                "wrong_cache": [1, 96, 2, 60, 104],
+            },
+            producer=producer,
+        )
+        self.assertEqual(result, "exact_cache")
+
+    def test_fusion_analysis_contracts_are_sha_bound_to_v5_audit_and_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            structural = {}
+            for kind in ("initial", "steady"):
+                structural[kind] = {
+                    "conv_signatures": [
+                        {
+                            "call_site": f"int8/{kind}/module_{index}/call_0",
+                            "input_shape": [1, 96, 3, 62, 106],
+                            "output_shape": [1, 96, 1, 60, 104],
+                        }
+                        for index in range(EXPECTED_CALL_SITES)
+                    ]
+                }
+            audit = {
+                "schema_version": QDQ_SCHEMA_VERSION,
+                "passed": True,
+                "complete": True,
+                "errors": [],
+                "structural": structural,
+            }
+            audit_path = root / "int8_audit_v5.json"
+            audit_path.write_text(json.dumps(audit), encoding="utf-8")
+            audit_sha = hashlib.sha256(audit_path.read_bytes()).hexdigest()
+            manifest = {
+                "int8_audit": {
+                    "report_file": audit_path.name,
+                    "report_sha256": audit_sha,
+                },
+                "cache": {
+                    "bindings": [
+                        {
+                            "input_name": f"cache_in_{index}",
+                            "output_name": f"cache_out_{index}",
+                            "shape": [1, 96, 2, 60, 104],
+                            "dtype": "float16",
+                        }
+                        for index in range(32)
+                    ]
+                },
+            }
+            contracts = _load_analysis_contracts(
+                base_root=root,
+                base_manifest=manifest,
+            )
+            self.assertEqual(
+                contracts["analysis_schema_version"],
+                FUSION_ANALYSIS_SCHEMA_VERSION,
+            )
+            self.assertEqual(contracts["int8_audit_sha256"], audit_sha)
+            self.assertEqual(len(contracts["graphs"]["initial"]), 84)
+            self.assertEqual(len(contracts["graphs"]["steady"]), 84)
+            self.assertEqual(len(contracts["cache_shapes"]["initial"]), 32)
+            self.assertEqual(len(contracts["cache_shapes"]["steady"]), 64)
+            self.assertEqual(len(contracts["contract_sha256"]), 64)
+
+            audit_path.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "SHA256"):
+                _load_analysis_contracts(
+                    base_root=root,
+                    base_manifest=manifest,
+                )
+
     def test_pad_metadata_constant_node_chain_is_static(self):
         class FakeHelper:
             @staticmethod
@@ -6649,6 +6801,18 @@ class TestSfWanTensorRTFusionExperiment(CustomTestCase):
         )
         self.assertEqual(np.asarray(exported).shape, (10,))
         self.assertEqual(np.asarray(exported).dtype, np.dtype(np.int64))
+        exported_from_rank_only = _constant_array(
+            name="exported_pads",
+            initializers={},
+            numpy_helper=numpy_helper,
+            producer=producer,
+            helper=FakeHelper,
+            np_module=np,
+            shapes={},
+            ranks={"activation": 5},
+        )
+        self.assertEqual(np.asarray(exported_from_rank_only).shape, (10,))
+        failures = {}
         self.assertIsNone(
             _constant_array(
                 name="runtime_pads",
@@ -6658,8 +6822,10 @@ class TestSfWanTensorRTFusionExperiment(CustomTestCase):
                 helper=FakeHelper,
                 np_module=np,
                 shapes={},
+                failures=failures,
             )
         )
+        self.assertEqual(failures["runtime_pads"]["reason"], "no_constant_producer")
 
     def test_profile_schema_v2_classifies_each_fusion_plugin(self):
         self.assertEqual(TRT_LAYER_PROFILE_SCHEMA_VERSION, 2)
