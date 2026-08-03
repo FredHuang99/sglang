@@ -1538,6 +1538,16 @@ TensorRT 10.3 会把 Wan RMSNorm 拆成 `ReduceL2`/`Reduce` 与 elementwise，
 固定图，且检查顺序先排除 attention、upsample 和 norm；不把所有 layout
 conversion 都宣称为 cache。
 
+INT8 v5 还有一条只对已审计 plan 生效的有序邻接规则。TensorRT 10.3
+compiler backend 会把部分 activation Q/DQ + layout 降成匿名
+`TranReshSlic`、`ReshTran` 等 `kgen`，原 ONNX 名称完全消失。catalog 仅将
+“紧邻 v5 audit 已映射 INT8 Conv 之前、连续不超过三个、且 opcode 明确是
+transpose/reshape/slice 的 kgen”归入 `target_qdq_cast_reformat`；相同名字若
+不紧邻目标 Conv，仍保留为 `other`。这利用了 Inspector 的物理执行顺序和
+84 个 audited consumer，而不是凭 `int8` 文本猜测。`CastCastAddCast`、
+`CastCastMulCast` 以及指向 `PWN(.../Add)` 的 Reformat 则是 residual/norm
+外围，归入 `norm_activation_residual`。
+
 FP16 映射不是靠 `Conv` 字符串猜测：profile builder 沿用 v5 的静态 weight
 initializer 解析得到 28 个逻辑模块和 84 个原始 ONNX node name，再以完整
 node-name 边界匹配 Inspector `Name`/`Metadata`；因此 `Conv` 不会误命中

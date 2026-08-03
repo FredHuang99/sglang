@@ -558,6 +558,15 @@ attention, upsample, and norm paths have been excluded, exported causal-state
 work.  A generic Reformat still remains `other` unless it has explicit cache
 evidence, so ordinary layout conversion is not mislabeled as feature-cache
 traffic.
+For the audited INT8 v5 plan, TensorRT 10.3 may erase the ONNX Q/DQ name and
+emit anonymous `kgen` layout kernels immediately before a target Conv. The
+catalog classifies only a contiguous run of at most three recognized
+transpose/reshape/slice kernels feeding an audit-mapped INT8 Conv as
+`target_qdq_cast_reformat`; the same generated names elsewhere remain
+`other`. Compiler `CastCastAddCast`/`CastCastMulCast` kernels and Reformat
+nodes tied to a `PWN(.../Add)` residual are classified as
+`norm_activation_residual`. This ordered, audit-backed rule is needed for
+Orin's compiler backend and does not infer precision from an `int8` substring.
 A fused physical layer is timed once even when it maps to several
 logical call sites; its time is never divided among those sites. Unreliable
 mappings remain `other` instead of being guessed from a name. Each catalog is

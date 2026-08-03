@@ -623,18 +623,12 @@ def _classify_layer(
             "int8/steady/",
         )
     )
-    if target_quantization_scope and any(
-        marker in haystack
-        for marker in (
-            "quantizelinear",
-            "dequantizelinear",
-            "quantize",
-            "dequantize",
-            "reformat",
-            " cast",
-            "cast ",
-        )
-    ):
+    # The Q/DQ rewriter owns these namespaces.  TensorRT 10.3 may lower a
+    # Cast/Q/DQ node to a zero-cost NoOp or Constant and retain only the scoped
+    # ONNX name, so requiring the physical layer type to still say Cast or
+    # Reformat would incorrectly leave valid quantization scaffolding in
+    # ``other``.
+    if target_quantization_scope:
         return "target_qdq_cast_reformat", "name_rule"
     if any(marker in haystack for marker in ("attention", "sdpa", "scaled_dot")):
         return "attention", "name_rule"
@@ -653,6 +647,18 @@ def _classify_layer(
     norm_or_activation = any(
         marker in haystack for marker in ("/norm", "norm_", "reducel2")
     ) or any(marker in haystack for marker in ("/nonlinearity", "sigmoid", "tanh"))
+    compiler_elementwise = "kgen" in type_text and any(
+        marker in haystack
+        for marker in (
+            "castcastaddcast",
+            "castcastmulcast",
+            "castcastsubcast",
+            "castcastdivcast",
+        )
+    )
+    residual_reformat = (
+        "reformat" in type_text and "pwn(" in haystack and "/add" in haystack
+    )
     if (
         any(
             marker in haystack
@@ -666,6 +672,8 @@ def _classify_layer(
             )
         )
         or norm_or_activation
+        or compiler_elementwise
+        or residual_reformat
     ):
         return "norm_activation_residual", "name_rule"
     cache_scope = any(
@@ -716,6 +724,57 @@ def _classify_layer(
     if any(marker in type_text for marker in ("convolution", "conv")):
         return "non_target_conv", "inspector"
     return "other", "unknown"
+
+
+def _refine_int8_boundary_kernels(entries: list[dict[str, Any]]) -> None:
+    """Classify anonymous compiler layout kernels feeding audited INT8 Conv.
+
+    TensorRT 10.3's compiler backend erases the ONNX Q/DQ name from several
+    physical activation-boundary kernels.  On Orin these appear as short
+    ``kgen`` runs such as ``TranReshSlic -> ReshTran`` immediately before a
+    v5-audited INT8 convolution.  The ordered Inspector catalog and the audit
+    mapping together provide stronger evidence than the generated name alone:
+    the consumer is one of the exact 84 target call sites and its audited
+    activation input is INT8.
+
+    Only a contiguous run of at most three recognized layout kernels directly
+    preceding such a consumer is reclassified.  Generic kgen/Reformat work
+    elsewhere remains ``other``; this avoids turning proximity to an arbitrary
+    convolution into quantization evidence.
+    """
+
+    layout_markers = (
+        "tranreshslic",
+        "tranresh",
+        "reshtran",
+        "slicresh",
+        "__myl_tran_",
+    )
+    target_indices = [
+        index
+        for index, entry in enumerate(entries)
+        if entry["category"] == "target_quantized_conv"
+    ]
+    for target_index in target_indices:
+        for offset in range(1, 4):
+            index = target_index - offset
+            if index < 0:
+                break
+            entry = entries[index]
+            if entry["category"] != "other":
+                break
+            type_text = " ".join(
+                (str(entry.get("layer_type", "")), str(entry.get("parameter_type", "")))
+            ).lower()
+            evidence = " ".join(
+                (str(entry.get("name", "")), str(entry.get("tactic_name", "")))
+            ).lower()
+            if "kgen" not in type_text or not any(
+                marker in evidence for marker in layout_markers
+            ):
+                break
+            entry["category"] = "target_qdq_cast_reformat"
+            entry["classification_source"] = "int8_audited_boundary"
 
 
 def build_physical_layer_catalog(
@@ -827,6 +886,8 @@ def build_physical_layer_catalog(
         )
     if not entries:
         raise ValueError("TensorRT Inspector returned no physical layers")
+    if precision == "int8":
+        _refine_int8_boundary_kernels(entries)
     if precision == "int8" or fp16_targets:
         mapped_call_sites = {
             call_site for entry in entries for call_site in entry["logical_call_sites"]

@@ -6011,6 +6011,129 @@ class TestSfWanTensorRTLayerProfile(CustomTestCase):
             ],
         )
 
+    def test_int8_catalog_classifies_anonymous_audited_boundary_kernels(self):
+        int8_audit = {
+            "schema_version": QDQ_SCHEMA_VERSION,
+            "passed": True,
+            "complete": True,
+            "errors": [],
+            "plan_sha256": {"initial": "a" * 64},
+            "tactics": {
+                "initial": {
+                    "passed": True,
+                    "mapped_count": 2,
+                    "errors": [],
+                    "matches": {
+                        "call-a": {
+                            "layer_names": ["target-a"],
+                            "metadata": [],
+                        },
+                        "call-b": {
+                            "layer_names": ["target-b"],
+                            "metadata": [],
+                        },
+                    },
+                }
+            },
+        }
+        layers = [
+            {
+                "Name": "__myl_TranResh_myl_unrelated_0",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "qdq/initial/activation/a/call_0/cast_to_fp32",
+                "LayerType": "NoOp",
+            },
+            {
+                "Name": "cache_in_000 concat",
+                "LayerType": "Concatenation",
+            },
+            {
+                "Name": "__myl_TranReshSlic_myl_a_0",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "__myl_ReshTran_myl_a_1",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "target-a",
+                "LayerType": "CaskConvolution",
+                "ParameterType": "Convolution",
+            },
+            {
+                "Name": "qdq/initial/output/a/call_0/cast_to_fp16",
+                "LayerType": "NoOp",
+            },
+            {
+                "Name": "Reformatting CopyNode to PWN(/decoder/resnet/Add)",
+                "LayerType": "Reformat",
+            },
+            {
+                "Name": "__myl_CastCastAddCast_myl_residual_0",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "__myl_CastCastMulCast_myl_norm_0",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "__myl_TranResh_myl_not_adjacent_0",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "/decoder/norm/ReduceL2",
+                "LayerType": "Reduce",
+            },
+            {
+                "Name": "qdq/initial/activation/b/call_0/quantize",
+                "LayerType": "Reformat",
+            },
+            {
+                "Name": "__myl_SlicResh_myl_b_0",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "__myl_Tran_myl_b_1",
+                "LayerType": "kgen",
+            },
+            {
+                "Name": "target-b",
+                "LayerType": "CaskConvolution",
+                "ParameterType": "Convolution",
+            },
+        ]
+        with mock.patch(
+            "sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_profile."
+            "EXPECTED_CALL_SITES",
+            2,
+        ):
+            catalog = build_physical_layer_catalog(
+                engine_kind="initial",
+                plan_sha256="a" * 64,
+                inspector={"Layers": layers},
+                precision="int8",
+                int8_audit=int8_audit,
+            )
+
+        categories = [layer["category"] for layer in catalog["layers"]]
+        self.assertEqual(categories[0], "other")
+        self.assertEqual(categories[10], "other")
+        self.assertEqual(categories[1], "target_qdq_cast_reformat")
+        self.assertEqual(categories[6], "target_qdq_cast_reformat")
+        self.assertEqual(categories[2], "cache_layout_copy")
+        self.assertEqual(categories[5], "target_quantized_conv")
+        self.assertEqual(categories[15], "target_quantized_conv")
+        for index in (3, 4, 13, 14):
+            self.assertEqual(categories[index], "target_qdq_cast_reformat")
+            self.assertEqual(
+                catalog["layers"][index]["classification_source"],
+                "int8_audited_boundary",
+            )
+        for index in (7, 8, 9, 11):
+            self.assertEqual(categories[index], "norm_activation_residual")
+
     def test_fp16_catalog_maps_the_same_84_target_call_sites_exactly(self):
         target_map = []
         layers = []
