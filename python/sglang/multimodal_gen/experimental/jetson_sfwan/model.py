@@ -39,6 +39,7 @@ class ModelLoadConfig(msgspec.Struct, frozen=True, kw_only=True):
     dit_cpu_offload: bool = False
     vae_cpu_offload: bool = False
     enable_profile: bool = False
+    enable_trt_layer_profile: bool = False
     enable_nvtx: bool = False
 
 
@@ -1273,6 +1274,7 @@ class SfWanVaeModel:
             model_path=load_config.model_path,
             device=self.device,
             enable_profile=load_config.enable_profile,
+            enable_trt_layer_profile=load_config.enable_trt_layer_profile,
             enable_nvtx=load_config.enable_nvtx,
         )
         manifest = self._trt_runtime.manifest
@@ -1324,6 +1326,12 @@ class SfWanVaeModel:
         else:
             self.vae.reset_causal_decode_state()
         self._request_active = True
+
+    @property
+    def trt_layer_profile_metadata(self) -> dict[str, Any] | None:
+        if self._trt_runtime is None:
+            return None
+        return self._trt_runtime.layer_profile_metadata
 
     def finish_request(self) -> None:
         try:

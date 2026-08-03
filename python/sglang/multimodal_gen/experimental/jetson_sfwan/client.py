@@ -409,6 +409,36 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
     timeout = httpx.Timeout(args.request_timeout_seconds)
     iterations = []
     async with httpx.AsyncClient(timeout=timeout) as client:
+        engine_response = await client.get(f"{args.server_url.rstrip('/')}/v1/engine")
+        engine_response.raise_for_status()
+        engine_status = engine_response.json()
+        engine_contract = engine_status.get("contract", {})
+        if not isinstance(engine_contract, dict):
+            raise RuntimeError("VAE server returned an invalid engine contract")
+        layer_profile_enabled = bool(
+            engine_contract.get("trt_layer_profile_enabled", False)
+        )
+        layer_profile_path = getattr(args, "trt_layer_profile_json", None)
+        summary_path = getattr(args, "summary_json", None)
+        if (
+            layer_profile_path is not None
+            and summary_path is not None
+            and Path(layer_profile_path).expanduser().resolve()
+            == Path(summary_path).expanduser().resolve()
+        ):
+            raise ValueError(
+                "--trt-layer-profile-json and --summary-json must use different files"
+            )
+        if layer_profile_enabled and layer_profile_path is None:
+            raise ValueError(
+                "the VAE server has TensorRT layer profiling enabled; "
+                "provide --trt-layer-profile-json"
+            )
+        if layer_profile_path is not None and not layer_profile_enabled:
+            raise ValueError(
+                "--trt-layer-profile-json requires a VAE server started with "
+                "--enable-trt-layer-profile"
+            )
         for index in range(args.warmup + args.repeat):
             iterations.append(
                 await _run_profile_iteration(
@@ -420,7 +450,7 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 )
             )
     measurements = [_profile_measurement_view(item) for item in iterations]
-    return {
+    summary = {
         "mode": "profile-vae",
         "warmup": args.warmup,
         "repeat": args.repeat,
@@ -438,6 +468,101 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
             if "_saved_output_path" in item
         ],
     }
+    if layer_profile_enabled:
+        from .vae_trt_profile import (
+            TRT_LAYER_PROFILE_SCHEMA_VERSION,
+            aggregate_trt_layer_profile_iterations,
+            write_trt_layer_profile_artifact,
+        )
+
+        metadata_values = []
+        for measurement in measurements:
+            execution = measurement.get("profile_execution")
+            metadata = (
+                execution.pop("trt_layer_profile_metadata", None)
+                if isinstance(execution, dict)
+                else None
+            )
+            if not isinstance(metadata, dict):
+                raise RuntimeError(
+                    "TensorRT layer-profile result has no catalog metadata"
+                )
+            metadata_values.append(metadata)
+        metadata = metadata_values[0]
+        if any(value != metadata for value in metadata_values[1:]):
+            diagnostic = {
+                "schema_version": TRT_LAYER_PROFILE_SCHEMA_VERSION,
+                "validation": {
+                    "valid_for_optimization_decision": False,
+                    "catalog_stable": False,
+                    "warnings": [
+                        "TensorRT layer-profile metadata drifted across iterations"
+                    ],
+                },
+                "iterations": measurements,
+                "metadata_by_iteration": metadata_values,
+            }
+            reference = write_trt_layer_profile_artifact(
+                path=layer_profile_path,
+                detailed=diagnostic,
+            )
+            raise RuntimeError(
+                "TensorRT layer-profile metadata drifted across iterations; "
+                f"diagnostic evidence was written to {reference['path']}"
+            )
+        try:
+            aggregated = aggregate_trt_layer_profile_iterations(
+                measurements,
+                catalogs=metadata["catalogs"],
+                environment=metadata.get("environment"),
+                precision=metadata["precision"],
+                plan_sha256=metadata["plan_sha256"],
+                qdq_schema_version=metadata.get("qdq_schema_version"),
+                weight_encoding=metadata.get("weight_encoding"),
+            )
+        except BaseException as exc:
+            diagnostic = {
+                "schema_version": TRT_LAYER_PROFILE_SCHEMA_VERSION,
+                "validation": {
+                    "valid_for_optimization_decision": False,
+                    "warnings": [f"{type(exc).__name__}: {exc}"],
+                },
+                "environment": metadata.get("environment", {}),
+                "metadata": metadata,
+                "iterations": measurements,
+            }
+            reference = write_trt_layer_profile_artifact(
+                path=layer_profile_path,
+                detailed=diagnostic,
+            )
+            raise RuntimeError(
+                "TensorRT layer-profile aggregation failed; diagnostic evidence "
+                f"was written to {reference['path']}"
+            ) from exc
+
+        reference = write_trt_layer_profile_artifact(
+            path=layer_profile_path,
+            detailed=aggregated["detailed"],
+        )
+        layer_summary = dict(aggregated["summary"])
+        layer_summary["detailed_artifact"] = reference
+        summary["trt_layer_profile_summary"] = layer_summary
+
+        # The normal summary retains model-execution metrics and the aggregate,
+        # but the per-physical-layer vectors live only in the detailed artifact.
+        for measurement in measurements:
+            execution = measurement.get("profile_execution")
+            chunks = execution.get("chunks", []) if isinstance(execution, dict) else []
+            for chunk in chunks:
+                if isinstance(chunk, dict):
+                    chunk.pop("trt_layer_profile", None)
+
+        if not layer_summary["valid_for_optimization_decision"]:
+            raise RuntimeError(
+                "TensorRT layer-profile evidence is not valid for an optimization "
+                f"decision; inspect {reference['path']}"
+            )
+    return summary
 
 
 async def _run_dit_profile_iteration(
@@ -571,6 +696,13 @@ def _build_parser() -> argparse.ArgumentParser:
     profile.add_argument("--seed", type=int, default=DEFAULT_SEED)
     profile.add_argument("--warmup", type=int, default=0)
     profile.add_argument("--repeat", type=int, default=1)
+    profile.add_argument(
+        "--trt-layer-profile-json",
+        help=(
+            "separate detailed TensorRT physical-layer artifact; required "
+            "when the VAE server enables fine-grained layer profiling"
+        ),
+    )
     profile.add_argument(
         "--save-video",
         "--save-output",

@@ -88,6 +88,7 @@ class ServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     vae_cpu_offload: bool = False
     latent_transport: LatentTransport = "http"
     enable_profile: bool = False
+    enable_trt_layer_profile: bool = False
     enable_nvtx: bool = False
 
 
@@ -130,6 +131,18 @@ class SfWanRuntime:
             raise ValueError("--transfer-queue-depth must be positive")
         if config.chunk_timeout_seconds <= 0:
             raise ValueError("--chunk-timeout-seconds must be positive")
+        if config.enable_trt_layer_profile:
+            if not config.enable_profile:
+                raise ValueError("--enable-trt-layer-profile requires --enable-profile")
+            if config.role != "vae":
+                raise ValueError(
+                    "--enable-trt-layer-profile is valid only for --role vae"
+                )
+            if not _uses_trt_vae(config.vae_precision):
+                raise ValueError(
+                    "--enable-trt-layer-profile requires --vae-precision "
+                    "fp16_trt or int8_trt"
+                )
         if config.role == "monolithic" and config.vae_url is not None:
             raise ValueError("--vae-url is not valid for the monolithic role")
         if config.role in {"monolithic", "vae"}:
@@ -191,6 +204,7 @@ class SfWanRuntime:
             dit_cpu_offload=self.config.dit_cpu_offload,
             vae_cpu_offload=self.config.vae_cpu_offload,
             enable_profile=self.config.enable_profile,
+            enable_trt_layer_profile=self.config.enable_trt_layer_profile,
             enable_nvtx=self.config.enable_nvtx,
         )
         factory = self._model_factory or self._default_model_factory()
@@ -353,6 +367,10 @@ class SfWanRuntime:
             raise ValueError("latent jobs are accepted only by the VAE role")
         if spec.source == "profile" and not self.config.enable_profile:
             raise ValueError("VAE profiling requires the server flag --enable-profile")
+        if self.config.enable_trt_layer_profile and spec.source != "profile":
+            raise ValueError(
+                "a TensorRT layer-profile server accepts source=profile jobs only"
+            )
         if spec.transport != self.config.latent_transport:
             raise ValueError(
                 f"VAE server accepts transport={self.config.latent_transport}, "
@@ -531,6 +549,7 @@ class SfWanRuntime:
     def engine_status(self) -> EngineStatus:
         contract = dict(getattr(self.model, "contract", {}))
         contract["profile_enabled"] = self.config.enable_profile
+        contract["trt_layer_profile_enabled"] = self.config.enable_trt_layer_profile
         if self.engine is None:
             return EngineStatus(
                 role=self.config.role,
@@ -1011,6 +1030,20 @@ class SfWanRuntime:
                             for chunk in execution_chunks
                         ),
                     }
+                    if self.config.enable_trt_layer_profile:
+                        layer_profile_metadata = getattr(
+                            self.model,
+                            "trt_layer_profile_metadata",
+                            None,
+                        )
+                        if layer_profile_metadata is None:
+                            raise RuntimeError(
+                                "TensorRT layer profiling completed without both "
+                                "initial and steady physical-layer catalogs"
+                            )
+                        profile_execution["trt_layer_profile_metadata"] = (
+                            layer_profile_metadata
+                        )
                     record.metrics.update(
                         {
                             "vae_reset_ms": (reset_ms if reset_completed else None),
@@ -1344,6 +1377,14 @@ def _parse_args() -> ServerConfig:
         default=False,
     )
     parser.add_argument("--enable-profile", action="store_true")
+    parser.add_argument(
+        "--enable-trt-layer-profile",
+        action="store_true",
+        help=(
+            "enable diagnostic TensorRT IProfiler callbacks for a dedicated "
+            "VAE profile server"
+        ),
+    )
     parser.add_argument("--enable-nvtx", action="store_true")
     args = parser.parse_args()
     return ServerConfig(
@@ -1365,6 +1406,7 @@ def _parse_args() -> ServerConfig:
         vae_cpu_offload=args.vae_cpu_offload,
         latent_transport=args.latent_transport,
         enable_profile=args.enable_profile,
+        enable_trt_layer_profile=args.enable_trt_layer_profile,
         enable_nvtx=args.enable_nvtx,
     )
 

@@ -20,6 +20,9 @@
   存在。
 - `profile_execution` 只表示模型执行。queue、HTTP、parse、D2H/H2D、
   RGB D2H 和 MP4 不得与它相加。
+- TensorRT 逐物理 layer 的细粒度 profile 是另一个默认关闭的诊断开关；
+  只允许专用 `role=vae` profile server。它会扰动执行，只用于性能归因，
+  不能替代关闭该开关后得到的 `trt_engine_cuda_ms` 真实性能结果。
 - CPU offload 的启动默认值固定为 T5 开、DiT 关、VAE 关；三个选择由
   server CLI 明确传到 loader，SGLang 自动调优不会改写它们。完整 C10d
   环境使用原 FSDP 路径；Jetson 无 C10d 环境把 T5/DiT offload 映射为
@@ -37,6 +40,8 @@
 | [`vae_trt_build.py`](vae_trt_build.py) | 在目标 Orin 上捕获原生 Wan VAE、收集 dummy scale、导出 initial/steady ONNX，执行全 signature preflight、事务式 timing cache、full-plan tactic audit 与断点恢复 | 不进入 server 热路径，不实现新的 decoder 数学 |
 | [`vae_trt_qdq.py`](vae_trt_qdq.py) | 对 ONNX 中 28 个 residual Conv3d 的 84 个展开 call site 分别插入 input/output Q/DQ，并支持独立 FP32-weight Q/DQ 或预量化 INT8-weight DQ，做结构审计并提取真实 Conv signature | 不加载 Torch、TensorRT 或模型权重 |
 | [`vae_trt_runtime.py`](vae_trt_runtime.py) | 校验 manifest/plan，绑定 PyTorch CUDA tensor，执行 initial/steady context 并管理双 cache bank | 不接 HTTP，不执行 latent 传输，不提供动态 shape |
+| [`vae_trt_profile_build.py`](vae_trt_profile_build.py) | 从同一 opset-19 FP16 源图构建独立 DETAILED FP16 profile plans，生成 Inspector/profile manifest，并以独立 state/timing cache 支持断点恢复 | 不重建已审计 INT8 v5 plan，不覆盖 production artifact |
+| [`vae_trt_profile.py`](vae_trt_profile.py) | 按需挂载 TensorRT `IProfiler`、建立物理 layer catalog、校验逐 chunk callback，并汇总详细/紧凑 profile 产物 | 开关关闭时不导入，不参与普通 VAE 执行 |
 | [`engine.py`](engine.py) | request-level FCFS、job 状态、HTTP DiT→VAE sender | 不做模型 forward |
 | [`transport.py`](transport.py) | pinned H2D、POSIX SHM、CUDA host registration、SHM sender | 不决定请求顺序 |
 | [`server.py`](server.py) | 角色装配、FastAPI 接口、model thread、job handler、MP4 | 不实现 Transformer/VAE 数学 |
@@ -94,6 +99,10 @@ flowchart LR
 | `stage_shared_chunk_to_device()` | VAE handler | shared slot → `StagedDeviceChunk` | 只创建 VAE 本地 H2D event |
 | `create_app()` | server CLI/tests | config/model factory → FastAPI app | endpoint 只做验证/排队，不在 event loop 跑模型 |
 | `_write_mp4()` | mono/VAE handler | CPU uint8 chunks → MP4 | 整体编码时间与模型 execution 分开 |
+| `validate_trt_layer_profile_manifest()` | TRT runtime 启动 | 独立 profile manifest + precision → 已解析 plan/Inspector contract | 绑定 source/plan/audit SHA；只在细粒度开关开启时调用 |
+| `build_physical_layer_catalog()` | `TensorRTVaeRuntime` | Inspector + FP16 source-node map 或 v5 audit → 有序物理 layer catalog | FP16/INT8 精确对齐同一组 84 个目标 call site；融合 layer 只出现一次；证据不足归入 `other` |
+| `aggregate_trt_layer_profile_iterations()` | profile-vae client | warmup/measured chunk records → detailed artifact + compact summary | 统计只使用 measured；保留 warmup 原始数组 |
+| `detailed_artifact_reference()` | profile-vae client | detailed JSON 路径/内容 → 绝对路径 + SHA256 | summary 不复制完整 catalog 和时间数组 |
 
 ## 3. 数据与数值契约
 
@@ -181,6 +190,7 @@ latent：
 | `model.py` | `_ComponentSet` | 一个进程一次；monolithic 两角色共享 | 收口 SGLang loader 和 world-size=1 初始化 |
 | `model.py` | `SfWanDitModel` / `SfWanVaeModel` / `SfWanMonolithicModel` | 唯一 model executor thread 使用 | 三种明确数值角色；不做通用 pipeline 抽象 |
 | `vae_trt_runtime.py` | `TensorRTVaeRuntime` | VAE model 创建一次；两个 context/cache bank 维持到 server 退出 | 把 request 的 chunk 0 路由到 initial engine，其余 chunk 路由到 steady engine |
+| `vae_trt_profile.py` | `TrtLayerProfileCapture` | 细粒度开关开启时每个 initial/steady context 各一个；server 生命周期 | 串行维护 active capture、callback 顺序和稳定 catalog；异常时 fail closed |
 | `runtime/distributed/local_single_process.py` | `LocalSingleProcessGroupCoordinator` | 无 C10d 进程初始化一次；各逻辑并行组共享 | 提供单 rank identity collective；跨 rank P2P 明确失败 |
 | `engine.py` | `ReceivedChunk` | `VaeJobRecord` 从接收到消费 | 把 `data`（HTTP body view、SHM ref 或 CPU fake）、digest、接收时间和 ingress 诊断绑在一起 |
 | `engine.py` | `PendingChunk` | HTTP DiT sender 从 D2H 启动到序列化完成 | 保持 GPU source、pinned slot 和 ready event 生命周期 |
@@ -233,6 +243,8 @@ pickle。CUDA VAE 使用 `parse_latent_safetensors_payload()` 做严格 header
 - `vae_cpu_offload`：VAE 是否在每个三 latent chunk 周围整模型搬入/搬出；
   默认关。
 - `enable_profile`：是否执行低层计时。
+- `enable_trt_layer_profile`：是否在专用 VAE profile server 上挂载
+  TensorRT `IProfiler`；默认关，开启时必须同时启用 `enable_profile`。
 - `enable_nvtx`：是否发出 NVTX range，和计时开关独立。
 
 #### `_ComponentSet`
@@ -925,6 +937,7 @@ throughput。`profile_execution` 与 raw lifecycle/transfer 指标必须分别�
 | `--dit-cpu-offload [true\|false]` | 关 | mono/dit | 完整 C10d 为单卡 FSDP inference；Jetson local 为 layerwise；权重搬迁计入 forward |
 | `--vae-cpu-offload [true\|false]` | 关 | mono/vae | 每个三 latent chunk 前整模型 H2D、结果组装后整模型 D2H |
 | `--enable-profile` | 关 | 全部 | 开启详细计时并允许 profile request |
+| `--enable-trt-layer-profile` | 关 | 仅 vae | 仅与 `--enable-profile` 和 TRT precision 联用；把 server 限定为 VAE profile-only 并启用 TensorRT `IProfiler`；见第 15 节 |
 | `--enable-nvtx` | 关 | 全部 | 独立 NVTX range |
 
 ### Client generate
@@ -950,6 +963,7 @@ throughput。`profile_execution` 与 raw lifecycle/transfer 指标必须分别�
 | `--repeat R` | R 个完整 measured 请求 |
 | `profile-dit --num-frames` | 决定所有 DiT chunk 状态都被覆盖 |
 | `profile-vae --seed` | 完整 FP32 dummy latent 的 CPU RNG seed |
+| `profile-vae --trt-layer-profile-json PATH` | 细粒度 TRT server 必填；写完整 catalog、逐 layer 数组和 validation，summary 只保存其路径/SHA 与紧凑聚合 |
 | `--save-video` | VAE profile 额外做 RGB/MP4，但不并入 execution |
 
 ## 12. 推荐代码阅读路径
@@ -1301,3 +1315,329 @@ profile 关闭时，kind/precision 仍作为低成本状态存在，但三个 `*
 - [ ] reset 后下一请求的 chunk 0 是否重新走 initial？
 - [ ] `fp32/fp16` 启动是否完全不导入 TensorRT runtime？
 - [ ] monolithic TRT 是否未加载 PyTorch VAE，且仍按 chunk 同步交错？
+
+## 15. TensorRT 细粒度 layer profile
+
+### 15.1 定位：诊断模式，不是新的性能主路径
+
+细粒度 layer profile 是为了给下一轮量化性能摸高提供证据的中间工具。它
+回答“时间落在哪个 TensorRT 物理 layer/算子类别”，不改变模型数学，也不
+取代 production latency：
+
+| 模式 | server 开关 | 回答的问题 | 是否用于最终延迟对比 |
+|---|---|---|---|
+| 普通 TensorRT profile | `--enable-profile` | denorm、cast、整块 engine、finalize 各耗时多少 | 是；重点看 `trt_engine_cuda_ms` |
+| TensorRT 细粒度 profile | 再加 `--enable-trt-layer-profile` | engine 内物理 layer 和算子类别占比 | 否；`IProfiler` callback/report 会扰动执行 |
+| NVTX | 独立 `--enable-nvtx` | 外部 profiler 的 range 归属 | 不隐式开启上述任何一种 profile |
+
+隔离不变量：
+
+- 默认关闭；关闭时不读 profile manifest、不导入 `vae_trt_profile.py`、不
+  构造 `IProfiler`、不访问 context profile API。
+- 只支持 `role=vae`、`source=profile` 和 `fp16_trt/int8_trt`。
+- 开启后普通 disaggregated latent job 会被拒绝；它必须是专用 profile
+  server，避免带插桩与不带插桩的请求混跑。
+- 不支持 monolithic、DiT 或 PyTorch VAE。
+- 不改 Q/DQ v5、weight encoding、activation scale、32 个 FP16 feature-cache
+  binding、双 bank、FCFS、HTTP ingress 和 chunk 顺序。
+
+### 15.2 两种 precision 如何保证可比
+
+```mermaid
+flowchart TD
+    SourceInitial["initial_fp16_opset19.onnx"]
+    SourceSteady["steady_fp16_opset19.onnx"]
+    BuildFP16["vae_trt_profile_build.py<br/>DETAILED FP16 build"]
+    FP16Plans["initial/steady_fp16_layer_profile.plan"]
+
+    QDQV5["Q/DQ v5 rewrite"]
+    Audit["int8_audit_v5.json<br/>84/84 + tactic fail-closed"]
+    INT8Plans["existing initial/steady_int8_qdq_v5.plan"]
+
+    Runtime["TensorRTVaeRuntime<br/>fine profile enabled"]
+
+    SourceInitial --> BuildFP16
+    SourceSteady --> BuildFP16
+    BuildFP16 --> FP16Plans --> Runtime
+
+    SourceInitial --> QDQV5
+    SourceSteady --> QDQV5
+    QDQV5 --> Audit --> INT8Plans --> Runtime
+```
+
+FP16 control 必须直接来自 Q/DQ 重写之前的同一份真实 opset-19 source，不能
+拿历史 opset-17 plan 当“同源控制”。INT8 则直接引用已经通过 v5 tactic audit
+的 DETAILED runtime plan；profile builder 绝不重新构建第二份 INT8 plan。
+因此两者共享 initial/steady 展开方式、shape 和 cache ABI，而量化拓扑只有
+INT8 分支存在。
+
+### 15.3 独立 profile-plan 构建与 artifact 所有权
+
+`vae_trt_profile_build.py` 的输入是一个已经完成 production build 的 engine
+目录。它新增且只管理：
+
+```text
+initial_fp16_layer_profile.plan
+steady_fp16_layer_profile.plan
+initial_fp16_layer_profile_inspector.json
+steady_fp16_layer_profile_inspector.json
+trt_layer_profile_manifest.json
+trt_layer_profile_build_state.json
+trt_layer_profile_timing.cache
+```
+
+它不会覆盖：
+
+- `manifest.json`；
+- FP16 production plan；
+- `initial/steady_int8_qdq_v5.plan`；
+- `int8_audit_v5.json`；
+- production 或 v5 timing cache。
+
+构建状态绑定 source ONNX SHA、plan SHA、SM、TensorRT/CUDA 版本和构建
+参数。`--resume` 只跳过 identity 完全一致且已经验证成功的 stage。
+profile timing cache 使用独立文件；builder 先持有 candidate bytes，只有
+plan 反序列化、I/O 和 32-cache-binding 校验全部通过后才原子提交，失败或
+中断不污染稳定 cache。stage 不会在审计前写成 completed。
+
+```mermaid
+flowchart TD
+    Start["profile builder --resume"]
+    Identity["校验 source/plan/env/build identity"]
+    Initial{"initial FP16 profile stage valid?"}
+    BuildInitial["build DETAILED initial candidate"]
+    ValidateInitial["validate latent/RGB + 32 FP16 cache outputs"]
+    Steady{"steady FP16 profile stage valid?"}
+    BuildSteady["build DETAILED steady candidate"]
+    ValidateSteady["validate latent/RGB + 32 FP16 cache inputs/outputs"]
+    Int8["validate existing audited INT8 v5 plan SHA"]
+    Commit["atomically write timing cache/state/manifest"]
+
+    Start --> Identity --> Initial
+    Initial -->|yes| Steady
+    Initial -->|no| BuildInitial --> ValidateInitial --> Steady
+    Steady -->|yes| Int8
+    Steady -->|no| BuildSteady --> ValidateSteady --> Int8
+    Int8 --> Commit
+```
+
+### 15.4 Server 启动约束与可观察 contract
+
+`--enable-trt-layer-profile` 必须与以下设置同时成立：
+
+| 约束 | 原因 |
+|---|---|
+| `--enable-profile` | 细粒度结果仍需与已有 chunk CUDA Event 区间配对 |
+| `--role vae` | 单 worker、完整请求级 feature-cache 所有权是 profiler 串行化前提 |
+| `--vae-precision fp16_trt\|int8_trt` | PyTorch VAE 没有 TensorRT execution context |
+| `--vae-engine-dir` | profile manifest、profile plan 或 v5 audit/plan 的来源 |
+| `trt_layer_profile_manifest.json` 有效 | 绑定 source、plan、I/O 和 environment identity |
+
+启动时逐项探测 TensorRT 10.3 API：`IProfiler`、context `profiler`、
+`enqueue_emits_profile` 和 `report_to_profiler`。任一缺失都立即报错，不能像
+过去错误假设 builder API 一样在真实执行中才暴露，也不能静默降级成只有
+整块 Event 的结果。
+
+`GET /v1/engine` 暴露：
+
+```json
+{
+  "trt_layer_profile_enabled": true,
+  "trt_layer_profile_scope": "vae_profile_only",
+  "trt_layer_profile_schema_version": 1,
+  "trt_layer_profile_plan_kind": "same_source_fp16|audited_int8_v5",
+  "trt_layer_profile_plan_sha256": {
+    "initial": "...",
+    "steady": "..."
+  }
+}
+```
+
+client 在上传 dummy latent 之前读取这个 contract：server 已开启但 client
+没有 `--trt-layer-profile-json`，或 client 指定了该路径而 server 没开，均
+在第一个请求发出前报错。
+
+### 15.5 `IProfiler` 调用顺序和状态机
+
+每个 initial/steady execution context 各拥有一个 profiler。runtime 明确
+设置：
+
+```text
+context.enqueue_emits_profile = False
+```
+
+每个 chunk 的唯一合法调用序列为：
+
+```mermaid
+sequenceDiagram
+    participant R as TensorRTVaeRuntime
+    participant P as LayerProfiler
+    participant C as IExecutionContext
+    participant T as TensorRT callbacks
+
+    R->>P: begin_capture(chunk_index, engine_kind)
+    R->>C: execute_async_v3(current CUDA stream)
+    C-->>R: enqueue success
+    R->>C: report_to_profiler()
+    C->>T: report_layer_time(name, ms) × N
+    T->>P: append ordered sample
+    C-->>R: report success
+    R->>P: finish_capture()
+    P-->>R: compact chunk record
+```
+
+约束：
+
+- `report_to_profiler()` 紧跟同一 context 的成功 enqueue；stream/context 在
+  report 完成前保持存活。
+- profiler 同时只能有一个 active capture，依赖现有 SingleWorkerEngine
+  的单模型线程，不增加锁内并发。
+- initial 只接受 chunk 0；steady 只接受 chunk 1–6。
+- report 返回 false、零 callback、嵌套 capture、跳号、engine kind 错误、
+  layer 数量或有序名称漂移均 fail closed。
+- 请求失败/结束会清空 active capture 状态，但不改变正常 cache bank
+  reset/释放流程。
+
+### 15.6 物理 layer catalog 与分类
+
+首次 initial/steady 执行分别固定一个 catalog。layer 的稳定身份不是只有
+名字，而是 `name + occurrence index`；这样 TensorRT 返回重名 layer 时仍
+可与时间数组一一对应。后续每次 callback 必须保持相同顺序和长度。
+
+catalog entry：
+
+```json
+{
+  "index": 0,
+  "name": "...",
+  "layer_type": "...",
+  "tactic_name": "...",
+  "category": "target_quantized_conv",
+  "logical_call_sites": ["..."],
+  "classification_source": "source_onnx|v5_audit|inspector|name_rule|unknown"
+}
+```
+
+固定类别：
+
+| 类别 | 含义 |
+|---|---|
+| `target_quantized_conv` | 跨精度目标集合：INT8 为 v5 audit 证明真实 INT8 tactic 的 residual Conv；FP16 为同一 84 个 call site 的未量化控制层 |
+| `target_qdq_cast_reformat` | 目标 Conv 周围独立存在的量化、Cast、layout/reformat |
+| `non_target_conv` | 首尾、shortcut、temporal/spatial 等尚未纳入目标的 Conv |
+| `attention` | spatial attention 的 Q/K/V、投影和融合 attention layer |
+| `upsample_resample` | temporal/spatial upsample、resize/resample |
+| `norm_activation_residual` | norm、SiLU、residual/add 及其融合 |
+| `cache_layout_copy` | Inspector name/Metadata 明确带 cache 语义的 concat/slice/copy/layout；普通 Shuffle/Reshape 不会被猜成 cache |
+| `other` | 证据不足，拒绝只凭名字猜测 |
+
+FP16 映射不是靠 `Conv` 字符串猜测：profile builder 沿用 v5 的静态 weight
+initializer 解析得到 28 个逻辑模块和 84 个原始 ONNX node name，再以完整
+node-name 边界匹配 Inspector `Name`/`Metadata`；因此 `Conv` 不会误命中
+`Conv_1`。INT8 继续只接受 v5 tactic audit 映射。任一 precision 缺少 84 个
+target call site 时 fail closed。
+
+一个物理融合 layer 可以映射多个 logical call site，但时间只累计
+一次，也不会人为平均分摊给这些 logical Conv。catalog SHA 绑定 plan SHA
+和有序 entries，防止把某次运行的数组套到另一份 plan/catalog。
+
+### 15.7 chunk 记录、详细产物和紧凑 summary
+
+server 在原有 `profile_execution.chunks[i]` 中只增加紧凑记录：
+
+```json
+{
+  "trt_layer_profile": {
+    "schema_version": 1,
+    "engine_kind": "initial|steady",
+    "catalog_sha256": "...",
+    "layer_times_ms": [1.2, 0.4, 3.1],
+    "layer_sum_ms": 4.7,
+    "engine_event_ms": 4.9,
+    "layer_sum_over_engine_ratio": 0.959,
+    "category_totals_ms": {
+      "target_quantized_conv": 2.8,
+      "cache_layout_copy": 1.1,
+      "other": 0.8
+    },
+    "reported_layer_count": 3
+  }
+}
+```
+
+`engine_event_ms` 是已有 `trt_engine_cuda_ms` 的同一插桩区间；
+`layer_sum_ms` 是 TensorRT callback 之和。两者的差不能简单命名为 Q/DQ
+开销：IProfiler 本身、TensorRT 融合/图优化和未 callback 的子图都可能产生
+偏差。`layer_sum_over_engine_ratio` 只用于覆盖度判断。
+
+client 的两个输出各有明确边界：
+
+| 参数/文件 | 内容 |
+|---|---|
+| `--trt-layer-profile-json PATH` | 环境、plan/catalog SHA、完整 initial/steady catalog、所有 warmup/measured 数组、逐 layer 统计、逐 chunk/steady pooled/whole-request/category 汇总、validation/warnings |
+| `--summary-json PATH` | 原有 execution 结果 + 紧凑 `trt_layer_profile_summary` + detailed artifact 的绝对路径和 SHA256；不复制完整 catalog/数组 |
+
+两个路径必须不同；client 会在提交第一个请求前拒绝相同路径，避免紧凑
+summary 覆盖详细证据并使其中记录的 SHA256 失效。
+
+warmup 原始数据会写入详细文件，但所有 mean、population stddev、min、max
+和 count 只使用 measured iteration。81 帧时：
+
+- chunk 0/initial 的样本数是 `repeat`；
+- chunk 1–6 各自样本数是 `repeat`；
+- steady pooled 样本数是 `repeat × 6`；
+- whole request 每个 measured iteration 都包含 7 个 chunk。
+
+client 先写详细诊断文件并计算 SHA，再写紧凑引用；即使 validity 最后判定
+失败，也先保留现场再以非零状态退出。
+
+### 15.8 科学有效性与优化决策门槛
+
+`valid_for_optimization_decision` 只有在以下条件同时满足时才为 true：
+
+- plan SHA、profile manifest 和 catalog SHA 一致；
+- initial/steady catalog 跨 iteration 稳定；
+- 每个时间数组长度等于 catalog 长度，callback/report 均完整；
+- FP16 initial/steady 的 84 个 source target，以及 INT8 initial/steady 的
+  84 个 audited target call site 都映射完整；INT8 还必须保留 v5 tactic 证据；
+- category 总和与 `layer_sum_ms` 在浮点容差内闭合。
+
+下列情况会保存数据但增加 warning/限制结论：
+
+- `layer_sum_over_engine_ratio` 超出 `[0.90, 1.10]`：profile 覆盖不完整，
+  `layer_profile_complete=false`；
+- `other` 超过 layer sum 的 10%：分类不足，不能据此选择具体算子族；
+- instrumented 与 uninstrumented engine 时间明显不同：逐 layer 数据只能看
+  占比，不能直接作为真实 latency。
+
+通过后按以下阈值决定下一轮开发：
+
+| 实测条件 | 优先动作 |
+|---|---|
+| Q/DQ/Cast/Reformat ≥ 10% | 融合/减少量化边界 |
+| non-target Conv ≥ 10% | 逐 signature probe 后扩大 Conv 量化覆盖 |
+| steady cache ≥ 20% 且 DRAM-bound | 评估 INT8 feature-cache ABI |
+| attention/upsample 占主导 | 转向对应 kernel/图融合，而非继续盲目量化 Conv |
+
+完成归因后必须关闭 `--enable-trt-layer-profile`，用同样的 warmup、repeat、
+shape、seed 分别重测 FP16/INT8 `trt_engine_cuda_ms`。细粒度结果决定“优化
+哪里”，无插桩结果决定“真实加速多少”。
+
+### 15.9 细粒度 profile 审核清单
+
+- [ ] FP16 profile plan 是否来自 `*_fp16_opset19.onnx`，而非历史 opset-17？
+- [ ] INT8 是否引用原有 audited v5 plan，且没有重新构建？
+- [ ] profile artifacts/state/cache 是否与 production/v5 artifact 完全隔离？
+- [ ] initial/steady profile plan 是否仍有 32 个 FP16 cache binding？
+- [ ] server 是否同时满足 role、precision、engine-dir 和两个 profile 开关？
+- [ ] 缺少任一 TensorRT profiler API 时是否启动即失败？
+- [ ] 开关关闭时是否完全没有 profiler import/manifest read/context hook？
+- [ ] instrumented server 是否拒绝 `source != profile` 的 latent job？
+- [ ] chunk 0 是否只用 initial，chunk 1–6 是否只用 steady？
+- [ ] callback 的 layer 名称、occurrence、顺序和数量是否稳定？
+- [ ] 融合 layer 是否只累计一次，且未把时间虚构分摊到多个 call site？
+- [ ] category totals 是否严格闭合为 `layer_sum_ms`？
+- [ ] detailed artifact 是否在 validation failure 前落盘？
+- [ ] summary 引用的绝对路径和 SHA256 是否与 detailed 文件一致？
+- [ ] warmup 是否保留但排除于所有 measured 统计？
+- [ ] 最终性能结论是否来自关闭细粒度开关后的真实性能重测？

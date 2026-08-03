@@ -102,6 +102,13 @@ lifecycle data such as accepted/started/completed timestamps, queue wait, total
 wall time, chunk IDs, and frame counts. `--enable-nvtx` is independent: it may
 emit NVTX ranges without enabling CUDA Event timing or per-call synchronization.
 
+TensorRT layer profiling is a second, more intrusive diagnostic mode. It is
+also disabled by default and is never implied by `--enable-profile` or
+`--enable-nvtx`. See [TensorRT fine-grained layer profiling](#tensorrt-fine-grained-layer-profiling)
+for its dedicated plans, server restrictions, result files, and validity
+checks. Use that mode to attribute time to physical TensorRT layers; use it
+*disabled* when reporting end-to-end engine latency.
+
 ## CPU offload controls
 
 CPU offload is selected when each server starts:
@@ -380,6 +387,203 @@ For monolithic execution, pass the same `--vae-precision` and
 `--vae-engine-dir` to a `--role monolithic` server. Its order remains strictly
 `DiT chunk i -> clean-KV -> TRT VAE chunk i -> RGB CPU -> DiT chunk i+1`;
 there is no latent D2H/H2D or DiT/VAE overlap.
+
+## TensorRT fine-grained layer profiling
+
+This feature is an opt-in, temporary performance-attribution path. It answers
+which *physical TensorRT layers* consume time; it does not change the Q/DQ v5
+topology, the 32 FP16 feature-cache bindings, the two cache banks, FCFS, HTTP
+ingress, or chunk order. Its callbacks and explicit profile reporting perturb
+execution, so its timings are diagnostic. For publication-quality latency,
+restart the same server without `--enable-trt-layer-profile` and use
+`trt_engine_cuda_ms`.
+
+### Profile-plan artifacts
+
+`vae_trt_profile_build.py` creates an isolated, resumable profile-plan family
+inside an existing validated engine directory:
+
+```text
+initial_fp16_layer_profile.plan
+steady_fp16_layer_profile.plan
+initial_fp16_layer_profile_inspector.json
+steady_fp16_layer_profile_inspector.json
+trt_layer_profile_manifest.json
+trt_layer_profile_build_state.json
+trt_layer_profile_timing.cache
+```
+
+The FP16 controls are built with `ProfilingVerbosity.DETAILED` directly from
+`initial_fp16_opset19.onnx` and `steady_fp16_opset19.onnx`: the same unquantized
+opset-19 sources that precede the v5 Q/DQ rewrite. They are therefore suitable
+controls for the initial/steady graph and cache ABI. The INT8 profile path does
+not build a second INT8 engine; it references the already audited detailed v5
+plans and verifies their plan hashes against `manifest.json` and
+`int8_audit_v5.json`.
+
+The builder resolves the same 28 residual Conv weights in each FP16 source
+graph that the v5 rewriter used, records their 84 unrolled ONNX node names, and
+binds that map to the FP16 Inspector catalog. Startup fails if all 84 cannot be
+mapped. Consequently `target_quantized_conv` is a cross-precision category:
+for INT8 it means the audited quantized physical layers; for FP16 it means the
+exact unquantized counterparts selected for v5, not every Conv in the graph.
+
+The profile builder never overwrites production plans, production manifests,
+the v5 audit, or a production timing cache. Its build-state identity binds the
+source-ONNX hashes, plan hashes, TensorRT/CUDA/SM versions, and build options.
+`--resume` reuses only a completed, identity-matching stage. A timing-cache
+candidate is committed atomically only after plan and I/O validation, so an
+interrupted or failed build cannot poison the stable profile cache. Both plans
+must expose the original FP16 latent/RGB contract and exactly 32 FP16 cache
+bindings.
+
+The conceptual build workflow is:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_profile_build \
+  --engine-dir "$SFWAN_TRT_DIR" \
+  --workspace-gib 8 \
+  --device-index 0 \
+  --timing-cache "$SFWAN_TRT_DIR/trt_layer_profile_timing.cache" \
+  --resume
+```
+
+Run this on the target Orin/TensorRT stack. The command builds only the missing
+FP16 profile stages; existing audited INT8 v5 plans are validated, not rebuilt.
+
+### Dedicated profile server
+
+Fine-grained collection is deliberately restricted to a VAE-only profile
+server:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.server \
+  --role vae \
+  --model-path "$SFWAN_MODEL" \
+  --port 30001 \
+  --latent-transport http \
+  --vae-precision int8_trt \
+  --vae-engine-dir "$SFWAN_TRT_DIR" \
+  --enable-profile \
+  --enable-trt-layer-profile \
+  --output-dir /workspace/results/sfwan-vae-int8-layer-profile
+```
+
+The switch is valid only with all of the following:
+
+- `--enable-profile` is also present;
+- `--role vae` is used;
+- `--vae-precision` is `fp16_trt` or `int8_trt`;
+- a validated `--vae-engine-dir` contains
+  `trt_layer_profile_manifest.json`;
+- TensorRT provides `IProfiler`, context `profiler`,
+  `enqueue_emits_profile`, and `report_to_profiler`.
+
+Startup fails if any requirement is missing. While the switch is enabled, the
+server accepts only latent jobs whose `source` is `profile`; it rejects ordinary
+disaggregated VAE generation so instrumented and uninstrumented measurements
+cannot be mixed. It is not supported for monolithic or DiT roles. With the
+switch absent, the runtime does not read the profile manifest, import the
+layer-profiler helper, attach callbacks, or call `report_to_profiler()`.
+
+For each chunk, the enabled runtime follows:
+
+```text
+begin_capture(chunk_index)
+  -> execute_async_v3(current PyTorch CUDA stream)
+  -> context.report_to_profiler()
+  -> report_layer_time(name, milliseconds) callbacks
+  -> finish_capture()
+```
+
+`context.enqueue_emits_profile` is set to `False`, so the existing asynchronous
+enqueue remains explicit and the immediately following report belongs to that
+same successful context execution. Chunk 0 must use `initial`; chunks 1--6 must
+use `steady`. A false report result, zero callbacks, nested capture, wrong chunk
+kind, changed layer order, or changed layer count fails closed and preserves the
+diagnostic evidence. TensorRT documents this callback/report workflow in the
+[TensorRT 10.3 Developer Guide](https://docs.nvidia.com/deeplearning/tensorrt/archives/tensorrt-1030/pdf/TensorRT-Developer-Guide.pdf).
+
+### Result files and interpretation
+
+The client requires a separate detailed output path when the server exposes
+layer profiling:
+
+```bash
+python -m sglang.multimodal_gen.experimental.jetson_sfwan.client profile-vae \
+  --server-url http://127.0.0.1:30001 \
+  --height 480 \
+  --width 832 \
+  --num-frames 81 \
+  --seed 1024 \
+  --warmup 10 \
+  --repeat 50 \
+  --summary-json /workspace/results/vae-int8-layer-summary.json \
+  --trt-layer-profile-json /workspace/results/vae-int8-layer-detail.json
+```
+
+The client first checks `GET /v1/engine`. Supplying
+`--trt-layer-profile-json` to a normal server, or omitting it for an instrumented
+server, is an error before the first request is sent. The detailed path must also
+be different from `--summary-json`; otherwise the client fails before submission
+instead of allowing the compact summary to overwrite the layer evidence.
+
+The detailed JSON stores environment identity, plan and catalog hashes,
+initial/steady physical-layer catalogs, every warmup and measured per-layer
+array, per-layer mean/population-standard-deviation/min/max/count, per-chunk
+statistics, the pooled steady result, whole-request totals, category totals,
+and validation warnings. Warmup arrays are retained for diagnosis but excluded
+from all reported means. `--summary-json` stores only compact per-chunk,
+initial, pooled-steady, whole-request, and category summaries plus the absolute
+path and SHA256 of the detailed artifact.
+
+Physical layers are classified into these fixed categories:
+
+- `target_quantized_conv`;
+- `target_qdq_cast_reformat`;
+- `non_target_conv`;
+- `attention`;
+- `upsample_resample`;
+- `norm_activation_residual`;
+- `cache_layout_copy`;
+- `other`.
+
+Classification uses Inspector `Name`, `Metadata`, layer type, the source-ONNX
+target map for FP16, and the v5 tactic audit for INT8. Node matching uses
+complete-name boundaries so names such as `Conv` and `Conv_1` cannot collide.
+A fused physical layer is timed once even when it maps to several
+logical call sites; its time is never divided among those sites. Unreliable
+mappings remain `other` instead of being guessed from a name. Each catalog is
+bound to the plan SHA and to a hash of the ordered physical-layer records.
+
+Each chunk's compact record contains `layer_times_ms`, `layer_sum_ms`, the
+existing event interval as `engine_event_ms`, their coverage ratio, category
+totals, layer count, engine kind, and catalog hash. The ratio is a coverage
+diagnostic, not a decomposition of the difference: TensorRT callbacks, fused
+subgraphs, graph optimization, and profiler perturbation can all make
+`layer_sum_ms` differ from the CUDA-event interval.
+
+The result is valid for an optimization decision only when plan/catalog hashes
+match, catalogs remain stable, callbacks and arrays are complete, and all 84
+target call sites map to corresponding physical layers in both FP16 and INT8
+runs. INT8 mappings additionally require the v5 tactic audit. A materially non-unit
+coverage ratio (outside `[0.90, 1.10]`) marks coverage incomplete. More than
+10% in `other` marks the
+classification insufficient for deciding which operator family to optimize.
+The detailed JSON is written before a validation failure is returned so the
+failed run remains inspectable.
+
+Use the category percentages as decision gates:
+
+- Q/DQ/Cast/Reformat at least 10%: reduce or fuse quantization boundaries;
+- unquantized Conv at least 10%: expand Conv coverage after signature probes;
+- steady cache work at least 20% and DRAM-bound: evaluate an INT8 cache ABI;
+- attention or upsample dominant: optimize that kernel family instead.
+
+Finally, restart without `--enable-trt-layer-profile` and repeat the same
+warmup/repeat matrix before reporting FP16-vs-INT8 latency. Layer-profile time
+and uninstrumented `trt_engine_cuda_ms` answer different questions and must not
+be put in the same latency table.
 
 ## 5090 monolithic
 

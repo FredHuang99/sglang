@@ -74,6 +74,95 @@ def _resolve_weight_names(
     return resolved
 
 
+def collect_fp16_target_call_sites(
+    *,
+    source_path: str | Path,
+    graph_kind: str,
+    target_module_names: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Identify the FP16 source nodes corresponding to the v5 INT8 targets.
+
+    The Q/DQ rewriter identifies targets through their static weight
+    initializer, not through fragile node-name heuristics.  The diagnostic
+    FP16 plan needs the exact same 84-call-site identity so its physical
+    TensorRT layers can be compared with the audited INT8 plan.  This helper
+    intentionally performs only read-only graph inspection; it does not
+    change the v5 topology or any initializer.
+    """
+
+    if graph_kind not in {"initial", "steady"}:
+        raise ValueError("graph_kind must be 'initial' or 'steady'")
+    if len(target_module_names) != EXPECTED_LOGICAL_CONVS:
+        raise ValueError(
+            f"expected {EXPECTED_LOGICAL_CONVS} target modules, "
+            f"got {len(target_module_names)}"
+        )
+    if len(set(target_module_names)) != len(target_module_names):
+        raise ValueError("target module names must be unique")
+
+    onnx, _np, _TensorProto, _helpers = _lazy_onnx()
+    source = Path(source_path)
+    model = onnx.load(str(source), load_external_data=True)
+    if _opset_version(model) != QDQ_OPSET:
+        raise ValueError(
+            f"FP16 target mapping requires ONNX opset {QDQ_OPSET}: {source}"
+        )
+    initializers = _initializer_map(model)
+    resolved_weights = _resolve_weight_names(
+        initializer_names=set(initializers),
+        target_module_names=target_module_names,
+    )
+    module_by_weight = {
+        weight_name: module_name
+        for module_name, weight_name in resolved_weights.items()
+    }
+    calls_by_module = {module_name: 0 for module_name in target_module_names}
+    call_sites: list[dict[str, Any]] = []
+    source_node_names: set[str] = set()
+    for node in model.graph.node:
+        if node.op_type != "Conv" or len(node.input) < 2:
+            continue
+        module_name = module_by_weight.get(node.input[1])
+        if module_name is None:
+            continue
+        if not node.name:
+            raise ValueError(
+                f"target FP16 Conv for {module_name!r} has no ONNX node name"
+            )
+        if node.name in source_node_names:
+            raise ValueError(f"duplicate target FP16 ONNX node name: {node.name!r}")
+        source_node_names.add(node.name)
+        call_index = calls_by_module[module_name]
+        calls_by_module[module_name] += 1
+        call_sites.append(
+            {
+                # Reuse the stable v5 logical identifier so FP16 and INT8
+                # catalogs can be compared without a name translation step.
+                "logical_call_site": (
+                    f"int8/{graph_kind}/{module_name}/call_{call_index}"
+                ),
+                "module_name": module_name,
+                "call_index": call_index,
+                "source_onnx_node_name": node.name,
+                "source_weight_initializer": node.input[1],
+            }
+        )
+
+    invalid_counts = {
+        module_name: count
+        for module_name, count in calls_by_module.items()
+        if count != EXPECTED_CALLS_PER_LOGICAL_CONV
+    }
+    if invalid_counts or len(call_sites) != EXPECTED_CALL_SITES:
+        raise ValueError(
+            "FP16 ONNX target mapping did not find exactly three calls for "
+            f"every residual Conv: counts={invalid_counts}, total={len(call_sites)}"
+        )
+    if len({record["logical_call_site"] for record in call_sites}) != len(call_sites):
+        raise ValueError("FP16 target logical call-site identifiers are not unique")
+    return call_sites
+
+
 def _remove_unused_initializers(model: Any) -> None:
     used = {input_name for node in model.graph.node for input_name in node.input}
     retained = [

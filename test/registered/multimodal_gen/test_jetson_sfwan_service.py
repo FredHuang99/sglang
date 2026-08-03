@@ -32,6 +32,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.client import (
     _run_dit_profile_iteration,
     _run_profile_iteration,
     build_interarrival_delays,
+    run_profile_vae,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.engine import (
     JobRecord,
@@ -107,6 +108,7 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_build import (
     _validate_onnx_fp16_io_contract,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
+    EXPECTED_CALL_SITES,
     EXPECTED_CONV_SIGNATURES,
     EXPECTED_LOGICAL_CONVS,
     QDQ_OPSET,
@@ -116,6 +118,19 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_qdq import (
     WEIGHT_ENCODING_PREQUANTIZED_INT8_DQ,
     audit_qdq_model,
     rewrite_onnx_with_int8_qdq,
+)
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_profile import (
+    PROFILE_CATEGORIES,
+    TrtLayerProfileCapture,
+    aggregate_trt_layer_profile_iterations,
+    build_physical_layer_catalog,
+    catalog_sha256,
+    make_compact_layer_profile_metrics,
+    probe_trt_layer_profile_api,
+    write_trt_layer_profile_artifact,
+)
+from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_profile_build import (
+    _parse_args as _parse_trt_profile_build_args,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
@@ -5582,6 +5597,509 @@ class TestSfWanTensorRTVaeConfiguration(CustomTestCase):
             DIT_COMPONENT_NAMES,
         )
         self.assertEqual(model.contract["vae"]["vae_backend"], "tensorrt")
+
+
+class TestSfWanTensorRTLayerProfile(CustomTestCase):
+    """Import-light coverage for the opt-in TensorRT diagnostic path."""
+
+    @staticmethod
+    def _inspector(*names):
+        return {
+            "Layers": [
+                {
+                    "Name": name,
+                    "LayerType": "Convolution",
+                    "ParameterType": "Convolution",
+                    "TacticName": "fake_tactic",
+                    "Metadata": "",
+                }
+                for name in names
+            ]
+        }
+
+    @staticmethod
+    def _catalog(*, kind, precision="fp16", name=None, mapped=False):
+        catalog = build_physical_layer_catalog(
+            engine_kind=kind,
+            plan_sha256=("a" if kind == "initial" else "b") * 64,
+            inspector=TestSfWanTensorRTLayerProfile._inspector(name or f"{kind}-layer"),
+            precision=precision,
+        )
+        if mapped:
+            catalog["layers"][0]["logical_call_sites"] = [
+                f"int8/{kind}/module_{index // 3}/call_{index % 3}"
+                for index in range(EXPECTED_CALL_SITES)
+            ]
+            catalog["layers"][0]["category"] = "target_quantized_conv"
+            catalog["layers"][0]["classification_source"] = "source_onnx"
+            catalog["expected_target_call_site_count"] = EXPECTED_CALL_SITES
+            catalog["catalog_sha256"] = catalog_sha256(catalog)
+        return catalog
+
+    def test_cli_is_strictly_opt_in_and_role_scoped(self):
+        with self.assertRaisesRegex(ValueError, "requires --enable-profile"):
+            SfWanRuntime(
+                config=ServerConfig(
+                    role="vae",
+                    vae_precision="int8_trt",
+                    vae_engine_dir="/engines",
+                    enable_trt_layer_profile=True,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "only for --role vae"):
+            SfWanRuntime(
+                config=ServerConfig(
+                    role="monolithic",
+                    vae_precision="int8_trt",
+                    vae_engine_dir="/engines",
+                    enable_profile=True,
+                    enable_trt_layer_profile=True,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "fp16_trt or int8_trt"):
+            SfWanRuntime(
+                config=ServerConfig(
+                    role="vae",
+                    vae_precision="fp16",
+                    enable_profile=True,
+                    enable_trt_layer_profile=True,
+                )
+            )
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "server",
+                "--role",
+                "vae",
+                "--vae-precision",
+                "fp16_trt",
+                "--vae-engine-dir",
+                "/engines",
+                "--enable-profile",
+                "--enable-trt-layer-profile",
+            ],
+        ):
+            config = _parse_args()
+        self.assertTrue(config.enable_trt_layer_profile)
+
+        parsed = _build_parser().parse_args(
+            [
+                "profile-vae",
+                "--server-url",
+                "http://vae",
+                "--trt-layer-profile-json",
+                "/results/layers.json",
+            ]
+        )
+        self.assertEqual(parsed.trt_layer_profile_json, "/results/layers.json")
+
+    def test_profile_builder_parser_exposes_resume_without_production_outputs(self):
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "vae_trt_profile_build",
+                "--engine-dir",
+                "/engines",
+                "--workspace-gib",
+                "6",
+                "--resume",
+            ],
+        ):
+            args = _parse_trt_profile_build_args()
+        self.assertEqual(args.engine_dir, "/engines")
+        self.assertEqual(args.workspace_gib, 6.0)
+        self.assertTrue(args.resume)
+
+    def test_client_requires_exact_layer_profile_artifact_switch_match(self):
+        class _Response:
+            def __init__(self, enabled):
+                self._enabled = enabled
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "contract": {
+                        "trt_layer_profile_enabled": self._enabled,
+                    }
+                }
+
+        class _Client:
+            def __init__(self, enabled):
+                self.enabled = enabled
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def get(self, _url):
+                return _Response(self.enabled)
+
+        def _args(path):
+            return SimpleNamespace(
+                warmup=0,
+                repeat=1,
+                request_timeout_seconds=1.0,
+                server_url="http://vae",
+                trt_layer_profile_json=path,
+                summary_json="summary.json",
+            )
+
+        with mock.patch("httpx.AsyncClient", return_value=_Client(True)):
+            with self.assertRaisesRegex(ValueError, "provide"):
+                asyncio.run(run_profile_vae(_args(None)))
+        with mock.patch("httpx.AsyncClient", return_value=_Client(False)):
+            with self.assertRaisesRegex(ValueError, "requires"):
+                asyncio.run(run_profile_vae(_args("layers.json")))
+        same_path = _args("summary.json")
+        with mock.patch("httpx.AsyncClient", return_value=_Client(True)):
+            with self.assertRaisesRegex(ValueError, "different files"):
+                asyncio.run(run_profile_vae(same_path))
+
+    def test_profiler_requires_api_and_enforces_enqueue_report_order(self):
+        class _IProfiler:
+            pass
+
+        trt = SimpleNamespace(IProfiler=_IProfiler)
+        order = []
+
+        class _Context:
+            profiler = None
+            enqueue_emits_profile = True
+
+            def report_to_profiler(self):
+                order.append("report")
+                self.profiler.report_layer_time("layer", 2.5)
+                return True
+
+        context = _Context()
+        self.assertTrue(
+            probe_trt_layer_profile_api(
+                trt=trt,
+                contexts={"initial": context},
+            )["available"]
+        )
+        with self.assertRaisesRegex(RuntimeError, "missing APIs"):
+            probe_trt_layer_profile_api(
+                trt=SimpleNamespace(),
+                contexts={"initial": SimpleNamespace()},
+            )
+
+        capture = TrtLayerProfileCapture(
+            trt=trt,
+            context=context,
+            engine_kind="initial",
+            catalog=self._catalog(kind="initial", name="layer", mapped=True),
+        )
+        capture.begin_capture(0)
+        order.append("enqueue")
+        capture.mark_enqueue_succeeded()
+        metrics = capture.report_and_finish(engine_event_ms=2.5)
+        self.assertEqual(order, ["enqueue", "report"])
+        self.assertEqual(metrics["reported_layer_count"], 1)
+        self.assertEqual(metrics["layer_times_ms"], [2.5])
+        self.assertEqual(
+            capture.catalog["expected_target_call_site_count"],
+            EXPECTED_CALL_SITES,
+        )
+
+    def test_profiler_fails_closed_for_zero_callbacks_and_catalog_drift(self):
+        class _IProfiler:
+            pass
+
+        trt = SimpleNamespace(IProfiler=_IProfiler)
+
+        class _Context:
+            profiler = None
+            enqueue_emits_profile = True
+
+            def __init__(self, callbacks):
+                self.callbacks = callbacks
+
+            def report_to_profiler(self):
+                for name, elapsed in self.callbacks.pop(0):
+                    self.profiler.report_layer_time(name, elapsed)
+                return True
+
+        empty_context = _Context([[]])
+        empty = TrtLayerProfileCapture(
+            trt=trt,
+            context=empty_context,
+            engine_kind="initial",
+            catalog=self._catalog(kind="initial", name="layer"),
+        )
+        empty.begin_capture(0)
+        empty.mark_enqueue_succeeded()
+        with self.assertRaisesRegex(RuntimeError, "zero layers"):
+            empty.report_and_finish(engine_event_ms=1.0)
+
+        false_context = _Context([[("layer", 1.0)]])
+        false_context.report_to_profiler = lambda: False
+        false_report = TrtLayerProfileCapture(
+            trt=trt,
+            context=false_context,
+            engine_kind="initial",
+            catalog=self._catalog(kind="initial", name="layer"),
+        )
+        false_report.begin_capture(0)
+        false_report.mark_enqueue_succeeded()
+        with self.assertRaisesRegex(RuntimeError, "returned False"):
+            false_report.report_and_finish(engine_event_ms=1.0)
+
+        drift_context = _Context([[("same", 1.0)], [("other", 1.0)]])
+        drift = TrtLayerProfileCapture(
+            trt=trt,
+            context=drift_context,
+            engine_kind="steady",
+            catalog=build_physical_layer_catalog(
+                engine_kind="steady",
+                plan_sha256="b" * 64,
+                inspector=self._inspector("same", "other"),
+                precision="fp16",
+            ),
+        )
+        drift.begin_capture(1)
+        drift.mark_enqueue_succeeded()
+        drift.report_and_finish(engine_event_ms=1.0)
+        drift.begin_capture(2)
+        drift.mark_enqueue_succeeded()
+        with self.assertRaisesRegex(RuntimeError, "catalog drifted"):
+            drift.report_and_finish(engine_event_ms=1.0)
+
+    def test_duplicate_names_and_fused_call_sites_are_counted_once(self):
+        int8_audit = {
+            "schema_version": QDQ_SCHEMA_VERSION,
+            "passed": True,
+            "complete": True,
+            "errors": [],
+            "plan_sha256": {"initial": "a" * 64},
+            "tactics": {
+                "initial": {
+                    "passed": True,
+                    "mapped_count": 2,
+                    "errors": [],
+                    "matches": {
+                        "call-a": {
+                            "layer_names": ["fused"],
+                            "metadata": [],
+                        },
+                        "call-b": {
+                            "layer_names": ["fused"],
+                            "metadata": [],
+                        },
+                    },
+                }
+            },
+        }
+        with mock.patch(
+            "sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_profile."
+            "EXPECTED_CALL_SITES",
+            2,
+        ):
+            catalog = build_physical_layer_catalog(
+                engine_kind="initial",
+                plan_sha256="a" * 64,
+                inspector=self._inspector("fused", "fused"),
+                precision="int8",
+                int8_audit=int8_audit,
+            )
+        self.assertEqual(
+            [layer["exact_key"] for layer in catalog["layers"]],
+            ["fused#0", "fused#1"],
+        )
+        self.assertEqual(
+            catalog["layers"][0]["logical_call_sites"],
+            ["call-a", "call-b"],
+        )
+        metrics = make_compact_layer_profile_metrics(
+            catalog=catalog,
+            layer_times_ms=[2.0, 3.0],
+            engine_event_ms=5.0,
+        )
+        self.assertEqual(metrics["layer_sum_ms"], 5.0)
+        self.assertEqual(
+            metrics["category_totals_ms"]["target_quantized_conv"],
+            5.0,
+        )
+        self.assertAlmostEqual(
+            sum(metrics["category_totals_ms"].values()),
+            metrics["layer_sum_ms"],
+        )
+
+    def test_catalog_does_not_guess_generic_layout_work_is_feature_cache(self):
+        inspector = {
+            "Layers": [
+                {
+                    "Name": "generic reshape",
+                    "LayerType": "Shuffle",
+                    "Metadata": "",
+                },
+                {
+                    "Name": "cache_out_003 reshape",
+                    "LayerType": "Shuffle",
+                    "Metadata": "feature_cache",
+                },
+            ]
+        }
+        catalog = build_physical_layer_catalog(
+            engine_kind="steady",
+            plan_sha256="b" * 64,
+            inspector=inspector,
+            precision="fp16",
+        )
+        self.assertEqual(
+            [layer["category"] for layer in catalog["layers"]],
+            ["other", "cache_layout_copy"],
+        )
+
+    def test_fp16_catalog_maps_the_same_84_target_call_sites_exactly(self):
+        target_map = []
+        layers = []
+        for index in range(EXPECTED_CALL_SITES):
+            module_index = index // 3
+            call_index = index % 3
+            if index == 0:
+                source_node = "/decoder/shared/Conv"
+            elif index == 1:
+                source_node = "/decoder/shared/Conv_1"
+            else:
+                source_node = f"/decoder/residual_{module_index}/Conv_{call_index}"
+            target_map.append(
+                {
+                    "logical_call_site": (
+                        f"int8/initial/module_{module_index}/call_{call_index}"
+                    ),
+                    "module_name": f"module_{module_index}",
+                    "call_index": call_index,
+                    "source_onnx_node_name": source_node,
+                    "source_weight_initializer": f"module_{module_index}.weight",
+                }
+            )
+            layers.append(
+                {
+                    "Name": f"{source_node} + fused activation",
+                    "LayerType": "Convolution",
+                    "ParameterType": "Convolution",
+                    "TacticName": "fp16_conv",
+                    "Metadata": "",
+                }
+            )
+        catalog = build_physical_layer_catalog(
+            engine_kind="initial",
+            plan_sha256="a" * 64,
+            inspector={"Layers": layers},
+            precision="fp16",
+            fp16_target_call_sites=target_map,
+        )
+        mapped = {
+            call_site
+            for layer in catalog["layers"]
+            for call_site in layer["logical_call_sites"]
+        }
+        self.assertEqual(len(mapped), EXPECTED_CALL_SITES)
+        self.assertTrue(
+            all(len(layer["logical_call_sites"]) == 1 for layer in catalog["layers"])
+        )
+        self.assertTrue(
+            all(
+                layer["category"] == "target_quantized_conv"
+                and layer["classification_source"] == "source_onnx"
+                for layer in catalog["layers"]
+            )
+        )
+
+    def test_measured_aggregation_excludes_warmup_and_writes_sha_bound_artifact(self):
+        catalogs = {
+            "initial": self._catalog(kind="initial", mapped=True),
+            "steady": self._catalog(kind="steady", mapped=True),
+        }
+
+        def _iteration(index, warmup):
+            chunks = []
+            for chunk_index in range(7):
+                kind = "initial" if chunk_index == 0 else "steady"
+                elapsed = float(100 * index + chunk_index + 1)
+                chunks.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "trt_layer_profile": make_compact_layer_profile_metrics(
+                            catalog=catalogs[kind],
+                            layer_times_ms=[elapsed],
+                            engine_event_ms=elapsed,
+                        ),
+                    }
+                )
+            return {
+                "iteration": index,
+                "warmup": warmup,
+                "request_id": f"request-{index}",
+                "state": "completed",
+                "error": None,
+                "profile_execution": {"chunks": chunks},
+            }
+
+        result = aggregate_trt_layer_profile_iterations(
+            [_iteration(0, True), _iteration(1, False), _iteration(2, False)],
+            catalogs=catalogs,
+            precision="fp16",
+            plan_sha256={"initial": "a" * 64, "steady": "b" * 64},
+        )
+        summary = result["summary"]
+        self.assertEqual(summary["initial"]["sample_count"], 2)
+        self.assertEqual(summary["steady_pooled"]["sample_count"], 12)
+        self.assertEqual(summary["whole_request"]["sample_count"], 2)
+        self.assertTrue(summary["valid_for_optimization_decision"])
+        self.assertEqual(
+            set(summary["category_percentages"]),
+            set(PROFILE_CATEGORIES),
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "layers.json"
+            reference = write_trt_layer_profile_artifact(
+                path=path,
+                detailed=result["detailed"],
+            )
+            self.assertEqual(reference["path"], str(path.resolve()))
+            self.assertEqual(
+                reference["sha256"],
+                hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+
+    def test_dedicated_layer_profile_server_rejects_normal_vae_jobs(self):
+        async def _scenario():
+            runtime = SfWanRuntime(
+                config=ServerConfig(
+                    role="vae",
+                    vae_precision="int8_trt",
+                    vae_engine_dir="/engines",
+                    enable_profile=True,
+                    enable_trt_layer_profile=True,
+                )
+            )
+            try:
+                with self.assertRaisesRegex(ValueError, "source=profile"):
+                    await runtime.register_latent_job(
+                        LatentJobSpec(
+                            request_id="normal-job",
+                            height=480,
+                            width=832,
+                            num_frames=81,
+                            source="dit",
+                        )
+                    )
+            finally:
+                runtime._executor.shutdown(wait=True)
+                assert runtime._transfer_executor is not None
+                runtime._transfer_executor.shutdown(wait=True)
+
+        asyncio.run(_scenario())
 
 
 if __name__ == "__main__":

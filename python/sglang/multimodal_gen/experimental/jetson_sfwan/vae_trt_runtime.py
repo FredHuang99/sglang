@@ -50,9 +50,14 @@ def _version_prefix(version: str, fields: int = 2) -> tuple[int, ...]:
 
 
 def _configure_context_nvtx(
-    *, context: Any, trt: Any, precision: TrtVaePrecision, enable_nvtx: bool
+    *,
+    context: Any,
+    trt: Any,
+    precision: TrtVaePrecision,
+    enable_nvtx: bool,
+    detailed_plan: bool = False,
 ) -> str:
-    if precision != "int8":
+    if precision != "int8" and not detailed_plan:
         effective = getattr(context, "nvtx_verbosity", None)
         return (
             str(effective).split(".")[-1].lower()
@@ -67,7 +72,7 @@ def _configure_context_nvtx(
         effective = context.nvtx_verbosity
     except (AttributeError, RuntimeError, TypeError) as exc:
         raise RuntimeError(
-            "TensorRT INT8 VAE could not set execution-context NVTX verbosity"
+            "TensorRT VAE detailed plan could not set execution-context NVTX verbosity"
         ) from exc
     if effective != requested:
         raise RuntimeError(
@@ -552,6 +557,7 @@ class TensorRTVaeRuntime:
         device: Any,
         enable_profile: bool,
         enable_nvtx: bool,
+        enable_trt_layer_profile: bool = False,
     ) -> None:
         try:
             import tensorrt as trt
@@ -565,7 +571,12 @@ class TensorRTVaeRuntime:
         self.precision = precision
         self.device = device
         self.enable_profile = enable_profile
+        self.enable_trt_layer_profile = enable_trt_layer_profile
         self.enable_nvtx = enable_nvtx
+        if enable_trt_layer_profile and not enable_profile:
+            raise ValueError(
+                "TensorRT layer profiling requires the regular profile timer"
+            )
         self.manifest = load_trt_vae_manifest(self.engine_dir)
         validated = validate_trt_vae_manifest(
             self.manifest,
@@ -574,6 +585,26 @@ class TensorRTVaeRuntime:
             model_path=model_path,
             verify_plan_hashes=True,
         )
+        layer_profile_validated = None
+        if enable_trt_layer_profile:
+            # This import is intentionally gated.  Production runtime startup
+            # neither reads diagnostic artifacts nor imports profiler helpers.
+            from .vae_trt_profile import (
+                load_trt_layer_profile_manifest,
+                validate_trt_layer_profile_manifest,
+            )
+
+            layer_profile_manifest = load_trt_layer_profile_manifest(self.engine_dir)
+            layer_profile_validated = validate_trt_layer_profile_manifest(
+                layer_profile_manifest,
+                engine_dir=self.engine_dir,
+                precision=precision,
+                production_manifest=self.manifest,
+                verify_hashes=True,
+            )
+            self._layer_profile_manifest = layer_profile_manifest
+        else:
+            self._layer_profile_manifest = None
         self._validate_environment(torch=torch, trt=trt)
         self._torch = torch
         self._trt = trt
@@ -583,8 +614,13 @@ class TensorRTVaeRuntime:
         self._engines: dict[str, Any] = {}
         self._contexts: dict[str, Any] = {}
         self._context_nvtx_verbosity: dict[str, str] = {}
+        selected_engines = (
+            layer_profile_validated["engines"]
+            if layer_profile_validated is not None
+            else validated["engines"]
+        )
         for kind in ("initial", "steady"):
-            plan_path = Path(validated["engines"][kind]["path"])
+            plan_path = Path(selected_engines[kind]["path"])
             engine = self._trt_runtime.deserialize_cuda_engine(plan_path.read_bytes())
             if engine is None:
                 raise RuntimeError(f"could not deserialize TensorRT plan: {plan_path}")
@@ -599,9 +635,52 @@ class TensorRTVaeRuntime:
                 trt=trt,
                 precision=precision,
                 enable_nvtx=enable_nvtx,
+                detailed_plan=enable_trt_layer_profile,
             )
             self._engines[kind] = engine
             self._contexts[kind] = context
+        self._layer_profile_captures: dict[str, Any] = {}
+        self._layer_profile_plan_sha256: dict[str, str] = {}
+        self._layer_profile_plan_kind: str | None = None
+        self._layer_profile_environment: dict[str, Any] = {}
+        self._layer_profile_qdq_schema_version: int | None = None
+        self._layer_profile_weight_encoding: str | None = None
+        if layer_profile_validated is not None:
+            from .vae_trt_profile import (
+                TrtLayerProfileCapture,
+                build_physical_layer_catalog,
+                probe_trt_layer_profile_api,
+            )
+
+            probe_trt_layer_profile_api(trt=trt, contexts=self._contexts)
+            self._layer_profile_plan_kind = layer_profile_validated["plan_kind"]
+            self._layer_profile_environment = dict(
+                layer_profile_validated.get("build", {})
+            )
+            audit = layer_profile_validated.get("int8_audit")
+            if isinstance(audit, dict):
+                self._layer_profile_qdq_schema_version = audit.get("schema_version")
+                self._layer_profile_weight_encoding = audit.get("weight_encoding")
+            for kind in ("initial", "steady"):
+                record = layer_profile_validated["engines"][kind]
+                plan_sha256 = str(record["sha256"])
+                catalog = build_physical_layer_catalog(
+                    engine_kind=kind,
+                    plan_sha256=plan_sha256,
+                    inspector=record["inspector"],
+                    precision=precision,
+                    int8_audit=audit,
+                    fp16_target_call_sites=(
+                        record.get("target_call_sites") if precision == "fp16" else None
+                    ),
+                )
+                self._layer_profile_plan_sha256[kind] = plan_sha256
+                self._layer_profile_captures[kind] = TrtLayerProfileCapture(
+                    trt=trt,
+                    context=self._contexts[kind],
+                    engine_kind=kind,
+                    catalog=catalog,
+                )
         self._cache_banks = [
             [
                 torch.empty(shape, device=device, dtype=torch.float16)
@@ -699,7 +778,7 @@ class TensorRTVaeRuntime:
 
     @property
     def contract(self) -> dict[str, Any]:
-        return {
+        contract = {
             "vae_backend": "tensorrt",
             "vae_engine_dir": self.engine_dir,
             "vae_engine_precision": self.precision,
@@ -714,13 +793,54 @@ class TensorRTVaeRuntime:
             "vae_cache_bank_bytes": TRT_VAE_CACHE_BANK_BYTES,
             "vae_cache_double_bank_bytes": TRT_VAE_CACHE_BANK_BYTES * 2,
         }
+        if self.enable_trt_layer_profile:
+            contract.update(
+                {
+                    "trt_layer_profile_enabled": True,
+                    "trt_layer_profile_scope": "vae_profile_only",
+                    "trt_layer_profile_schema_version": 1,
+                    "trt_layer_profile_plan_kind": self._layer_profile_plan_kind,
+                    "trt_layer_profile_plan_sha256": dict(
+                        self._layer_profile_plan_sha256
+                    ),
+                }
+            )
+        else:
+            contract["trt_layer_profile_enabled"] = False
+        return contract
+
+    @property
+    def layer_profile_metadata(self) -> dict[str, Any] | None:
+        if not self.enable_trt_layer_profile:
+            return None
+        catalogs = {
+            kind: capture.catalog
+            for kind, capture in self._layer_profile_captures.items()
+        }
+        if any(catalog is None for catalog in catalogs.values()):
+            return None
+        return {
+            "environment": dict(self._layer_profile_environment),
+            "precision": self.precision,
+            "plan_kind": self._layer_profile_plan_kind,
+            "plan_sha256": dict(self._layer_profile_plan_sha256),
+            "qdq_schema_version": self._layer_profile_qdq_schema_version,
+            "weight_encoding": self._layer_profile_weight_encoding,
+            "catalogs": catalogs,
+        }
+
+    def _abort_layer_profile_captures(self) -> None:
+        for capture in getattr(self, "_layer_profile_captures", {}).values():
+            capture.abort_capture()
 
     def reset_request(self) -> None:
+        self._abort_layer_profile_captures()
         self._request_active = True
         self._next_chunk_index = 0
         self._read_bank_index = None
 
     def finish_request(self) -> None:
+        self._abort_layer_profile_captures()
         self._request_active = False
         self._next_chunk_index = 0
         self._read_bank_index = None
@@ -729,7 +849,13 @@ class TensorRTVaeRuntime:
         if not context.set_tensor_address(name, int(tensor.data_ptr())):
             raise RuntimeError(f"TensorRT rejected the address for binding {name!r}")
 
-    def _execute(self, *, kind: TrtVaeEngineKind, latent: Any) -> Any:
+    def _execute(
+        self,
+        *,
+        kind: TrtVaeEngineKind,
+        latent: Any,
+        chunk_index: int | None = None,
+    ) -> Any:
         torch = self._torch
         context = self._contexts[kind]
         output_bank_index = (
@@ -747,8 +873,20 @@ class TensorRTVaeRuntime:
         for index, tensor in enumerate(output_bank):
             self._set_address(context, f"cache_out_{index:03d}", tensor)
         stream = torch.cuda.current_stream(device=self.device)
-        if not context.execute_async_v3(stream_handle=int(stream.cuda_stream)):
-            raise RuntimeError(f"TensorRT {kind} VAE execution returned failure")
+        capture = getattr(self, "_layer_profile_captures", {}).get(kind)
+        if capture is not None:
+            if chunk_index is None:
+                raise RuntimeError("TensorRT layer profiling requires a chunk index")
+            capture.begin_capture(chunk_index)
+        try:
+            if not context.execute_async_v3(stream_handle=int(stream.cuda_stream)):
+                raise RuntimeError(f"TensorRT {kind} VAE execution returned failure")
+            if capture is not None:
+                capture.mark_enqueue_succeeded()
+        except BaseException:
+            if capture is not None:
+                capture.abort_capture()
+            raise
         self._read_bank_index = output_bank_index
         return rgb
 
@@ -800,7 +938,14 @@ class TensorRTVaeRuntime:
         if self.enable_nvtx:
             torch.cuda.nvtx.range_push(f"sfwan.vae.trt.{kind}.execute")
         try:
-            output = self._execute(kind=kind, latent=latent_fp16)
+            if getattr(self, "enable_trt_layer_profile", False):
+                output = self._execute(
+                    kind=kind,
+                    latent=latent_fp16,
+                    chunk_index=chunk_index,
+                )
+            else:
+                output = self._execute(kind=kind, latent=latent_fp16)
         finally:
             if self.enable_nvtx:
                 torch.cuda.nvtx.range_pop()
@@ -808,6 +953,21 @@ class TensorRTVaeRuntime:
             engine_end.record()
             engine_end.synchronize()
             engine_ms = float(engine_start.elapsed_time(engine_end))
+
+        layer_profile_metrics = None
+        if getattr(self, "enable_trt_layer_profile", False):
+            if engine_ms is None:
+                self._layer_profile_captures[kind].abort_capture()
+                raise RuntimeError(
+                    "TensorRT layer profiling requires a CUDA engine-event time"
+                )
+            try:
+                layer_profile_metrics = self._layer_profile_captures[
+                    kind
+                ].report_and_finish(engine_event_ms=engine_ms)
+            except BaseException:
+                self._layer_profile_captures[kind].abort_capture()
+                raise
 
         self._next_chunk_index += 1
         metrics: dict[str, Any] = {
@@ -821,10 +981,13 @@ class TensorRTVaeRuntime:
                     "trt_engine_cuda_ms": engine_ms,
                 }
             )
+        if layer_profile_metrics is not None:
+            metrics["trt_layer_profile"] = layer_profile_metrics
         return output, metrics
 
     def close(self) -> None:
         self.finish_request()
+        getattr(self, "_layer_profile_captures", {}).clear()
         self._contexts.clear()
         self._engines.clear()
         self._cache_banks.clear()
