@@ -83,6 +83,10 @@ class FusionAuditError(RuntimeError):
     """A plan was built, but its physical tactic/plugin contract failed."""
 
 
+class _ProbeInfrastructureError(RuntimeError):
+    """A probe setup failure that cannot be repaired by another scheme."""
+
+
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
     if not path.is_file():
         raise ValueError(f"{label} does not exist: {path}")
@@ -454,8 +458,105 @@ def _find_record(analysis: Mapping[str, Any], call_site: str) -> dict[str, Any]:
     raise KeyError(call_site)
 
 
+def _probe_inputs(record: Mapping[str, Any], *, full_boundary: bool) -> list[str]:
+    values = [record["current_tensor"]]
+    cache = record.get("cache_tensor")
+    if isinstance(cache, str) and cache:
+        values.append(cache)
+    if full_boundary and record.get("epilogue_mode") == "conv2_residual":
+        values.append(record["epilogue_residual_tensor"])
+    return list(dict.fromkeys(values))
+
+
+def _normalize_probe_shape(value: Any, *, label: str) -> list[int]:
+    if not isinstance(value, (list, tuple)) or not value:
+        raise _ProbeInfrastructureError(f"{label} is not a static tensor shape")
+    shape = [int(dimension) for dimension in value]
+    if any(dimension <= 0 for dimension in shape):
+        raise _ProbeInfrastructureError(
+            f"{label} contains a dynamic or non-positive dimension: {shape}"
+        )
+    return shape
+
+
+def _probe_input_shapes(
+    record: Mapping[str, Any], *, full_boundary: bool
+) -> dict[str, list[int]]:
+    shapes: dict[str, list[int]] = {}
+
+    def _add(name: Any, shape: Any, *, label: str) -> None:
+        if not isinstance(name, str) or not name:
+            raise _ProbeInfrastructureError(f"{label} has no tensor name")
+        normalized = _normalize_probe_shape(shape, label=label)
+        existing = shapes.get(name)
+        if existing is not None and existing != normalized:
+            raise _ProbeInfrastructureError(
+                f"probe input {name} has conflicting static shapes: "
+                f"{existing} versus {normalized}"
+            )
+        shapes[name] = normalized
+
+    _add(
+        record.get("current_tensor"),
+        record.get("current_shape"),
+        label="current activation",
+    )
+    cache = record.get("cache_tensor")
+    if isinstance(cache, str) and cache:
+        _add(cache, record.get("cache_shape"), label="feature cache")
+    if full_boundary and record.get("epilogue_mode") == "conv2_residual":
+        _add(
+            record.get("epilogue_residual_tensor"),
+            record.get("epilogue_output_shape"),
+            label="epilogue residual",
+        )
+    expected = set(_probe_inputs(record, full_boundary=full_boundary))
+    if set(shapes) != expected:
+        raise _ProbeInfrastructureError(
+            "probe input-shape contract does not match the extracted inputs: "
+            f"inputs={sorted(expected)}, shapes={sorted(shapes)}"
+        )
+    return shapes
+
+
+def _specialize_probe_inputs(
+    *, onnx: Any, model: Any, input_shapes: Mapping[str, list[int]]
+) -> None:
+    graph_inputs = {value.name: value for value in model.graph.input}
+    if set(graph_inputs) != set(input_shapes):
+        raise _ProbeInfrastructureError(
+            "extracted probe inputs differ from the static analysis contract: "
+            f"onnx={sorted(graph_inputs)}, analysis={sorted(input_shapes)}"
+        )
+    for name, shape in input_shapes.items():
+        tensor_type = graph_inputs[name].type.tensor_type
+        dimensions = tensor_type.shape.dim
+        if len(dimensions) != len(shape):
+            raise _ProbeInfrastructureError(
+                f"probe input {name} rank differs from static analysis: "
+                f"onnx={len(dimensions)}, analysis={len(shape)}"
+            )
+        for dimension, size in zip(dimensions, shape, strict=True):
+            dimension.ClearField("dim_param")
+            dimension.dim_value = int(size)
+        if any(
+            not dimension.HasField("dim_value") or int(dimension.dim_value) <= 0
+            for dimension in dimensions
+        ):
+            raise _ProbeInfrastructureError(
+                f"probe input {name} remained dynamic after specialization"
+            )
+    onnx.checker.check_model(model)
+
+
 def _extract_probe(
-    *, onnx: Any, source: Path, destination: Path, inputs: list[str], outputs: list[str]
+    *,
+    onnx: Any,
+    source: Path,
+    destination: Path,
+    inputs: list[str],
+    outputs: list[str],
+    input_shapes: Mapping[str, list[int]],
 ) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(f"{destination.stem}.partial.onnx")
@@ -466,17 +567,14 @@ def _extract_probe(
         outputs,
         check_model=True,
     )
+    model = onnx.load(str(temporary))
+    _specialize_probe_inputs(
+        onnx=onnx,
+        model=model,
+        input_shapes=input_shapes,
+    )
+    onnx.save(model, str(temporary))
     temporary.replace(destination)
-
-
-def _probe_inputs(record: Mapping[str, Any], *, full_boundary: bool) -> list[str]:
-    values = [record["current_tensor"]]
-    cache = record.get("cache_tensor")
-    if isinstance(cache, str) and cache:
-        values.append(cache)
-    if full_boundary and record.get("epilogue_mode") == "conv2_residual":
-        values.append(record["epilogue_residual_tensor"])
-    return list(dict.fromkeys(values))
 
 
 def _inspector_layers(inspector_json: str) -> list[dict[str, Any]]:
@@ -718,6 +816,7 @@ def _build_probe(
     # Otherwise a faster candidate could simply be doing less work and the
     # threshold would be scientifically meaningless.
     inputs = _probe_inputs(record, full_boundary=True)
+    input_shapes = _probe_input_shapes(record, full_boundary=True)
     outputs = [
         record["epilogue_output_tensor"],
         record["cache_update_tensor"],
@@ -728,6 +827,7 @@ def _build_probe(
         destination=probe_onnx,
         inputs=inputs,
         outputs=list(dict.fromkeys(outputs)),
+        input_shapes=input_shapes,
     )
     plan, io_contract, inspector_json, _candidate_cache = _build_engine_bytes(
         trt=trt,
@@ -842,7 +942,15 @@ def _run_probe_suite(
                         repeat=repeat,
                         weight_encoding=weight_encoding,
                     )
+                except _ProbeInfrastructureError:
+                    raise
                 except BaseException as exc:
+                    if scheme == "baseline":
+                        raise _ProbeInfrastructureError(
+                            "the unfused baseline probe could not be built or run; "
+                            "trying other fusion schemes cannot repair this failure: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
                     schemes[scheme] = {
                         "scheme": scheme,
                         "passed_correctness": False,
@@ -923,6 +1031,8 @@ def _run_probe_suite(
                 "selection_candidates": candidates,
                 "schemes": schemes,
             }
+        except _ProbeInfrastructureError:
+            raise
         except BaseException as exc:
             result = {
                 **signature_record,

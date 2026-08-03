@@ -122,8 +122,11 @@ from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion import (
     _unpad_shape,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_fusion_build import (
+    _ProbeInfrastructureError,
     _analysis_signature as _fusion_analysis_signature,
     _load_analysis_contracts,
+    _probe_input_shapes,
+    _run_probe_suite,
     _selected_call_sites as _fusion_selected_call_sites,
 )
 from sglang.multimodal_gen.experimental.jetson_sfwan.vae_trt_perf_compare import (
@@ -6504,6 +6507,71 @@ class TestSfWanTensorRTFusionExperiment(CustomTestCase):
         self.assertEqual(first, _fusion_analysis_signature(copy.deepcopy(record)))
         record["padded_shape"][-1] += 1
         self.assertNotEqual(first, _fusion_analysis_signature(record))
+
+    def test_fusion_probe_inputs_use_analysis_v2_static_shapes(self):
+        record = {
+            "current_tensor": "current",
+            "current_shape": [1, 96, 1, 60, 104],
+            "cache_tensor": "cache",
+            "cache_shape": [1, 96, 2, 60, 104],
+            "epilogue_mode": "conv2_residual",
+            "epilogue_residual_tensor": "residual",
+            "epilogue_output_shape": [1, 96, 1, 60, 104],
+        }
+        self.assertEqual(
+            _probe_input_shapes(record, full_boundary=True),
+            {
+                "current": [1, 96, 1, 60, 104],
+                "cache": [1, 96, 2, 60, 104],
+                "residual": [1, 96, 1, 60, 104],
+            },
+        )
+        record["current_shape"][2] = -1
+        with self.assertRaisesRegex(
+            _ProbeInfrastructureError, "dynamic or non-positive"
+        ):
+            _probe_input_shapes(record, full_boundary=True)
+
+    def test_fusion_probe_stops_after_baseline_infrastructure_failure(self):
+        call_site = "int8/initial/decoder.up_blocks.3.block.conv1/call_0"
+        analysis = {
+            "signatures": {
+                "signature": {
+                    "representative": call_site,
+                    "eligible": True,
+                    "focused": True,
+                }
+            },
+            "graphs": {
+                "initial": {"call_sites": [{"call_site": call_site}]},
+                "steady": {"call_sites": []},
+            },
+        }
+        target = (
+            "sglang.multimodal_gen.experimental.jetson_sfwan."
+            "vae_trt_fusion_build._build_probe"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch(
+                target, side_effect=RuntimeError("missing profile")
+            ) as build:
+                with self.assertRaisesRegex(
+                    _ProbeInfrastructureError, "unfused baseline probe"
+                ):
+                    _run_probe_suite(
+                        trt=object(),
+                        torch=object(),
+                        onnx=object(),
+                        source_paths={"initial": Path("initial.onnx")},
+                        analysis=analysis,
+                        fusion_root=Path(directory),
+                        workspace_gib=1,
+                        device_index=0,
+                        warmup=1,
+                        repeat=1,
+                        weight_encoding="fp32_qdq",
+                    )
+        build.assert_called_once()
 
     def test_causal_concat_keeps_cache_first_for_four_frame_current(self):
         cache, current = _ordered_causal_concat_inputs(
