@@ -401,6 +401,8 @@ cutlass::Status runConv(int8_t const* activation, int8_t const* weight,
         cutlass::conv::IteratorAlgorithm::kOptimized,
         cutlass::conv::StrideSupport::kUnity>::Kernel;
     using Conv = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
+    using InputRef = cutlass::TensorRef<ElementInput, Layout>;
+    using OutputRef = cutlass::TensorRef<ElementOutput, Layout>;
     cutlass::conv::Conv2dProblemSize problem(
         cutlass::Tensor4DCoord(n, h, w, c),
         cutlass::Tensor4DCoord(k, r, s, c),
@@ -409,12 +411,21 @@ cutlass::Status runConv(int8_t const* activation, int8_t const* weight,
         cutlass::MatrixCoord(dilationH, dilationW),
         cutlass::Tensor4DCoord(n, p, q, k),
         cutlass::conv::Mode::kCrossCorrelation, 1);
+    // The legacy CUTLASS Conv2d wrapper exposes mutable TensorRef inputs even
+    // though its fprop iterators only read A and B.  Preserve const throughout
+    // the SFWan API and remove it only while binding those legacy references.
+    InputRef activationRef(const_cast<ElementInput*>(activation),
+        Layout::packed(cutlass::Tensor4DCoord(n, h, w, c)));
+    InputRef weightRef(const_cast<ElementInput*>(weight),
+        Layout::packed(cutlass::Tensor4DCoord(k, r, s, c)));
+    OutputRef outputRef(
+        output, Layout::packed(cutlass::Tensor4DCoord(n, p, q, k)));
     typename Conv::Arguments arguments{
         problem,
-        {activation, Layout::packed(cutlass::Tensor4DCoord(n, h, w, c))},
-        {weight, Layout::packed(cutlass::Tensor4DCoord(k, r, s, c))},
-        {output, Layout::packed(cutlass::Tensor4DCoord(n, p, q, k))},
-        {output, Layout::packed(cutlass::Tensor4DCoord(n, p, q, k))},
+        activationRef,
+        weightRef,
+        outputRef,
+        outputRef,
         {1, 0},
     };
     Conv operation;

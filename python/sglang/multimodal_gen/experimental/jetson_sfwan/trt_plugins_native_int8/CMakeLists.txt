@@ -86,7 +86,7 @@ target_compile_options(
   sfwan_vae_native_int8_v1
   PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-Wall;-Wextra;-Werror=return-type>
-    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--threads=2;-lineinfo>
+    $<$<COMPILE_LANGUAGE:CUDA>:-O3;--use_fast_math;--expt-relaxed-constexpr;--threads=2;-lineinfo>
 )
 target_link_libraries(
   sfwan_vae_native_int8_v1
