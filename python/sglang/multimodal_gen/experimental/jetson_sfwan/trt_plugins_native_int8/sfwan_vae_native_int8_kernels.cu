@@ -83,24 +83,6 @@ size_t alignUp(size_t value, size_t alignment = 256)
     return (value + alignment - 1) / alignment * alignment;
 }
 
-int64_t volume5(int32_t const* shape)
-{
-    if (shape == nullptr)
-    {
-        return -1;
-    }
-    int64_t result = 1;
-    for (int32_t index = 0; index < 5; ++index)
-    {
-        if (shape[index] <= 0)
-        {
-            return -1;
-        }
-        result *= shape[index];
-    }
-    return result;
-}
-
 bool zeroOrPositiveShape(int32_t const* shape, bool allowZero)
 {
     if (shape == nullptr)
