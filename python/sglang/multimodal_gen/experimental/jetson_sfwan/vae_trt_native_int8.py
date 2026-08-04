@@ -293,6 +293,7 @@ def analyze_native_int8_graphs(
     *,
     source_paths: Mapping[str, Path],
     base_analysis: Mapping[str, Any],
+    signature_contracts: Mapping[str, Mapping[str, Mapping[str, Any]]],
     target_module_names: tuple[str, ...],
 ) -> dict[str, Any]:
     """Prove all residual blocks, cache owners, groups, and weight contracts."""
@@ -311,16 +312,46 @@ def analyze_native_int8_graphs(
 
     graphs: dict[str, Any] = {}
     public_cache_slots_by_module: dict[str, int] = {}
-    signature_ids = set(base_analysis.get("signatures", {}))
-    signature_by_call_site = {
-        call_site: signature_id
-        for signature_id, signature in base_analysis.get("signatures", {}).items()
-        if isinstance(signature, Mapping)
-        for call_sites in signature.get("call_sites", {}).values()
-        if isinstance(call_sites, list)
-        for call_site in call_sites
-        if isinstance(call_site, str)
-    }
+    signature_fields = (
+        "input_shape",
+        "weight_shape",
+        "output_shape",
+        "kernel_shape",
+        "pads",
+        "strides",
+        "dilations",
+        "group",
+    )
+    signature_by_call_site: dict[str, str] = {}
+    signatures: dict[str, dict[str, Any]] = {}
+    for kind in ("initial", "steady"):
+        contracts = signature_contracts.get(kind)
+        if not isinstance(contracts, Mapping):
+            errors.append(f"{kind}: v5 Conv signature contracts are missing")
+            continue
+        for call_site, contract in contracts.items():
+            if not isinstance(call_site, str) or not isinstance(contract, Mapping):
+                errors.append(f"{kind}: invalid v5 Conv signature contract")
+                continue
+            signature_id = contract.get("signature_id")
+            if not isinstance(signature_id, str):
+                errors.append(f"{kind}:{call_site}: v5 Conv signature ID is missing")
+                continue
+            canonical = {field: contract.get(field) for field in signature_fields}
+            entry = signatures.setdefault(
+                signature_id,
+                {
+                    "signature_id": signature_id,
+                    "signature": canonical,
+                    "call_sites": {"initial": [], "steady": []},
+                },
+            )
+            if entry["signature"] != canonical:
+                errors.append(f"v5 Conv signature collision: {signature_id}")
+                continue
+            signature_by_call_site[call_site] = signature_id
+            entry["call_sites"][kind].append(call_site)
+    signature_ids = set(signatures)
     for kind in ("initial", "steady"):
         graph_analysis = base_analysis.get("graphs", {}).get(kind)
         if not isinstance(graph_analysis, Mapping):
@@ -549,7 +580,7 @@ def analyze_native_int8_graphs(
         "logical_target_conv_count": EXPECTED_LOGICAL_CONVS,
         "target_call_site_count_per_graph": EXPECTED_CALL_SITES_PER_GRAPH,
         "signature_count": len(signature_ids),
-        "signatures": dict(base_analysis.get("signatures", {})),
+        "signatures": signatures,
         "graphs": graphs,
         "int8_cache_slots": [steady_slots[index] for index in sorted(steady_slots)],
         "int8_cache_slot_count": len(steady_slots),

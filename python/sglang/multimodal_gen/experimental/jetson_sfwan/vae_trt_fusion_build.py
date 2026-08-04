@@ -53,7 +53,11 @@ from .vae_trt_fusion import (
     validate_fusion_manifest,
     write_json_atomic,
 )
-from .vae_trt_qdq import EXPECTED_CALL_SITES, QDQ_SCHEMA_VERSION
+from .vae_trt_qdq import (
+    EXPECTED_CALL_SITES,
+    QDQ_SCHEMA_VERSION,
+    conv_signature_id,
+)
 from .vae_trt_runtime import (
     TRT_VAE_CACHE_BANK_BYTES,
     TRT_VAE_CACHE_COUNT,
@@ -232,7 +236,10 @@ def _target_names(base_manifest: Mapping[str, Any]) -> tuple[str, ...]:
 
 
 def _load_analysis_contracts(
-    *, base_root: Path, base_manifest: Mapping[str, Any]
+    *,
+    base_root: Path,
+    base_manifest: Mapping[str, Any],
+    include_signature_metadata: bool = False,
 ) -> dict[str, Any]:
     """Load the SHA-bound v5 shapes that ONNX value_info may omit.
 
@@ -290,6 +297,7 @@ def _load_analysis_contracts(
             if not isinstance(signature, Mapping):
                 raise ValueError(f"base INT8 v5 {kind} Conv contract is invalid")
             call_site = signature.get("call_site")
+            signature_id = signature.get("signature_id")
             input_shape = signature.get("input_shape")
             output_shape = signature.get("output_shape")
             if (
@@ -298,6 +306,13 @@ def _load_analysis_contracts(
                 or call_site in contracts
             ):
                 raise ValueError(f"base INT8 v5 {kind} Conv call site is invalid")
+            if include_signature_metadata and (
+                not isinstance(signature_id, str)
+                or signature_id != conv_signature_id(dict(signature))
+            ):
+                raise ValueError(
+                    f"base INT8 v5 {kind} Conv signature is invalid: {call_site}"
+                )
             for label, shape in (("input", input_shape), ("output", output_shape)):
                 if (
                     not isinstance(shape, list)
@@ -312,10 +327,29 @@ def _load_analysis_contracts(
                     raise ValueError(
                         f"base INT8 v5 {call_site} {label} shape is invalid: {shape}"
                     )
-            contracts[call_site] = {
+            contract = {
                 "input_shape": [int(value) for value in input_shape],
                 "output_shape": [int(value) for value in output_shape],
             }
+            if include_signature_metadata:
+                contract.update(
+                    {
+                        "weight_shape": [
+                            int(value) for value in signature["weight_shape"]
+                        ],
+                        "kernel_shape": [
+                            int(value) for value in signature["kernel_shape"]
+                        ],
+                        "pads": [int(value) for value in signature["pads"]],
+                        "strides": [int(value) for value in signature["strides"]],
+                        "dilations": [
+                            int(value) for value in signature["dilations"]
+                        ],
+                        "group": int(signature["group"]),
+                        "signature_id": signature_id,
+                    }
+                )
+            contracts[call_site] = contract
         graph_contracts[kind] = contracts
 
     cache = base_manifest.get("cache")

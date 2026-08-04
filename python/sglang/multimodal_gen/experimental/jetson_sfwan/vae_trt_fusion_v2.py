@@ -133,10 +133,31 @@ def _find_norm1_contract(
 ) -> dict[str, Any]:
     """Recover ``block_input -> norm1 -> SiLU -> conv1 current`` exactly."""
 
-    source = peer_conv2.get("epilogue_residual_tensor")
+    residual = peer_conv2.get("epilogue_residual_tensor")
     target = record.get("current_tensor")
-    if not isinstance(source, str) or not isinstance(target, str):
+    if not isinstance(residual, str) or not isinstance(target, str):
         raise ValueError("residual block input/current tensor is unavailable")
+    source = residual
+    shortcut = producer.get(residual)
+    shortcut_name = None
+    if (
+        shortcut is not None
+        and shortcut.op_type == "Conv"
+        and "conv_shortcut" in shortcut.name
+    ):
+        attributes = {
+            value.name: helper.get_attribute_value(value)
+            for value in shortcut.attribute
+        }
+        kernel_shape = [
+            int(value) for value in attributes.get("kernel_shape", [])
+        ]
+        if kernel_shape != [1, 1, 1] or not shortcut.input:
+            raise ValueError(
+                f"unsupported residual shortcut topology: {shortcut.name}"
+            )
+        source = shortcut.input[0]
+        shortcut_name = shortcut.name
     subgraph = _collect_reverse_subgraph(
         target=target,
         source=source,
@@ -203,6 +224,8 @@ def _find_norm1_contract(
     )
     return {
         "input_tensor": source,
+        "residual_tensor": residual,
+        "shortcut_node": shortcut_name,
         "gamma_tensor": gamma_candidates[0],
         "output_tensor": target,
         "output_shape": [int(value) for value in output_shape],

@@ -272,7 +272,9 @@ def _analysis(
 ) -> dict[str, Any]:
     targets = _target_names(base_manifest)
     contracts = _load_analysis_contracts(
-        base_root=base_root, base_manifest=base_manifest
+        base_root=base_root,
+        base_manifest=base_manifest,
+        include_signature_metadata=True,
     )
     base_analysis = _run_analysis(
         source_paths=source_paths,
@@ -287,6 +289,7 @@ def _analysis(
     result = analyze_native_int8_graphs(
         source_paths=source_paths,
         base_analysis=base_analysis,
+        signature_contracts=contracts["graphs"],
         target_module_names=targets,
     )
     if result.get("passed") is not True:
