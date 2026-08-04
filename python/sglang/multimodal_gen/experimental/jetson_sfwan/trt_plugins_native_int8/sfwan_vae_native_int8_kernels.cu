@@ -196,21 +196,28 @@ __global__ void entryNormQuantWindowKernel(void const* input,
     int32_t const foldedChannels = channels * 3;
     for (int32_t c = lane; c < channels; c += 32)
     {
-        for (int32_t history = 0; history < 2; ++history)
+        if (d == 0)
         {
-            int32_t const cacheIndex = cacheDepth - 2 + history;
-            int8_t q = 0;
-            if (hasCache && cacheIndex >= 0)
+            for (int32_t outputDepth = 0; outputDepth < depth; ++outputDepth)
             {
-                q = cache[cdhw32Offset(n, c, cacheIndex, h, w, channels,
-                    cacheDepth, height, width)];
-            }
-            temporalWindow[nhwcOffset(n, h, w, history * channels + c,
-                height, width, foldedChannels)] = q;
-            if (history == 1 && cacheOutputDepth >= 2)
-            {
-                cacheOutput[cdhw32Offset(n, c, 0, h, w, channels,
-                    cacheOutputDepth, height, width)] = q;
+                for (int32_t history = 0; history < 3; ++history)
+                {
+                    int32_t const source
+                        = cacheDepth + outputDepth - 2 + history;
+                    if (source >= cacheDepth)
+                    {
+                        continue;
+                    }
+                    int8_t q = 0;
+                    if (hasCache && source >= 0)
+                    {
+                        q = cache[cdhw32Offset(n, c, source, h, w,
+                            channels, cacheDepth, height, width)];
+                    }
+                    temporalWindow[nhwcOffset(n * depth + outputDepth, h, w,
+                        history * channels + c, height, width,
+                        foldedChannels)] = q;
+                }
             }
         }
         float normalized = readBlockValue(input, inputIsInt8, inputScale, n,
@@ -218,10 +225,39 @@ __global__ void entryNormQuantWindowKernel(void const* input,
             * factor * __half2float(gamma[c]);
         float const silu = normalized / (1.0F + expf(-normalized));
         int8_t const q = quantizeSigned(silu, outputScale);
-        temporalWindow[nhwcOffset(n, h, w, 2 * channels + c, height, width,
-            foldedChannels)] = q;
-        cacheOutput[cdhw32Offset(n, c, cacheOutputDepth - 1, h, w, channels,
-            cacheOutputDepth, height, width)] = q;
+        for (int32_t outputDepth = d;
+             outputDepth < depth && outputDepth <= d + 2; ++outputDepth)
+        {
+            int32_t const history = 2 - (outputDepth - d);
+            temporalWindow[nhwcOffset(n * depth + outputDepth, h, w,
+                history * channels + c, height, width, foldedChannels)] = q;
+        }
+        int32_t const combinedDepth = cacheDepth + depth;
+        for (int32_t outputIndex = 0; outputIndex < cacheOutputDepth;
+             ++outputIndex)
+        {
+            int32_t const source
+                = combinedDepth - cacheOutputDepth + outputIndex;
+            if (source < cacheDepth)
+            {
+                if (d == 0)
+                {
+                    int8_t history = 0;
+                    if (hasCache && source >= 0)
+                    {
+                        history = cache[cdhw32Offset(n, c, source, h, w,
+                            channels, cacheDepth, height, width)];
+                    }
+                    cacheOutput[cdhw32Offset(n, c, outputIndex, h, w,
+                        channels, cacheOutputDepth, height, width)] = history;
+                }
+            }
+            else if (source - cacheDepth == d)
+            {
+                cacheOutput[cdhw32Offset(n, c, outputIndex, h, w, channels,
+                    cacheOutputDepth, height, width)] = q;
+            }
+        }
     }
 }
 
@@ -229,15 +265,16 @@ __global__ void accumulatorNormQuantWindowKernel(int32_t const* accumulator,
     float const* weightScale, float const* bias, int8_t const* cache,
     half const* gamma, int8_t* temporalWindow, int8_t* cacheOutput,
     bool hasCache, float activationScale, float outputScale, int32_t nSize,
-    int32_t channels, int32_t height, int32_t width, int32_t cacheDepth,
-    int32_t cacheOutputDepth)
+    int32_t channels, int32_t depth, int32_t height, int32_t width,
+    int32_t cacheDepth, int32_t cacheOutputDepth)
 {
     int32_t constexpr kWarpsPerBlock = 4;
     int32_t const lane = threadIdx.x & 31;
     int32_t const warp = threadIdx.x >> 5;
     int64_t const site
         = static_cast<int64_t>(blockIdx.x) * kWarpsPerBlock + warp;
-    int64_t const siteCount = static_cast<int64_t>(nSize) * height * width;
+    int64_t const siteCount
+        = static_cast<int64_t>(nSize) * depth * height * width;
     if (site >= siteCount)
     {
         return;
@@ -246,11 +283,14 @@ __global__ void accumulatorNormQuantWindowKernel(int32_t const* accumulator,
     int32_t const w = value % width;
     value /= width;
     int32_t const h = value % height;
-    int32_t const n = value / height;
+    value /= height;
+    int32_t const d = value % depth;
+    int32_t const n = value / depth;
     float sumSquares = 0.0F;
     for (int32_t c = lane; c < channels; c += 32)
     {
-        int64_t const index = nhwcOffset(n, h, w, c, height, width, channels);
+        int64_t const index = nhwcOffset(
+            n * depth + d, h, w, c, height, width, channels);
         float const x = static_cast<float>(accumulator[index])
                 * activationScale * weightScale[c]
             + bias[c];
@@ -267,34 +307,71 @@ __global__ void accumulatorNormQuantWindowKernel(int32_t const* accumulator,
     int32_t const foldedChannels = channels * 3;
     for (int32_t c = lane; c < channels; c += 32)
     {
-        for (int32_t history = 0; history < 2; ++history)
+        if (d == 0)
         {
-            int32_t const cacheIndex = cacheDepth - 2 + history;
-            int8_t q = 0;
-            if (hasCache && cacheIndex >= 0)
+            for (int32_t outputDepth = 0; outputDepth < depth; ++outputDepth)
             {
-                q = cache[cdhw32Offset(n, c, cacheIndex, h, w, channels,
-                    cacheDepth, height, width)];
-            }
-            temporalWindow[nhwcOffset(n, h, w, history * channels + c,
-                height, width, foldedChannels)] = q;
-            if (history == 1 && cacheOutputDepth >= 2)
-            {
-                cacheOutput[cdhw32Offset(n, c, 0, h, w, channels,
-                    cacheOutputDepth, height, width)] = q;
+                for (int32_t history = 0; history < 3; ++history)
+                {
+                    int32_t const source
+                        = cacheDepth + outputDepth - 2 + history;
+                    if (source >= cacheDepth)
+                    {
+                        continue;
+                    }
+                    int8_t q = 0;
+                    if (hasCache && source >= 0)
+                    {
+                        q = cache[cdhw32Offset(n, c, source, h, w,
+                            channels, cacheDepth, height, width)];
+                    }
+                    temporalWindow[nhwcOffset(n * depth + outputDepth, h, w,
+                        history * channels + c, height, width,
+                        foldedChannels)] = q;
+                }
             }
         }
-        int64_t const index = nhwcOffset(n, h, w, c, height, width, channels);
+        int64_t const index = nhwcOffset(
+            n * depth + d, h, w, c, height, width, channels);
         float normalized = (static_cast<float>(accumulator[index])
                                * activationScale * weightScale[c]
                                + bias[c])
             * factor * __half2float(gamma[c]);
         float const silu = normalized / (1.0F + expf(-normalized));
         int8_t const q = quantizeSigned(silu, outputScale);
-        temporalWindow[nhwcOffset(n, h, w, 2 * channels + c, height, width,
-            foldedChannels)] = q;
-        cacheOutput[cdhw32Offset(n, c, cacheOutputDepth - 1, h, w, channels,
-            cacheOutputDepth, height, width)] = q;
+        for (int32_t outputDepth = d;
+             outputDepth < depth && outputDepth <= d + 2; ++outputDepth)
+        {
+            int32_t const history = 2 - (outputDepth - d);
+            temporalWindow[nhwcOffset(n * depth + outputDepth, h, w,
+                history * channels + c, height, width, foldedChannels)] = q;
+        }
+        int32_t const combinedDepth = cacheDepth + depth;
+        for (int32_t outputIndex = 0; outputIndex < cacheOutputDepth;
+             ++outputIndex)
+        {
+            int32_t const source
+                = combinedDepth - cacheOutputDepth + outputIndex;
+            if (source < cacheDepth)
+            {
+                if (d == 0)
+                {
+                    int8_t history = 0;
+                    if (hasCache && source >= 0)
+                    {
+                        history = cache[cdhw32Offset(n, c, source, h, w,
+                            channels, cacheDepth, height, width)];
+                    }
+                    cacheOutput[cdhw32Offset(n, c, outputIndex, h, w,
+                        channels, cacheOutputDepth, height, width)] = history;
+                }
+            }
+            else if (source - cacheDepth == d)
+            {
+                cacheOutput[cdhw32Offset(n, c, outputIndex, h, w, channels,
+                    cacheOutputDepth, height, width)] = q;
+            }
+        }
     }
 }
 
@@ -321,8 +398,8 @@ __global__ void residualEpilogueKernel(int32_t const* accumulator,
         value /= depth;
         int32_t const c = value % channels;
         int32_t const n = value / channels;
-        int64_t const accumulatorIndex
-            = nhwcOffset(n, h, w, c, height, width, channels);
+        int64_t const accumulatorIndex = nhwcOffset(
+            n * depth + d, h, w, c, height, width, channels);
         float result = static_cast<float>(accumulator[accumulatorIndex])
                 * activationScale * weightScale[c]
             + bias[c];
@@ -487,15 +564,17 @@ WorkspaceLayout workspaceLayout(SfWanNativeInt8BlockConfig const& config)
     int64_t const k2 = config.weight2Shape[0];
     size_t cursor = 0;
     result.window1Offset = cursor;
-    cursor = alignUp(cursor + static_cast<size_t>(n * h1 * w1 * c1));
+    int64_t const d1 = config.inputShape[2];
+    int64_t const d2 = config.outputShape[2];
+    cursor = alignUp(cursor + static_cast<size_t>(n * d1 * h1 * w1 * c1));
     result.accumulator1Offset = cursor;
     cursor = alignUp(cursor
-        + static_cast<size_t>(n * h2 * w2 * k1) * sizeof(int32_t));
+        + static_cast<size_t>(n * d1 * h2 * w2 * k1) * sizeof(int32_t));
     result.window2Offset = cursor;
-    cursor = alignUp(cursor + static_cast<size_t>(n * h2 * w2 * c2));
+    cursor = alignUp(cursor + static_cast<size_t>(n * d2 * h2 * w2 * c2));
     result.accumulator2Offset = cursor;
     cursor = alignUp(cursor
-        + static_cast<size_t>(n * h2 * w2 * k2) * sizeof(int32_t));
+        + static_cast<size_t>(n * d2 * h2 * w2 * k2) * sizeof(int32_t));
     result.cutlassOffset = cursor;
     result.total = alignUp(cursor + kCutlassWorkspaceReserve);
     return result;
@@ -508,8 +587,13 @@ bool validConfig(SfWanNativeInt8BlockConfig const& config)
         || !zeroOrPositiveShape(config.outputShape, false)
         || !zeroOrPositiveShape(config.cache1OutputShape, false)
         || !zeroOrPositiveShape(config.cache2OutputShape, false)
-        || config.inputShape[0] != 1 || config.inputShape[2] != 1
-        || config.outputShape[0] != 1 || config.outputShape[2] != 1
+        || config.inputShape[0] != 1 || config.outputShape[0] != 1
+        || config.inputShape[2] != config.outputShape[2]
+        || config.shortcutShape[0] != config.outputShape[0]
+        || config.shortcutShape[1] != config.outputShape[1]
+        || config.shortcutShape[2] != config.outputShape[2]
+        || config.shortcutShape[3] != config.outputShape[3]
+        || config.shortcutShape[4] != config.outputShape[4]
         || config.inputShape[1] % 32 != 0
         || config.outputShape[1] % 32 != 0 || config.tile1 < 0
         || config.tile1 >= kTileCount || config.tile2 < 0
@@ -630,9 +714,11 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     void* cutlassWorkspace = bytes + layout.cutlassOffset;
     int32_t const n = config->inputShape[0];
     int32_t const c1 = config->inputShape[1];
+    int32_t const d1 = config->inputShape[2];
     int32_t const h1 = config->inputShape[3];
     int32_t const w1 = config->inputShape[4];
     int32_t const k1 = config->weight1Shape[0];
+    int32_t const d2 = config->outputShape[2];
     int32_t const h2 = config->outputShape[3];
     int32_t const w2 = config->outputShape[4];
     int32_t const k2 = config->weight2Shape[0];
@@ -640,8 +726,8 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
         = config->hasCache1 ? config->cache1InputShape[2] : 0;
     int32_t const cache2Depth
         = config->hasCache2 ? config->cache2InputShape[2] : 0;
-    int64_t const sites1 = static_cast<int64_t>(n) * h1 * w1;
-    int64_t const sites2 = static_cast<int64_t>(n) * h2 * w2;
+    int64_t const sites1 = static_cast<int64_t>(n) * d1 * h1 * w1;
+    int64_t const sites2 = static_cast<int64_t>(n) * d2 * h2 * w2;
     EventSet profile(gProfiling.load(std::memory_order_relaxed) != 0);
     if (profile.active)
     {
@@ -653,7 +739,7 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
         static_cast<half const*>(gamma1), window1,
         static_cast<int8_t*>(cache1Output), config->inputIsInt8 != 0,
         config->hasCache1 != 0, config->inputScale,
-        config->conv1InputScale, n, c1, 1, h1, w1, cache1Depth,
+        config->conv1InputScale, n, c1, d1, h1, w1, cache1Depth,
         config->cache1OutputShape[2]);
     if (cudaPeekAtLastError() != cudaSuccess)
     {
@@ -665,7 +751,7 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     }
     cutlass::Status status = dispatchConv(config->tile1, window1,
         static_cast<int8_t const*>(weight1), accumulator1, cutlassWorkspace,
-        n, h1, w1, c1 * 3, k1, config->weight1Shape[1],
+        n * d1, h1, w1, c1 * 3, k1, config->weight1Shape[1],
         config->weight1Shape[2], h2, w2, config->conv1Params[0],
         config->conv1Params[1], config->conv1Params[2],
         config->conv1Params[3], config->conv1Params[4],
@@ -684,8 +770,8 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
         static_cast<float const*>(bias1), static_cast<int8_t const*>(cache2),
         static_cast<half const*>(gamma2), window2,
         static_cast<int8_t*>(cache2Output), config->hasCache2 != 0,
-        config->conv1InputScale, config->conv2InputScale, n, k1, h2, w2,
-        cache2Depth, config->cache2OutputShape[2]);
+        config->conv1InputScale, config->conv2InputScale, n, k1, d2, h2,
+        w2, cache2Depth, config->cache2OutputShape[2]);
     if (cudaPeekAtLastError() != cudaSuccess)
     {
         return -1;
@@ -696,7 +782,7 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     }
     status = dispatchConv(config->tile2, window2,
         static_cast<int8_t const*>(weight2), accumulator2, cutlassWorkspace,
-        n, h2, w2, config->weight2Shape[3], k2,
+        n * d2, h2, w2, config->weight2Shape[3], k2,
         config->weight2Shape[1], config->weight2Shape[2],
         config->outputShape[3], config->outputShape[4],
         config->conv2Params[0], config->conv2Params[1],
@@ -763,7 +849,7 @@ extern "C" int32_t sfwanNativeInt8TuneConv(int32_t const* inputShape,
     {
         return -1;
     }
-    int32_t const n = inputShape[0];
+    int32_t const n = inputShape[0] * inputShape[2];
     int32_t const h = inputShape[3];
     int32_t const w = inputShape[4];
     int32_t const c = weightShape[3];

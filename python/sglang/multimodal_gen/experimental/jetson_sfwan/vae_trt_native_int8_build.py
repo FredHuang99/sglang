@@ -126,7 +126,6 @@ def _load_state(
     if (
         state.get("schema_version") != NATIVE_INT8_SCHEMA_VERSION
         or state.get("variant") != NATIVE_INT8_VARIANT
-        or state.get("identity") != dict(identity)
     ):
         raise ValueError(
             "native INT8 --resume identity differs from the preserved build state; "
@@ -134,6 +133,38 @@ def _load_state(
         )
     if not isinstance(state.get("stages"), dict):
         raise ValueError("native INT8 build state has no stage map")
+    previous_identity = state.get("identity")
+    if previous_identity != dict(identity):
+        if not isinstance(previous_identity, Mapping):
+            raise ValueError("native INT8 build state has no identity map")
+        previous_without_plugin = dict(previous_identity)
+        current_without_plugin = dict(identity)
+        previous_plugin = previous_without_plugin.pop("plugin_sha256", None)
+        current_plugin = current_without_plugin.pop("plugin_sha256", None)
+        if (
+            previous_without_plugin != current_without_plugin
+            or previous_plugin == current_plugin
+        ):
+            raise ValueError(
+                "native INT8 --resume identity differs from the preserved build "
+                "state; use a new engine directory or omit --resume"
+            )
+        preserved_stages = {
+            name: dict(record)
+            for name, record in state["stages"].items()
+            if name in {"analyze", "calibrate", "pack"}
+            and isinstance(record, Mapping)
+            and record.get("status") == "completed"
+        }
+        state = _new_state(identity)
+        state["stages"].update(preserved_stages)
+        state["plugin_rebuild"] = {
+            "previous_sha256": previous_plugin,
+            "current_sha256": current_plugin,
+            "invalidated_stages": ["tune", "build", "audit"],
+            "updated_unix_time_ns": time.time_ns(),
+        }
+        write_json_atomic(_state_path(root), state)
     return state
 
 
