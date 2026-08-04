@@ -26,7 +26,7 @@ from .vae_trt_fusion_build import (
     _environment,
     _load_analysis_contracts,
     _run_analysis,
-    _target_module_names,
+    _target_names,
     _validate_io,
 )
 from .vae_trt_fusion_v2 import (
@@ -262,7 +262,7 @@ def build_fusion_v2(
     library = _load_plugin(trt=trt, path=destination_plugin)
     del library
 
-    target_names = _target_module_names(base_manifest)
+    target_names = _target_names(base_manifest)
     contracts = _load_analysis_contracts(
         base_root=base_root, base_manifest=base_manifest
     )
