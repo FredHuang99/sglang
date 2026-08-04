@@ -464,6 +464,11 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 "model_loaded": engine_status.get("model_loaded"),
                 "profile_enabled": bool(engine_contract.get("profile_enabled", False)),
                 "trt_layer_profile_enabled": layer_profile_enabled,
+                "native_int8_kernel_profile_enabled": bool(
+                    engine_contract.get(
+                        "native_int8_kernel_profile_enabled", False
+                    )
+                ),
                 "vae_backend": engine_contract.get("vae_backend"),
                 "vae_engine_precision": engine_contract.get("vae_engine_precision"),
                 "vae_trt_variant": engine_contract.get("vae_trt_variant", "baseline"),
@@ -502,6 +507,60 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "vae_engine_plan_sha256": engine_contract.get("vae_engine_plan_sha256"),
                 "vae_trt_plugin_sha256": engine_contract.get("vae_trt_plugin_sha256"),
+                "native_int8_schema_version": engine_contract.get(
+                    "native_int8_schema_version"
+                ),
+                "native_int8_plugin_sha256": engine_contract.get(
+                    "native_int8_plugin_sha256"
+                ),
+                "native_int8_initial_plan_sha256": engine_contract.get(
+                    "native_int8_initial_plan_sha256"
+                ),
+                "native_int8_steady_plan_sha256": engine_contract.get(
+                    "native_int8_steady_plan_sha256"
+                ),
+                "native_int8_target_logical_conv_count": engine_contract.get(
+                    "native_int8_target_logical_conv_count"
+                ),
+                "native_int8_initial_call_site_count": engine_contract.get(
+                    "native_int8_initial_call_site_count"
+                ),
+                "native_int8_steady_call_site_count": engine_contract.get(
+                    "native_int8_steady_call_site_count"
+                ),
+                "native_int8_signature_count": engine_contract.get(
+                    "native_int8_signature_count"
+                ),
+                "native_int8_cache_int8_slot_count": engine_contract.get(
+                    "native_int8_cache_int8_slot_count"
+                ),
+                "native_int8_cache_fp16_slot_count": engine_contract.get(
+                    "native_int8_cache_fp16_slot_count"
+                ),
+                "native_int8_cache_bank_bytes": engine_contract.get(
+                    "native_int8_cache_bank_bytes"
+                ),
+                "native_int8_runtime_scale_mode": engine_contract.get(
+                    "native_int8_runtime_scale_mode"
+                ),
+                "native_int8_weight_mode": engine_contract.get(
+                    "native_int8_weight_mode"
+                ),
+                "native_int8_kernel_tile_map": engine_contract.get(
+                    "native_int8_kernel_tile_map"
+                ),
+                "native_int8_algorithm": engine_contract.get(
+                    "native_int8_algorithm"
+                ),
+                "native_int8_weight_layout": engine_contract.get(
+                    "native_int8_weight_layout"
+                ),
+                "native_int8_cutlass_commit": engine_contract.get(
+                    "native_int8_cutlass_commit"
+                ),
+                "native_int8_audit_passed": engine_contract.get(
+                    "native_int8_audit_passed"
+                ),
             },
         }
         for index in range(args.warmup + args.repeat):

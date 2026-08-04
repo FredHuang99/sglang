@@ -91,6 +91,7 @@ class ServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     latent_transport: LatentTransport = "http"
     enable_profile: bool = False
     enable_trt_layer_profile: bool = False
+    enable_native_int8_kernel_profile: bool = False
     enable_nvtx: bool = False
 
 
@@ -145,6 +146,26 @@ class SfWanRuntime:
                     "--enable-trt-layer-profile requires --vae-precision "
                     "fp16_trt or int8_trt"
                 )
+        if config.enable_native_int8_kernel_profile:
+            if not config.enable_profile:
+                raise ValueError(
+                    "--enable-native-int8-kernel-profile requires --enable-profile"
+                )
+            if config.role != "vae":
+                raise ValueError(
+                    "--enable-native-int8-kernel-profile is valid only for "
+                    "--role vae"
+                )
+            if config.vae_precision != "int8_trt":
+                raise ValueError(
+                    "--enable-native-int8-kernel-profile requires "
+                    "--vae-precision int8_trt"
+                )
+            if config.vae_trt_variant != "native_int8_v1":
+                raise ValueError(
+                    "--enable-native-int8-kernel-profile requires "
+                    "--vae-trt-variant native_int8_v1"
+                )
         if config.role == "monolithic" and config.vae_url is not None:
             raise ValueError("--vae-url is not valid for the monolithic role")
         if config.role in {"monolithic", "vae"}:
@@ -162,7 +183,11 @@ class SfWanRuntime:
                 raise ValueError(
                     "--vae-engine-dir is valid only with fp16_trt or int8_trt"
                 )
-        if config.vae_trt_variant in {"fusion_v1", "fusion_v2"}:
+        if config.vae_trt_variant in {
+            "fusion_v1",
+            "fusion_v2",
+            "native_int8_v1",
+        }:
             if config.vae_precision != "int8_trt":
                 raise ValueError(
                     f"--vae-trt-variant {config.vae_trt_variant} requires "
@@ -223,6 +248,9 @@ class SfWanRuntime:
             vae_cpu_offload=self.config.vae_cpu_offload,
             enable_profile=self.config.enable_profile,
             enable_trt_layer_profile=self.config.enable_trt_layer_profile,
+            enable_native_int8_kernel_profile=(
+                self.config.enable_native_int8_kernel_profile
+            ),
             enable_nvtx=self.config.enable_nvtx,
         )
         factory = self._model_factory or self._default_model_factory()
@@ -385,9 +413,13 @@ class SfWanRuntime:
             raise ValueError("latent jobs are accepted only by the VAE role")
         if spec.source == "profile" and not self.config.enable_profile:
             raise ValueError("VAE profiling requires the server flag --enable-profile")
-        if self.config.enable_trt_layer_profile and spec.source != "profile":
+        if (
+            self.config.enable_trt_layer_profile
+            or self.config.enable_native_int8_kernel_profile
+        ) and spec.source != "profile":
             raise ValueError(
-                "a TensorRT layer-profile server accepts source=profile jobs only"
+                "a diagnostic TensorRT VAE profile server accepts "
+                "source=profile jobs only"
             )
         if spec.transport != self.config.latent_transport:
             raise ValueError(
@@ -568,6 +600,9 @@ class SfWanRuntime:
         contract = dict(getattr(self.model, "contract", {}))
         contract["profile_enabled"] = self.config.enable_profile
         contract["trt_layer_profile_enabled"] = self.config.enable_trt_layer_profile
+        contract["native_int8_kernel_profile_enabled"] = (
+            self.config.enable_native_int8_kernel_profile
+        )
         if self.engine is None:
             return EngineStatus(
                 role=self.config.role,
@@ -1381,7 +1416,7 @@ def _parse_args() -> ServerConfig:
     parser.add_argument("--vae-engine-dir")
     parser.add_argument(
         "--vae-trt-variant",
-        choices=("baseline", "fusion_v1", "fusion_v2"),
+        choices=("baseline", "fusion_v1", "fusion_v2", "native_int8_v1"),
         default="baseline",
         help="isolated TensorRT VAE experiment variant; baseline is unchanged",
     )
@@ -1409,6 +1444,14 @@ def _parse_args() -> ServerConfig:
             "VAE profile server"
         ),
     )
+    parser.add_argument(
+        "--enable-native-int8-kernel-profile",
+        action="store_true",
+        help=(
+            "collect diagnostic native residual-block kernel timings for a "
+            "dedicated VAE profile server"
+        ),
+    )
     parser.add_argument("--enable-nvtx", action="store_true")
     args = parser.parse_args()
     return ServerConfig(
@@ -1432,6 +1475,9 @@ def _parse_args() -> ServerConfig:
         latent_transport=args.latent_transport,
         enable_profile=args.enable_profile,
         enable_trt_layer_profile=args.enable_trt_layer_profile,
+        enable_native_int8_kernel_profile=(
+            args.enable_native_int8_kernel_profile
+        ),
         enable_nvtx=args.enable_nvtx,
     )
 

@@ -20,6 +20,15 @@ EXPECTED_FRAMES = 81
 EXPECTED_CHUNKS = 7
 EXPECTED_WARMUP = 10
 EXPECTED_REPEAT = 50
+NATIVE_PROFILE_COMPONENTS = (
+    "target_int8_conv_ms",
+    "norm_silu_quant_cache_write_ms",
+    "residual_epilogue_ms",
+    "group_exit_ms",
+    "native_residual_blocks_ms",
+    "remaining_trt_operators_ms",
+    "engine_external_ms",
+)
 
 
 def _read_json(path: str | Path) -> dict[str, Any]:
@@ -115,6 +124,10 @@ def _require_context(
         raise ValueError(
             f"{label}: diagnostic TensorRT layer profiling must be disabled"
         )
+    if bool(server.get("native_int8_kernel_profile_enabled", False)):
+        raise ValueError(
+            f"{label}: diagnostic native INT8 kernel profiling must be disabled"
+        )
     return context
 
 
@@ -201,6 +214,105 @@ def _speedup(reference_ms: float, candidate_ms: float) -> float:
     return reference_ms / candidate_ms
 
 
+def _extract_native_kernel_profile(summary: Mapping[str, Any]) -> dict[str, Any]:
+    """Aggregate diagnostic native-plugin stages without calling them production."""
+
+    context = summary.get("measurement_context")
+    server = context.get("server") if isinstance(context, Mapping) else None
+    if (
+        not isinstance(server, Mapping)
+        or server.get("vae_trt_variant") != "native_int8_v1"
+        or server.get("native_int8_kernel_profile_enabled") is not True
+    ):
+        raise ValueError(
+            "native kernel-profile summary must come from an instrumented "
+            "native_int8_v1 server"
+        )
+    measured = summary.get("measured")
+    if not isinstance(measured, list) or not measured:
+        raise ValueError("native kernel-profile summary has no measured iterations")
+    per_chunk = [
+        {component: [] for component in NATIVE_PROFILE_COMPONENTS}
+        for _ in range(EXPECTED_CHUNKS)
+    ]
+    whole = {component: [] for component in NATIVE_PROFILE_COMPONENTS}
+    for iteration in measured:
+        execution = iteration.get("profile_execution")
+        chunks = execution.get("chunks") if isinstance(execution, Mapping) else None
+        if not isinstance(chunks, list) or len(chunks) != EXPECTED_CHUNKS:
+            raise ValueError("native kernel-profile iteration has invalid chunks")
+        request_values = {component: 0.0 for component in NATIVE_PROFILE_COMPONENTS}
+        for chunk in chunks:
+            index = chunk.get("chunk_index")
+            profile = chunk.get("native_int8_kernel_profile")
+            stages = profile.get("stage_totals_ms") if isinstance(profile, Mapping) else None
+            if not isinstance(index, int) or not 0 <= index < EXPECTED_CHUNKS:
+                raise ValueError("native kernel-profile chunk index is invalid")
+            if not isinstance(stages, Mapping):
+                raise ValueError(f"native chunk {index} has no plugin stage totals")
+            trt_ms = _finite_ms(
+                chunk.get("trt_engine_cuda_ms"), label=f"native chunk {index} engine"
+            )
+            execution_ms = _finite_ms(
+                chunk.get("chunk_execution_cuda_ms"),
+                label=f"native chunk {index} execution",
+            )
+            native_total = _finite_ms(
+                stages.get("residual_block_total_ms"),
+                label=f"native chunk {index} residual blocks",
+            )
+            values = {
+                "target_int8_conv_ms": _finite_ms(
+                    stages.get("conv1_mainloop_epilogue_ms"),
+                    label=f"native chunk {index} conv1",
+                )
+                + _finite_ms(
+                    stages.get("conv2_mainloop_ms"),
+                    label=f"native chunk {index} conv2",
+                ),
+                "norm_silu_quant_cache_write_ms": _finite_ms(
+                    stages.get("entry_norm_silu_quant_cache_write_ms"),
+                    label=f"native chunk {index} entry producer",
+                )
+                + _finite_ms(
+                    stages.get("mid_norm_silu_quant_cache_write_ms"),
+                    label=f"native chunk {index} mid producer",
+                ),
+                "residual_epilogue_ms": _finite_ms(
+                    stages.get("residual_epilogue_ms"),
+                    label=f"native chunk {index} residual epilogue",
+                ),
+                "group_exit_ms": _finite_ms(
+                    stages.get("group_exit_ms"),
+                    label=f"native chunk {index} group exit",
+                ),
+                "native_residual_blocks_ms": native_total,
+                "remaining_trt_operators_ms": max(0.0, trt_ms - native_total),
+                "engine_external_ms": max(0.0, execution_ms - trt_ms),
+            }
+            for component, value in values.items():
+                per_chunk[index][component].append(value)
+                request_values[component] += value
+        for component, value in request_values.items():
+            whole[component].append(value)
+    return {
+        "schema_version": 1,
+        "diagnostic_only": True,
+        "measured_iteration_count": len(measured),
+        "per_chunk": [
+            {component: _stats(values) for component, values in chunk.items()}
+            for chunk in per_chunk
+        ],
+        "whole_request": {
+            component: _stats(values) for component, values in whole.items()
+        },
+        "attribution_limit": (
+            "cache write is fused into the producer kernels and is therefore "
+            "reported together with Norm/SiLU/static quantization"
+        ),
+    }
+
+
 def compare_profile_summaries(
     inputs: Mapping[str, tuple[str | Path, Mapping[str, Any]]],
     *,
@@ -208,7 +320,12 @@ def compare_profile_summaries(
     expected_repeat: int = EXPECTED_REPEAT,
 ) -> dict[str, Any]:
     required = {"fp32", "fp16_trt", "int8_v5"}
-    allowed = {*required, "int8_fusion_v1", "int8_fusion_v2"}
+    allowed = {
+        *required,
+        "int8_fusion_v1",
+        "int8_fusion_v2",
+        "native_int8_v1",
+    }
     if not required.issubset(inputs):
         raise ValueError(f"missing comparison inputs: {sorted(required - set(inputs))}")
     if not set(inputs).issubset(allowed):
@@ -260,6 +377,7 @@ def compare_profile_summaries(
         "int8_v5": ("tensorrt", "int8"),
         "int8_fusion_v1": ("tensorrt", "int8"),
         "int8_fusion_v2": ("tensorrt", "int8"),
+        "native_int8_v1": ("tensorrt", "int8"),
     }
     for label, context in contexts.items():
         expected_backend, expected_precision = expected_backends[label]
@@ -299,6 +417,37 @@ def compare_profile_summaries(
             raise ValueError("int8_fusion_v2 did not use the six-slot INT8 cache ABI")
         if server.get("vae_cache_migration") != "one_time_after_chunk_0":
             raise ValueError("int8_fusion_v2 cache migration contract is missing")
+    if "native_int8_v1" in contexts:
+        server = contexts["native_int8_v1"]["server"]
+        if server.get("vae_trt_variant") != "native_int8_v1":
+            raise ValueError("native_int8_v1 input uses a different variant")
+        required_native = {
+            "native_int8_audit_passed": True,
+            "native_int8_target_logical_conv_count": 28,
+            "native_int8_initial_call_site_count": 84,
+            "native_int8_steady_call_site_count": 84,
+            "native_int8_signature_count": 9,
+            "native_int8_cache_int8_slot_count": 28,
+            "native_int8_cache_fp16_slot_count": 4,
+            "native_int8_runtime_scale_mode": "static",
+            "native_int8_weight_mode": "offline_per_channel_packed",
+            "native_int8_algorithm": (
+                "temporal_folded_cutlass_conv2d_implicit_gemm"
+            ),
+            "native_int8_weight_layout": "KRSTC_FLAT",
+            "vae_cache_migration": "none",
+        }
+        for key, expected in required_native.items():
+            if server.get(key) != expected:
+                raise ValueError(
+                    f"native_int8_v1 {key} must be {expected!r}, "
+                    f"got {server.get(key)!r}"
+                )
+        if not server.get("native_int8_plugin_sha256"):
+            raise ValueError("native_int8_v1 input has no plugin SHA")
+        cutlass_commit = server.get("native_int8_cutlass_commit")
+        if not isinstance(cutlass_commit, str) or len(cutlass_commit) != 40:
+            raise ValueError("native_int8_v1 input has no pinned CUTLASS commit")
 
     fp32_total = results["fp32"]["whole_request"]["mean_ms"]
     fp16_total = results["fp16_trt"]["whole_request"]["mean_ms"]
@@ -331,6 +480,7 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
             "int8_v5",
             "int8_fusion_v1",
             "int8_fusion_v2",
+            "native_int8_v1",
         )
         if label in results
     ]
@@ -378,6 +528,26 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
             f"{steady['population_stddev_ms']:.3f} | "
             f"{value['whole_request']['sample_count']} requests |"
         )
+    native_profile = comparison.get("native_int8_kernel_profile")
+    if isinstance(native_profile, Mapping):
+        lines.extend(
+            [
+                "",
+                "## Native INT8 diagnostic component attribution",
+                "",
+                "These values come from the opt-in instrumented plugin and are not "
+                "production latency. Cache writes are fused with Norm/SiLU/quant.",
+                "",
+                "| component | 7-chunk mean (ms) | population sigma (ms) |",
+                "| --- | ---: | ---: |",
+            ]
+        )
+        for component in NATIVE_PROFILE_COMPONENTS:
+            stats = native_profile["whole_request"][component]
+            lines.append(
+                f"| {component} | {stats['mean_ms']:.3f} | "
+                f"{stats['population_stddev_ms']:.3f} |"
+            )
     return "\n".join(lines) + "\n"
 
 
@@ -396,6 +566,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--int8-v5-json", required=True)
     parser.add_argument("--int8-fusion-v1-json")
     parser.add_argument("--int8-fusion-v2-json")
+    parser.add_argument("--native-int8-v1-json")
+    parser.add_argument("--native-int8-kernel-profile-json")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown", required=True)
     parser.add_argument("--expected-warmup", type=int, default=EXPECTED_WARMUP)
@@ -414,12 +586,23 @@ def main() -> None:
         sources["int8_fusion_v1"] = args.int8_fusion_v1_json
     if args.int8_fusion_v2_json:
         sources["int8_fusion_v2"] = args.int8_fusion_v2_json
+    if args.native_int8_v1_json:
+        sources["native_int8_v1"] = args.native_int8_v1_json
     inputs = {label: (path, _read_json(path)) for label, path in sources.items()}
     comparison = compare_profile_summaries(
         inputs,
         expected_warmup=args.expected_warmup,
         expected_repeat=args.expected_repeat,
     )
+    if args.native_int8_kernel_profile_json:
+        profile_path = Path(args.native_int8_kernel_profile_json).expanduser().resolve()
+        comparison["native_int8_kernel_profile"] = _extract_native_kernel_profile(
+            _read_json(profile_path)
+        )
+        comparison["artifacts"]["native_int8_kernel_profile"] = {
+            "path": str(profile_path),
+            "sha256": _sha256_file(profile_path),
+        }
     _write_text(
         args.output_json,
         json.dumps(comparison, indent=2, ensure_ascii=False, allow_nan=False) + "\n",

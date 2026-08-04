@@ -27,7 +27,12 @@ from .protocol import (
 )
 
 VaePrecision = Literal["fp32", "fp16", "fp16_trt", "int8_trt"]
-VaeTrtVariant = Literal["baseline", "fusion_v1", "fusion_v2"]
+VaeTrtVariant = Literal[
+    "baseline",
+    "fusion_v1",
+    "fusion_v2",
+    "native_int8_v1",
+]
 TRT_VAE_PRECISIONS = frozenset({"fp16_trt", "int8_trt"})
 
 
@@ -42,6 +47,7 @@ class ModelLoadConfig(msgspec.Struct, frozen=True, kw_only=True):
     vae_cpu_offload: bool = False
     enable_profile: bool = False
     enable_trt_layer_profile: bool = False
+    enable_native_int8_kernel_profile: bool = False
     enable_nvtx: bool = False
 
 
@@ -1287,6 +1293,9 @@ class SfWanVaeModel:
             device=self.device,
             enable_profile=load_config.enable_profile,
             enable_trt_layer_profile=load_config.enable_trt_layer_profile,
+            enable_native_int8_kernel_profile=(
+                load_config.enable_native_int8_kernel_profile
+            ),
             enable_nvtx=load_config.enable_nvtx,
             variant=load_config.vae_trt_variant,
         )

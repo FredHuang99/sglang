@@ -27,7 +27,12 @@ TRT_VAE_CACHE_BANK_BYTES = TRT_VAE_CACHE_TOTAL_ELEMENTS * 2
 
 TrtVaePrecision = Literal["fp16", "int8"]
 TrtVaeEngineKind = Literal["initial", "steady"]
-TrtVaeVariant = Literal["baseline", "fusion_v1", "fusion_v2"]
+TrtVaeVariant = Literal[
+    "baseline",
+    "fusion_v1",
+    "fusion_v2",
+    "native_int8_v1",
+]
 
 
 def _sha256_file(path: Path) -> str:
@@ -622,6 +627,7 @@ class TensorRTVaeRuntime:
         enable_profile: bool,
         enable_nvtx: bool,
         enable_trt_layer_profile: bool = False,
+        enable_native_int8_kernel_profile: bool = False,
         variant: TrtVaeVariant = "baseline",
     ) -> None:
         try:
@@ -637,16 +643,37 @@ class TensorRTVaeRuntime:
         self.device = device
         self.enable_profile = enable_profile
         self.enable_trt_layer_profile = enable_trt_layer_profile
+        self.enable_native_int8_kernel_profile = (
+            enable_native_int8_kernel_profile
+        )
         self.enable_nvtx = enable_nvtx
         self.variant = variant
-        if variant not in {"baseline", "fusion_v1", "fusion_v2"}:
+        if variant not in {
+            "baseline",
+            "fusion_v1",
+            "fusion_v2",
+            "native_int8_v1",
+        }:
             raise ValueError(f"unsupported TensorRT VAE variant: {variant}")
-        if variant in {"fusion_v1", "fusion_v2"} and precision != "int8":
+        if variant in {
+            "fusion_v1",
+            "fusion_v2",
+            "native_int8_v1",
+        } and precision != "int8":
             raise ValueError(f"{variant} requires TensorRT INT8 VAE precision")
         if enable_trt_layer_profile and not enable_profile:
             raise ValueError(
                 "TensorRT layer profiling requires the regular profile timer"
             )
+        if enable_native_int8_kernel_profile:
+            if not enable_profile:
+                raise ValueError(
+                    "native INT8 kernel profiling requires the regular profile timer"
+                )
+            if variant != "native_int8_v1":
+                raise ValueError(
+                    "native INT8 kernel profiling requires native_int8_v1"
+                )
         self.manifest = load_trt_vae_manifest(self.engine_dir)
         validated = validate_trt_vae_manifest(
             self.manifest,
@@ -659,6 +686,10 @@ class TensorRTVaeRuntime:
         self._fusion_manifest: dict[str, Any] | None = None
         self._fusion_validated: dict[str, Any] | None = None
         self._fusion_plugin_library: Any | None = None
+        native_validated = None
+        self._native_manifest: dict[str, Any] | None = None
+        self._native_validated: dict[str, Any] | None = None
+        self._native_plugin_library: Any | None = None
         if variant == "fusion_v1":
             # Deliberately delayed: the baseline path never imports fusion
             # helpers, reads fusion artifacts, or loads a plugin library.
@@ -720,6 +751,39 @@ class TensorRTVaeRuntime:
                 library=self._fusion_plugin_library,
                 ctypes_module=__import__("ctypes"),
             )
+        elif variant == "native_int8_v1":
+            # The native plugin and manifest live in a completely separate
+            # namespace.  Existing variants never import or inspect them.
+            from .vae_trt_native_int8 import (
+                NATIVE_INT8_PLUGIN_CREATORS,
+                NATIVE_INT8_PLUGIN_INIT_SYMBOL,
+                NATIVE_INT8_PLUGIN_NAMESPACE,
+                NATIVE_INT8_PLUGIN_VERSION,
+                load_native_int8_manifest,
+                validate_native_int8_manifest,
+            )
+
+            native_manifest = load_native_int8_manifest(self.engine_dir)
+            native_validated = validate_native_int8_manifest(
+                native_manifest,
+                engine_dir=self.engine_dir,
+                base_manifest=self.manifest,
+                verify_hashes=True,
+            )
+            self._native_manifest = native_manifest
+            self._native_validated = native_validated
+            self._native_plugin_library = _load_fusion_plugin_library(
+                trt=trt,
+                plugin_path=native_validated["plugin_path"],
+                creator_names=NATIVE_INT8_PLUGIN_CREATORS,
+                plugin_version=NATIVE_INT8_PLUGIN_VERSION,
+                plugin_namespace=NATIVE_INT8_PLUGIN_NAMESPACE,
+                init_symbol=NATIVE_INT8_PLUGIN_INIT_SYMBOL,
+            )
+            self._configure_native_int8_kernel_profile(
+                library=self._native_plugin_library,
+                ctypes_module=__import__("ctypes"),
+            )
         layer_profile_validated = None
         if enable_trt_layer_profile:
             # This import is intentionally gated.  Production runtime startup
@@ -769,6 +833,33 @@ class TensorRTVaeRuntime:
                     "build": dict(self._fusion_manifest.get("build", {})),
                 }
                 self._layer_profile_manifest = self._fusion_manifest
+            elif native_validated is not None and variant == "native_int8_v1":
+                native_audit = dict(native_validated["audit"])
+                native_audit["native_plugin_mappings"] = {
+                    kind: [
+                        {
+                            **dict(record),
+                            "logical_call_sites": [
+                                f"int8/{kind}/{record['block_prefix']}.conv1/"
+                                f"call_{record['call_index']}",
+                                f"int8/{kind}/{record['block_prefix']}.conv2/"
+                                f"call_{record['call_index']}",
+                            ],
+                        }
+                        for record in native_validated["profile_ids"].get(kind, [])
+                    ]
+                    for kind in ("initial", "steady")
+                }
+                layer_profile_validated = {
+                    "schema_version": 3,
+                    "scope": "vae_profile_only",
+                    "precision": "int8",
+                    "plan_kind": "native_int8_v1_detailed",
+                    "engines": native_validated["engines"],
+                    "int8_audit": native_audit,
+                    "build": dict(self._native_manifest.get("build", {})),
+                }
+                self._layer_profile_manifest = self._native_manifest
             else:
                 layer_profile_manifest = load_trt_layer_profile_manifest(
                     self.engine_dir
@@ -792,18 +883,19 @@ class TensorRTVaeRuntime:
         self._engines: dict[str, Any] = {}
         self._contexts: dict[str, Any] = {}
         self._context_nvtx_verbosity: dict[str, str] = {}
-        selected_engines = (
-            layer_profile_validated["engines"]
-            if layer_profile_validated is not None
-            else {
+        if layer_profile_validated is not None:
+            selected_engines = layer_profile_validated["engines"]
+        elif native_validated is not None:
+            selected_engines = native_validated["engines"]
+        elif variant == "fusion_v2" and fusion_validated is not None:
+            selected_engines = {
                 "initial": validated["engines"]["initial"],
                 "steady": fusion_validated["steady_engine"],
             }
-            if variant == "fusion_v2" and fusion_validated is not None
-            else fusion_validated["engines"]
-            if fusion_validated is not None
-            else validated["engines"]
-        )
+        elif fusion_validated is not None:
+            selected_engines = fusion_validated["engines"]
+        else:
+            selected_engines = validated["engines"]
         self._active_plan_sha256 = {
             kind: str(selected_engines[kind]["sha256"])
             for kind in ("initial", "steady")
@@ -828,6 +920,7 @@ class TensorRTVaeRuntime:
                     enable_trt_layer_profile
                     or variant == "fusion_v1"
                     or (variant == "fusion_v2" and kind == "steady")
+                    or variant == "native_int8_v1"
                 ),
             )
             self._engines[kind] = engine
@@ -882,8 +975,29 @@ class TensorRTVaeRuntime:
                 int(entry["index"]): dict(entry)
                 for entry in fusion_validated["selected_cache_slots"]
             }
+        self._native_cache_slots: dict[int, dict[str, Any]] = {}
+        if variant == "native_int8_v1":
+            self._native_cache_slots = {
+                int(entry["index"]): dict(entry)
+                for entry in native_validated["cache_bindings"]
+                if entry["dtype"] == "int8"
+            }
+            all_native_bindings = {
+                int(entry["index"]): dict(entry)
+                for entry in native_validated["cache_bindings"]
+            }
+            if set(all_native_bindings) != set(range(len(self._cache_shapes))):
+                raise ValueError("native INT8 mixed-cache indices are incomplete")
+            for index, shape in enumerate(self._cache_shapes):
+                if tuple(all_native_bindings[index]["shape"]) != tuple(shape):
+                    raise ValueError(
+                        f"native INT8 cache slot {index} shape differs from base ABI"
+                    )
         self._cache_dtypes = [
-            torch.int8 if index in self._fusion_v2_cache_slots else torch.float16
+            torch.int8
+            if index in self._fusion_v2_cache_slots
+            or index in self._native_cache_slots
+            else torch.float16
             for index in range(len(self._cache_shapes))
         ]
         self._cache_banks = [
@@ -900,6 +1014,12 @@ class TensorRTVaeRuntime:
             ]
             if variant == "fusion_v2"
             else None
+        )
+        self._cache_bank_bytes = sum(
+            math.prod(shape) * (1 if dtype == torch.int8 else 2)
+            for shape, dtype in zip(
+                self._cache_shapes, self._cache_dtypes, strict=True
+            )
         )
         self._rgb_outputs = {
             "initial": torch.empty(
@@ -941,6 +1061,131 @@ class TensorRTVaeRuntime:
         function.restype = ctypes_module.c_int32
         self._fusion_v2_migrate_cache = function
         self._fusion_v2_ctypes = ctypes_module
+
+    def _configure_native_int8_kernel_profile(
+        self, *, library: Any, ctypes_module: Any
+    ) -> None:
+        """Bind the opt-in native timing API without affecting other variants."""
+
+        symbols = {}
+        for name in (
+            "sfwanNativeInt8SetProfiling",
+            "sfwanNativeInt8ResetProfiles",
+            "sfwanNativeInt8ReadProfile",
+        ):
+            try:
+                symbols[name] = getattr(library, name)
+            except AttributeError as exc:
+                raise RuntimeError(
+                    f"native INT8 plugin has no required profiling symbol {name}"
+                ) from exc
+        symbols["sfwanNativeInt8SetProfiling"].argtypes = [ctypes_module.c_int32]
+        symbols["sfwanNativeInt8SetProfiling"].restype = ctypes_module.c_int32
+        symbols["sfwanNativeInt8ResetProfiles"].argtypes = []
+        symbols["sfwanNativeInt8ResetProfiles"].restype = ctypes_module.c_int32
+        symbols["sfwanNativeInt8ReadProfile"].argtypes = [
+            ctypes_module.c_int32,
+            ctypes_module.POINTER(ctypes_module.c_float),
+            ctypes_module.c_int32,
+            ctypes_module.POINTER(ctypes_module.c_int64),
+        ]
+        symbols["sfwanNativeInt8ReadProfile"].restype = ctypes_module.c_int32
+        enabled = int(self.enable_native_int8_kernel_profile)
+        if int(symbols["sfwanNativeInt8SetProfiling"](enabled)) != 0:
+            raise RuntimeError("native INT8 plugin rejected profiling mode")
+        self._native_profile_set = symbols["sfwanNativeInt8SetProfiling"]
+        self._native_profile_reset = symbols["sfwanNativeInt8ResetProfiles"]
+        self._native_profile_read = symbols["sfwanNativeInt8ReadProfile"]
+        self._native_profile_ctypes = ctypes_module
+
+    def _begin_native_int8_kernel_profile(self) -> None:
+        if not self.enable_native_int8_kernel_profile:
+            return
+        if int(self._native_profile_reset()) != 0:
+            raise RuntimeError("native INT8 plugin could not reset profile counters")
+
+    def _read_native_int8_kernel_profile(
+        self, *, kind: str, chunk_index: int
+    ) -> dict[str, Any] | None:
+        if not self.enable_native_int8_kernel_profile:
+            return None
+        stage_names = (
+            "entry_norm_silu_quant_cache_write_ms",
+            "conv1_mainloop_epilogue_ms",
+            "mid_norm_silu_quant_cache_write_ms",
+            "conv2_mainloop_ms",
+            "residual_epilogue_ms",
+            "group_exit_ms",
+            "residual_block_total_ms",
+        )
+        ctypes_module = self._native_profile_ctypes
+        records = self._native_validated["profile_ids"].get(kind, [])
+        per_block: list[dict[str, Any]] = []
+        stage_totals = {name: 0.0 for name in stage_names}
+        signature_totals: dict[str, dict[str, Any]] = {}
+        total_calls = 0
+        tile_map = self._native_manifest["tune"]["kernel_tile_map"]
+        for record in records:
+            values = (ctypes_module.c_float * len(stage_names))()
+            calls = ctypes_module.c_int64()
+            status = self._native_profile_read(
+                ctypes_module.c_int32(int(record["profile_id"])),
+                values,
+                ctypes_module.c_int32(len(stage_names)),
+                ctypes_module.byref(calls),
+            )
+            if int(status) != 0:
+                raise RuntimeError(
+                    f"native INT8 profile read failed for id {record['profile_id']}"
+                )
+            if int(calls.value) != 1:
+                raise RuntimeError(
+                    f"native INT8 profile id {record['profile_id']} reported "
+                    f"{calls.value} calls; expected one"
+                )
+            stages = {
+                name: float(values[index])
+                for index, name in enumerate(stage_names)
+            }
+            for name, value in stages.items():
+                stage_totals[name] += value
+            total_calls += int(calls.value)
+            for signature_key, stage_key in (
+                ("conv1_signature", "conv1_mainloop_epilogue_ms"),
+                ("conv2_signature", "conv2_mainloop_ms"),
+            ):
+                signature = record.get(signature_key)
+                if not isinstance(signature, str):
+                    continue
+                summary = signature_totals.setdefault(
+                    signature,
+                    {
+                        "tile_id": tile_map.get(signature),
+                        "call_count": 0,
+                        "conv_cuda_ms": 0.0,
+                    },
+                )
+                summary["call_count"] += 1
+                summary["conv_cuda_ms"] += stages[stage_key]
+            per_block.append(
+                {
+                    "profile_id": int(record["profile_id"]),
+                    "block_prefix": record["block_prefix"],
+                    "call_index": int(record["call_index"]),
+                    "conv1_signature": record.get("conv1_signature"),
+                    "conv2_signature": record.get("conv2_signature"),
+                    "stages": stages,
+                }
+            )
+        return {
+            "schema_version": 1,
+            "engine_kind": kind,
+            "chunk_index": chunk_index,
+            "profiled_block_call_count": total_calls,
+            "stage_totals_ms": stage_totals,
+            "per_signature": signature_totals,
+            "blocks": per_block,
+        }
 
     def _validate_engine_contract(self, *, kind: str, engine: Any) -> None:
         trt = self._trt
@@ -987,6 +1232,15 @@ class TensorRTVaeRuntime:
                 int(entry["index"])
                 for entry in self._fusion_validated["selected_cache_slots"]
             }
+        native_cache_indices = set(
+            getattr(self, "_native_cache_slots", {}).keys()
+        )
+        if self.variant == "native_int8_v1" and not native_cache_indices:
+            native_cache_indices = {
+                int(entry["index"])
+                for entry in self._native_validated["cache_bindings"]
+                if entry["dtype"] == "int8"
+            }
         for name, (mode, shape) in expected.items():
             if engine.get_tensor_mode(name) != mode:
                 raise ValueError(f"TensorRT binding {name!r} has the wrong I/O mode")
@@ -1008,11 +1262,29 @@ class TensorRTVaeRuntime:
                 and match in selected_cache_indices
             ):
                 expected_dtype = trt.int8
+            if self.variant == "native_int8_v1" and match in native_cache_indices:
+                expected_dtype = trt.int8
             if engine.get_tensor_dtype(name) != expected_dtype:
                 raise ValueError(
                     f"TensorRT binding {name!r} must expose {expected_dtype}, "
                     f"got {engine.get_tensor_dtype(name)}"
                 )
+            if (
+                self.variant == "native_int8_v1"
+                and match in native_cache_indices
+                and callable(getattr(engine, "get_tensor_format", None))
+            ):
+                expected_format = getattr(trt.TensorFormat, "CDHW32", None)
+                if expected_format is None:
+                    raise ValueError(
+                        "TensorRT runtime has no CDHW32 tensor-format symbol"
+                    )
+                actual_format = engine.get_tensor_format(name)
+                if actual_format != expected_format:
+                    raise ValueError(
+                        f"native INT8 cache binding {name!r} must expose "
+                        f"CDHW32, got {actual_format}"
+                    )
 
     def _validate_environment(self, *, torch: Any, trt: Any) -> None:
         build = self.manifest.get("build")
@@ -1046,6 +1318,12 @@ class TensorRTVaeRuntime:
             if isinstance(fusion_validated, dict)
             else None
         )
+        native_validated = getattr(self, "_native_validated", None)
+        native_audit = (
+            native_validated.get("audit")
+            if isinstance(native_validated, dict)
+            else None
+        )
         contract = {
             "vae_backend": "tensorrt",
             "vae_engine_dir": self.engine_dir,
@@ -1061,7 +1339,9 @@ class TensorRTVaeRuntime:
             "vae_runtime_cuda_version": str(self._torch.version.cuda),
             "vae_runtime_torch_version": str(self._torch.__version__),
             "vae_int8_audit_passed": bool(
-                fusion_audit.get("passed", False)
+                native_audit.get("passed", False)
+                if isinstance(native_audit, dict)
+                else fusion_audit.get("passed", False)
                 if isinstance(fusion_audit, dict)
                 else self.manifest.get("int8_audit", {}).get("passed", False)
             ),
@@ -1069,8 +1349,8 @@ class TensorRTVaeRuntime:
             "vae_engine_plan_sha256": dict(self._active_plan_sha256),
             "vae_runtime_nvtx_verbosity": dict(self._context_nvtx_verbosity),
             "vae_cache_tensor_count": TRT_VAE_CACHE_COUNT,
-            "vae_cache_bank_bytes": TRT_VAE_CACHE_BANK_BYTES,
-            "vae_cache_double_bank_bytes": TRT_VAE_CACHE_BANK_BYTES * 2,
+            "vae_cache_bank_bytes": self._cache_bank_bytes,
+            "vae_cache_double_bank_bytes": self._cache_bank_bytes * 2,
         }
         if self.variant == "fusion_v1":
             plugin = self._fusion_manifest["plugin"]
@@ -1114,6 +1394,54 @@ class TensorRTVaeRuntime:
                     "vae_cache_migration": "one_time_after_chunk_0",
                 }
             )
+        elif self.variant == "native_int8_v1":
+            plugin = self._native_manifest["plugin"]
+            cache = self._native_manifest["cache"]
+            contract.update(
+                {
+                    "vae_trt_plugin_sha256": plugin["sha256"],
+                    "native_int8_schema_version": self._native_manifest[
+                        "schema_version"
+                    ],
+                    "native_int8_plugin_sha256": plugin["sha256"],
+                    "native_int8_initial_plan_sha256": self._active_plan_sha256[
+                        "initial"
+                    ],
+                    "native_int8_steady_plan_sha256": self._active_plan_sha256[
+                        "steady"
+                    ],
+                    "native_int8_target_logical_conv_count": 28,
+                    "native_int8_initial_call_site_count": 84,
+                    "native_int8_steady_call_site_count": 84,
+                    "native_int8_signature_count": 9,
+                    "native_int8_cache_int8_slot_count": cache[
+                        "int8_slot_count"
+                    ],
+                    "native_int8_cache_fp16_slot_count": cache[
+                        "fp16_slot_count"
+                    ],
+                    "native_int8_cache_bank_bytes": cache[
+                        "single_bank_bytes"
+                    ],
+                    "native_int8_runtime_scale_mode": "static",
+                    "native_int8_weight_mode": "offline_per_channel_packed",
+                    "native_int8_kernel_tile_map": dict(
+                        self._native_manifest["tune"]["kernel_tile_map"]
+                    ),
+                    "native_int8_algorithm": self._native_manifest["algorithm"],
+                    "native_int8_weight_layout": self._native_manifest["weights"][
+                        "layout"
+                    ],
+                    "native_int8_cutlass_commit": plugin["cutlass_commit"],
+                    "native_int8_audit_passed": bool(native_audit["passed"]),
+                    "native_int8_kernel_profile_enabled": (
+                        self.enable_native_int8_kernel_profile
+                    ),
+                    "vae_cache_migration": "none",
+                }
+            )
+        else:
+            contract["native_int8_kernel_profile_enabled"] = False
         if self.enable_trt_layer_profile:
             from .vae_trt_profile import TRT_LAYER_PROFILE_SCHEMA_VERSION
 
@@ -1160,6 +1488,8 @@ class TensorRTVaeRuntime:
 
     def reset_request(self) -> None:
         self._abort_layer_profile_captures()
+        if self.enable_native_int8_kernel_profile:
+            self._begin_native_int8_kernel_profile()
         self._request_active = True
         self._next_chunk_index = 0
         self._read_bank_index = None
@@ -1326,6 +1656,7 @@ class TensorRTVaeRuntime:
             cast_end.synchronize()
             cast_ms = float(cast_start.elapsed_time(cast_end))
 
+        self._begin_native_int8_kernel_profile()
         if self.enable_profile:
             engine_start = torch.cuda.Event(enable_timing=True)
             engine_end = torch.cuda.Event(enable_timing=True)
@@ -1348,6 +1679,10 @@ class TensorRTVaeRuntime:
             engine_end.record()
             engine_end.synchronize()
             engine_ms = float(engine_start.elapsed_time(engine_end))
+        native_kernel_profile = self._read_native_int8_kernel_profile(
+            kind=kind,
+            chunk_index=chunk_index,
+        )
         if self.variant == "fusion_v2" and kind == "initial":
             caller_stream = torch.cuda.current_stream(device=self.device)
             execution_stream = self._execution_stream
@@ -1398,10 +1733,14 @@ class TensorRTVaeRuntime:
                 )
         if layer_profile_metrics is not None:
             metrics["trt_layer_profile"] = layer_profile_metrics
+        if native_kernel_profile is not None:
+            metrics["native_int8_kernel_profile"] = native_kernel_profile
         return output, metrics
 
     def close(self) -> None:
         self.finish_request()
+        if getattr(self, "_native_profile_set", None) is not None:
+            self._native_profile_set(0)
         getattr(self, "_layer_profile_captures", {}).clear()
         self._contexts.clear()
         self._engines.clear()
@@ -1410,3 +1749,4 @@ class TensorRTVaeRuntime:
             self._initial_cache_bank.clear()
         self._rgb_outputs.clear()
         self._fusion_plugin_library = None
+        self._native_plugin_library = None

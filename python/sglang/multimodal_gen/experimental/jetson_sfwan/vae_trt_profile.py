@@ -17,12 +17,12 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .vae_trt_qdq import EXPECTED_CALL_SITES, QDQ_SCHEMA_VERSION
 
-TRT_LAYER_PROFILE_SCHEMA_VERSION = 2
-SUPPORTED_TRT_LAYER_PROFILE_SCHEMA_VERSIONS = frozenset({1, 2})
+TRT_LAYER_PROFILE_SCHEMA_VERSION = 3
+SUPPORTED_TRT_LAYER_PROFILE_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 TRT_LAYER_PROFILE_MANIFEST_FILE = "trt_layer_profile_manifest.json"
 TRT_LAYER_PROFILE_SCOPE = "vae_profile_only"
 
-PROFILE_CATEGORIES = (
+PROFILE_CATEGORIES_V2 = (
     "target_quantized_conv",
     "target_qdq_cast_reformat",
     "non_target_conv",
@@ -40,9 +40,19 @@ PROFILE_CATEGORIES = (
     "fusion_v2_conv2_residual_tail",
     "other",
 )
+PROFILE_CATEGORIES = (
+    *PROFILE_CATEGORIES_V2[:-1],
+    "native_int8_residual_block",
+    "native_int8_entry_norm_quant",
+    "native_int8_conv1",
+    "native_int8_mid_norm_quant",
+    "native_int8_conv2_residual",
+    "native_int8_group_exit",
+    "other",
+)
 LEGACY_PROFILE_CATEGORIES = tuple(
     category
-    for category in PROFILE_CATEGORIES
+    for category in PROFILE_CATEGORIES_V2
     if not category.startswith(("fused_", "fusion_v2_"))
 )
 
@@ -515,6 +525,27 @@ def _audit_layer_mapping(
     metadata: dict[str, set[str]] = defaultdict(set)
     if not isinstance(int8_audit, Mapping):
         return names, metadata
+    if int8_audit.get("variant") == "native_int8_v1":
+        mappings_by_kind = int8_audit.get("native_plugin_mappings")
+        mappings = (
+            mappings_by_kind.get(engine_kind)
+            if isinstance(mappings_by_kind, Mapping)
+            else None
+        )
+        if not isinstance(mappings, list):
+            return names, metadata
+        for record in mappings:
+            if not isinstance(record, Mapping):
+                continue
+            plugin_name = record.get("plugin_name")
+            call_sites = record.get("logical_call_sites")
+            if not isinstance(plugin_name, str) or not isinstance(call_sites, list):
+                continue
+            for call_site in call_sites:
+                if isinstance(call_site, str):
+                    names[plugin_name].add(call_site)
+                    metadata[plugin_name].add(call_site)
+        return names, metadata
     tactics = int8_audit.get("tactics")
     tactic = tactics.get(engine_kind) if isinstance(tactics, Mapping) else None
     matches = tactic.get("matches") if isinstance(tactic, Mapping) else None
@@ -626,6 +657,11 @@ def _classify_layer(
 ) -> tuple[str, str]:
     haystack = " ".join((name, layer_type, metadata, parameter_type)).lower()
     type_text = " ".join((layer_type, parameter_type)).lower()
+    if (
+        "sfwannativeint8residualblock" in haystack
+        or "native_int8/" in haystack
+    ):
+        return "native_int8_residual_block", "native_int8_v1_plugin"
     if "fusion_v2/norm1_silu_quant_pack/" in haystack:
         return "fusion_v2_norm1_silu_pack_quant", "fusion_v2_plugin"
     if "fusion_v2/conv1_to_conv2_norm_silu_quant_pack/" in haystack:
@@ -844,10 +880,13 @@ def build_physical_layer_catalog(
             else None
         )
         fusion_audit = fusion_variant in {"fusion_v1", "fusion_v2"}
+        native_audit = fusion_variant == "native_int8_v1"
         valid_schema = (
             int8_audit.get("schema_version") == 1
             and int8_audit.get("qdq_schema_version") == QDQ_SCHEMA_VERSION
             if fusion_audit
+            else int8_audit.get("schema_version") == 1
+            if native_audit
             else isinstance(int8_audit, Mapping)
             and int8_audit.get("schema_version") == QDQ_SCHEMA_VERSION
         )
@@ -867,15 +906,18 @@ def build_physical_layer_catalog(
             or audit_plan_sha.get(engine_kind) != plan_sha256
         ):
             raise ValueError("INT8 physical-layer catalog plan/audit digest mismatch")
-        tactics = int8_audit.get("tactics")
-        tactic = tactics.get(engine_kind) if isinstance(tactics, Mapping) else None
-        if (
-            not isinstance(tactic, Mapping)
-            or tactic.get("passed") is not True
-            or tactic.get("mapped_count") != EXPECTED_CALL_SITES
-            or tactic.get("errors") != []
-        ):
-            raise ValueError("INT8 physical-layer catalog tactic audit is incomplete")
+        if not native_audit:
+            tactics = int8_audit.get("tactics")
+            tactic = tactics.get(engine_kind) if isinstance(tactics, Mapping) else None
+            if (
+                not isinstance(tactic, Mapping)
+                or tactic.get("passed") is not True
+                or tactic.get("mapped_count") != EXPECTED_CALL_SITES
+                or tactic.get("errors") != []
+            ):
+                raise ValueError(
+                    "INT8 physical-layer catalog tactic audit is incomplete"
+                )
     audit_names, audit_metadata = _audit_layer_mapping(
         int8_audit=int8_audit, engine_kind=engine_kind
     )
@@ -900,6 +942,13 @@ def build_physical_layer_catalog(
         tactic_name = _first_text(record, "TacticName")
         call_sites = set(audit_names.get(name, set()))
         call_sites.update(audit_metadata.get(metadata, set()))
+        if (
+            isinstance(int8_audit, Mapping)
+            and int8_audit.get("variant") == "native_int8_v1"
+        ):
+            for marker, sites in audit_names.items():
+                if marker in name or marker in metadata:
+                    call_sites.update(sites)
         # Some TensorRT releases preserve the ONNX call-site only in Metadata.
         # This is still tied to the audited call-site set, not inferred from an
         # arbitrary substring such as "int8".
@@ -910,7 +959,8 @@ def build_physical_layer_catalog(
             f"{int8_audit.get('variant')}_audit"
             if call_sites
             and isinstance(int8_audit, Mapping)
-            and int8_audit.get("variant") in {"fusion_v1", "fusion_v2"}
+            and int8_audit.get("variant")
+            in {"fusion_v1", "fusion_v2", "native_int8_v1"}
             else "v5_audit"
             if call_sites
             else None
@@ -1244,6 +1294,7 @@ def validate_compact_layer_profile_metrics(
     category_keys = set(category) if isinstance(category, Mapping) else set()
     if not isinstance(category, Mapping) or category_keys not in (
         set(PROFILE_CATEGORIES),
+        set(PROFILE_CATEGORIES_V2),
         set(LEGACY_PROFILE_CATEGORIES),
     ):
         raise ValueError("TensorRT compact profile categories are incomplete")
@@ -1605,6 +1656,9 @@ def aggregate_trt_layer_profile_iterations(
             "fused_conv1_norm_silu"
         ],
         "fused_conv2_residual_percentage": category_percentages["fused_conv2_residual"],
+        "native_int8_residual_block_percentage": category_percentages[
+            "native_int8_residual_block"
+        ],
         "other_percentage": category_percentages["other"],
         **validation,
     }
