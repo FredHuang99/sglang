@@ -2,7 +2,43 @@
 
 #include "sfwan_vae_native_int8_kernels.h"
 
+#include <cstdint>
+
+#include <cutlass/conv/convolution.h>
+
+// CUTLASS 57e3cfb still ships the legacy ImplicitGemmConvolution device
+// wrapper, but convolution.h no longer provides the workspace-size helper
+// referenced by that wrapper.  The native SFWan kernels use serial split-K
+// with one slice, so this helper is not exercised at runtime; it must still
+// be visible while the wrapper template is parsed.  Keep the complete legacy
+// semantics here so the compatibility shim is also correct if workspace-size
+// validation is performed for another convolution operator.
+namespace cutlass::conv
+{
+
+inline std::int64_t sfwan_implicit_gemm_tensor_c_size(
+    Operator convolutionOperator, Conv2dProblemSize const& problemSize)
+{
+    if (convolutionOperator == Operator::kFprop)
+    {
+        return static_cast<std::int64_t>(problemSize.N) * problemSize.P
+            * problemSize.Q * problemSize.K;
+    }
+    if (convolutionOperator == Operator::kDgrad
+        || convolutionOperator == Operator::kDeconv)
+    {
+        return static_cast<std::int64_t>(problemSize.N) * problemSize.H
+            * problemSize.W * problemSize.C;
+    }
+    return static_cast<std::int64_t>(problemSize.K) * problemSize.R
+        * problemSize.S * problemSize.C;
+}
+
+} // namespace cutlass::conv
+
+#define implicit_gemm_tensor_c_size sfwan_implicit_gemm_tensor_c_size
 #include <cutlass/conv/device/implicit_gemm_convolution.h>
+#undef implicit_gemm_tensor_c_size
 #include <cutlass/conv/kernel/default_conv2d_fprop.h>
 #include <cutlass/conv/threadblock/threadblock_swizzle.h>
 #include <cutlass/cutlass.h>
@@ -15,7 +51,6 @@
 #include <array>
 #include <atomic>
 #include <cmath>
-#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <vector>

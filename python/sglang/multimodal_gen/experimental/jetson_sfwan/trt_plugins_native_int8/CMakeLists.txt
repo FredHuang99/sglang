@@ -80,7 +80,6 @@ target_compile_definitions(
   sfwan_vae_native_int8_v1
   PRIVATE
     CUTLASS_ENABLE_TENSOR_CORE_MMA=1
-    CUTLASS_ARCH_MMA_SM80_ENABLED=1
     SFWAN_CUTLASS_COMMIT="${SFWAN_CUTLASS_COMMIT}"
 )
 target_compile_options(
