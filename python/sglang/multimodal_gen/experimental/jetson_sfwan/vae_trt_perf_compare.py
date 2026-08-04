@@ -208,7 +208,7 @@ def compare_profile_summaries(
     expected_repeat: int = EXPECTED_REPEAT,
 ) -> dict[str, Any]:
     required = {"fp32", "fp16_trt", "int8_v5"}
-    allowed = {*required, "int8_fusion_v1"}
+    allowed = {*required, "int8_fusion_v1", "int8_fusion_v2"}
     if not required.issubset(inputs):
         raise ValueError(f"missing comparison inputs: {sorted(required - set(inputs))}")
     if not set(inputs).issubset(allowed):
@@ -259,6 +259,7 @@ def compare_profile_summaries(
         "fp16_trt": ("tensorrt", "fp16"),
         "int8_v5": ("tensorrt", "int8"),
         "int8_fusion_v1": ("tensorrt", "int8"),
+        "int8_fusion_v2": ("tensorrt", "int8"),
     }
     for label, context in contexts.items():
         expected_backend, expected_precision = expected_backends[label]
@@ -284,6 +285,20 @@ def compare_profile_summaries(
             raise ValueError("int8_fusion_v1 input does not use fusion_v1")
         if not server.get("vae_trt_plugin_sha256"):
             raise ValueError("int8_fusion_v1 input has no plugin SHA")
+    if "int8_fusion_v2" in contexts:
+        server = contexts["int8_fusion_v2"]["server"]
+        if server.get("vae_trt_variant") != "fusion_v2":
+            raise ValueError("int8_fusion_v2 input does not use fusion_v2")
+        if not server.get("vae_trt_plugin_sha256"):
+            raise ValueError("int8_fusion_v2 input has no plugin SHA")
+        if server.get("vae_trt_initial_variant") != "raw_int8_v5":
+            raise ValueError("int8_fusion_v2 did not use raw v5 for chunk 0")
+        if server.get("vae_trt_steady_variant") != "fusion_v2":
+            raise ValueError("int8_fusion_v2 did not use fusion_v2 for chunks 1-6")
+        if server.get("vae_cache_selected_int8_slot_count") != 6:
+            raise ValueError("int8_fusion_v2 did not use the six-slot INT8 cache ABI")
+        if server.get("vae_cache_migration") != "one_time_after_chunk_0":
+            raise ValueError("int8_fusion_v2 cache migration contract is missing")
 
     fp32_total = results["fp32"]["whole_request"]["mean_ms"]
     fp16_total = results["fp16_trt"]["whole_request"]["mean_ms"]
@@ -310,7 +325,13 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
     results = comparison["results"]
     ordered = [
         label
-        for label in ("fp32", "fp16_trt", "int8_v5", "int8_fusion_v1")
+        for label in (
+            "fp32",
+            "fp16_trt",
+            "int8_v5",
+            "int8_fusion_v1",
+            "int8_fusion_v2",
+        )
         if label in results
     ]
     columns = ["precision/variant", *[f"chunk {index}" for index in range(7)]]
@@ -374,6 +395,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fp16-trt-json", required=True)
     parser.add_argument("--int8-v5-json", required=True)
     parser.add_argument("--int8-fusion-v1-json")
+    parser.add_argument("--int8-fusion-v2-json")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown", required=True)
     parser.add_argument("--expected-warmup", type=int, default=EXPECTED_WARMUP)
@@ -390,6 +412,8 @@ def main() -> None:
     }
     if args.int8_fusion_v1_json:
         sources["int8_fusion_v1"] = args.int8_fusion_v1_json
+    if args.int8_fusion_v2_json:
+        sources["int8_fusion_v2"] = args.int8_fusion_v2_json
     inputs = {label: (path, _read_json(path)) for label, path in sources.items()}
     comparison = compare_profile_summaries(
         inputs,

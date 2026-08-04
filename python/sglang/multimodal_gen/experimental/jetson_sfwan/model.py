@@ -27,7 +27,7 @@ from .protocol import (
 )
 
 VaePrecision = Literal["fp32", "fp16", "fp16_trt", "int8_trt"]
-VaeTrtVariant = Literal["baseline", "fusion_v1"]
+VaeTrtVariant = Literal["baseline", "fusion_v1", "fusion_v2"]
 TRT_VAE_PRECISIONS = frozenset({"fp16_trt", "int8_trt"})
 
 

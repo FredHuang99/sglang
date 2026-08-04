@@ -467,6 +467,19 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 "vae_backend": engine_contract.get("vae_backend"),
                 "vae_engine_precision": engine_contract.get("vae_engine_precision"),
                 "vae_trt_variant": engine_contract.get("vae_trt_variant", "baseline"),
+                "vae_trt_initial_variant": engine_contract.get(
+                    "vae_trt_initial_variant"
+                ),
+                "vae_trt_steady_variant": engine_contract.get(
+                    "vae_trt_steady_variant"
+                ),
+                "vae_cache_selected_int8_slots": engine_contract.get(
+                    "vae_cache_selected_int8_slots"
+                ),
+                "vae_cache_selected_int8_slot_count": engine_contract.get(
+                    "vae_cache_selected_int8_slot_count"
+                ),
+                "vae_cache_migration": engine_contract.get("vae_cache_migration"),
                 "vae_engine_schema_version": engine_contract.get(
                     "vae_engine_schema_version"
                 ),

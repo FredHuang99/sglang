@@ -34,10 +34,16 @@ PROFILE_CATEGORIES = (
     "fused_cache_update",
     "fused_conv1_norm_silu",
     "fused_conv2_residual",
+    "fusion_v2_norm1_silu_pack_quant",
+    "fusion_v2_conv1_norm2_silu_pack_quant",
+    "fusion_v2_conv2_residual_next_norm_pack_quant",
+    "fusion_v2_conv2_residual_tail",
     "other",
 )
 LEGACY_PROFILE_CATEGORIES = tuple(
-    category for category in PROFILE_CATEGORIES if not category.startswith("fused_")
+    category
+    for category in PROFILE_CATEGORIES
+    if not category.startswith(("fused_", "fusion_v2_"))
 )
 
 # Layer callbacks and the outer CUDA event are different instrumentation
@@ -620,6 +626,17 @@ def _classify_layer(
 ) -> tuple[str, str]:
     haystack = " ".join((name, layer_type, metadata, parameter_type)).lower()
     type_text = " ".join((layer_type, parameter_type)).lower()
+    if "fusion_v2/norm1_silu_quant_pack/" in haystack:
+        return "fusion_v2_norm1_silu_pack_quant", "fusion_v2_plugin"
+    if "fusion_v2/conv1_to_conv2_norm_silu_quant_pack/" in haystack:
+        return "fusion_v2_conv1_norm2_silu_pack_quant", "fusion_v2_plugin"
+    if "fusion_v2/conv2_residual_next_norm_silu_quant_pack/" in haystack:
+        return (
+            "fusion_v2_conv2_residual_next_norm_pack_quant",
+            "fusion_v2_plugin",
+        )
+    if "fusion_v2/conv2_residual_tail/" in haystack:
+        return "fusion_v2_conv2_residual_tail", "fusion_v2_plugin"
     if (
         "sfwancausalpackquant" in haystack
         or "sfwan_causal_pack_quant" in haystack
@@ -821,9 +838,12 @@ def build_physical_layer_catalog(
         raise ValueError("FP16 source target map cannot be used with an INT8 plan")
     plan_sha256 = _validate_digest(plan_sha256, label="TensorRT profile plan")
     if precision == "int8":
-        fusion_audit = (
-            isinstance(int8_audit, Mapping) and int8_audit.get("variant") == "fusion_v1"
+        fusion_variant = (
+            int8_audit.get("variant")
+            if isinstance(int8_audit, Mapping)
+            else None
         )
+        fusion_audit = fusion_variant in {"fusion_v1", "fusion_v2"}
         valid_schema = (
             int8_audit.get("schema_version") == 1
             and int8_audit.get("qdq_schema_version") == QDQ_SCHEMA_VERSION
@@ -839,7 +859,7 @@ def build_physical_layer_catalog(
             or int8_audit.get("errors") != []
         ):
             raise ValueError(
-                "INT8 physical-layer catalog requires a passing v5 or fusion-v1 audit"
+                "INT8 physical-layer catalog requires a passing v5/fusion audit"
             )
         audit_plan_sha = int8_audit.get("plan_sha256")
         if (
@@ -887,10 +907,10 @@ def build_physical_layer_catalog(
             all_audited = set().union(*audit_names.values(), *audit_metadata.values())
             call_sites.update(site for site in all_audited if site in metadata)
         mapping_source = (
-            "fusion_v1_audit"
+            f"{int8_audit.get('variant')}_audit"
             if call_sites
             and isinstance(int8_audit, Mapping)
-            and int8_audit.get("variant") == "fusion_v1"
+            and int8_audit.get("variant") in {"fusion_v1", "fusion_v2"}
             else "v5_audit"
             if call_sites
             else None

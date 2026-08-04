@@ -27,7 +27,7 @@ TRT_VAE_CACHE_BANK_BYTES = TRT_VAE_CACHE_TOTAL_ELEMENTS * 2
 
 TrtVaePrecision = Literal["fp16", "int8"]
 TrtVaeEngineKind = Literal["initial", "steady"]
-TrtVaeVariant = Literal["baseline", "fusion_v1"]
+TrtVaeVariant = Literal["baseline", "fusion_v1", "fusion_v2"]
 
 
 def _sha256_file(path: Path) -> str:
@@ -67,6 +67,7 @@ def _load_fusion_plugin_library(
     creator_names: tuple[str, ...],
     plugin_version: str,
     plugin_namespace: str,
+    init_symbol: str = "initSfWanVaeTrtFusionPlugins",
 ) -> Any:
     """Load and verify fusion creators before deserializing a plugin plan."""
 
@@ -81,10 +82,10 @@ def _load_fusion_plugin_library(
             f"could not load TensorRT VAE fusion plugin: {path}"
         ) from exc
     try:
-        initialize = library.initSfWanVaeTrtFusionPlugins
+        initialize = getattr(library, init_symbol)
     except AttributeError as exc:
         raise RuntimeError(
-            "TensorRT VAE fusion plugin has no initSfWanVaeTrtFusionPlugins"
+            f"TensorRT VAE fusion plugin has no {init_symbol}"
         ) from exc
     initialize.argtypes = []
     initialize.restype = ctypes.c_bool
@@ -638,10 +639,10 @@ class TensorRTVaeRuntime:
         self.enable_trt_layer_profile = enable_trt_layer_profile
         self.enable_nvtx = enable_nvtx
         self.variant = variant
-        if variant not in {"baseline", "fusion_v1"}:
+        if variant not in {"baseline", "fusion_v1", "fusion_v2"}:
             raise ValueError(f"unsupported TensorRT VAE variant: {variant}")
-        if variant == "fusion_v1" and precision != "int8":
-            raise ValueError("fusion_v1 requires TensorRT INT8 VAE precision")
+        if variant in {"fusion_v1", "fusion_v2"} and precision != "int8":
+            raise ValueError(f"{variant} requires TensorRT INT8 VAE precision")
         if enable_trt_layer_profile and not enable_profile:
             raise ValueError(
                 "TensorRT layer profiling requires the regular profile timer"
@@ -685,6 +686,40 @@ class TensorRTVaeRuntime:
                 plugin_version=PLUGIN_VERSION,
                 plugin_namespace=PLUGIN_NAMESPACE,
             )
+        elif variant == "fusion_v2":
+            # Fusion-v2 is a different plugin ABI and artifact namespace.  It
+            # deliberately reuses the raw v5 initial plan and selects only a
+            # rewritten steady plan with six INT8 feature-cache slots.
+            from .vae_trt_fusion_v2 import (
+                PLUGIN_CREATORS,
+                PLUGIN_INIT_SYMBOL,
+                PLUGIN_NAMESPACE,
+                PLUGIN_VERSION,
+                load_fusion_v2_manifest,
+                validate_fusion_v2_manifest,
+            )
+
+            fusion_manifest = load_fusion_v2_manifest(self.engine_dir)
+            fusion_validated = validate_fusion_v2_manifest(
+                fusion_manifest,
+                engine_dir=self.engine_dir,
+                base_manifest=self.manifest,
+                verify_hashes=True,
+            )
+            self._fusion_manifest = fusion_manifest
+            self._fusion_validated = fusion_validated
+            self._fusion_plugin_library = _load_fusion_plugin_library(
+                trt=trt,
+                plugin_path=fusion_validated["plugin_path"],
+                creator_names=PLUGIN_CREATORS,
+                plugin_version=PLUGIN_VERSION,
+                plugin_namespace=PLUGIN_NAMESPACE,
+                init_symbol=PLUGIN_INIT_SYMBOL,
+            )
+            self._configure_fusion_v2_migration(
+                library=self._fusion_plugin_library,
+                ctypes_module=__import__("ctypes"),
+            )
         layer_profile_validated = None
         if enable_trt_layer_profile:
             # This import is intentionally gated.  Production runtime startup
@@ -694,13 +729,42 @@ class TensorRTVaeRuntime:
                 validate_trt_layer_profile_manifest,
             )
 
-            if fusion_validated is not None:
+            if fusion_validated is not None and variant == "fusion_v1":
                 layer_profile_validated = {
                     "schema_version": 2,
                     "scope": "vae_profile_only",
                     "precision": "int8",
                     "plan_kind": "audited_int8_fusion_v1",
                     "engines": fusion_validated["engines"],
+                    "int8_audit": fusion_validated["audit"],
+                    "build": dict(self._fusion_manifest.get("build", {})),
+                }
+                self._layer_profile_manifest = self._fusion_manifest
+            elif fusion_validated is not None and variant == "fusion_v2":
+                initial_inspector_path = (
+                    Path(self.engine_dir) / "initial_int8_qdq_v5_inspector.json"
+                )
+                try:
+                    initial_inspector = json.loads(
+                        initial_inspector_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise ValueError(
+                        "fusion-v2 layer profile requires the v5 initial inspector"
+                    ) from exc
+                initial_record = {
+                    **validated["engines"]["initial"],
+                    "inspector": initial_inspector,
+                }
+                layer_profile_validated = {
+                    "schema_version": 2,
+                    "scope": "vae_profile_only",
+                    "precision": "int8",
+                    "plan_kind": "raw_initial_plus_fusion_v2_steady",
+                    "engines": {
+                        "initial": initial_record,
+                        "steady": fusion_validated["steady_engine"],
+                    },
                     "int8_audit": fusion_validated["audit"],
                     "build": dict(self._fusion_manifest.get("build", {})),
                 }
@@ -731,6 +795,11 @@ class TensorRTVaeRuntime:
         selected_engines = (
             layer_profile_validated["engines"]
             if layer_profile_validated is not None
+            else {
+                "initial": validated["engines"]["initial"],
+                "steady": fusion_validated["steady_engine"],
+            }
+            if variant == "fusion_v2" and fusion_validated is not None
             else fusion_validated["engines"]
             if fusion_validated is not None
             else validated["engines"]
@@ -755,7 +824,11 @@ class TensorRTVaeRuntime:
                 trt=trt,
                 precision=precision,
                 enable_nvtx=enable_nvtx,
-                detailed_plan=enable_trt_layer_profile or variant == "fusion_v1",
+                detailed_plan=(
+                    enable_trt_layer_profile
+                    or variant == "fusion_v1"
+                    or (variant == "fusion_v2" and kind == "steady")
+                ),
             )
             self._engines[kind] = engine
             self._contexts[kind] = context
@@ -803,13 +876,31 @@ class TensorRTVaeRuntime:
                     engine_kind=kind,
                     catalog=catalog,
                 )
+        self._fusion_v2_cache_slots: dict[int, dict[str, Any]] = {}
+        if variant == "fusion_v2":
+            self._fusion_v2_cache_slots = {
+                int(entry["index"]): dict(entry)
+                for entry in fusion_validated["selected_cache_slots"]
+            }
+        self._cache_dtypes = [
+            torch.int8 if index in self._fusion_v2_cache_slots else torch.float16
+            for index in range(len(self._cache_shapes))
+        ]
         self._cache_banks = [
+            [
+                torch.empty(shape, device=device, dtype=self._cache_dtypes[index])
+                for index, shape in enumerate(self._cache_shapes)
+            ]
+            for _ in range(2)
+        ]
+        self._initial_cache_bank = (
             [
                 torch.empty(shape, device=device, dtype=torch.float16)
                 for shape in self._cache_shapes
             ]
-            for _ in range(2)
-        ]
+            if variant == "fusion_v2"
+            else None
+        )
         self._rgb_outputs = {
             "initial": torch.empty(
                 (1, 3, 9, TRT_VAE_HEIGHT, TRT_VAE_WIDTH),
@@ -829,6 +920,27 @@ class TensorRTVaeRuntime:
         self._request_active = False
         self._next_chunk_index = 0
         self._read_bank_index: int | None = None
+        self._pending_cache_migration_events: tuple[Any, Any] | None = None
+
+    def _configure_fusion_v2_migration(
+        self, *, library: Any, ctypes_module: Any
+    ) -> None:
+        try:
+            function = library.sfwanFusionV2MigrateCache
+        except AttributeError as exc:
+            raise RuntimeError(
+                "fusion-v2 plugin has no sfwanFusionV2MigrateCache launcher"
+            ) from exc
+        function.argtypes = [
+            ctypes_module.c_void_p,
+            ctypes_module.c_void_p,
+            ctypes_module.c_float,
+            ctypes_module.POINTER(ctypes_module.c_int32),
+            ctypes_module.c_void_p,
+        ]
+        function.restype = ctypes_module.c_int32
+        self._fusion_v2_migrate_cache = function
+        self._fusion_v2_ctypes = ctypes_module
 
     def _validate_engine_contract(self, *, kind: str, engine: Any) -> None:
         trt = self._trt
@@ -864,6 +976,17 @@ class TensorRTVaeRuntime:
                 f"missing={sorted(set(expected) - actual_names)}, "
                 f"extra={sorted(actual_names - set(expected))}"
             )
+        selected_cache_indices = set(
+            getattr(self, "_fusion_v2_cache_slots", {}).keys()
+        )
+        # During context creation the slot map is populated from the already
+        # validated fusion-v2 manifest.  Initial remains the raw v5 FP16 ABI;
+        # only selected steady cache bindings use INT8/CDHW32.
+        if self.variant == "fusion_v2" and not selected_cache_indices:
+            selected_cache_indices = {
+                int(entry["index"])
+                for entry in self._fusion_validated["selected_cache_slots"]
+            }
         for name, (mode, shape) in expected.items():
             if engine.get_tensor_mode(name) != mode:
                 raise ValueError(f"TensorRT binding {name!r} has the wrong I/O mode")
@@ -872,9 +995,22 @@ class TensorRTVaeRuntime:
                     f"TensorRT binding {name!r} shape is "
                     f"{tuple(engine.get_tensor_shape(name))}, expected {shape}"
                 )
-            if engine.get_tensor_dtype(name) != trt.float16:
+            expected_dtype = trt.float16
+            match = None
+            if name.startswith("cache_in_") or name.startswith("cache_out_"):
+                try:
+                    match = int(name.rsplit("_", 1)[1])
+                except (IndexError, ValueError):
+                    match = None
+            if (
+                self.variant == "fusion_v2"
+                and kind == "steady"
+                and match in selected_cache_indices
+            ):
+                expected_dtype = trt.int8
+            if engine.get_tensor_dtype(name) != expected_dtype:
                 raise ValueError(
-                    f"TensorRT binding {name!r} must expose float16, "
+                    f"TensorRT binding {name!r} must expose {expected_dtype}, "
                     f"got {engine.get_tensor_dtype(name)}"
                 )
 
@@ -950,6 +1086,34 @@ class TensorRTVaeRuntime:
                     ),
                 }
             )
+        elif self.variant == "fusion_v2":
+            plugin = self._fusion_manifest["plugin"]
+            selected = self._fusion_validated["selected_cache_slots"]
+            int8_bytes = sum(
+                math.prod(entry["shape"]) for entry in selected
+            )
+            selected_indices = {int(entry["index"]) for entry in selected}
+            fp16_bytes = sum(
+                math.prod(shape) * 2
+                for index, shape in enumerate(self._cache_shapes)
+                if index not in selected_indices
+            )
+            contract.update(
+                {
+                    "vae_trt_plugin_sha256": plugin["sha256"],
+                    "vae_trt_fusion_audit_passed": True,
+                    "vae_trt_fusion_counts": dict(
+                        self._fusion_manifest["graph"]["plugin_counts"]
+                    ),
+                    "vae_trt_initial_variant": "raw_int8_v5",
+                    "vae_trt_steady_variant": "fusion_v2",
+                    "vae_cache_selected_int8_slots": sorted(selected_indices),
+                    "vae_cache_selected_int8_slot_count": len(selected_indices),
+                    "vae_cache_steady_mixed_bank_bytes": int8_bytes
+                    + fp16_bytes,
+                    "vae_cache_migration": "one_time_after_chunk_0",
+                }
+            )
         if self.enable_trt_layer_profile:
             from .vae_trt_profile import TRT_LAYER_PROFILE_SCHEMA_VERSION
 
@@ -999,16 +1163,59 @@ class TensorRTVaeRuntime:
         self._request_active = True
         self._next_chunk_index = 0
         self._read_bank_index = None
+        self._pending_cache_migration_events = None
 
     def finish_request(self) -> None:
         self._abort_layer_profile_captures()
         self._request_active = False
         self._next_chunk_index = 0
         self._read_bank_index = None
+        self._pending_cache_migration_events = None
 
     def _set_address(self, context: Any, name: str, tensor: Any) -> None:
         if not context.set_tensor_address(name, int(tensor.data_ptr())):
             raise RuntimeError(f"TensorRT rejected the address for binding {name!r}")
+
+    def _migrate_fusion_v2_initial_cache(self, *, execution_stream: Any) -> None:
+        """Convert six raw-v5 FP16 slots once and seed steady bank zero."""
+
+        if self.variant != "fusion_v2" or self._initial_cache_bank is None:
+            raise RuntimeError("fusion-v2 cache migration was requested incorrectly")
+        torch = self._torch
+        destination_bank = self._cache_banks[0]
+        start = end = None
+        if self.enable_profile:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(execution_stream)
+        ctypes_module = self._fusion_v2_ctypes
+        for index, (source, destination) in enumerate(
+            zip(self._initial_cache_bank, destination_bank, strict=True)
+        ):
+            source.record_stream(execution_stream)
+            destination.record_stream(execution_stream)
+            slot = self._fusion_v2_cache_slots.get(index)
+            if slot is None:
+                with torch.cuda.stream(execution_stream):
+                    destination.copy_(source, non_blocking=True)
+                continue
+            shape_values = [int(value) for value in slot["shape"]]
+            shape_array = (ctypes_module.c_int32 * 5)(*shape_values)
+            status = self._fusion_v2_migrate_cache(
+                ctypes_module.c_void_p(int(source.data_ptr())),
+                ctypes_module.c_void_p(int(destination.data_ptr())),
+                ctypes_module.c_float(float(slot["scale"])),
+                shape_array,
+                ctypes_module.c_void_p(int(execution_stream.cuda_stream)),
+            )
+            if int(status) != 0:
+                raise RuntimeError(
+                    f"fusion-v2 cache migration failed for slot {index}"
+                )
+        if self.enable_profile:
+            end.record(execution_stream)
+            self._pending_cache_migration_events = (start, end)
+        self._read_bank_index = 0
 
     def _execute(
         self,
@@ -1019,10 +1226,19 @@ class TensorRTVaeRuntime:
     ) -> Any:
         torch = self._torch
         context = self._contexts[kind]
+        fusion_v2_initial = self.variant == "fusion_v2" and kind == "initial"
         output_bank_index = (
-            0 if self._read_bank_index is None else 1 - self._read_bank_index
+            None
+            if fusion_v2_initial
+            else 0 if self._read_bank_index is None else 1 - self._read_bank_index
         )
-        output_bank = self._cache_banks[output_bank_index]
+        output_bank = (
+            self._initial_cache_bank
+            if fusion_v2_initial
+            else self._cache_banks[output_bank_index]
+        )
+        if output_bank is None:
+            raise RuntimeError("TensorRT VAE cache output bank is unavailable")
         self._set_address(context, "latent", latent)
         if kind == "steady":
             if self._read_bank_index is None:
@@ -1065,7 +1281,8 @@ class TensorRTVaeRuntime:
             if capture is not None:
                 capture.abort_capture()
             raise
-        self._read_bank_index = output_bank_index
+        if not fusion_v2_initial:
+            self._read_bank_index = output_bank_index
         return rgb
 
     def decode_chunk(
@@ -1131,6 +1348,22 @@ class TensorRTVaeRuntime:
             engine_end.record()
             engine_end.synchronize()
             engine_ms = float(engine_start.elapsed_time(engine_end))
+        if self.variant == "fusion_v2" and kind == "initial":
+            caller_stream = torch.cuda.current_stream(device=self.device)
+            execution_stream = self._execution_stream
+            execution_stream.wait_stream(caller_stream)
+            self._migrate_fusion_v2_initial_cache(
+                execution_stream=execution_stream
+            )
+            caller_stream.wait_stream(execution_stream)
+        cache_migration_ms = None
+        if self._pending_cache_migration_events is not None:
+            migration_start, migration_end = self._pending_cache_migration_events
+            migration_end.synchronize()
+            cache_migration_ms = float(
+                migration_start.elapsed_time(migration_end)
+            )
+            self._pending_cache_migration_events = None
 
         layer_profile_metrics = None
         if getattr(self, "enable_trt_layer_profile", False):
@@ -1159,6 +1392,10 @@ class TensorRTVaeRuntime:
                     "trt_engine_cuda_ms": engine_ms,
                 }
             )
+            if cache_migration_ms is not None:
+                metrics["fusion_v2_cache_migration_cuda_ms"] = (
+                    cache_migration_ms
+                )
         if layer_profile_metrics is not None:
             metrics["trt_layer_profile"] = layer_profile_metrics
         return output, metrics
@@ -1169,5 +1406,7 @@ class TensorRTVaeRuntime:
         self._contexts.clear()
         self._engines.clear()
         self._cache_banks.clear()
+        if self._initial_cache_bank is not None:
+            self._initial_cache_bank.clear()
         self._rgb_outputs.clear()
         self._fusion_plugin_library = None

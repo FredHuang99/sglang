@@ -162,14 +162,16 @@ class SfWanRuntime:
                 raise ValueError(
                     "--vae-engine-dir is valid only with fp16_trt or int8_trt"
                 )
-        if config.vae_trt_variant == "fusion_v1":
+        if config.vae_trt_variant in {"fusion_v1", "fusion_v2"}:
             if config.vae_precision != "int8_trt":
                 raise ValueError(
-                    "--vae-trt-variant fusion_v1 requires --vae-precision int8_trt"
+                    f"--vae-trt-variant {config.vae_trt_variant} requires "
+                    "--vae-precision int8_trt"
                 )
             if config.role not in {"monolithic", "vae"}:
                 raise ValueError(
-                    "--vae-trt-variant fusion_v1 is valid only for VAE execution"
+                    f"--vae-trt-variant {config.vae_trt_variant} is valid only "
+                    "for VAE execution"
                 )
         elif config.vae_trt_variant != "baseline":
             raise ValueError(
@@ -1379,7 +1381,7 @@ def _parse_args() -> ServerConfig:
     parser.add_argument("--vae-engine-dir")
     parser.add_argument(
         "--vae-trt-variant",
-        choices=("baseline", "fusion_v1"),
+        choices=("baseline", "fusion_v1", "fusion_v2"),
         default="baseline",
         help="isolated TensorRT VAE experiment variant; baseline is unchanged",
     )
