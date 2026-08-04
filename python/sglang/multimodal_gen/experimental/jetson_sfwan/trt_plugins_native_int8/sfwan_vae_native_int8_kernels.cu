@@ -16,8 +16,9 @@
 namespace cutlass::conv
 {
 
+template <typename ProblemSize>
 inline std::int64_t sfwan_implicit_gemm_tensor_c_size(
-    Operator convolutionOperator, Conv2dProblemSize const& problemSize)
+    Operator convolutionOperator, ProblemSize const& problemSize)
 {
     if (convolutionOperator == Operator::kFprop)
     {
