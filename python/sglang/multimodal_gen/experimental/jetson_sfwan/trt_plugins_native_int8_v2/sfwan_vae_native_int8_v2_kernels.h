@@ -67,6 +67,13 @@ extern "C" int32_t sfwanNativeInt8V2WorkspaceContract(
     SfWanNativeInt8V2BlockConfig const* config, uint64_t* values,
     int32_t valueCount);
 
+// P1 algorithm contract. Values are, in order: tensor-core INT8,
+// accumulator2 global store, separate residual kernel, direct-conv kernel
+// used by P1, and the unchanged serialized-config ABI revision.
+extern "C" char const* sfwanNativeInt8V2P1Algorithm();
+extern "C" int32_t sfwanNativeInt8V2P1KernelContract(
+    uint64_t* values, int32_t valueCount);
+
 extern "C" int32_t sfwanNativeInt8V2PersistentTile(
     SfWanNativeInt8V2BlockConfig const* config, int32_t* tileH,
     int32_t* tileW, uint64_t* dynamicSharedBytes);

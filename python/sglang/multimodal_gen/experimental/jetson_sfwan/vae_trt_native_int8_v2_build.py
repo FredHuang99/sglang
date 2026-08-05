@@ -46,7 +46,10 @@ from .vae_trt_native_int8_v2 import (
     NATIVE_INT8_V2_PLUGIN_NAME,
     NATIVE_INT8_V2_PLUGIN_NAMESPACE,
     NATIVE_INT8_V2_PLUGIN_VERSION,
+    NATIVE_INT8_V2_P1_ALGORITHM,
+    NATIVE_INT8_V2_P1_KERNEL_REVISION,
     NATIVE_INT8_V2_SCHEMA_VERSION,
+    NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION,
     NATIVE_INT8_V2_SUBDIRECTORY,
     NATIVE_INT8_V2_VARIANT,
     load_native_int8_v2_manifest,
@@ -190,6 +193,41 @@ def _load_plugin(*, trt: Any, path: Path) -> Any:
             f"{NATIVE_INT8_V2_CUTLASS_COMMIT}"
         )
     return library
+
+
+def _p1_kernel_contract(library: Any) -> dict[str, Any]:
+    algorithm = getattr(library, "sfwanNativeInt8V2P1Algorithm", None)
+    contract = getattr(library, "sfwanNativeInt8V2P1KernelContract", None)
+    if algorithm is None or contract is None:
+        raise RuntimeError("Native INT8 V2 plugin lacks the P1 kernel contract")
+    algorithm.argtypes = []
+    algorithm.restype = ctypes.c_char_p
+    actual_algorithm = algorithm().decode("ascii")
+    values = (ctypes.c_uint64 * 5)()
+    contract.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int32]
+    contract.restype = ctypes.c_int32
+    if int(contract(values, len(values))) != 0:
+        raise RuntimeError("Native INT8 V2 plugin rejected the P1 kernel audit")
+    result = {
+        "tensor_core_int8": bool(values[0]),
+        "accumulator2_global_store": bool(values[1]),
+        "separate_residual_kernel": bool(values[2]),
+        "direct_conv_kernel_used_by_p1": bool(values[3]),
+        "serialization_abi_revision": int(values[4]),
+    }
+    expected = {
+        "tensor_core_int8": True,
+        "accumulator2_global_store": False,
+        "separate_residual_kernel": False,
+        "direct_conv_kernel_used_by_p1": False,
+        "serialization_abi_revision": NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION,
+    }
+    if actual_algorithm != NATIVE_INT8_V2_P1_ALGORITHM or result != expected:
+        raise RuntimeError(
+            "Native INT8 V2 P1 kernel contract mismatch: "
+            f"algorithm={actual_algorithm!r}, contract={result!r}"
+        )
+    return {"algorithm": actual_algorithm, **result}
 
 
 class _BlockConfig(ctypes.Structure):
@@ -345,6 +383,165 @@ def _workspace_audit(*, library: Any, graph_paths: Mapping[str, Path], level: st
     }
 
 
+def _rebind_existing_p1(
+    *,
+    level_root: Path,
+    base_root: Path,
+    base_manifest: Mapping[str, Any],
+    v1_manifest: Mapping[str, Any],
+    plugin_manifest: Mapping[str, Any],
+    library: Any,
+) -> dict[str, Any]:
+    """Atomically bind an unchanged P1 plan to the corrected compatible DSO."""
+
+    manifest_path = level_root / _LEVEL_FILES["manifest"]
+    old = _load_json(manifest_path, label="existing Native INT8 V2 P1 manifest")
+    old_plugin = old.get("plugin")
+    engines = old.get("engines")
+    graph = old.get("graph")
+    audit_record = old.get("audit")
+    timing_cache = old.get("timing_cache")
+    if not all(
+        isinstance(value, Mapping)
+        for value in (old_plugin, engines, graph, audit_record, timing_cache)
+    ):
+        raise RuntimeError("P1 compatible rebind rejected an incomplete old manifest")
+    if (
+        old.get("schema_version") != NATIVE_INT8_V2_SCHEMA_VERSION
+        or old.get("variant") != NATIVE_INT8_V2_VARIANT
+        or old.get("level") != "p1"
+        or old.get("base_native_int8_v1_identity") != _identity(v1_manifest)
+    ):
+        raise RuntimeError("P1 compatible rebind identity changed; rebuild is required")
+    abi_keys = (
+        "file",
+        "plugin_name",
+        "plugin_version",
+        "plugin_namespace",
+        "init_symbol",
+        "cutlass_commit",
+    )
+    if any(old_plugin.get(key) != plugin_manifest.get(key) for key in abi_keys):
+        raise RuntimeError("P1 plugin creator/ABI changed; rebuild is required")
+    if old_plugin.get("sha256") == plugin_manifest.get("sha256"):
+        raise RuntimeError(
+            "P1 manifest already references this DSO but lacks the corrected "
+            "kernel contract; install the rebuilt plugin or perform a full rebuild"
+        )
+
+    old_audit_path = level_root / str(audit_record.get("file"))
+    if (
+        not old_audit_path.is_file()
+        or sha256_file(old_audit_path) != audit_record.get("sha256")
+    ):
+        raise RuntimeError("P1 old audit SHA changed; rebuild is required")
+    old_audit = _load_json(old_audit_path, label="existing Native INT8 V2 P1 audit")
+    if old_audit.get("passed") is not True or old_audit.get("errors") != []:
+        raise RuntimeError("P1 old audit did not pass; rebuild is required")
+
+    graph_paths: dict[str, Path] = {}
+    inspector_mappings: dict[str, Any] = {}
+    for kind in _KINDS:
+        engine = engines.get(kind)
+        graph_record = graph.get(kind)
+        if not isinstance(engine, Mapping) or not isinstance(graph_record, Mapping):
+            raise RuntimeError(f"P1 {kind} artifact record is incomplete")
+        plan_path = level_root / str(engine.get("file"))
+        onnx_path = level_root / str(engine.get("source_onnx_file"))
+        inspector_path = level_root / str(engine.get("inspector_file"))
+        checks = (
+            (plan_path, engine.get("sha256"), "plan"),
+            (onnx_path, engine.get("source_onnx_sha256"), "ONNX"),
+            (inspector_path, engine.get("inspector_sha256"), "Inspector"),
+        )
+        for path, expected_sha, label in checks:
+            if not path.is_file() or sha256_file(path) != expected_sha:
+                raise RuntimeError(
+                    f"P1 {kind} {label} changed; compatible rebind is unsafe"
+                )
+        if old_audit.get("plan_sha256", {}).get(kind) != engine.get("sha256"):
+            raise RuntimeError(f"P1 {kind} audit/plan identity changed")
+        if graph_record.get("destination_sha256") != sha256_file(onnx_path):
+            raise RuntimeError(f"P1 {kind} serialized plugin graph changed")
+        expected_names = [
+            value["v2_name"] for value in graph_record.get("plugins", [])
+        ]
+        if len(expected_names) != EXPECTED_RESIDUAL_BLOCKS * 3:
+            raise RuntimeError(f"P1 {kind} serialized plugin count changed")
+        inspector = json.loads(inspector_path.read_text(encoding="utf-8"))
+        inspector_mappings[kind] = _map_native_plugins(
+            inspector, expected_names=expected_names
+        )
+        if inspector_mappings[kind]["passed"] is not True:
+            raise RuntimeError(f"P1 {kind} Inspector mapping changed")
+        graph_paths[kind] = onnx_path
+
+    cache_path = level_root / str(timing_cache.get("file"))
+    if not cache_path.is_file() or sha256_file(cache_path) != timing_cache.get(
+        "sha256"
+    ):
+        raise RuntimeError("P1 timing cache changed; compatible rebind is unsafe")
+    if old.get("cache") != v1_manifest.get("cache"):
+        raise RuntimeError("P1 mixed-cache ABI changed; rebuild is required")
+
+    workspace = _workspace_audit(
+        library=library, graph_paths=graph_paths, level="p1"
+    )
+    expected_plugins = EXPECTED_RESIDUAL_BLOCKS * 3 * 2
+    if (
+        workspace["plugin_call_count"] != expected_plugins
+        or workspace["accumulator2_workspace_bytes"] != 0
+    ):
+        raise RuntimeError("P1 corrected DSO workspace contract did not pass")
+    kernel_contract = _p1_kernel_contract(library)
+    plan_sha = {kind: str(engines[kind]["sha256"]) for kind in _KINDS}
+    audit = {
+        **old_audit,
+        "passed": True,
+        "complete": True,
+        "errors": [],
+        "accumulator1_workspace_bytes": workspace[
+            "accumulator1_workspace_bytes"
+        ],
+        "accumulator2_workspace_bytes": workspace[
+            "accumulator2_workspace_bytes"
+        ],
+        "temporal_window_bytes": workspace["temporal_window_bytes"],
+        "max_plugin_workspace_bytes": workspace["max_plugin_workspace_bytes"],
+        "residual_epilogue_kernel_present": False,
+        "p1_algorithm": kernel_contract.pop("algorithm"),
+        "p1_kernel_revision": NATIVE_INT8_V2_P1_KERNEL_REVISION,
+        "p1_kernel_contract": kernel_contract,
+        "plan_sha256": plan_sha,
+        "inspector_plugin_mappings": inspector_mappings,
+        "workspace_records": workspace["records"],
+        "plan_reused": True,
+        "plugin_rebound": True,
+    }
+    write_json_atomic(old_audit_path, audit)
+    rebound = {
+        **old,
+        "plugin": dict(plugin_manifest),
+        "audit": {
+            "file": old_audit_path.name,
+            "sha256": sha256_file(old_audit_path),
+            "passed": True,
+        },
+        "plan_reused": True,
+        "plugin_rebound": True,
+        "p1_kernel_revision": NATIVE_INT8_V2_P1_KERNEL_REVISION,
+    }
+    write_json_atomic(manifest_path, rebound)
+    validate_native_int8_v2_manifest(
+        rebound,
+        engine_dir=base_root,
+        base_manifest=base_manifest,
+        level="p1",
+        verify_hashes=True,
+    )
+    return rebound
+
+
 def _build_level(
     *,
     level: str,
@@ -364,13 +561,25 @@ def _build_level(
     existing_manifest = level_root / _LEVEL_FILES["manifest"]
     if resume and existing_manifest.is_file():
         manifest = load_native_int8_v2_manifest(base_root, level=level)
-        validate_native_int8_v2_manifest(
-            manifest,
-            engine_dir=base_root,
-            base_manifest=base_manifest,
-            level=level,
-            verify_hashes=True,
-        )
+        try:
+            validate_native_int8_v2_manifest(
+                manifest,
+                engine_dir=base_root,
+                base_manifest=base_manifest,
+                level=level,
+                verify_hashes=True,
+            )
+        except ValueError:
+            if level != "p1":
+                raise
+            return _rebind_existing_p1(
+                level_root=level_root,
+                base_root=base_root,
+                base_manifest=base_manifest,
+                v1_manifest=v1_manifest,
+                plugin_manifest=plugin_manifest,
+                library=library,
+            )
         return manifest
 
     v1_root = base_root / NATIVE_INT8_SUBDIRECTORY
@@ -441,6 +650,7 @@ def _build_level(
         errors.append("Conv1 accumulator workspace is nonzero")
     if level == "p3" and workspace["persistent_block_count"] != expected_plugins:
         errors.append("persistent-block coverage is incomplete")
+    p1_kernel_contract = _p1_kernel_contract(library) if level == "p1" else None
 
     inspector_mappings: dict[str, Any] = {}
     for kind in _KINDS:
@@ -485,6 +695,23 @@ def _build_level(
         "direct_causal_iterator": level in {"p2", "p3"},
         "persistent_block_count": workspace["persistent_block_count"],
         "residual_epilogue_kernel_present": False,
+        "p1_algorithm": (
+            p1_kernel_contract["algorithm"] if p1_kernel_contract else None
+        ),
+        "p1_kernel_revision": (
+            NATIVE_INT8_V2_P1_KERNEL_REVISION if level == "p1" else None
+        ),
+        "p1_kernel_contract": (
+            {
+                key: value
+                for key, value in p1_kernel_contract.items()
+                if key != "algorithm"
+            }
+            if p1_kernel_contract
+            else None
+        ),
+        "plan_reused": False,
+        "plugin_rebound": False,
         "plan_sha256": {
             kind: plan_records[kind]["sha256"] for kind in _KINDS
         },
@@ -551,6 +778,11 @@ def _build_level(
             "api_supported": use_timing_cache,
         },
         "build": dict(v1_manifest["build"]),
+        "plan_reused": False,
+        "plugin_rebound": False,
+        "p1_kernel_revision": (
+            NATIVE_INT8_V2_P1_KERNEL_REVISION if level == "p1" else None
+        ),
     }
     write_json_atomic(existing_manifest, manifest)
     validate_native_int8_v2_manifest(

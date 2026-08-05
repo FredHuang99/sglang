@@ -801,6 +801,8 @@ class TensorRTVaeRuntime:
                 NATIVE_INT8_V2_PLUGIN_NAME,
                 NATIVE_INT8_V2_PLUGIN_NAMESPACE,
                 NATIVE_INT8_V2_PLUGIN_VERSION,
+                NATIVE_INT8_V2_P1_ALGORITHM,
+                NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION,
                 load_native_int8_v2_manifest,
                 validate_native_int8_v2_manifest,
             )
@@ -825,6 +827,15 @@ class TensorRTVaeRuntime:
                 plugin_namespace=NATIVE_INT8_V2_PLUGIN_NAMESPACE,
                 init_symbol=NATIVE_INT8_V2_PLUGIN_INIT_SYMBOL,
             )
+            if native_int8_v2_level == "p1":
+                self._validate_native_int8_v2_p1_kernel_contract(
+                    library=self._native_plugin_library,
+                    ctypes_module=__import__("ctypes"),
+                    expected_algorithm=NATIVE_INT8_V2_P1_ALGORITHM,
+                    expected_serialization_abi=(
+                        NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION
+                    ),
+                )
             self._configure_native_int8_kernel_profile(
                 library=self._native_plugin_library,
                 ctypes_module=__import__("ctypes"),
@@ -1156,6 +1167,41 @@ class TensorRTVaeRuntime:
         self._native_profile_read = symbols[names["read"]]
         self._native_profile_ctypes = ctypes_module
 
+    def _validate_native_int8_v2_p1_kernel_contract(
+        self,
+        *,
+        library: Any,
+        ctypes_module: Any,
+        expected_algorithm: str,
+        expected_serialization_abi: int,
+    ) -> None:
+        """Bind the loaded P1 plan only to the corrected compatible kernel."""
+
+        try:
+            algorithm = library.sfwanNativeInt8V2P1Algorithm
+            contract = library.sfwanNativeInt8V2P1KernelContract
+        except AttributeError as exc:
+            raise RuntimeError(
+                "Native INT8 V2 P1 plugin lacks its kernel contract"
+            ) from exc
+        algorithm.argtypes = []
+        algorithm.restype = ctypes_module.c_char_p
+        values = (ctypes_module.c_uint64 * 5)()
+        contract.argtypes = [
+            ctypes_module.POINTER(ctypes_module.c_uint64),
+            ctypes_module.c_int32,
+        ]
+        contract.restype = ctypes_module.c_int32
+        status = int(contract(values, len(values)))
+        actual = algorithm().decode("ascii")
+        expected = (1, 0, 0, 0, int(expected_serialization_abi))
+        observed = tuple(int(value) for value in values)
+        if status != 0 or actual != expected_algorithm or observed != expected:
+            raise RuntimeError(
+                "Native INT8 V2 P1 loaded DSO contract mismatch: "
+                f"algorithm={actual!r}, values={observed!r}"
+            )
+
     def _begin_native_int8_kernel_profile(self) -> None:
         if not self.enable_native_int8_kernel_profile:
             return
@@ -1173,7 +1219,7 @@ class TensorRTVaeRuntime:
                 "conv1_mainloop_epilogue_ms",
                 "mid_norm_silu_quant_cache_write_ms",
                 "conv2_mma_and_fused_residual_epilogue_ms",
-                "fused_dequant_bias_residual_requant_ms",
+                "residual_epilogue_ms",
                 "group_exit_ms",
                 "residual_block_total_ms",
             )
@@ -1280,7 +1326,7 @@ class TensorRTVaeRuntime:
                     "stages": stages,
                 }
             )
-        return {
+        result = {
             "schema_version": 2 if self.variant == "native_int8_v2" else 1,
             "engine_kind": kind,
             "chunk_index": chunk_index,
@@ -1295,6 +1341,9 @@ class TensorRTVaeRuntime:
             "per_signature": signature_totals,
             "blocks": per_block,
         }
+        if self.variant == "native_int8_v2" and self.native_int8_v2_level == "p1":
+            result["residual_epilogue_status"] = "fused_into_conv2"
+        return result
 
     def _validate_engine_contract(self, *, kind: str, engine: Any) -> None:
         trt = self._trt
@@ -1585,6 +1634,19 @@ class TensorRTVaeRuntime:
                         ]
                     ),
                     "native_int8_v2_audit_passed": bool(audit["passed"]),
+                    "native_int8_v2_plan_reused": bool(
+                        self._native_manifest.get("plan_reused", False)
+                    ),
+                    "native_int8_v2_plugin_rebound": bool(
+                        self._native_manifest.get("plugin_rebound", False)
+                    ),
+                    "native_int8_v2_p1_algorithm": audit.get("p1_algorithm"),
+                    "native_int8_v2_p1_kernel_revision": audit.get(
+                        "p1_kernel_revision"
+                    ),
+                    "native_int8_v2_p1_kernel_contract": audit.get(
+                        "p1_kernel_contract"
+                    ),
                     "native_int8_cache_int8_slot_count": cache[
                         "int8_slot_count"
                     ],

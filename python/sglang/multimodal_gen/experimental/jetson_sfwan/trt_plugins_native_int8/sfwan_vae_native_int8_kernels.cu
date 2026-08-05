@@ -45,6 +45,11 @@ inline std::int64_t sfwan_implicit_gemm_tensor_c_size(
 #include <cutlass/cutlass.h>
 #include <cutlass/epilogue/thread/linear_combination.h>
 #include <cutlass/layout/tensor.h>
+#ifdef SFWAN_NATIVE_INT8_V2
+#include <cutlass/conv/kernel/default_conv2d_fprop_with_broadcast.h>
+#include <cutlass/conv/kernel/implicit_gemm_convolution_with_fused_epilogue.h>
+#include <cutlass/epilogue/threadblock/default_epilogue_with_broadcast.h>
+#endif
 
 #include <cuda_fp16.h>
 
@@ -552,6 +557,188 @@ cutlass::Status dispatchConv(int32_t tileId, int8_t const* activation,
     }
 }
 
+#ifdef SFWAN_NATIVE_INT8_V2
+template <typename ThreadblockShape, typename WarpShape, int Stages,
+    bool ShortcutIsInt8, bool OutputIsInt8>
+cutlass::Status runFusedResidualConv(int8_t const* activation,
+    int8_t const* weight, float const* weightScale, float const* bias,
+    void const* shortcut, void* output, float activationScale,
+    float shortcutScale, float outputScale, void* cutlassWorkspace,
+    int32_t n, int32_t h, int32_t w, int32_t c, int32_t k, int32_t r,
+    int32_t s, int32_t p, int32_t q, int32_t padH, int32_t padW,
+    int32_t strideH, int32_t strideW, int32_t dilationH,
+    int32_t dilationW, cudaStream_t stream)
+{
+    using ElementInput = int8_t;
+    using ElementAccumulator = int32_t;
+    using ElementDummyOutput = int32_t;
+    using Layout = cutlass::layout::TensorNHWC;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+    using OutputOp
+        = SfWanCutlassResidualOutputOp<ShortcutIsInt8, OutputIsInt8>;
+    using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+    using DefaultKernel
+        = typename cutlass::conv::kernel::DefaultConv2dFpropWithBroadcast<
+            ElementInput, Layout, ElementInput, Layout, ElementDummyOutput,
+            Layout, ElementAccumulator, cutlass::arch::OpClassTensorOp,
+            cutlass::arch::Sm80, ThreadblockShape, WarpShape,
+            InstructionShape, OutputOp, Swizzle, Stages,
+            cutlass::arch::OpMultiplyAddSaturate,
+            cutlass::conv::IteratorAlgorithm::kOptimized,
+            cutlass::conv::StrideSupport::kUnity>::Kernel;
+    using StandardEpilogue = typename DefaultKernel::Epilogue;
+    using Epilogue = SfWanCutlassResidualEpilogue<
+        typename StandardEpilogue::Shape,
+        typename StandardEpilogue::WarpMmaOperator,
+        StandardEpilogue::kPartitionsK,
+        typename StandardEpilogue::OutputTileIterator,
+        typename StandardEpilogue::TensorTileIterator,
+        typename StandardEpilogue::ElementVector,
+        typename StandardEpilogue::AccumulatorFragmentIterator,
+        typename StandardEpilogue::WarpTileIterator,
+        typename StandardEpilogue::SharedLoadIterator, OutputOp,
+        typename StandardEpilogue::Padding>;
+    using Kernel
+        = cutlass::conv::kernel::ImplicitGemmConvolutionWithFusedEpilogue<
+            typename DefaultKernel::Mma, Epilogue, Swizzle,
+            cutlass::conv::Operator::kFprop>;
+    using Conv = cutlass::conv::device::ImplicitGemmConvolution<Kernel>;
+    using InputRef = cutlass::TensorRef<ElementInput, Layout>;
+    using OutputRef = cutlass::TensorRef<ElementDummyOutput, Layout>;
+
+    cutlass::conv::Conv2dProblemSize problem(
+        cutlass::Tensor4DCoord(n, h, w, c),
+        cutlass::Tensor4DCoord(k, r, s, c),
+        cutlass::Tensor4DCoord(padH, padH, padW, padW),
+        cutlass::MatrixCoord(strideH, strideW),
+        cutlass::MatrixCoord(dilationH, dilationW),
+        cutlass::Tensor4DCoord(n, p, q, k),
+        cutlass::conv::Mode::kCrossCorrelation, 1);
+    InputRef activationRef(const_cast<ElementInput*>(activation),
+        Layout::packed(cutlass::Tensor4DCoord(n, h, w, c)));
+    InputRef weightRef(const_cast<ElementInput*>(weight),
+        Layout::packed(cutlass::Tensor4DCoord(k, r, s, c)));
+    // The custom epilogue never dereferences ref_C/ref_D.  The fused wrapper
+    // still requires type-compatible references while it constructs its
+    // standard iterator state, so bind the naturally aligned CUDA output
+    // allocation and route all physical loads/stores through OutputOp::Params.
+    OutputRef dummyRef(reinterpret_cast<ElementDummyOutput*>(output),
+        Layout::packed(cutlass::Tensor4DCoord(n, p, q, k)));
+    typename OutputOp::Params outputParams{
+        activationScale,
+        shortcutScale,
+        outputScale,
+        bias,
+        shortcut,
+        output,
+        static_cast<int64_t>(n) * p * q,
+        k,
+    };
+    typename Conv::Arguments arguments{problem, activationRef, weightRef,
+        dummyRef, dummyRef, outputParams, cutlass::conv::SplitKMode::kSerial,
+        const_cast<float*>(weightScale), nullptr, 0, 0};
+    Conv operation;
+    cutlass::Status status = operation.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess)
+    {
+        return status;
+    }
+    return operation(arguments, cutlassWorkspace, stream);
+}
+
+template <bool ShortcutIsInt8, bool OutputIsInt8>
+cutlass::Status dispatchFusedResidualConv(int32_t tileId,
+    int8_t const* activation, int8_t const* weight,
+    float const* weightScale, float const* bias, void const* shortcut,
+    void* output, float activationScale, float shortcutScale,
+    float outputScale, void* cutlassWorkspace, int32_t n, int32_t h,
+    int32_t w, int32_t c, int32_t k, int32_t r, int32_t s, int32_t p,
+    int32_t q, int32_t padH, int32_t padW, int32_t strideH,
+    int32_t strideW, int32_t dilationH, int32_t dilationW,
+    cudaStream_t stream)
+{
+    switch (tileId % kBaseTileCount)
+    {
+    case 0:
+        return runFusedResidualConv<cutlass::gemm::GemmShape<64, 64, 64>,
+            cutlass::gemm::GemmShape<32, 32, 64>, 2, ShortcutIsInt8,
+            OutputIsInt8>(activation, weight, weightScale, bias, shortcut,
+            output, activationScale, shortcutScale, outputScale,
+            cutlassWorkspace, n, h, w, c, k, r, s, p, q, padH, padW,
+            strideH, strideW, dilationH, dilationW, stream);
+    case 1:
+        return runFusedResidualConv<cutlass::gemm::GemmShape<128, 64, 64>,
+            cutlass::gemm::GemmShape<64, 32, 64>, 2, ShortcutIsInt8,
+            OutputIsInt8>(activation, weight, weightScale, bias, shortcut,
+            output, activationScale, shortcutScale, outputScale,
+            cutlassWorkspace, n, h, w, c, k, r, s, p, q, padH, padW,
+            strideH, strideW, dilationH, dilationW, stream);
+    case 2:
+        return runFusedResidualConv<cutlass::gemm::GemmShape<64, 128, 64>,
+            cutlass::gemm::GemmShape<32, 64, 64>, 2, ShortcutIsInt8,
+            OutputIsInt8>(activation, weight, weightScale, bias, shortcut,
+            output, activationScale, shortcutScale, outputScale,
+            cutlassWorkspace, n, h, w, c, k, r, s, p, q, padH, padW,
+            strideH, strideW, dilationH, dilationW, stream);
+    case 3:
+        return runFusedResidualConv<cutlass::gemm::GemmShape<64, 64, 64>,
+            cutlass::gemm::GemmShape<32, 32, 64>, 3, ShortcutIsInt8,
+            OutputIsInt8>(activation, weight, weightScale, bias, shortcut,
+            output, activationScale, shortcutScale, outputScale,
+            cutlassWorkspace, n, h, w, c, k, r, s, p, q, padH, padW,
+            strideH, strideW, dilationH, dilationW, stream);
+    case 4:
+        return runFusedResidualConv<cutlass::gemm::GemmShape<128, 64, 64>,
+            cutlass::gemm::GemmShape<64, 32, 64>, 3, ShortcutIsInt8,
+            OutputIsInt8>(activation, weight, weightScale, bias, shortcut,
+            output, activationScale, shortcutScale, outputScale,
+            cutlassWorkspace, n, h, w, c, k, r, s, p, q, padH, padW,
+            strideH, strideW, dilationH, dilationW, stream);
+    case 5:
+        return runFusedResidualConv<cutlass::gemm::GemmShape<64, 128, 64>,
+            cutlass::gemm::GemmShape<32, 64, 64>, 3, ShortcutIsInt8,
+            OutputIsInt8>(activation, weight, weightScale, bias, shortcut,
+            output, activationScale, shortcutScale, outputScale,
+            cutlassWorkspace, n, h, w, c, k, r, s, p, q, padH, padW,
+            strideH, strideW, dilationH, dilationW, stream);
+    default:
+        return cutlass::Status::kErrorInvalidProblem;
+    }
+}
+
+cutlass::Status dispatchFusedResidualConv(int32_t tileId,
+    int8_t const* activation, int8_t const* weight,
+    float const* weightScale, float const* bias, void const* shortcut,
+    void* output, bool shortcutIsInt8, bool outputIsInt8,
+    float activationScale, float shortcutScale, float outputScale,
+    void* cutlassWorkspace, int32_t n, int32_t h, int32_t w, int32_t c,
+    int32_t k, int32_t r, int32_t s, int32_t p, int32_t q,
+    int32_t padH, int32_t padW, int32_t strideH, int32_t strideW,
+    int32_t dilationH, int32_t dilationW, cudaStream_t stream)
+{
+#define SFWAN_DISPATCH_FUSED(SHORTCUT_INT8, OUTPUT_INT8)                     \
+    return dispatchFusedResidualConv<SHORTCUT_INT8, OUTPUT_INT8>(tileId,     \
+        activation, weight, weightScale, bias, shortcut, output,             \
+        activationScale, shortcutScale, outputScale, cutlassWorkspace, n,    \
+        h, w, c, k, r, s, p, q, padH, padW, strideH, strideW, dilationH,     \
+        dilationW, stream)
+    if (shortcutIsInt8)
+    {
+        if (outputIsInt8)
+        {
+            SFWAN_DISPATCH_FUSED(true, true);
+        }
+        SFWAN_DISPATCH_FUSED(true, false);
+    }
+    if (outputIsInt8)
+    {
+        SFWAN_DISPATCH_FUSED(false, true);
+    }
+    SFWAN_DISPATCH_FUSED(false, false);
+#undef SFWAN_DISPATCH_FUSED
+}
+#endif
+
 struct WorkspaceLayout
 {
     size_t window1Offset{};
@@ -763,6 +950,26 @@ extern "C" int32_t sfwanNativeInt8V2WorkspaceContract(
     values[1] = static_cast<uint64_t>(layout.accumulator2Bytes);
     values[2] = static_cast<uint64_t>(layout.windowBytes);
     values[3] = static_cast<uint64_t>(layout.total);
+    return 0;
+}
+
+extern "C" char const* sfwanNativeInt8V2P1Algorithm()
+{
+    return "cutlass_implicit_gemm_fused_epilogue";
+}
+
+extern "C" int32_t sfwanNativeInt8V2P1KernelContract(
+    uint64_t* values, int32_t valueCount)
+{
+    if (values == nullptr || valueCount != 5)
+    {
+        return -1;
+    }
+    values[0] = 1; // tensor_core_int8
+    values[1] = 0; // accumulator2_global_store
+    values[2] = 0; // separate_residual_kernel
+    values[3] = 0; // direct_conv_kernel_used_by_p1
+    values[4] = 1; // serialized config ABI revision (unchanged)
     return 0;
 }
 
@@ -996,19 +1203,22 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
         cudaEventRecord(profile.events[3], stream);
     }
 #ifdef SFWAN_NATIVE_INT8_V2
-    int32_t fusedStatus = sfwan_v2::launchFusedResidualConv(false, window2,
-        nullptr, false, static_cast<int8_t const*>(weight2),
+    // P1 keeps the tuned Native V1 CUTLASS mainloop and changes only the
+    // output stage.  P2 intentionally retains its direct-causal experimental
+    // implementation until P1 clears the performance gate.
+    status = dispatchFusedResidualConv(config->tile2, window2,
+        static_cast<int8_t const*>(weight2),
         static_cast<float const*>(weightScale2),
         static_cast<float const*>(bias2), shortcut, blockOutput,
         config->shortcutIsInt8 != 0, config->outputIsInt8 != 0,
-        config->conv2InputScale, config->inputScale, config->outputScale, n,
-        k1, d2, h2, w2, 0, k2, config->outputShape[2],
-        config->outputShape[3], config->outputShape[4],
+        config->conv2InputScale, config->inputScale, config->outputScale,
+        cutlassWorkspace, n * d2, h2, w2, config->weight2Shape[3], k2,
         config->weight2Shape[1], config->weight2Shape[2],
+        config->outputShape[3], config->outputShape[4],
         config->conv2Params[0], config->conv2Params[1],
         config->conv2Params[2], config->conv2Params[3],
         config->conv2Params[4], config->conv2Params[5], stream);
-    if (fusedStatus != 0)
+    if (status != cutlass::Status::kSuccess)
     {
         return -1;
     }

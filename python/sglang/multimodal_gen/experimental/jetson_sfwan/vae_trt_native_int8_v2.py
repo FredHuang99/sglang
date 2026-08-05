@@ -29,6 +29,9 @@ NATIVE_INT8_V2_PLUGIN_VERSION = "1"
 NATIVE_INT8_V2_PLUGIN_INIT_SYMBOL = "initSfWanVaeNativeInt8V2Plugins"
 NATIVE_INT8_V2_CUTLASS_COMMIT = "57e3cfb47a2d9e0d46eb6335c3dc411498efa198"
 NATIVE_INT8_V2_LEVEL_OFFSETS = {"p1": 0, "p2": 6, "p3": 12}
+NATIVE_INT8_V2_P1_ALGORITHM = "cutlass_implicit_gemm_fused_epilogue"
+NATIVE_INT8_V2_P1_KERNEL_REVISION = "cutlass_fused_epilogue_v2"
+NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION = 1
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -219,6 +222,26 @@ def validate_native_int8_v2_manifest(
                 f"Native INT8 V2 {level} audit {key}={audit.get(key)!r}, "
                 f"expected {expected!r}"
             )
+    if level == "p1":
+        contract = audit.get("p1_kernel_contract")
+        expected_contract = {
+            "tensor_core_int8": True,
+            "accumulator2_global_store": False,
+            "separate_residual_kernel": False,
+            "direct_conv_kernel_used_by_p1": False,
+            "serialization_abi_revision": (
+                NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION
+            ),
+        }
+        if (
+            audit.get("p1_algorithm") != NATIVE_INT8_V2_P1_ALGORITHM
+            or audit.get("p1_kernel_revision")
+            != NATIVE_INT8_V2_P1_KERNEL_REVISION
+            or contract != expected_contract
+            or manifest.get("p1_kernel_revision")
+            != NATIVE_INT8_V2_P1_KERNEL_REVISION
+        ):
+            raise ValueError("Native INT8 V2 P1 CUTLASS kernel contract changed")
     validated_engines: dict[str, Any] = {}
     for kind in ("initial", "steady"):
         record = engines.get(kind)
@@ -269,7 +292,10 @@ __all__ = [
     "NATIVE_INT8_V2_PLUGIN_NAME",
     "NATIVE_INT8_V2_PLUGIN_NAMESPACE",
     "NATIVE_INT8_V2_PLUGIN_VERSION",
+    "NATIVE_INT8_V2_P1_ALGORITHM",
+    "NATIVE_INT8_V2_P1_KERNEL_REVISION",
     "NATIVE_INT8_V2_SCHEMA_VERSION",
+    "NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION",
     "NATIVE_INT8_V2_SUBDIRECTORY",
     "NATIVE_INT8_V2_VARIANT",
     "load_native_int8_v2_manifest",
