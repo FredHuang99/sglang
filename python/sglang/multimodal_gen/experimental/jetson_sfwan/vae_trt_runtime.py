@@ -32,7 +32,9 @@ TrtVaeVariant = Literal[
     "fusion_v1",
     "fusion_v2",
     "native_int8_v1",
+    "native_int8_v2",
 ]
+NativeInt8V2Level = Literal["p1", "p2", "p3"]
 
 
 def _sha256_file(path: Path) -> str:
@@ -629,6 +631,7 @@ class TensorRTVaeRuntime:
         enable_trt_layer_profile: bool = False,
         enable_native_int8_kernel_profile: bool = False,
         variant: TrtVaeVariant = "baseline",
+        native_int8_v2_level: NativeInt8V2Level = "p1",
     ) -> None:
         try:
             import tensorrt as trt
@@ -648,17 +651,20 @@ class TensorRTVaeRuntime:
         )
         self.enable_nvtx = enable_nvtx
         self.variant = variant
+        self.native_int8_v2_level = native_int8_v2_level
         if variant not in {
             "baseline",
             "fusion_v1",
             "fusion_v2",
             "native_int8_v1",
+            "native_int8_v2",
         }:
             raise ValueError(f"unsupported TensorRT VAE variant: {variant}")
         if variant in {
             "fusion_v1",
             "fusion_v2",
             "native_int8_v1",
+            "native_int8_v2",
         } and precision != "int8":
             raise ValueError(f"{variant} requires TensorRT INT8 VAE precision")
         if enable_trt_layer_profile and not enable_profile:
@@ -670,10 +676,15 @@ class TensorRTVaeRuntime:
                 raise ValueError(
                     "native INT8 kernel profiling requires the regular profile timer"
                 )
-            if variant != "native_int8_v1":
+            if variant not in {"native_int8_v1", "native_int8_v2"}:
                 raise ValueError(
-                    "native INT8 kernel profiling requires native_int8_v1"
+                    "native INT8 kernel profiling requires native_int8_v1 "
+                    "or native_int8_v2"
                 )
+        if native_int8_v2_level not in {"p1", "p2", "p3"}:
+            raise ValueError(
+                f"unsupported Native INT8 V2 level: {native_int8_v2_level}"
+            )
         self.manifest = load_trt_vae_manifest(self.engine_dir)
         validated = validate_trt_vae_manifest(
             self.manifest,
@@ -784,6 +795,40 @@ class TensorRTVaeRuntime:
                 library=self._native_plugin_library,
                 ctypes_module=__import__("ctypes"),
             )
+        elif variant == "native_int8_v2":
+            from .vae_trt_native_int8_v2 import (
+                NATIVE_INT8_V2_PLUGIN_INIT_SYMBOL,
+                NATIVE_INT8_V2_PLUGIN_NAME,
+                NATIVE_INT8_V2_PLUGIN_NAMESPACE,
+                NATIVE_INT8_V2_PLUGIN_VERSION,
+                load_native_int8_v2_manifest,
+                validate_native_int8_v2_manifest,
+            )
+
+            native_manifest = load_native_int8_v2_manifest(
+                self.engine_dir, level=native_int8_v2_level
+            )
+            native_validated = validate_native_int8_v2_manifest(
+                native_manifest,
+                engine_dir=self.engine_dir,
+                base_manifest=self.manifest,
+                level=native_int8_v2_level,
+                verify_hashes=True,
+            )
+            self._native_manifest = native_manifest
+            self._native_validated = native_validated
+            self._native_plugin_library = _load_fusion_plugin_library(
+                trt=trt,
+                plugin_path=native_validated["plugin_path"],
+                creator_names=(NATIVE_INT8_V2_PLUGIN_NAME,),
+                plugin_version=NATIVE_INT8_V2_PLUGIN_VERSION,
+                plugin_namespace=NATIVE_INT8_V2_PLUGIN_NAMESPACE,
+                init_symbol=NATIVE_INT8_V2_PLUGIN_INIT_SYMBOL,
+            )
+            self._configure_native_int8_kernel_profile(
+                library=self._native_plugin_library,
+                ctypes_module=__import__("ctypes"),
+            )
         layer_profile_validated = None
         if enable_trt_layer_profile:
             # This import is intentionally gated.  Production runtime startup
@@ -833,7 +878,10 @@ class TensorRTVaeRuntime:
                     "build": dict(self._fusion_manifest.get("build", {})),
                 }
                 self._layer_profile_manifest = self._fusion_manifest
-            elif native_validated is not None and variant == "native_int8_v1":
+            elif native_validated is not None and variant in {
+                "native_int8_v1",
+                "native_int8_v2",
+            }:
                 native_audit = dict(native_validated["audit"])
                 native_audit["native_plugin_mappings"] = {
                     kind: [
@@ -854,7 +902,11 @@ class TensorRTVaeRuntime:
                     "schema_version": 3,
                     "scope": "vae_profile_only",
                     "precision": "int8",
-                    "plan_kind": "native_int8_v1_detailed",
+                    "plan_kind": (
+                        "native_int8_v1_detailed"
+                        if variant == "native_int8_v1"
+                        else f"native_int8_v2_{native_int8_v2_level}_detailed"
+                    ),
                     "engines": native_validated["engines"],
                     "int8_audit": native_audit,
                     "build": dict(self._native_manifest.get("build", {})),
@@ -920,7 +972,7 @@ class TensorRTVaeRuntime:
                     enable_trt_layer_profile
                     or variant == "fusion_v1"
                     or (variant == "fusion_v2" and kind == "steady")
-                    or variant == "native_int8_v1"
+                    or variant in {"native_int8_v1", "native_int8_v2"}
                 ),
             )
             self._engines[kind] = engine
@@ -976,7 +1028,7 @@ class TensorRTVaeRuntime:
                 for entry in fusion_validated["selected_cache_slots"]
             }
         self._native_cache_slots: dict[int, dict[str, Any]] = {}
-        if variant == "native_int8_v1":
+        if variant in {"native_int8_v1", "native_int8_v2"}:
             self._native_cache_slots = {
                 int(entry["index"]): dict(entry)
                 for entry in native_validated["cache_bindings"]
@@ -1067,35 +1119,41 @@ class TensorRTVaeRuntime:
     ) -> None:
         """Bind the opt-in native timing API without affecting other variants."""
 
+        symbol_prefix = (
+            "sfwanNativeInt8V2"
+            if self.variant == "native_int8_v2"
+            else "sfwanNativeInt8"
+        )
         symbols = {}
-        for name in (
-            "sfwanNativeInt8SetProfiling",
-            "sfwanNativeInt8ResetProfiles",
-            "sfwanNativeInt8ReadProfile",
-        ):
+        names = {
+            "set": f"{symbol_prefix}SetProfiling",
+            "reset": f"{symbol_prefix}ResetProfiles",
+            "read": f"{symbol_prefix}ReadProfile",
+        }
+        for name in names.values():
             try:
                 symbols[name] = getattr(library, name)
             except AttributeError as exc:
                 raise RuntimeError(
                     f"native INT8 plugin has no required profiling symbol {name}"
                 ) from exc
-        symbols["sfwanNativeInt8SetProfiling"].argtypes = [ctypes_module.c_int32]
-        symbols["sfwanNativeInt8SetProfiling"].restype = ctypes_module.c_int32
-        symbols["sfwanNativeInt8ResetProfiles"].argtypes = []
-        symbols["sfwanNativeInt8ResetProfiles"].restype = ctypes_module.c_int32
-        symbols["sfwanNativeInt8ReadProfile"].argtypes = [
+        symbols[names["set"]].argtypes = [ctypes_module.c_int32]
+        symbols[names["set"]].restype = ctypes_module.c_int32
+        symbols[names["reset"]].argtypes = []
+        symbols[names["reset"]].restype = ctypes_module.c_int32
+        symbols[names["read"]].argtypes = [
             ctypes_module.c_int32,
             ctypes_module.POINTER(ctypes_module.c_float),
             ctypes_module.c_int32,
             ctypes_module.POINTER(ctypes_module.c_int64),
         ]
-        symbols["sfwanNativeInt8ReadProfile"].restype = ctypes_module.c_int32
+        symbols[names["read"]].restype = ctypes_module.c_int32
         enabled = int(self.enable_native_int8_kernel_profile)
-        if int(symbols["sfwanNativeInt8SetProfiling"](enabled)) != 0:
+        if int(symbols[names["set"]](enabled)) != 0:
             raise RuntimeError("native INT8 plugin rejected profiling mode")
-        self._native_profile_set = symbols["sfwanNativeInt8SetProfiling"]
-        self._native_profile_reset = symbols["sfwanNativeInt8ResetProfiles"]
-        self._native_profile_read = symbols["sfwanNativeInt8ReadProfile"]
+        self._native_profile_set = symbols[names["set"]]
+        self._native_profile_reset = symbols[names["reset"]]
+        self._native_profile_read = symbols[names["read"]]
         self._native_profile_ctypes = ctypes_module
 
     def _begin_native_int8_kernel_profile(self) -> None:
@@ -1109,22 +1167,57 @@ class TensorRTVaeRuntime:
     ) -> dict[str, Any] | None:
         if not self.enable_native_int8_kernel_profile:
             return None
-        stage_names = (
-            "entry_norm_silu_quant_cache_write_ms",
-            "conv1_mainloop_epilogue_ms",
-            "mid_norm_silu_quant_cache_write_ms",
-            "conv2_mainloop_ms",
-            "residual_epilogue_ms",
-            "group_exit_ms",
-            "residual_block_total_ms",
-        )
+        if self.variant == "native_int8_v2" and self.native_int8_v2_level == "p1":
+            stage_names = (
+                "entry_norm_silu_quant_cache_write_ms",
+                "conv1_mainloop_epilogue_ms",
+                "mid_norm_silu_quant_cache_write_ms",
+                "conv2_mma_and_fused_residual_epilogue_ms",
+                "fused_dequant_bias_residual_requant_ms",
+                "group_exit_ms",
+                "residual_block_total_ms",
+            )
+        elif self.variant == "native_int8_v2" and self.native_int8_v2_level == "p2":
+            stage_names = (
+                "entry_norm_silu_quant_cache_ms",
+                "direct_causal_iterator_conv1_ms",
+                "mid_norm_silu_quant_cache_ms",
+                "direct_causal_iterator_conv2_residual_ms",
+                "fused_dequant_bias_residual_requant_ms",
+                "group_exit_ms",
+                "residual_block_total_ms",
+            )
+        elif self.variant == "native_int8_v2":
+            stage_names = (
+                "persistent_block_total_ms",
+                "persistent_conv1_ms",
+                "persistent_mid_norm_silu_quant_ms",
+                "persistent_conv2_residual_ms",
+                "persistent_cache_store_ms",
+                "persistent_group_exit_ms",
+                "residual_block_total_ms",
+            )
+        else:
+            stage_names = (
+                "entry_norm_silu_quant_cache_write_ms",
+                "conv1_mainloop_epilogue_ms",
+                "mid_norm_silu_quant_cache_write_ms",
+                "conv2_mainloop_ms",
+                "residual_epilogue_ms",
+                "group_exit_ms",
+                "residual_block_total_ms",
+            )
         ctypes_module = self._native_profile_ctypes
         records = self._native_validated["profile_ids"].get(kind, [])
         per_block: list[dict[str, Any]] = []
         stage_totals = {name: 0.0 for name in stage_names}
         signature_totals: dict[str, dict[str, Any]] = {}
         total_calls = 0
-        tile_map = self._native_manifest["tune"]["kernel_tile_map"]
+        tile_map = (
+            self._native_manifest["kernel_catalog"]["kernel_tile_map"]
+            if self.variant == "native_int8_v2"
+            else self._native_manifest["tune"]["kernel_tile_map"]
+        )
         for record in records:
             values = (ctypes_module.c_float * len(stage_names))()
             calls = ctypes_module.c_int64()
@@ -1150,10 +1243,20 @@ class TensorRTVaeRuntime:
             for name, value in stages.items():
                 stage_totals[name] += value
             total_calls += int(calls.value)
-            for signature_key, stage_key in (
-                ("conv1_signature", "conv1_mainloop_epilogue_ms"),
-                ("conv2_signature", "conv2_mainloop_ms"),
-            ):
+            signature_stage_keys = (
+                (
+                    "conv1_signature",
+                    "direct_causal_iterator_conv1_ms",
+                ),
+                (
+                    "conv2_signature",
+                    "direct_causal_iterator_conv2_residual_ms",
+                ),
+            ) if self.variant == "native_int8_v2" and self.native_int8_v2_level == "p2" else (
+                ("conv1_signature", stage_names[1]),
+                ("conv2_signature", stage_names[3]),
+            )
+            for signature_key, stage_key in signature_stage_keys:
                 signature = record.get(signature_key)
                 if not isinstance(signature, str):
                     continue
@@ -1178,9 +1281,15 @@ class TensorRTVaeRuntime:
                 }
             )
         return {
-            "schema_version": 1,
+            "schema_version": 2 if self.variant == "native_int8_v2" else 1,
             "engine_kind": kind,
             "chunk_index": chunk_index,
+            "native_int8_variant": self.variant,
+            "native_int8_v2_level": (
+                self.native_int8_v2_level
+                if self.variant == "native_int8_v2"
+                else None
+            ),
             "profiled_block_call_count": total_calls,
             "stage_totals_ms": stage_totals,
             "per_signature": signature_totals,
@@ -1235,7 +1344,7 @@ class TensorRTVaeRuntime:
         native_cache_indices = set(
             getattr(self, "_native_cache_slots", {}).keys()
         )
-        if self.variant == "native_int8_v1" and not native_cache_indices:
+        if self.variant in {"native_int8_v1", "native_int8_v2"} and not native_cache_indices:
             native_cache_indices = {
                 int(entry["index"])
                 for entry in self._native_validated["cache_bindings"]
@@ -1262,7 +1371,7 @@ class TensorRTVaeRuntime:
                 and match in selected_cache_indices
             ):
                 expected_dtype = trt.int8
-            if self.variant == "native_int8_v1" and match in native_cache_indices:
+            if self.variant in {"native_int8_v1", "native_int8_v2"} and match in native_cache_indices:
                 expected_dtype = trt.int8
             if engine.get_tensor_dtype(name) != expected_dtype:
                 raise ValueError(
@@ -1270,7 +1379,7 @@ class TensorRTVaeRuntime:
                     f"got {engine.get_tensor_dtype(name)}"
                 )
             if (
-                self.variant == "native_int8_v1"
+                self.variant in {"native_int8_v1", "native_int8_v2"}
                 and match in native_cache_indices
                 and callable(getattr(engine, "get_tensor_format", None))
             ):
@@ -1434,6 +1543,60 @@ class TensorRTVaeRuntime:
                     ],
                     "native_int8_cutlass_commit": plugin["cutlass_commit"],
                     "native_int8_audit_passed": bool(native_audit["passed"]),
+                    "native_int8_kernel_profile_enabled": (
+                        self.enable_native_int8_kernel_profile
+                    ),
+                    "vae_cache_migration": "none",
+                }
+            )
+        elif self.variant == "native_int8_v2":
+            plugin = self._native_manifest["plugin"]
+            cache = self._native_manifest["cache"]
+            audit = self._native_validated["audit"]
+            contract.update(
+                {
+                    "vae_trt_plugin_sha256": plugin["sha256"],
+                    "native_int8_v2_level": self.native_int8_v2_level,
+                    "native_int8_v2_schema_version": self._native_manifest[
+                        "schema_version"
+                    ],
+                    "native_int8_v2_plugin_sha256": plugin["sha256"],
+                    "native_int8_v2_plan_sha256": dict(
+                        self._active_plan_sha256
+                    ),
+                    "native_int8_v2_accumulator1_workspace_bytes": audit[
+                        "accumulator1_workspace_bytes"
+                    ],
+                    "native_int8_v2_accumulator2_workspace_bytes": audit[
+                        "accumulator2_workspace_bytes"
+                    ],
+                    "native_int8_v2_temporal_window_bytes": audit[
+                        "temporal_window_bytes"
+                    ],
+                    "native_int8_v2_direct_causal_iterator": audit[
+                        "direct_causal_iterator"
+                    ],
+                    "native_int8_v2_persistent_block_count": audit[
+                        "persistent_block_count"
+                    ],
+                    "native_int8_v2_signature_kernel_map": dict(
+                        self._native_manifest["kernel_catalog"][
+                            "kernel_tile_map"
+                        ]
+                    ),
+                    "native_int8_v2_audit_passed": bool(audit["passed"]),
+                    "native_int8_cache_int8_slot_count": cache[
+                        "int8_slot_count"
+                    ],
+                    "native_int8_cache_fp16_slot_count": cache[
+                        "fp16_slot_count"
+                    ],
+                    "native_int8_cache_bank_bytes": cache[
+                        "single_bank_bytes"
+                    ],
+                    "native_int8_runtime_scale_mode": "static",
+                    "native_int8_weight_mode": "offline_per_channel_packed",
+                    "native_int8_cutlass_commit": plugin["cutlass_commit"],
                     "native_int8_kernel_profile_enabled": (
                         self.enable_native_int8_kernel_profile
                     ),

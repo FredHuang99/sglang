@@ -63,7 +63,12 @@ inline std::int64_t sfwan_implicit_gemm_tensor_c_size(
 namespace
 {
 
+#ifdef SFWAN_NATIVE_INT8_V2
+constexpr int32_t kBaseTileCount = 6;
+constexpr int32_t kTileCount = 18;
+#else
 constexpr int32_t kTileCount = 6;
+#endif
 constexpr int32_t kProfileStageCount = 7;
 constexpr int32_t kMaxProfileIds = 2048;
 constexpr size_t kCutlassWorkspaceReserve = 64U * 1024U * 1024U;
@@ -430,6 +435,10 @@ __global__ void residualEpilogueKernel(int32_t const* accumulator,
     }
 }
 
+#ifdef SFWAN_NATIVE_INT8_V2
+#include "../trt_plugins_native_int8_v2/sfwan_vae_native_int8_v2_iterators.cuh"
+#endif
+
 int32_t launchCount(int64_t count)
 {
     return static_cast<int32_t>(
@@ -503,6 +512,9 @@ cutlass::Status dispatchConv(int32_t tileId, int8_t const* activation,
     int32_t strideH, int32_t strideW, int32_t dilationH,
     int32_t dilationW, cudaStream_t stream)
 {
+#ifdef SFWAN_NATIVE_INT8_V2
+    tileId %= kBaseTileCount;
+#endif
     switch (tileId)
     {
     case 0:
@@ -547,6 +559,10 @@ struct WorkspaceLayout
     size_t window2Offset{};
     size_t accumulator2Offset{};
     size_t cutlassOffset{};
+    size_t windowBytes{};
+    size_t compactBytes{};
+    size_t accumulator1Bytes{};
+    size_t accumulator2Bytes{};
     size_t total{};
 };
 
@@ -563,20 +579,67 @@ WorkspaceLayout workspaceLayout(SfWanNativeInt8BlockConfig const& config)
     int64_t const c2 = config.weight2Shape[3];
     int64_t const k2 = config.weight2Shape[0];
     size_t cursor = 0;
+#ifdef SFWAN_NATIVE_INT8_V2
+    int32_t const level = config.tile1 / kBaseTileCount + 1;
+#else
+    int32_t const level = 0;
+#endif
     result.window1Offset = cursor;
     int64_t const d1 = config.inputShape[2];
     int64_t const d2 = config.outputShape[2];
-    cursor = alignUp(cursor + static_cast<size_t>(n * d1 * h1 * w1 * c1));
+    if (level < 2)
+    {
+        result.windowBytes
+            = static_cast<size_t>(n * d1 * h1 * w1 * c1);
+        cursor = alignUp(cursor + result.windowBytes);
+    }
+#ifdef SFWAN_NATIVE_INT8_V2
+    else if (level == 2)
+    {
+        result.compactBytes
+            = static_cast<size_t>(n * d1 * h1 * w1 * config.inputShape[1]);
+        cursor = alignUp(cursor + result.compactBytes);
+    }
+#endif
     result.accumulator1Offset = cursor;
-    cursor = alignUp(cursor
-        + static_cast<size_t>(n * d1 * h2 * w2 * k1) * sizeof(int32_t));
+    if (level < 3)
+    {
+        result.accumulator1Bytes
+            = static_cast<size_t>(n * d1 * h2 * w2 * k1)
+            * sizeof(int32_t);
+        cursor = alignUp(cursor + result.accumulator1Bytes);
+    }
     result.window2Offset = cursor;
-    cursor = alignUp(cursor + static_cast<size_t>(n * d2 * h2 * w2 * c2));
+    if (level < 2)
+    {
+        size_t const bytes = static_cast<size_t>(n * d2 * h2 * w2 * c2);
+        result.windowBytes += bytes;
+        cursor = alignUp(cursor + bytes);
+    }
+#ifdef SFWAN_NATIVE_INT8_V2
+    else if (level == 2)
+    {
+        size_t const bytes
+            = static_cast<size_t>(n * d2 * h2 * w2 * k1);
+        result.compactBytes += bytes;
+        cursor = alignUp(cursor + bytes);
+    }
+#endif
     result.accumulator2Offset = cursor;
-    cursor = alignUp(cursor
-        + static_cast<size_t>(n * d2 * h2 * w2 * k2) * sizeof(int32_t));
+#ifndef SFWAN_NATIVE_INT8_V2
+    result.accumulator2Bytes
+        = static_cast<size_t>(n * d2 * h2 * w2 * k2)
+        * sizeof(int32_t);
+    cursor = alignUp(cursor + result.accumulator2Bytes);
+#endif
     result.cutlassOffset = cursor;
+#ifdef SFWAN_NATIVE_INT8_V2
+    result.total = alignUp(cursor
+        + (level < 3 ? kCutlassWorkspaceReserve
+                     : sfwan_v2::kBlockScratchBytes));
+#else
     result.total = alignUp(cursor + kCutlassWorkspaceReserve);
+#endif
     return result;
 }
 
@@ -683,6 +746,42 @@ extern "C" size_t sfwanNativeInt8WorkspaceSize(
     return workspaceLayout(*config).total;
 }
 
+#ifdef SFWAN_NATIVE_INT8_V2
+extern "C" int32_t sfwanNativeInt8V2WorkspaceContract(
+    SfWanNativeInt8BlockConfig const* config, uint64_t* values,
+    int32_t valueCount)
+{
+    if (config == nullptr || values == nullptr || valueCount != 4
+        || !validConfig(*config))
+    {
+        return -1;
+    }
+    WorkspaceLayout const layout = workspaceLayout(*config);
+    values[0] = static_cast<uint64_t>(layout.accumulator1Bytes);
+    values[1] = static_cast<uint64_t>(layout.accumulator2Bytes);
+    values[2] = static_cast<uint64_t>(layout.windowBytes);
+    values[3] = static_cast<uint64_t>(layout.total);
+    return 0;
+}
+
+extern "C" int32_t sfwanNativeInt8V2PersistentTile(
+    SfWanNativeInt8BlockConfig const* config, int32_t* tileH,
+    int32_t* tileW, uint64_t* dynamicSharedBytes)
+{
+    if (config == nullptr || tileH == nullptr || tileW == nullptr
+        || dynamicSharedBytes == nullptr || !validConfig(*config)
+        || config->tile1 / kBaseTileCount + 1 != 3)
+    {
+        return -1;
+    }
+    size_t bytes{};
+    int32_t status
+        = sfwan_v2::selectPersistentTile(*config, *tileH, *tileW, bytes);
+    *dynamicSharedBytes = static_cast<uint64_t>(bytes);
+    return status;
+}
+#endif
+
 extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     SfWanNativeInt8BlockConfig const* config, void const* blockInput,
     void const* shortcut, void const* cache1, void const* cache2,
@@ -734,6 +833,118 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
         cudaEventRecord(profile.events[0], stream);
     }
 
+#ifdef SFWAN_NATIVE_INT8_V2
+    int32_t const level = config->tile1 / kBaseTileCount + 1;
+    if (config->tile2 / kBaseTileCount + 1 != level)
+    {
+        return -1;
+    }
+    auto* compact1 = reinterpret_cast<int8_t*>(bytes + layout.window1Offset);
+    auto* compact2 = reinterpret_cast<int8_t*>(bytes + layout.window2Offset);
+    if (level >= 2)
+    {
+        compact1 = reinterpret_cast<int8_t*>(bytes + layout.window1Offset);
+        compact2 = reinterpret_cast<int8_t*>(bytes + layout.window2Offset);
+    }
+    if (level == 3)
+    {
+        int32_t persistentStatus = sfwan_v2::launchPersistentResidualBlock(
+            *config, blockInput, shortcut,
+            static_cast<int8_t const*>(cache1),
+            static_cast<int8_t const*>(cache2),
+            static_cast<half const*>(gamma1),
+            static_cast<half const*>(gamma2),
+            static_cast<int8_t const*>(weight1),
+            static_cast<float const*>(weightScale1),
+            static_cast<float const*>(bias1),
+            static_cast<int8_t const*>(weight2),
+            static_cast<float const*>(weightScale2),
+            static_cast<float const*>(bias2), blockOutput,
+            static_cast<int8_t*>(cache1Output),
+            static_cast<int8_t*>(cache2Output), stream);
+        if (profile.active)
+        {
+            for (int32_t index = 1; index < 7; ++index)
+            {
+                cudaEventRecord(profile.events[index], stream);
+            }
+            commitProfile(profile, config->profileId);
+        }
+        return persistentStatus;
+    }
+    if (level >= 2)
+    {
+        sfwan_v2::entryNormQuantCompactKernel<<<
+            static_cast<int32_t>((sites1 + 3) / 4), 128, 0, stream>>>(
+            blockInput, static_cast<int8_t const*>(cache1),
+            static_cast<half const*>(gamma1), compact1,
+            static_cast<int8_t*>(cache1Output), config->inputIsInt8 != 0,
+            config->hasCache1 != 0, config->inputScale,
+            config->conv1InputScale, n, c1, d1, h1, w1, cache1Depth,
+            config->cache1OutputShape[2]);
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return -1;
+        }
+        if (profile.active) cudaEventRecord(profile.events[1], stream);
+        if (sfwan_v2::launchDirectConvAccumulator(compact1,
+                static_cast<int8_t const*>(cache1),
+                config->hasCache1 != 0,
+                static_cast<int8_t const*>(weight1), accumulator1, n, c1,
+                d1, h1, w1, cache1Depth, k1, d2, h2, w2,
+                config->weight1Shape[1], config->weight1Shape[2],
+                config->conv1Params[0], config->conv1Params[1],
+                config->conv1Params[2], config->conv1Params[3],
+                config->conv1Params[4], config->conv1Params[5], stream)
+            != 0)
+        {
+            return -1;
+        }
+        if (profile.active) cudaEventRecord(profile.events[2], stream);
+        sfwan_v2::accumulatorNormQuantCompactKernel<<<
+            static_cast<int32_t>((sites2 + 3) / 4), 128, 0, stream>>>(
+            accumulator1, static_cast<float const*>(weightScale1),
+            static_cast<float const*>(bias1),
+            static_cast<int8_t const*>(cache2),
+            static_cast<half const*>(gamma2), compact2,
+            static_cast<int8_t*>(cache2Output), config->hasCache2 != 0,
+            config->conv1InputScale, config->conv2InputScale, n, k1, d2,
+            h2, w2, cache2Depth, config->cache2OutputShape[2]);
+        if (cudaPeekAtLastError() != cudaSuccess)
+        {
+            return -1;
+        }
+        if (profile.active) cudaEventRecord(profile.events[3], stream);
+        if (sfwan_v2::launchFusedResidualConv(true, compact2,
+                static_cast<int8_t const*>(cache2),
+                config->hasCache2 != 0,
+                static_cast<int8_t const*>(weight2),
+                static_cast<float const*>(weightScale2),
+                static_cast<float const*>(bias2), shortcut, blockOutput,
+                config->shortcutIsInt8 != 0, config->outputIsInt8 != 0,
+                config->conv2InputScale, config->inputScale,
+                config->outputScale, n, k1, d2, h2, w2, cache2Depth, k2,
+                config->outputShape[2], config->outputShape[3],
+                config->outputShape[4], config->weight2Shape[1],
+                config->weight2Shape[2], config->conv2Params[0],
+                config->conv2Params[1], config->conv2Params[2],
+                config->conv2Params[3], config->conv2Params[4],
+                config->conv2Params[5], stream)
+            != 0)
+        {
+            return -1;
+        }
+        if (profile.active)
+        {
+            cudaEventRecord(profile.events[4], stream);
+            cudaEventRecord(profile.events[5], stream);
+            cudaEventRecord(profile.events[6], stream);
+            commitProfile(profile, config->profileId);
+        }
+        return 0;
+    }
+#endif
+
     entryNormQuantWindowKernel<<<static_cast<int32_t>((sites1 + 3) / 4),
         128, 0, stream>>>(blockInput, static_cast<int8_t const*>(cache1),
         static_cast<half const*>(gamma1), window1,
@@ -780,6 +991,24 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     {
         cudaEventRecord(profile.events[3], stream);
     }
+#ifdef SFWAN_NATIVE_INT8_V2
+    int32_t fusedStatus = sfwan_v2::launchFusedResidualConv(false, window2,
+        nullptr, false, static_cast<int8_t const*>(weight2),
+        static_cast<float const*>(weightScale2),
+        static_cast<float const*>(bias2), shortcut, blockOutput,
+        config->shortcutIsInt8 != 0, config->outputIsInt8 != 0,
+        config->conv2InputScale, config->inputScale, config->outputScale, n,
+        k1, d2, h2, w2, 0, k2, config->outputShape[2],
+        config->outputShape[3], config->outputShape[4],
+        config->weight2Shape[1], config->weight2Shape[2],
+        config->conv2Params[0], config->conv2Params[1],
+        config->conv2Params[2], config->conv2Params[3],
+        config->conv2Params[4], config->conv2Params[5], stream);
+    if (fusedStatus != 0)
+    {
+        return -1;
+    }
+#else
     status = dispatchConv(config->tile2, window2,
         static_cast<int8_t const*>(weight2), accumulator2, cutlassWorkspace,
         n * d2, h2, w2, config->weight2Shape[3], k2,
@@ -792,10 +1021,12 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     {
         return -1;
     }
+#endif
     if (profile.active)
     {
         cudaEventRecord(profile.events[4], stream);
     }
+#ifndef SFWAN_NATIVE_INT8_V2
     int64_t const outputCount
         = static_cast<int64_t>(n) * k2 * config->outputShape[2]
         * config->outputShape[3] * config->outputShape[4];
@@ -810,6 +1041,7 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     {
         return -1;
     }
+#endif
     if (profile.active)
     {
         cudaEventRecord(profile.events[5], stream);
@@ -849,6 +1081,9 @@ extern "C" int32_t sfwanNativeInt8TuneConv(int32_t const* inputShape,
     {
         return -1;
     }
+#ifdef SFWAN_NATIVE_INT8_V2
+    tileId %= kBaseTileCount;
+#endif
     int32_t const n = inputShape[0] * inputShape[2];
     int32_t const h = inputShape[3];
     int32_t const w = inputShape[4];

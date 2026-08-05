@@ -221,12 +221,12 @@ def _extract_native_kernel_profile(summary: Mapping[str, Any]) -> dict[str, Any]
     server = context.get("server") if isinstance(context, Mapping) else None
     if (
         not isinstance(server, Mapping)
-        or server.get("vae_trt_variant") != "native_int8_v1"
+        or server.get("vae_trt_variant") not in {"native_int8_v1", "native_int8_v2"}
         or server.get("native_int8_kernel_profile_enabled") is not True
     ):
         raise ValueError(
             "native kernel-profile summary must come from an instrumented "
-            "native_int8_v1 server"
+            "native_int8_v1 or native_int8_v2 server"
         )
     measured = summary.get("measured")
     if not isinstance(measured, list) or not measured:
@@ -261,30 +261,43 @@ def _extract_native_kernel_profile(summary: Mapping[str, Any]) -> dict[str, Any]
                 stages.get("residual_block_total_ms"),
                 label=f"native chunk {index} residual blocks",
             )
+            def stage(*names: str) -> float:
+                for name in names:
+                    if name in stages:
+                        return _finite_ms(
+                            stages[name], label=f"native chunk {index} {name}"
+                        )
+                return 0.0
+
             values = {
-                "target_int8_conv_ms": _finite_ms(
-                    stages.get("conv1_mainloop_epilogue_ms"),
-                    label=f"native chunk {index} conv1",
+                "target_int8_conv_ms": stage(
+                    "conv1_mainloop_epilogue_ms",
+                    "direct_causal_iterator_conv1_ms",
+                    "persistent_conv1_ms",
                 )
-                + _finite_ms(
-                    stages.get("conv2_mainloop_ms"),
-                    label=f"native chunk {index} conv2",
+                + stage(
+                    "conv2_mainloop_ms",
+                    "conv2_mma_and_fused_residual_epilogue_ms",
+                    "direct_causal_iterator_conv2_residual_ms",
+                    "persistent_conv2_residual_ms",
                 ),
-                "norm_silu_quant_cache_write_ms": _finite_ms(
-                    stages.get("entry_norm_silu_quant_cache_write_ms"),
-                    label=f"native chunk {index} entry producer",
+                "norm_silu_quant_cache_write_ms": stage(
+                    "entry_norm_silu_quant_cache_write_ms",
+                    "entry_norm_silu_quant_cache_ms",
+                    "persistent_entry_ms",
                 )
-                + _finite_ms(
-                    stages.get("mid_norm_silu_quant_cache_write_ms"),
-                    label=f"native chunk {index} mid producer",
+                + stage(
+                    "mid_norm_silu_quant_cache_write_ms",
+                    "mid_norm_silu_quant_cache_ms",
+                    "persistent_mid_norm_silu_quant_ms",
                 ),
-                "residual_epilogue_ms": _finite_ms(
-                    stages.get("residual_epilogue_ms"),
-                    label=f"native chunk {index} residual epilogue",
+                "residual_epilogue_ms": stage(
+                    "residual_epilogue_ms",
+                    "fused_dequant_bias_residual_requant_ms",
                 ),
-                "group_exit_ms": _finite_ms(
-                    stages.get("group_exit_ms"),
-                    label=f"native chunk {index} group exit",
+                "group_exit_ms": stage(
+                    "group_exit_ms",
+                    "persistent_group_exit_ms",
                 ),
                 "native_residual_blocks_ms": native_total,
                 "remaining_trt_operators_ms": max(0.0, trt_ms - native_total),
@@ -298,6 +311,8 @@ def _extract_native_kernel_profile(summary: Mapping[str, Any]) -> dict[str, Any]
     return {
         "schema_version": 1,
         "diagnostic_only": True,
+        "variant": server["vae_trt_variant"],
+        "native_int8_v2_level": server.get("native_int8_v2_level"),
         "measured_iteration_count": len(measured),
         "per_chunk": [
             {component: _stats(values) for component, values in chunk.items()}
@@ -325,6 +340,9 @@ def compare_profile_summaries(
         "int8_fusion_v1",
         "int8_fusion_v2",
         "native_int8_v1",
+        "native_int8_v2_p1",
+        "native_int8_v2_p2",
+        "native_int8_v2_p3",
     }
     if not required.issubset(inputs):
         raise ValueError(f"missing comparison inputs: {sorted(required - set(inputs))}")
@@ -378,6 +396,9 @@ def compare_profile_summaries(
         "int8_fusion_v1": ("tensorrt", "int8"),
         "int8_fusion_v2": ("tensorrt", "int8"),
         "native_int8_v1": ("tensorrt", "int8"),
+        "native_int8_v2_p1": ("tensorrt", "int8"),
+        "native_int8_v2_p2": ("tensorrt", "int8"),
+        "native_int8_v2_p3": ("tensorrt", "int8"),
     }
     for label, context in contexts.items():
         expected_backend, expected_precision = expected_backends[label]
@@ -448,6 +469,31 @@ def compare_profile_summaries(
         cutlass_commit = server.get("native_int8_cutlass_commit")
         if not isinstance(cutlass_commit, str) or len(cutlass_commit) != 40:
             raise ValueError("native_int8_v1 input has no pinned CUTLASS commit")
+    for level in ("p1", "p2", "p3"):
+        label = f"native_int8_v2_{level}"
+        if label not in contexts:
+            continue
+        server = contexts[label]["server"]
+        if server.get("vae_trt_variant") != "native_int8_v2":
+            raise ValueError(f"{label} input uses a different variant")
+        if server.get("native_int8_v2_level") != level:
+            raise ValueError(f"{label} input uses a different V2 level")
+        if server.get("native_int8_v2_audit_passed") is not True:
+            raise ValueError(f"{label} audit did not pass")
+        if server.get("native_int8_v2_accumulator2_workspace_bytes") != 0:
+            raise ValueError(f"{label} retained Conv2 accumulator workspace")
+        if level in {"p2", "p3"}:
+            if server.get("native_int8_v2_temporal_window_bytes") != 0:
+                raise ValueError(f"{label} retained temporal-window workspace")
+            if server.get("native_int8_v2_direct_causal_iterator") is not True:
+                raise ValueError(f"{label} did not enable direct causal iterator")
+        if level == "p3":
+            if server.get("native_int8_v2_accumulator1_workspace_bytes") != 0:
+                raise ValueError(f"{label} retained Conv1 accumulator workspace")
+            if server.get("native_int8_v2_persistent_block_count") != 84:
+                raise ValueError(f"{label} persistent coverage is incomplete")
+        if not server.get("native_int8_v2_plugin_sha256"):
+            raise ValueError(f"{label} has no plugin SHA")
 
     fp32_total = results["fp32"]["whole_request"]["mean_ms"]
     fp16_total = results["fp16_trt"]["whole_request"]["mean_ms"]
@@ -481,6 +527,9 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
             "int8_fusion_v1",
             "int8_fusion_v2",
             "native_int8_v1",
+            "native_int8_v2_p1",
+            "native_int8_v2_p2",
+            "native_int8_v2_p3",
         )
         if label in results
     ]
@@ -528,8 +577,11 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
             f"{steady['population_stddev_ms']:.3f} | "
             f"{value['whole_request']['sample_count']} requests |"
         )
-    native_profile = comparison.get("native_int8_kernel_profile")
-    if isinstance(native_profile, Mapping):
+    native_profiles = comparison.get("native_int8_kernel_profiles")
+    if not isinstance(native_profiles, Mapping):
+        legacy = comparison.get("native_int8_kernel_profile")
+        native_profiles = {"native_int8": legacy} if isinstance(legacy, Mapping) else {}
+    if native_profiles:
         lines.extend(
             [
                 "",
@@ -538,16 +590,17 @@ def render_markdown(comparison: Mapping[str, Any]) -> str:
                 "These values come from the opt-in instrumented plugin and are not "
                 "production latency. Cache writes are fused with Norm/SiLU/quant.",
                 "",
-                "| component | 7-chunk mean (ms) | population sigma (ms) |",
-                "| --- | ---: | ---: |",
+                "| variant | component | 7-chunk mean (ms) | population sigma (ms) |",
+                "| --- | --- | ---: | ---: |",
             ]
         )
-        for component in NATIVE_PROFILE_COMPONENTS:
-            stats = native_profile["whole_request"][component]
-            lines.append(
-                f"| {component} | {stats['mean_ms']:.3f} | "
-                f"{stats['population_stddev_ms']:.3f} |"
-            )
+        for label, native_profile in native_profiles.items():
+            for component in NATIVE_PROFILE_COMPONENTS:
+                stats = native_profile["whole_request"][component]
+                lines.append(
+                    f"| {label} | {component} | {stats['mean_ms']:.3f} | "
+                    f"{stats['population_stddev_ms']:.3f} |"
+                )
     return "\n".join(lines) + "\n"
 
 
@@ -567,7 +620,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--int8-fusion-v1-json")
     parser.add_argument("--int8-fusion-v2-json")
     parser.add_argument("--native-int8-v1-json")
+    parser.add_argument("--native-int8-v2-p1-json")
+    parser.add_argument("--native-int8-v2-p2-json")
+    parser.add_argument("--native-int8-v2-p3-json")
     parser.add_argument("--native-int8-kernel-profile-json")
+    parser.add_argument("--native-int8-v1-kernel-profile-json")
+    parser.add_argument("--native-int8-v2-p1-kernel-profile-json")
+    parser.add_argument("--native-int8-v2-p2-kernel-profile-json")
+    parser.add_argument("--native-int8-v2-p3-kernel-profile-json")
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--output-markdown", required=True)
     parser.add_argument("--expected-warmup", type=int, default=EXPECTED_WARMUP)
@@ -588,6 +648,12 @@ def main() -> None:
         sources["int8_fusion_v2"] = args.int8_fusion_v2_json
     if args.native_int8_v1_json:
         sources["native_int8_v1"] = args.native_int8_v1_json
+    if args.native_int8_v2_p1_json:
+        sources["native_int8_v2_p1"] = args.native_int8_v2_p1_json
+    if args.native_int8_v2_p2_json:
+        sources["native_int8_v2_p2"] = args.native_int8_v2_p2_json
+    if args.native_int8_v2_p3_json:
+        sources["native_int8_v2_p3"] = args.native_int8_v2_p3_json
     inputs = {label: (path, _read_json(path)) for label, path in sources.items()}
     comparison = compare_profile_summaries(
         inputs,
@@ -603,6 +669,29 @@ def main() -> None:
             "path": str(profile_path),
             "sha256": _sha256_file(profile_path),
         }
+    profile_sources = {
+        "native_int8_v1": args.native_int8_v1_kernel_profile_json,
+        "native_int8_v2_p1": args.native_int8_v2_p1_kernel_profile_json,
+        "native_int8_v2_p2": args.native_int8_v2_p2_kernel_profile_json,
+        "native_int8_v2_p3": args.native_int8_v2_p3_kernel_profile_json,
+    }
+    native_profiles: dict[str, Any] = {}
+    for label, source in profile_sources.items():
+        if not source:
+            continue
+        profile_path = Path(source).expanduser().resolve()
+        profile = _extract_native_kernel_profile(_read_json(profile_path))
+        expected_variant = "native_int8_v1" if label == "native_int8_v1" else "native_int8_v2"
+        expected_level = label.removeprefix("native_int8_v2_") if expected_variant == "native_int8_v2" else None
+        if profile["variant"] != expected_variant or profile["native_int8_v2_level"] != expected_level:
+            raise ValueError(f"{label} kernel profile identity does not match its CLI argument")
+        native_profiles[label] = profile
+        comparison["artifacts"][f"{label}_kernel_profile"] = {
+            "path": str(profile_path),
+            "sha256": _sha256_file(profile_path),
+        }
+    if native_profiles:
+        comparison["native_int8_kernel_profiles"] = native_profiles
     _write_text(
         args.output_json,
         json.dumps(comparison, indent=2, ensure_ascii=False, allow_nan=False) + "\n",

@@ -32,7 +32,9 @@ VaeTrtVariant = Literal[
     "fusion_v1",
     "fusion_v2",
     "native_int8_v1",
+    "native_int8_v2",
 ]
+NativeInt8V2Level = Literal["p1", "p2", "p3"]
 TRT_VAE_PRECISIONS = frozenset({"fp16_trt", "int8_trt"})
 
 
@@ -42,6 +44,7 @@ class ModelLoadConfig(msgspec.Struct, frozen=True, kw_only=True):
     vae_precision: VaePrecision = "fp32"
     vae_engine_dir: str | None = None
     vae_trt_variant: VaeTrtVariant = "baseline"
+    native_int8_v2_level: NativeInt8V2Level = "p1"
     text_encoder_cpu_offload: bool = True
     dit_cpu_offload: bool = False
     vae_cpu_offload: bool = False
@@ -1298,6 +1301,7 @@ class SfWanVaeModel:
             ),
             enable_nvtx=load_config.enable_nvtx,
             variant=load_config.vae_trt_variant,
+            native_int8_v2_level=load_config.native_int8_v2_level,
         )
         manifest = self._trt_runtime.manifest
         latents_mean = manifest.get("latents_mean")

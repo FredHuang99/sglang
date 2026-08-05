@@ -561,6 +561,39 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 "native_int8_audit_passed": engine_contract.get(
                     "native_int8_audit_passed"
                 ),
+                "native_int8_v2_level": engine_contract.get(
+                    "native_int8_v2_level"
+                ),
+                "native_int8_v2_schema_version": engine_contract.get(
+                    "native_int8_v2_schema_version"
+                ),
+                "native_int8_v2_plugin_sha256": engine_contract.get(
+                    "native_int8_v2_plugin_sha256"
+                ),
+                "native_int8_v2_plan_sha256": engine_contract.get(
+                    "native_int8_v2_plan_sha256"
+                ),
+                "native_int8_v2_accumulator1_workspace_bytes": engine_contract.get(
+                    "native_int8_v2_accumulator1_workspace_bytes"
+                ),
+                "native_int8_v2_accumulator2_workspace_bytes": engine_contract.get(
+                    "native_int8_v2_accumulator2_workspace_bytes"
+                ),
+                "native_int8_v2_temporal_window_bytes": engine_contract.get(
+                    "native_int8_v2_temporal_window_bytes"
+                ),
+                "native_int8_v2_direct_causal_iterator": engine_contract.get(
+                    "native_int8_v2_direct_causal_iterator"
+                ),
+                "native_int8_v2_persistent_block_count": engine_contract.get(
+                    "native_int8_v2_persistent_block_count"
+                ),
+                "native_int8_v2_signature_kernel_map": engine_contract.get(
+                    "native_int8_v2_signature_kernel_map"
+                ),
+                "native_int8_v2_audit_passed": engine_contract.get(
+                    "native_int8_v2_audit_passed"
+                ),
             },
         }
         for index in range(args.warmup + args.repeat):

@@ -32,6 +32,7 @@ from .model import (
     SfWanDitModel,
     SfWanMonolithicModel,
     SfWanVaeModel,
+    NativeInt8V2Level,
     VaePrecision,
     VaeTrtVariant,
     _uses_trt_vae,
@@ -85,6 +86,7 @@ class ServerConfig(msgspec.Struct, frozen=True, kw_only=True):
     vae_precision: VaePrecision = "fp32"
     vae_engine_dir: str | None = None
     vae_trt_variant: VaeTrtVariant = "baseline"
+    native_int8_v2_level: NativeInt8V2Level = "p1"
     text_encoder_cpu_offload: bool = True
     dit_cpu_offload: bool = False
     vae_cpu_offload: bool = False
@@ -161,10 +163,10 @@ class SfWanRuntime:
                     "--enable-native-int8-kernel-profile requires "
                     "--vae-precision int8_trt"
                 )
-            if config.vae_trt_variant != "native_int8_v1":
+            if config.vae_trt_variant not in {"native_int8_v1", "native_int8_v2"}:
                 raise ValueError(
                     "--enable-native-int8-kernel-profile requires "
-                    "--vae-trt-variant native_int8_v1"
+                    "--vae-trt-variant native_int8_v1 or native_int8_v2"
                 )
         if config.role == "monolithic" and config.vae_url is not None:
             raise ValueError("--vae-url is not valid for the monolithic role")
@@ -187,6 +189,7 @@ class SfWanRuntime:
             "fusion_v1",
             "fusion_v2",
             "native_int8_v1",
+            "native_int8_v2",
         }:
             if config.vae_precision != "int8_trt":
                 raise ValueError(
@@ -243,6 +246,7 @@ class SfWanRuntime:
             vae_precision=self.config.vae_precision,
             vae_engine_dir=self.config.vae_engine_dir,
             vae_trt_variant=self.config.vae_trt_variant,
+            native_int8_v2_level=self.config.native_int8_v2_level,
             text_encoder_cpu_offload=self.config.text_encoder_cpu_offload,
             dit_cpu_offload=self.config.dit_cpu_offload,
             vae_cpu_offload=self.config.vae_cpu_offload,
@@ -1422,9 +1426,21 @@ def _parse_args() -> ServerConfig:
     parser.add_argument("--vae-engine-dir")
     parser.add_argument(
         "--vae-trt-variant",
-        choices=("baseline", "fusion_v1", "fusion_v2", "native_int8_v1"),
+        choices=(
+            "baseline",
+            "fusion_v1",
+            "fusion_v2",
+            "native_int8_v1",
+            "native_int8_v2",
+        ),
         default="baseline",
         help="isolated TensorRT VAE experiment variant; baseline is unchanged",
+    )
+    parser.add_argument(
+        "--native-int8-v2-level",
+        choices=("p1", "p2", "p3"),
+        default="p1",
+        help="Native INT8 V2 optimization level; ignored by other variants",
     )
     parser.add_argument(
         "--text-encoder-cpu-offload",
@@ -1475,6 +1491,7 @@ def _parse_args() -> ServerConfig:
         vae_precision=args.vae_precision,
         vae_engine_dir=args.vae_engine_dir,
         vae_trt_variant=args.vae_trt_variant,
+        native_int8_v2_level=args.native_int8_v2_level,
         text_encoder_cpu_offload=args.text_encoder_cpu_offload,
         dit_cpu_offload=args.dit_cpu_offload,
         vae_cpu_offload=args.vae_cpu_offload,

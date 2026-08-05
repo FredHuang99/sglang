@@ -2,7 +2,37 @@
 
 #include "NvInfer.h"
 #include "NvInferPlugin.h"
-#include "sfwan_vae_native_int8_kernels.h"
+#ifndef SFWAN_NATIVE_INT8_KERNEL_HEADER
+#define SFWAN_NATIVE_INT8_KERNEL_HEADER "sfwan_vae_native_int8_kernels.h"
+#endif
+#include SFWAN_NATIVE_INT8_KERNEL_HEADER
+
+#ifndef SFWAN_NATIVE_INT8_CONFIG_TYPE
+#define SFWAN_NATIVE_INT8_CONFIG_TYPE SfWanNativeInt8BlockConfig
+#endif
+#ifndef SFWAN_NATIVE_INT8_WORKSPACE_SIZE
+#define SFWAN_NATIVE_INT8_WORKSPACE_SIZE sfwanNativeInt8WorkspaceSize
+#endif
+#ifndef SFWAN_NATIVE_INT8_LAUNCH
+#define SFWAN_NATIVE_INT8_LAUNCH sfwanNativeInt8LaunchResidualBlock
+#endif
+#ifndef SFWAN_NATIVE_INT8_TILE_COUNT
+#define SFWAN_NATIVE_INT8_TILE_COUNT sfwanNativeInt8TileCount
+#endif
+#ifndef SFWAN_NATIVE_INT8_PLUGIN_NAME
+#define SFWAN_NATIVE_INT8_PLUGIN_NAME "SfWanNativeInt8ResidualBlockPlugin"
+#endif
+#ifndef SFWAN_NATIVE_INT8_PLUGIN_INIT
+#define SFWAN_NATIVE_INT8_PLUGIN_INIT initSfWanVaeNativeInt8V1Plugins
+#endif
+
+// The V2 translation unit reuses the stable TensorRT IPluginV3 plumbing while
+// binding it to a different config type and kernel entry points.  The default
+// macros above preserve the byte-for-byte V1 ABI and creator identity.
+#define SfWanNativeInt8BlockConfig SFWAN_NATIVE_INT8_CONFIG_TYPE
+#define sfwanNativeInt8WorkspaceSize SFWAN_NATIVE_INT8_WORKSPACE_SIZE
+#define sfwanNativeInt8LaunchResidualBlock SFWAN_NATIVE_INT8_LAUNCH
+#define sfwanNativeInt8TileCount SFWAN_NATIVE_INT8_TILE_COUNT
 
 #include <array>
 #include <cmath>
@@ -20,7 +50,7 @@ namespace
 
 constexpr char const* kNamespace = "sglang.sfwan";
 constexpr char const* kVersion = "1";
-constexpr char const* kPluginName = "SfWanNativeInt8ResidualBlockPlugin";
+constexpr char const* kPluginName = SFWAN_NATIVE_INT8_PLUGIN_NAME;
 constexpr int32_t kInputs = 12;
 constexpr int32_t kOutputs = 3;
 
@@ -589,7 +619,7 @@ bool gRegistered{false};
 
 } // namespace
 
-extern "C" bool initSfWanVaeNativeInt8V1Plugins()
+extern "C" bool SFWAN_NATIVE_INT8_PLUGIN_INIT()
 {
     std::call_once(gRegisterOnce, [] {
         IPluginRegistry* registry = getPluginRegistry();

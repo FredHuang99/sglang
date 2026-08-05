@@ -525,7 +525,7 @@ def _audit_layer_mapping(
     metadata: dict[str, set[str]] = defaultdict(set)
     if not isinstance(int8_audit, Mapping):
         return names, metadata
-    if int8_audit.get("variant") == "native_int8_v1":
+    if int8_audit.get("variant") in {"native_int8_v1", "native_int8_v2"}:
         mappings_by_kind = int8_audit.get("native_plugin_mappings")
         mappings = (
             mappings_by_kind.get(engine_kind)
@@ -659,9 +659,16 @@ def _classify_layer(
     type_text = " ".join((layer_type, parameter_type)).lower()
     if (
         "sfwannativeint8residualblock" in haystack
+        or "sfwannativeint8v2residualblock" in haystack
         or "native_int8/" in haystack
+        or "native_int8_v2/" in haystack
     ):
-        return "native_int8_residual_block", "native_int8_v1_plugin"
+        return (
+            "native_int8_residual_block",
+            "native_int8_v2_plugin"
+            if "v2" in haystack
+            else "native_int8_v1_plugin",
+        )
     if "fusion_v2/norm1_silu_quant_pack/" in haystack:
         return "fusion_v2_norm1_silu_pack_quant", "fusion_v2_plugin"
     if "fusion_v2/conv1_to_conv2_norm_silu_quant_pack/" in haystack:
@@ -880,12 +887,12 @@ def build_physical_layer_catalog(
             else None
         )
         fusion_audit = fusion_variant in {"fusion_v1", "fusion_v2"}
-        native_audit = fusion_variant == "native_int8_v1"
+        native_audit = fusion_variant in {"native_int8_v1", "native_int8_v2"}
         valid_schema = (
             int8_audit.get("schema_version") == 1
             and int8_audit.get("qdq_schema_version") == QDQ_SCHEMA_VERSION
             if fusion_audit
-            else int8_audit.get("schema_version") == 1
+            else int8_audit.get("schema_version") in {1, 2}
             if native_audit
             else isinstance(int8_audit, Mapping)
             and int8_audit.get("schema_version") == QDQ_SCHEMA_VERSION
@@ -944,7 +951,7 @@ def build_physical_layer_catalog(
         call_sites.update(audit_metadata.get(metadata, set()))
         if (
             isinstance(int8_audit, Mapping)
-            and int8_audit.get("variant") == "native_int8_v1"
+            and int8_audit.get("variant") in {"native_int8_v1", "native_int8_v2"}
         ):
             for marker, sites in audit_names.items():
                 if marker in name or marker in metadata:
@@ -960,7 +967,7 @@ def build_physical_layer_catalog(
             if call_sites
             and isinstance(int8_audit, Mapping)
             and int8_audit.get("variant")
-            in {"fusion_v1", "fusion_v2", "native_int8_v1"}
+            in {"fusion_v1", "fusion_v2", "native_int8_v1", "native_int8_v2"}
             else "v5_audit"
             if call_sites
             else None
