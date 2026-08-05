@@ -134,6 +134,93 @@ public:
     }
 };
 
+// P3 Conv1 epilogue: dequantize the INT32 fragment with static activation and
+// per-output-channel weight scales, add bias, and write a channel-contiguous
+// FP16 NHWC mid tensor.  No addressable INT32 accumulator is produced.
+class SfWanCutlassFp16OutputOp
+{
+public:
+    using ElementOutput = int32_t;
+    using ElementAccumulator = int32_t;
+    using ElementCompute = float;
+    using ElementVector = float;
+    using ElementZ = int32_t;
+    using ElementT = int32_t;
+    using ElementTensor = int32_t;
+    static int constexpr kElementsPerAccess = 4;
+    static int constexpr kCount = kElementsPerAccess;
+    static bool constexpr kStoreZ = false;
+    static bool constexpr kStoreT = false;
+    static bool constexpr kIsSingleSource = true;
+
+    using FragmentAccumulator
+        = cutlass::Array<ElementAccumulator, kElementsPerAccess>;
+    using FragmentOutput = cutlass::Array<ElementOutput, kElementsPerAccess>;
+    using FragmentSource = FragmentOutput;
+    using FragmentCompute = cutlass::Array<ElementCompute, kElementsPerAccess>;
+    using FragmentVector = cutlass::Array<ElementVector, kElementsPerAccess>;
+    using FragmentZ = cutlass::Array<ElementZ, kElementsPerAccess>;
+    using FragmentT = cutlass::Array<ElementT, kElementsPerAccess>;
+    using FragmentTensor = cutlass::Array<ElementTensor, kElementsPerAccess>;
+    using FragmentScale = cutlass::Array<ElementCompute, kElementsPerAccess>;
+
+    struct Params
+    {
+        float activationScale{};
+        float const* bias{};
+        half* output{};
+        int32_t channels{};
+    };
+
+private:
+    Params params_;
+
+public:
+    CUTLASS_HOST_DEVICE
+    explicit SfWanCutlassFp16OutputOp(Params const& params) : params_(params)
+    {
+    }
+
+    CUTLASS_HOST_DEVICE
+    bool is_source_needed() const
+    {
+        return false;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void set_k_partition(int, int)
+    {
+    }
+
+    CUTLASS_DEVICE
+    float const* bias_pointer() const
+    {
+        return params_.bias;
+    }
+
+    CUTLASS_DEVICE
+    void apply(FragmentAccumulator const& accumulator,
+        FragmentScale const& weightScale, FragmentScale const& bias,
+        int64_t row, int32_t column, int64_t rowExtent,
+        int32_t columnExtent) const
+    {
+        CUTLASS_PRAGMA_UNROLL
+        for (int32_t index = 0; index < kElementsPerAccess; ++index)
+        {
+            int32_t const channel = column + index;
+            if (row >= rowExtent || channel >= columnExtent)
+            {
+                continue;
+            }
+            float const result = static_cast<float>(accumulator[index])
+                    * params_.activationScale * weightScale[index]
+                + bias[index];
+            params_.output[row * params_.channels + channel]
+                = __float2half_rn(result);
+        }
+    }
+};
+
 // This is the no-source specialization of CUTLASS EpilogueWithBroadcast with
 // one surgical difference: instead of materialising Z/T, it hands each aligned
 // accumulator access and its per-channel weight scale to the SFWan output op.

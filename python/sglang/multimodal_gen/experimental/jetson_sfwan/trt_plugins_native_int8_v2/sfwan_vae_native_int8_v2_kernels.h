@@ -66,12 +66,25 @@ extern "C" int32_t sfwanNativeInt8V2ReadProfile(int32_t profileId,
 extern "C" int32_t sfwanNativeInt8V2WorkspaceContract(
     SfWanNativeInt8V2BlockConfig const* config, uint64_t* values,
     int32_t valueCount);
+// Extended workspace contract: accumulator1, accumulator2, temporal-window,
+// FP16 Conv1-mid, total workspace.
+extern "C" int32_t sfwanNativeInt8V2WorkspaceContractV2(
+    SfWanNativeInt8V2BlockConfig const* config, uint64_t* values,
+    int32_t valueCount);
 
 // P1 algorithm contract. Values are, in order: tensor-core INT8,
 // accumulator2 global store, separate residual kernel, direct-conv kernel
 // used by P1, and the unchanged serialized-config ABI revision.
 extern "C" char const* sfwanNativeInt8V2P1Algorithm();
 extern "C" int32_t sfwanNativeInt8V2P1KernelContract(
+    uint64_t* values, int32_t valueCount);
+
+extern "C" char const* sfwanNativeInt8V2P2Algorithm();
+extern "C" int32_t sfwanNativeInt8V2P2KernelContract(
+    uint64_t* values, int32_t valueCount);
+
+extern "C" char const* sfwanNativeInt8V2P3Algorithm();
+extern "C" int32_t sfwanNativeInt8V2P3KernelContract(
     uint64_t* values, int32_t valueCount);
 
 extern "C" int32_t sfwanNativeInt8V2PersistentTile(

@@ -582,6 +582,9 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 "native_int8_v2_temporal_window_bytes": engine_contract.get(
                     "native_int8_v2_temporal_window_bytes"
                 ),
+                "native_int8_v2_conv1_mid_workspace_bytes": engine_contract.get(
+                    "native_int8_v2_conv1_mid_workspace_bytes"
+                ),
                 "native_int8_v2_direct_causal_iterator": engine_contract.get(
                     "native_int8_v2_direct_causal_iterator"
                 ),
@@ -593,6 +596,18 @@ async def run_profile_vae(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "native_int8_v2_audit_passed": engine_contract.get(
                     "native_int8_v2_audit_passed"
+                ),
+                "native_int8_v2_algorithm": engine_contract.get(
+                    "native_int8_v2_algorithm"
+                ),
+                "native_int8_v2_kernel_revision": engine_contract.get(
+                    "native_int8_v2_kernel_revision"
+                ),
+                "native_int8_v2_legacy_wmma_used": engine_contract.get(
+                    "native_int8_v2_legacy_wmma_used"
+                ),
+                "native_int8_v2_kernel_contract": engine_contract.get(
+                    "native_int8_v2_kernel_contract"
                 ),
             },
         }

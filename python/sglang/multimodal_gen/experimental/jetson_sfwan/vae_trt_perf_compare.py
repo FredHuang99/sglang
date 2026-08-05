@@ -273,12 +273,15 @@ def _extract_native_kernel_profile(summary: Mapping[str, Any]) -> dict[str, Any]
                 "target_int8_conv_ms": stage(
                     "conv1_mainloop_epilogue_ms",
                     "direct_causal_iterator_conv1_ms",
+                    "direct_cutlass_conv1_ms",
+                    "direct_cutlass_conv1_fp16_epilogue_ms",
                     "persistent_conv1_ms",
                 )
                 + stage(
                     "conv2_mainloop_ms",
                     "conv2_mma_and_fused_residual_epilogue_ms",
                     "direct_causal_iterator_conv2_residual_ms",
+                    "direct_cutlass_conv2_fused_residual_ms",
                     "persistent_conv2_residual_ms",
                 ),
                 "norm_silu_quant_cache_write_ms": stage(
@@ -289,6 +292,7 @@ def _extract_native_kernel_profile(summary: Mapping[str, Any]) -> dict[str, Any]
                 + stage(
                     "mid_norm_silu_quant_cache_write_ms",
                     "mid_norm_silu_quant_cache_ms",
+                    "mid_fp16_norm_silu_quant_cache_ms",
                     "persistent_mid_norm_silu_quant_ms",
                 ),
                 "residual_epilogue_ms": stage(
@@ -487,11 +491,26 @@ def compare_profile_summaries(
                 raise ValueError(f"{label} retained temporal-window workspace")
             if server.get("native_int8_v2_direct_causal_iterator") is not True:
                 raise ValueError(f"{label} did not enable direct causal iterator")
+            if server.get("native_int8_v2_legacy_wmma_used") is not False:
+                raise ValueError(f"{label} still reports the legacy WMMA path")
+        if level == "p2":
+            if int(server.get("native_int8_v2_accumulator1_workspace_bytes") or 0) <= 0:
+                raise ValueError(f"{label} lost its Conv1 accumulator workspace")
+            if server.get("native_int8_v2_algorithm") != (
+                "cutlass_direct_causal_implicit_gemm"
+            ):
+                raise ValueError(f"{label} does not use direct causal CUTLASS")
         if level == "p3":
             if server.get("native_int8_v2_accumulator1_workspace_bytes") != 0:
                 raise ValueError(f"{label} retained Conv1 accumulator workspace")
-            if server.get("native_int8_v2_persistent_block_count") != 84:
-                raise ValueError(f"{label} persistent coverage is incomplete")
+            if int(server.get("native_int8_v2_conv1_mid_workspace_bytes") or 0) <= 0:
+                raise ValueError(f"{label} has no FP16 Conv1-mid workspace")
+            if server.get("native_int8_v2_persistent_block_count") != 0:
+                raise ValueError(f"{label} still reports the legacy persistent WMMA path")
+            if server.get("native_int8_v2_algorithm") != (
+                "cutlass_direct_two_conv_pipeline"
+            ):
+                raise ValueError(f"{label} does not use the CUTLASS two-Conv pipeline")
         if not server.get("native_int8_v2_plugin_sha256"):
             raise ValueError(f"{label} has no plugin SHA")
 

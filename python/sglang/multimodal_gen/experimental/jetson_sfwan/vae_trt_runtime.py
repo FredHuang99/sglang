@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Mapping
 
 from .vae_trt_qdq import (
     EXPECTED_CALL_SITES,
@@ -801,8 +801,6 @@ class TensorRTVaeRuntime:
                 NATIVE_INT8_V2_PLUGIN_NAME,
                 NATIVE_INT8_V2_PLUGIN_NAMESPACE,
                 NATIVE_INT8_V2_PLUGIN_VERSION,
-                NATIVE_INT8_V2_P1_ALGORITHM,
-                NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION,
                 load_native_int8_v2_manifest,
                 validate_native_int8_v2_manifest,
             )
@@ -827,15 +825,12 @@ class TensorRTVaeRuntime:
                 plugin_namespace=NATIVE_INT8_V2_PLUGIN_NAMESPACE,
                 init_symbol=NATIVE_INT8_V2_PLUGIN_INIT_SYMBOL,
             )
-            if native_int8_v2_level == "p1":
-                self._validate_native_int8_v2_p1_kernel_contract(
-                    library=self._native_plugin_library,
-                    ctypes_module=__import__("ctypes"),
-                    expected_algorithm=NATIVE_INT8_V2_P1_ALGORITHM,
-                    expected_serialization_abi=(
-                        NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION
-                    ),
-                )
+            self._validate_native_int8_v2_kernel_contract(
+                library=self._native_plugin_library,
+                ctypes_module=__import__("ctypes"),
+                level=native_int8_v2_level,
+                audit=native_validated["audit"],
+            )
             self._configure_native_int8_kernel_profile(
                 library=self._native_plugin_library,
                 ctypes_module=__import__("ctypes"),
@@ -1202,6 +1197,87 @@ class TensorRTVaeRuntime:
                 f"algorithm={actual!r}, values={observed!r}"
             )
 
+    def _validate_native_int8_v2_kernel_contract(
+        self,
+        *,
+        library: Any,
+        ctypes_module: Any,
+        level: str,
+        audit: Mapping[str, Any],
+    ) -> None:
+        if level == "p1":
+            contract = audit["p1_kernel_contract"]
+            self._validate_native_int8_v2_p1_kernel_contract(
+                library=library,
+                ctypes_module=ctypes_module,
+                expected_algorithm=str(audit["p1_algorithm"]),
+                expected_serialization_abi=int(
+                    contract["serialization_abi_revision"]
+                ),
+            )
+            return
+        value_keys = {
+            "p2": (
+                "tensor_core_int8",
+                "direct_causal_iterator",
+                "legacy_direct_wmma",
+                "temporal_window_bytes",
+                "accumulator1_global_store",
+                "accumulator2_global_store",
+                "conv2_fused_residual_epilogue",
+            ),
+            "p3": (
+                "tensor_core_int8",
+                "legacy_persistent_wmma",
+                "direct_causal_iterator",
+                "temporal_window_bytes",
+                "accumulator1_global_store",
+                "accumulator2_global_store",
+                "conv1_output_dtype_fp16",
+                "conv1_fused_dequant_bias",
+                "conv2_fused_residual_epilogue",
+            ),
+        }[level]
+        try:
+            algorithm = getattr(
+                library, f"sfwanNativeInt8V2{level.upper()}Algorithm"
+            )
+            function = getattr(
+                library, f"sfwanNativeInt8V2{level.upper()}KernelContract"
+            )
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"Native INT8 V2 {level} plugin lacks its CUTLASS contract"
+            ) from exc
+        algorithm.argtypes = []
+        algorithm.restype = ctypes_module.c_char_p
+        values = (ctypes_module.c_uint64 * len(value_keys))()
+        function.argtypes = [
+            ctypes_module.POINTER(ctypes_module.c_uint64),
+            ctypes_module.c_int32,
+        ]
+        function.restype = ctypes_module.c_int32
+        status = int(function(values, len(values)))
+        expected_contract = audit["native_int8_v2_kernel_contract"]
+        observed = {
+            key: (
+                int(value)
+                if key.endswith("_bytes")
+                else bool(value)
+            )
+            for key, value in zip(value_keys, values)
+        }
+        actual = algorithm().decode("ascii")
+        if (
+            status != 0
+            or actual != audit["native_int8_v2_algorithm"]
+            or observed != expected_contract
+        ):
+            raise RuntimeError(
+                f"Native INT8 V2 {level} loaded DSO contract mismatch: "
+                f"algorithm={actual!r}, contract={observed!r}"
+            )
+
     def _begin_native_int8_kernel_profile(self) -> None:
         if not self.enable_native_int8_kernel_profile:
             return
@@ -1226,21 +1302,21 @@ class TensorRTVaeRuntime:
         elif self.variant == "native_int8_v2" and self.native_int8_v2_level == "p2":
             stage_names = (
                 "entry_norm_silu_quant_cache_ms",
-                "direct_causal_iterator_conv1_ms",
+                "direct_cutlass_conv1_ms",
                 "mid_norm_silu_quant_cache_ms",
-                "direct_causal_iterator_conv2_residual_ms",
-                "fused_dequant_bias_residual_requant_ms",
+                "direct_cutlass_conv2_fused_residual_ms",
+                "reserved_fused_stage_ms",
                 "group_exit_ms",
                 "residual_block_total_ms",
             )
         elif self.variant == "native_int8_v2":
             stage_names = (
-                "persistent_block_total_ms",
-                "persistent_conv1_ms",
-                "persistent_mid_norm_silu_quant_ms",
-                "persistent_conv2_residual_ms",
-                "persistent_cache_store_ms",
-                "persistent_group_exit_ms",
+                "entry_norm_silu_quant_cache_ms",
+                "direct_cutlass_conv1_fp16_epilogue_ms",
+                "mid_fp16_norm_silu_quant_cache_ms",
+                "direct_cutlass_conv2_fused_residual_ms",
+                "reserved_fused_stage_ms",
+                "group_exit_ms",
                 "residual_block_total_ms",
             )
         else:
@@ -1290,15 +1366,6 @@ class TensorRTVaeRuntime:
                 stage_totals[name] += value
             total_calls += int(calls.value)
             signature_stage_keys = (
-                (
-                    "conv1_signature",
-                    "direct_causal_iterator_conv1_ms",
-                ),
-                (
-                    "conv2_signature",
-                    "direct_causal_iterator_conv2_residual_ms",
-                ),
-            ) if self.variant == "native_int8_v2" and self.native_int8_v2_level == "p2" else (
                 ("conv1_signature", stage_names[1]),
                 ("conv2_signature", stage_names[3]),
             )
@@ -1622,6 +1689,9 @@ class TensorRTVaeRuntime:
                     "native_int8_v2_temporal_window_bytes": audit[
                         "temporal_window_bytes"
                     ],
+                    "native_int8_v2_conv1_mid_workspace_bytes": audit.get(
+                        "conv1_mid_workspace_bytes", 0
+                    ),
                     "native_int8_v2_direct_causal_iterator": audit[
                         "direct_causal_iterator"
                     ],
@@ -1646,6 +1716,18 @@ class TensorRTVaeRuntime:
                     ),
                     "native_int8_v2_p1_kernel_contract": audit.get(
                         "p1_kernel_contract"
+                    ),
+                    "native_int8_v2_algorithm": audit.get(
+                        "native_int8_v2_algorithm"
+                    ),
+                    "native_int8_v2_kernel_revision": audit.get(
+                        "native_int8_v2_kernel_revision"
+                    ),
+                    "native_int8_v2_legacy_wmma_used": audit.get(
+                        "native_int8_v2_legacy_wmma_used"
+                    ),
+                    "native_int8_v2_kernel_contract": audit.get(
+                        "native_int8_v2_kernel_contract"
                     ),
                     "native_int8_cache_int8_slot_count": cache[
                         "int8_slot_count"

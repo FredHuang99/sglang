@@ -737,6 +737,334 @@ cutlass::Status dispatchFusedResidualConv(int32_t tileId,
     SFWAN_DISPATCH_FUSED(false, false);
 #undef SFWAN_DISPATCH_FUSED
 }
+
+template <typename Kernel>
+cutlass::Status launchDirectCausalKernel(
+    typename Kernel::Params const& params, cudaStream_t stream)
+{
+    typename Kernel::ThreadblockSwizzle swizzle;
+    dim3 const grid = swizzle.get_grid_shape(params.grid_tiled_shape);
+    dim3 const block(Kernel::kThreadCount, 1, 1);
+    int32_t const sharedBytes
+        = static_cast<int32_t>(sizeof(typename Kernel::SharedStorage));
+    if (sharedBytes >= (48 << 10))
+    {
+        cudaError_t const attribute = cudaFuncSetAttribute(
+            cutlass::Kernel<Kernel>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            sharedBytes);
+        if (attribute != cudaSuccess)
+        {
+            return cutlass::Status::kErrorInternal;
+        }
+    }
+    cutlass::arch::synclog_setup();
+    cutlass::Kernel<Kernel><<<grid, block, sharedBytes, stream>>>(params);
+    return cudaPeekAtLastError() == cudaSuccess
+        ? cutlass::Status::kSuccess
+        : cutlass::Status::kErrorInternal;
+}
+
+template <typename ThreadblockShape, typename WarpShape, int Stages>
+cutlass::Status runDirectCausalConv(int8_t const* current,
+    int8_t const* cache, bool hasCache, int8_t const* weight,
+    int32_t* output, void* cutlassWorkspace, int32_t n, int32_t depth,
+    int32_t h, int32_t w, int32_t channels, int32_t cacheDepth,
+    int32_t outputChannels, int32_t r, int32_t s, int32_t p, int32_t q,
+    int32_t padH, int32_t padW, int32_t strideH, int32_t strideW,
+    int32_t dilationH, int32_t dilationW, cudaStream_t stream)
+{
+    using ElementInput = int8_t;
+    using ElementOutput = int32_t;
+    using ElementAccumulator = int32_t;
+    using Layout = cutlass::layout::TensorNHWC;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+    using OutputOp = cutlass::epilogue::thread::LinearCombination<
+        ElementOutput, 4, ElementAccumulator, ElementAccumulator>;
+    using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+    using DefaultKernel = typename cutlass::conv::kernel::DefaultConv2dFprop<
+        ElementInput, Layout, ElementInput, Layout, ElementOutput, Layout,
+        ElementAccumulator, cutlass::arch::OpClassTensorOp,
+        cutlass::arch::Sm80, ThreadblockShape, WarpShape, InstructionShape,
+        OutputOp, Swizzle, Stages, cutlass::arch::OpMultiplyAddSaturate,
+        cutlass::conv::IteratorAlgorithm::kOptimized,
+        cutlass::conv::StrideSupport::kUnity>::Kernel;
+    using DefaultMma = typename DefaultKernel::Mma;
+    using DefaultIteratorA = typename DefaultMma::IteratorA;
+    using IteratorA = sfwan_v2::SfWanDirectCausalActivationIterator<
+        typename DefaultIteratorA::Shape, ElementInput, Layout,
+        typename DefaultIteratorA::ThreadMap,
+        typename DefaultIteratorA::AccessType>;
+    using Mma = cutlass::conv::threadblock::ImplicitGemmMultistage<
+        ThreadblockShape, IteratorA, typename DefaultMma::SmemIteratorA,
+        DefaultMma::kCacheOpA, typename DefaultMma::IteratorB,
+        typename DefaultMma::SmemIteratorB, DefaultMma::kCacheOpB,
+        typename DefaultMma::Policy, Stages>;
+    using Kernel = cutlass::conv::kernel::ImplicitGemmConvolution<Mma,
+        typename DefaultKernel::Epilogue, Swizzle,
+        cutlass::conv::Operator::kFprop>;
+    using InputRef = cutlass::TensorRef<ElementInput, Layout>;
+    using OutputRef = cutlass::TensorRef<ElementOutput, Layout>;
+
+    int32_t const foldedChannels = channels * 3;
+    cutlass::conv::Conv2dProblemSize problem(
+        cutlass::Tensor4DCoord(n * depth, h, w, foldedChannels),
+        cutlass::Tensor4DCoord(outputChannels, r, s, foldedChannels),
+        cutlass::Tensor4DCoord(padH, padH, padW, padW),
+        cutlass::MatrixCoord(strideH, strideW),
+        cutlass::MatrixCoord(dilationH, dilationW),
+        cutlass::Tensor4DCoord(n * depth, p, q, outputChannels),
+        cutlass::conv::Mode::kCrossCorrelation, 1);
+    InputRef currentRef(const_cast<ElementInput*>(current),
+        Layout::packed(cutlass::Tensor4DCoord(
+            n * depth, h, w, foldedChannels)));
+    InputRef weightRef(const_cast<ElementInput*>(weight),
+        Layout::packed(cutlass::Tensor4DCoord(
+            outputChannels, r, s, foldedChannels)));
+    OutputRef outputRef(output,
+        Layout::packed(cutlass::Tensor4DCoord(
+            n * depth, p, q, outputChannels)));
+    typename Kernel::Arguments arguments{
+        problem, currentRef, weightRef, outputRef, outputRef, {1, 0}};
+    cutlass::Status status = IteratorA::can_implement(problem);
+    if (status != cutlass::Status::kSuccess)
+    {
+        return status;
+    }
+    typename Kernel::Params params(
+        arguments, static_cast<int32_t*>(cutlassWorkspace));
+    params.iterator_A.configure(cache, hasCache, channels, depth, h, w,
+        cacheDepth);
+    return launchDirectCausalKernel<Kernel>(params, stream);
+}
+
+template <typename ThreadblockShape, typename WarpShape, int Stages,
+    typename OutputOp>
+cutlass::Status runDirectCausalFusedConv(int8_t const* current,
+    int8_t const* cache, bool hasCache, int8_t const* weight,
+    float const* weightScale, typename OutputOp::Params const& outputParams,
+    void* dummyOutput, void* cutlassWorkspace, int32_t n, int32_t depth,
+    int32_t h, int32_t w, int32_t channels, int32_t cacheDepth,
+    int32_t outputChannels, int32_t r, int32_t s, int32_t p, int32_t q,
+    int32_t padH, int32_t padW, int32_t strideH, int32_t strideW,
+    int32_t dilationH, int32_t dilationW, cudaStream_t stream)
+{
+    using ElementInput = int8_t;
+    using ElementAccumulator = int32_t;
+    using ElementDummyOutput = int32_t;
+    using Layout = cutlass::layout::TensorNHWC;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+    using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+    using DefaultKernel
+        = typename cutlass::conv::kernel::DefaultConv2dFpropWithBroadcast<
+            ElementInput, Layout, ElementInput, Layout, ElementDummyOutput,
+            Layout, ElementAccumulator, cutlass::arch::OpClassTensorOp,
+            cutlass::arch::Sm80, ThreadblockShape, WarpShape,
+            InstructionShape, OutputOp, Swizzle, Stages,
+            cutlass::arch::OpMultiplyAddSaturate,
+            cutlass::conv::IteratorAlgorithm::kOptimized,
+            cutlass::conv::StrideSupport::kUnity>::Kernel;
+    using DefaultMma = typename DefaultKernel::Mma;
+    using DefaultIteratorA = typename DefaultMma::IteratorA;
+    using IteratorA = sfwan_v2::SfWanDirectCausalActivationIterator<
+        typename DefaultIteratorA::Shape, ElementInput, Layout,
+        typename DefaultIteratorA::ThreadMap,
+        typename DefaultIteratorA::AccessType>;
+    using Mma = cutlass::conv::threadblock::ImplicitGemmMultistage<
+        ThreadblockShape, IteratorA, typename DefaultMma::SmemIteratorA,
+        DefaultMma::kCacheOpA, typename DefaultMma::IteratorB,
+        typename DefaultMma::SmemIteratorB, DefaultMma::kCacheOpB,
+        typename DefaultMma::Policy, Stages>;
+    using StandardEpilogue = typename DefaultKernel::Epilogue;
+    using Epilogue = SfWanCutlassResidualEpilogue<
+        typename StandardEpilogue::Shape,
+        typename StandardEpilogue::WarpMmaOperator,
+        StandardEpilogue::kPartitionsK,
+        typename StandardEpilogue::OutputTileIterator,
+        typename StandardEpilogue::TensorTileIterator,
+        typename StandardEpilogue::ElementVector,
+        typename StandardEpilogue::AccumulatorFragmentIterator,
+        typename StandardEpilogue::WarpTileIterator,
+        typename StandardEpilogue::SharedLoadIterator, OutputOp,
+        typename StandardEpilogue::Padding>;
+    using Kernel
+        = cutlass::conv::kernel::ImplicitGemmConvolutionWithFusedEpilogue<
+            Mma, Epilogue, Swizzle, cutlass::conv::Operator::kFprop>;
+    using InputRef = cutlass::TensorRef<ElementInput, Layout>;
+    using OutputRef = cutlass::TensorRef<ElementDummyOutput, Layout>;
+
+    int32_t const foldedChannels = channels * 3;
+    cutlass::conv::Conv2dProblemSize problem(
+        cutlass::Tensor4DCoord(n * depth, h, w, foldedChannels),
+        cutlass::Tensor4DCoord(outputChannels, r, s, foldedChannels),
+        cutlass::Tensor4DCoord(padH, padH, padW, padW),
+        cutlass::MatrixCoord(strideH, strideW),
+        cutlass::MatrixCoord(dilationH, dilationW),
+        cutlass::Tensor4DCoord(n * depth, p, q, outputChannels),
+        cutlass::conv::Mode::kCrossCorrelation, 1);
+    InputRef currentRef(const_cast<ElementInput*>(current),
+        Layout::packed(cutlass::Tensor4DCoord(
+            n * depth, h, w, foldedChannels)));
+    InputRef weightRef(const_cast<ElementInput*>(weight),
+        Layout::packed(cutlass::Tensor4DCoord(
+            outputChannels, r, s, foldedChannels)));
+    OutputRef dummyRef(reinterpret_cast<ElementDummyOutput*>(dummyOutput),
+        Layout::packed(cutlass::Tensor4DCoord(
+            n * depth, p, q, outputChannels)));
+    typename Kernel::Arguments arguments{problem, currentRef, weightRef,
+        dummyRef, dummyRef, outputParams, cutlass::conv::SplitKMode::kSerial,
+        const_cast<float*>(weightScale), nullptr, 0, 0};
+    cutlass::Status status = IteratorA::can_implement(problem);
+    if (status != cutlass::Status::kSuccess)
+    {
+        return status;
+    }
+    typename Kernel::Params params(
+        arguments, static_cast<int32_t*>(cutlassWorkspace));
+    params.iterator_A.configure(cache, hasCache, channels, depth, h, w,
+        cacheDepth);
+    return launchDirectCausalKernel<Kernel>(params, stream);
+}
+
+cutlass::Status dispatchDirectCausalConv(int32_t tileId,
+    int8_t const* current, int8_t const* cache, bool hasCache,
+    int8_t const* weight, int32_t* output, void* cutlassWorkspace,
+    int32_t n, int32_t depth, int32_t h, int32_t w, int32_t channels,
+    int32_t cacheDepth, int32_t outputChannels, int32_t r, int32_t s,
+    int32_t p, int32_t q, int32_t padH, int32_t padW, int32_t strideH,
+    int32_t strideW, int32_t dilationH, int32_t dilationW,
+    cudaStream_t stream)
+{
+    using Tb0 = cutlass::gemm::GemmShape<64, 64, 64>;
+    using Tb1 = cutlass::gemm::GemmShape<128, 64, 64>;
+    using Tb2 = cutlass::gemm::GemmShape<64, 128, 64>;
+    using Warp0 = cutlass::gemm::GemmShape<32, 32, 64>;
+    using Warp1 = cutlass::gemm::GemmShape<64, 32, 64>;
+    using Warp2 = cutlass::gemm::GemmShape<32, 64, 64>;
+#define SFWAN_RUN_DIRECT(TB, WARP, STAGES)                                  \
+    return runDirectCausalConv<TB, WARP, STAGES>(current, cache, hasCache,   \
+        weight, output, cutlassWorkspace, n, depth, h, w, channels,         \
+        cacheDepth, outputChannels, r, s, p, q, padH, padW, strideH,        \
+        strideW, dilationH, dilationW, stream)
+    switch (tileId % kBaseTileCount)
+    {
+    case 0:
+        SFWAN_RUN_DIRECT(Tb0, Warp0, 2);
+    case 1:
+        SFWAN_RUN_DIRECT(Tb1, Warp1, 2);
+    case 2:
+        SFWAN_RUN_DIRECT(Tb2, Warp2, 2);
+    case 3:
+        SFWAN_RUN_DIRECT(Tb0, Warp0, 3);
+    case 4:
+        SFWAN_RUN_DIRECT(Tb1, Warp1, 3);
+    case 5:
+        SFWAN_RUN_DIRECT(Tb2, Warp2, 3);
+    default:
+        return cutlass::Status::kErrorInvalidProblem;
+    }
+#undef SFWAN_RUN_DIRECT
+}
+
+template <typename OutputOp>
+cutlass::Status dispatchDirectCausalFused(int32_t tileId,
+    int8_t const* current, int8_t const* cache, bool hasCache,
+    int8_t const* weight, float const* weightScale,
+    typename OutputOp::Params const& outputParams, void* dummyOutput,
+    void* cutlassWorkspace, int32_t n, int32_t depth, int32_t h, int32_t w,
+    int32_t channels, int32_t cacheDepth, int32_t outputChannels,
+    int32_t r, int32_t s, int32_t p, int32_t q, int32_t padH,
+    int32_t padW, int32_t strideH, int32_t strideW, int32_t dilationH,
+    int32_t dilationW, cudaStream_t stream)
+{
+    using Tb0 = cutlass::gemm::GemmShape<64, 64, 64>;
+    using Tb1 = cutlass::gemm::GemmShape<128, 64, 64>;
+    using Tb2 = cutlass::gemm::GemmShape<64, 128, 64>;
+    using Warp0 = cutlass::gemm::GemmShape<32, 32, 64>;
+    using Warp1 = cutlass::gemm::GemmShape<64, 32, 64>;
+    using Warp2 = cutlass::gemm::GemmShape<32, 64, 64>;
+#define SFWAN_RUN_DIRECT_FUSED(TB, WARP, STAGES)                            \
+    return runDirectCausalFusedConv<TB, WARP, STAGES, OutputOp>(current,    \
+        cache, hasCache, weight, weightScale, outputParams, dummyOutput,    \
+        cutlassWorkspace, n, depth, h, w, channels, cacheDepth,             \
+        outputChannels, r, s, p, q, padH, padW, strideH, strideW,           \
+        dilationH, dilationW, stream)
+    switch (tileId % kBaseTileCount)
+    {
+    case 0:
+        SFWAN_RUN_DIRECT_FUSED(Tb0, Warp0, 2);
+    case 1:
+        SFWAN_RUN_DIRECT_FUSED(Tb1, Warp1, 2);
+    case 2:
+        SFWAN_RUN_DIRECT_FUSED(Tb2, Warp2, 2);
+    case 3:
+        SFWAN_RUN_DIRECT_FUSED(Tb0, Warp0, 3);
+    case 4:
+        SFWAN_RUN_DIRECT_FUSED(Tb1, Warp1, 3);
+    case 5:
+        SFWAN_RUN_DIRECT_FUSED(Tb2, Warp2, 3);
+    default:
+        return cutlass::Status::kErrorInvalidProblem;
+    }
+#undef SFWAN_RUN_DIRECT_FUSED
+}
+
+cutlass::Status dispatchDirectCausalFusedResidualConv(int32_t tileId,
+    int8_t const* current, int8_t const* cache, bool hasCache,
+    int8_t const* weight, float const* weightScale, float const* bias,
+    void const* shortcut, void* output, bool shortcutIsInt8,
+    bool outputIsInt8, float activationScale, float shortcutScale,
+    float outputScale, void* cutlassWorkspace, int32_t n, int32_t depth,
+    int32_t h, int32_t w, int32_t channels, int32_t cacheDepth,
+    int32_t outputChannels, int32_t r, int32_t s, int32_t p, int32_t q,
+    int32_t padH, int32_t padW, int32_t strideH, int32_t strideW,
+    int32_t dilationH, int32_t dilationW, cudaStream_t stream)
+{
+#define SFWAN_DIRECT_RESIDUAL(SHORTCUT_INT8, OUTPUT_INT8)                   \
+    do                                                                       \
+    {                                                                        \
+        using Op = SfWanCutlassResidualOutputOp<SHORTCUT_INT8, OUTPUT_INT8>; \
+        Op::Params params{activationScale, shortcutScale,                    \
+            outputScale, bias, shortcut, output,                             \
+            static_cast<int64_t>(n) * depth * p * q, outputChannels};        \
+        return dispatchDirectCausalFused<Op>(tileId, current, cache,          \
+            hasCache, weight, weightScale, params, output,                   \
+            cutlassWorkspace, n, depth, h, w, channels, cacheDepth,          \
+            outputChannels, r, s, p, q, padH, padW, strideH, strideW,        \
+            dilationH, dilationW, stream);                                   \
+    } while (false)
+    if (shortcutIsInt8)
+    {
+        if (outputIsInt8)
+        {
+            SFWAN_DIRECT_RESIDUAL(true, true);
+        }
+        SFWAN_DIRECT_RESIDUAL(true, false);
+    }
+    if (outputIsInt8)
+    {
+        SFWAN_DIRECT_RESIDUAL(false, true);
+    }
+    SFWAN_DIRECT_RESIDUAL(false, false);
+#undef SFWAN_DIRECT_RESIDUAL
+}
+
+cutlass::Status dispatchDirectCausalFp16Conv(int32_t tileId,
+    int8_t const* current, int8_t const* cache, bool hasCache,
+    int8_t const* weight, float const* weightScale, float const* bias,
+    half* output, float activationScale, void* cutlassWorkspace,
+    int32_t n, int32_t depth, int32_t h, int32_t w, int32_t channels,
+    int32_t cacheDepth, int32_t outputChannels, int32_t r, int32_t s,
+    int32_t p, int32_t q, int32_t padH, int32_t padW, int32_t strideH,
+    int32_t strideW, int32_t dilationH, int32_t dilationW,
+    cudaStream_t stream)
+{
+    using Op = SfWanCutlassFp16OutputOp;
+    Op::Params params{activationScale, bias, output, outputChannels};
+    return dispatchDirectCausalFused<Op>(tileId, current, cache, hasCache,
+        weight, weightScale, params, output, cutlassWorkspace, n, depth, h,
+        w, channels, cacheDepth, outputChannels, r, s, p, q, padH, padW,
+        strideH, strideW, dilationH, dilationW, stream);
+}
 #endif
 
 struct WorkspaceLayout
@@ -750,6 +1078,7 @@ struct WorkspaceLayout
     size_t compactBytes{};
     size_t accumulator1Bytes{};
     size_t accumulator2Bytes{};
+    size_t midFp16Bytes{};
     size_t total{};
 };
 
@@ -783,7 +1112,7 @@ WorkspaceLayout workspaceLayout(SfWanNativeInt8BlockConfig const& config)
         cursor = alignUp(cursor + result.windowBytes);
     }
 #ifdef SFWAN_NATIVE_INT8_V2
-    else if (level == 2)
+    else
     {
         result.compactBytes
             = static_cast<size_t>(n * d1 * h1 * w1 * config.inputShape[1]);
@@ -798,6 +1127,15 @@ WorkspaceLayout workspaceLayout(SfWanNativeInt8BlockConfig const& config)
             * sizeof(int32_t);
         cursor = alignUp(cursor + result.accumulator1Bytes);
     }
+#ifdef SFWAN_NATIVE_INT8_V2
+    else
+    {
+        result.midFp16Bytes
+            = static_cast<size_t>(n * d1 * h2 * w2 * k1)
+            * sizeof(half);
+        cursor = alignUp(cursor + result.midFp16Bytes);
+    }
+#endif
     result.window2Offset = cursor;
     if (level < 2)
     {
@@ -806,7 +1144,7 @@ WorkspaceLayout workspaceLayout(SfWanNativeInt8BlockConfig const& config)
         cursor = alignUp(cursor + bytes);
     }
 #ifdef SFWAN_NATIVE_INT8_V2
-    else if (level == 2)
+    else
     {
         size_t const bytes
             = static_cast<size_t>(n * d2 * h2 * w2 * k1);
@@ -823,9 +1161,7 @@ WorkspaceLayout workspaceLayout(SfWanNativeInt8BlockConfig const& config)
 #endif
     result.cutlassOffset = cursor;
 #ifdef SFWAN_NATIVE_INT8_V2
-    result.total = alignUp(cursor
-        + (level < 3 ? kCutlassWorkspaceReserve
-                     : sfwan_v2::kBlockScratchBytes));
+    result.total = alignUp(cursor + kCutlassWorkspaceReserve);
 #else
     result.total = alignUp(cursor + kCutlassWorkspaceReserve);
 #endif
@@ -953,6 +1289,24 @@ extern "C" int32_t sfwanNativeInt8V2WorkspaceContract(
     return 0;
 }
 
+extern "C" int32_t sfwanNativeInt8V2WorkspaceContractV2(
+    SfWanNativeInt8BlockConfig const* config, uint64_t* values,
+    int32_t valueCount)
+{
+    if (config == nullptr || values == nullptr || valueCount != 5
+        || !validConfig(*config))
+    {
+        return -1;
+    }
+    WorkspaceLayout const layout = workspaceLayout(*config);
+    values[0] = static_cast<uint64_t>(layout.accumulator1Bytes);
+    values[1] = static_cast<uint64_t>(layout.accumulator2Bytes);
+    values[2] = static_cast<uint64_t>(layout.windowBytes);
+    values[3] = static_cast<uint64_t>(layout.midFp16Bytes);
+    values[4] = static_cast<uint64_t>(layout.total);
+    return 0;
+}
+
 extern "C" char const* sfwanNativeInt8V2P1Algorithm()
 {
     return "cutlass_implicit_gemm_fused_epilogue";
@@ -970,6 +1324,52 @@ extern "C" int32_t sfwanNativeInt8V2P1KernelContract(
     values[2] = 0; // separate_residual_kernel
     values[3] = 0; // direct_conv_kernel_used_by_p1
     values[4] = 1; // serialized config ABI revision (unchanged)
+    return 0;
+}
+
+extern "C" char const* sfwanNativeInt8V2P2Algorithm()
+{
+    return "cutlass_direct_causal_implicit_gemm";
+}
+
+extern "C" int32_t sfwanNativeInt8V2P2KernelContract(
+    uint64_t* values, int32_t valueCount)
+{
+    if (values == nullptr || valueCount != 7)
+    {
+        return -1;
+    }
+    values[0] = 1; // tensor_core_int8
+    values[1] = 1; // direct_causal_iterator
+    values[2] = 0; // legacy_direct_wmma
+    values[3] = 0; // temporal_window_bytes
+    values[4] = 1; // accumulator1_global_store
+    values[5] = 0; // accumulator2_global_store
+    values[6] = 1; // conv2_fused_residual_epilogue
+    return 0;
+}
+
+extern "C" char const* sfwanNativeInt8V2P3Algorithm()
+{
+    return "cutlass_direct_two_conv_pipeline";
+}
+
+extern "C" int32_t sfwanNativeInt8V2P3KernelContract(
+    uint64_t* values, int32_t valueCount)
+{
+    if (values == nullptr || valueCount != 9)
+    {
+        return -1;
+    }
+    values[0] = 1; // tensor_core_int8
+    values[1] = 0; // legacy_persistent_wmma
+    values[2] = 1; // direct_causal_iterator
+    values[3] = 0; // temporal_window_bytes
+    values[4] = 0; // accumulator1_global_store
+    values[5] = 0; // accumulator2_global_store
+    values[6] = 1; // conv1_output_dtype_fp16
+    values[7] = 1; // conv1_fused_dequant_bias
+    values[8] = 1; // conv2_fused_residual_epilogue
     return 0;
 }
 
@@ -1016,6 +1416,9 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     auto* window1 = reinterpret_cast<int8_t*>(bytes + layout.window1Offset);
     auto* accumulator1
         = reinterpret_cast<int32_t*>(bytes + layout.accumulator1Offset);
+#ifdef SFWAN_NATIVE_INT8_V2
+    auto* midFp16 = reinterpret_cast<half*>(bytes + layout.accumulator1Offset);
+#endif
     auto* window2 = reinterpret_cast<int8_t*>(bytes + layout.window2Offset);
 #ifndef SFWAN_NATIVE_INT8_V2
     auto* accumulator2
@@ -1057,32 +1460,6 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
         compact1 = reinterpret_cast<int8_t*>(bytes + layout.window1Offset);
         compact2 = reinterpret_cast<int8_t*>(bytes + layout.window2Offset);
     }
-    if (level == 3)
-    {
-        int32_t persistentStatus = sfwan_v2::launchPersistentResidualBlock(
-            *config, blockInput, shortcut,
-            static_cast<int8_t const*>(cache1),
-            static_cast<int8_t const*>(cache2),
-            static_cast<half const*>(gamma1),
-            static_cast<half const*>(gamma2),
-            static_cast<int8_t const*>(weight1),
-            static_cast<float const*>(weightScale1),
-            static_cast<float const*>(bias1),
-            static_cast<int8_t const*>(weight2),
-            static_cast<float const*>(weightScale2),
-            static_cast<float const*>(bias2), blockOutput,
-            static_cast<int8_t*>(cache1Output),
-            static_cast<int8_t*>(cache2Output), stream);
-        if (profile.active)
-        {
-            for (int32_t index = 1; index < 7; ++index)
-            {
-                cudaEventRecord(profile.events[index], stream);
-            }
-            commitProfile(profile, config->profileId);
-        }
-        return persistentStatus;
-    }
     if (level >= 2)
     {
         sfwan_v2::entryNormQuantCompactKernel<<<
@@ -1098,50 +1475,81 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
             return -1;
         }
         if (profile.active) cudaEventRecord(profile.events[1], stream);
-        if (sfwan_v2::launchDirectConvAccumulator(compact1,
+        cutlass::Status directStatus = cutlass::Status::kSuccess;
+        if (level == 2)
+        {
+            directStatus = dispatchDirectCausalConv(config->tile1, compact1,
                 static_cast<int8_t const*>(cache1),
                 config->hasCache1 != 0,
-                static_cast<int8_t const*>(weight1), accumulator1, n, c1,
-                d1, h1, w1, cache1Depth, k1, d2, h2, w2,
-                config->weight1Shape[1], config->weight1Shape[2],
+                static_cast<int8_t const*>(weight1), accumulator1,
+                cutlassWorkspace, n, d1, h1, w1, c1, cache1Depth, k1,
+                config->weight1Shape[1], config->weight1Shape[2], h2, w2,
                 config->conv1Params[0], config->conv1Params[1],
                 config->conv1Params[2], config->conv1Params[3],
-                config->conv1Params[4], config->conv1Params[5], stream)
-            != 0)
+                config->conv1Params[4], config->conv1Params[5], stream);
+        }
+        else
+        {
+            directStatus = dispatchDirectCausalFp16Conv(config->tile1,
+                compact1, static_cast<int8_t const*>(cache1),
+                config->hasCache1 != 0,
+                static_cast<int8_t const*>(weight1),
+                static_cast<float const*>(weightScale1),
+                static_cast<float const*>(bias1), midFp16,
+                config->conv1InputScale, cutlassWorkspace, n, d1, h1, w1,
+                c1, cache1Depth, k1, config->weight1Shape[1],
+                config->weight1Shape[2], h2, w2, config->conv1Params[0],
+                config->conv1Params[1], config->conv1Params[2],
+                config->conv1Params[3], config->conv1Params[4],
+                config->conv1Params[5], stream);
+        }
+        if (directStatus != cutlass::Status::kSuccess)
         {
             return -1;
         }
         if (profile.active) cudaEventRecord(profile.events[2], stream);
-        sfwan_v2::accumulatorNormQuantCompactKernel<<<
-            static_cast<int32_t>((sites2 + 3) / 4), 128, 0, stream>>>(
-            accumulator1, static_cast<float const*>(weightScale1),
-            static_cast<float const*>(bias1),
-            static_cast<int8_t const*>(cache2),
-            static_cast<half const*>(gamma2), compact2,
-            static_cast<int8_t*>(cache2Output), config->hasCache2 != 0,
-            config->conv1InputScale, config->conv2InputScale, n, k1, d2,
-            h2, w2, cache2Depth, config->cache2OutputShape[2]);
+        if (level == 2)
+        {
+            sfwan_v2::accumulatorNormQuantCompactKernel<<<
+                static_cast<int32_t>((sites2 + 3) / 4), 128, 0, stream>>>(
+                accumulator1, static_cast<float const*>(weightScale1),
+                static_cast<float const*>(bias1),
+                static_cast<int8_t const*>(cache2),
+                static_cast<half const*>(gamma2), compact2,
+                static_cast<int8_t*>(cache2Output), config->hasCache2 != 0,
+                config->conv1InputScale, config->conv2InputScale, n, k1,
+                d2, h2, w2, cache2Depth, config->cache2OutputShape[2]);
+        }
+        else
+        {
+            sfwan_v2::fp16NormQuantCompactKernel<<<
+                static_cast<int32_t>((sites2 + 3) / 4), 128, 0, stream>>>(
+                midFp16, static_cast<int8_t const*>(cache2),
+                static_cast<half const*>(gamma2), compact2,
+                static_cast<int8_t*>(cache2Output), config->hasCache2 != 0,
+                config->conv2InputScale, n, k1, d2, h2, w2, cache2Depth,
+                config->cache2OutputShape[2]);
+        }
         if (cudaPeekAtLastError() != cudaSuccess)
         {
             return -1;
         }
         if (profile.active) cudaEventRecord(profile.events[3], stream);
-        if (sfwan_v2::launchFusedResidualConv(true, compact2,
-                static_cast<int8_t const*>(cache2),
-                config->hasCache2 != 0,
-                static_cast<int8_t const*>(weight2),
-                static_cast<float const*>(weightScale2),
-                static_cast<float const*>(bias2), shortcut, blockOutput,
-                config->shortcutIsInt8 != 0, config->outputIsInt8 != 0,
-                config->conv2InputScale, config->inputScale,
-                config->outputScale, n, k1, d2, h2, w2, cache2Depth, k2,
-                config->outputShape[2], config->outputShape[3],
-                config->outputShape[4], config->weight2Shape[1],
-                config->weight2Shape[2], config->conv2Params[0],
-                config->conv2Params[1], config->conv2Params[2],
-                config->conv2Params[3], config->conv2Params[4],
-                config->conv2Params[5], stream)
-            != 0)
+        directStatus = dispatchDirectCausalFusedResidualConv(config->tile2,
+            compact2, static_cast<int8_t const*>(cache2),
+            config->hasCache2 != 0, static_cast<int8_t const*>(weight2),
+            static_cast<float const*>(weightScale2),
+            static_cast<float const*>(bias2), shortcut, blockOutput,
+            config->shortcutIsInt8 != 0, config->outputIsInt8 != 0,
+            config->conv2InputScale, config->inputScale,
+            config->outputScale, cutlassWorkspace, n, d2, h2, w2, k1,
+            cache2Depth, k2, config->weight2Shape[1],
+            config->weight2Shape[2], config->outputShape[3],
+            config->outputShape[4], config->conv2Params[0],
+            config->conv2Params[1], config->conv2Params[2],
+            config->conv2Params[3], config->conv2Params[4],
+            config->conv2Params[5], stream);
+        if (directStatus != cutlass::Status::kSuccess)
         {
             return -1;
         }
@@ -1203,9 +1611,8 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
         cudaEventRecord(profile.events[3], stream);
     }
 #ifdef SFWAN_NATIVE_INT8_V2
-    // P1 keeps the tuned Native V1 CUTLASS mainloop and changes only the
-    // output stage.  P2 intentionally retains its direct-causal experimental
-    // implementation until P1 clears the performance gate.
+    // P1 remains byte-for-byte on its validated windowed CUTLASS path. P2/P3
+    // return earlier through their direct-causal CUTLASS branches.
     status = dispatchFusedResidualConv(config->tile2, window2,
         static_cast<int8_t const*>(weight2),
         static_cast<float const*>(weightScale2),

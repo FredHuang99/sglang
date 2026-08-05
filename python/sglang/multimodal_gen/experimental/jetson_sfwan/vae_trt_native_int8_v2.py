@@ -31,6 +31,10 @@ NATIVE_INT8_V2_CUTLASS_COMMIT = "57e3cfb47a2d9e0d46eb6335c3dc411498efa198"
 NATIVE_INT8_V2_LEVEL_OFFSETS = {"p1": 0, "p2": 6, "p3": 12}
 NATIVE_INT8_V2_P1_ALGORITHM = "cutlass_implicit_gemm_fused_epilogue"
 NATIVE_INT8_V2_P1_KERNEL_REVISION = "cutlass_fused_epilogue_v2"
+NATIVE_INT8_V2_P2_ALGORITHM = "cutlass_direct_causal_implicit_gemm"
+NATIVE_INT8_V2_P2_KERNEL_REVISION = "cutlass_direct_causal_v1"
+NATIVE_INT8_V2_P3_ALGORITHM = "cutlass_direct_two_conv_pipeline"
+NATIVE_INT8_V2_P3_KERNEL_REVISION = "cutlass_two_conv_pipeline_v1"
 NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION = 1
 
 
@@ -205,7 +209,7 @@ def validate_native_int8_v2_manifest(
             "accumulator2_workspace_bytes": 0,
             "temporal_window_bytes": 0,
             "direct_causal_iterator": True,
-            "persistent_block_count": EXPECTED_RESIDUAL_BLOCKS * 3 * 2,
+            "persistent_block_count": 0,
         },
     }[level]
     if (
@@ -222,6 +226,10 @@ def validate_native_int8_v2_manifest(
                 f"Native INT8 V2 {level} audit {key}={audit.get(key)!r}, "
                 f"expected {expected!r}"
             )
+    if level == "p2" and int(audit.get("accumulator1_workspace_bytes", 0)) <= 0:
+        raise ValueError("Native INT8 V2 P2 lost its Conv1 accumulator workspace")
+    if level == "p3" and int(audit.get("conv1_mid_workspace_bytes", 0)) <= 0:
+        raise ValueError("Native INT8 V2 P3 has no FP16 Conv1-mid workspace")
     if level == "p1":
         contract = audit.get("p1_kernel_contract")
         expected_contract = {
@@ -242,6 +250,50 @@ def validate_native_int8_v2_manifest(
             != NATIVE_INT8_V2_P1_KERNEL_REVISION
         ):
             raise ValueError("Native INT8 V2 P1 CUTLASS kernel contract changed")
+    else:
+        expected_algorithms = {
+            "p2": (
+                NATIVE_INT8_V2_P2_ALGORITHM,
+                NATIVE_INT8_V2_P2_KERNEL_REVISION,
+                {
+                    "tensor_core_int8": True,
+                    "direct_causal_iterator": True,
+                    "legacy_direct_wmma": False,
+                    "temporal_window_bytes": 0,
+                    "accumulator1_global_store": True,
+                    "accumulator2_global_store": False,
+                    "conv2_fused_residual_epilogue": True,
+                },
+            ),
+            "p3": (
+                NATIVE_INT8_V2_P3_ALGORITHM,
+                NATIVE_INT8_V2_P3_KERNEL_REVISION,
+                {
+                    "tensor_core_int8": True,
+                    "legacy_persistent_wmma": False,
+                    "direct_causal_iterator": True,
+                    "temporal_window_bytes": 0,
+                    "accumulator1_global_store": False,
+                    "accumulator2_global_store": False,
+                    "conv1_output_dtype_fp16": True,
+                    "conv1_fused_dequant_bias": True,
+                    "conv2_fused_residual_epilogue": True,
+                },
+            ),
+        }
+        algorithm, revision, contract = expected_algorithms[level]
+        if (
+            audit.get("native_int8_v2_algorithm") != algorithm
+            or audit.get("native_int8_v2_kernel_revision") != revision
+            or audit.get("native_int8_v2_legacy_wmma_used") is not False
+            or audit.get("native_int8_v2_kernel_contract") != contract
+            or manifest.get("native_int8_v2_algorithm") != algorithm
+            or manifest.get("native_int8_v2_kernel_revision") != revision
+            or manifest.get("native_int8_v2_legacy_wmma_used") is not False
+        ):
+            raise ValueError(
+                f"Native INT8 V2 {level} CUTLASS kernel contract changed"
+            )
     validated_engines: dict[str, Any] = {}
     for kind in ("initial", "steady"):
         record = engines.get(kind)

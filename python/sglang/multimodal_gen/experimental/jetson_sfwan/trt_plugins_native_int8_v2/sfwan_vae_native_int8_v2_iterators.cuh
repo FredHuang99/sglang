@@ -24,6 +24,289 @@ constexpr size_t kWarpScratchBytes
     = kWarpABytes + kWarpBBytes + kWarpAccumulatorBytes;
 constexpr size_t kBlockScratchBytes = kWarpsPerBlock * kWarpScratchBytes;
 
+// CUTLASS sees the causal 3-D convolution as a 2-D implicit GEMM whose
+// logical activation is [N * D, H, W, 3 * C].  Materialising that tensor was
+// the largest remaining P2 boundary.  This access iterator preserves the
+// stock CUTLASS multistage mainloop while resolving every 16-byte A-side
+// access directly to compact CDHW32 current/cache storage.  Invalid history
+// and spatial padding are predicated out, so cp.async writes zero without a
+// physical pad/concat buffer.
+template <typename Shape_, typename Element_, typename Layout_,
+    typename ThreadMap_, typename AccessType_ = cutlass::AlignedArray<
+        Element_, ThreadMap_::kElementsPerAccess>>
+class SfWanDirectCausalActivationIterator
+{
+public:
+    using Shape = Shape_;
+    using Element = Element_;
+    using Layout = Layout_;
+    using ThreadMap = ThreadMap_;
+    using AccessType = AccessType_;
+    using TensorRef = cutlass::TensorRef<Element, Layout>;
+    using Index = typename Layout::Index;
+    using LongIndex = typename Layout::LongIndex;
+    using ConvProblemSize = cutlass::conv::Conv2dProblemSize;
+    static cutlass::conv::IteratorAlgorithm const kIteratorAlgorithm
+        = cutlass::conv::IteratorAlgorithm::kOptimized;
+    static cutlass::conv::StrideSupport const kStrideSupport
+        = cutlass::conv::StrideSupport::kUnity;
+    static int const kConvDim = 2;
+    static int const kAccessesPerVector
+        = ThreadMap::kElementsPerAccess / AccessType::kElements;
+
+    static_assert(ThreadMap::Iterations::kContiguous == 1,
+        "direct causal iterator requires one contiguous iteration");
+    static_assert(
+        !(ThreadMap::kElementsPerAccess % AccessType::kElements),
+        "thread-map access must be divisible by the vector type");
+
+    struct Params
+    {
+        int8_t const* cache{};
+        int32_t channels{};
+        int32_t depth{};
+        int32_t height{};
+        int32_t width{};
+        int32_t cacheDepth{};
+        int32_t hasCache{};
+
+        CUTLASS_HOST_DEVICE
+        Params() = default;
+
+        CUTLASS_HOST_DEVICE
+        void configure(int8_t const* cachePointer, bool cachePresent,
+            int32_t channelCount, int32_t depthCount, int32_t heightCount,
+            int32_t widthCount, int32_t historyDepth)
+        {
+            cache = cachePointer;
+            hasCache = cachePresent ? 1 : 0;
+            channels = channelCount;
+            depth = depthCount;
+            height = heightCount;
+            width = widthCount;
+            cacheDepth = historyDepth;
+        }
+    };
+
+private:
+    Params const& params_;
+    ConvProblemSize const& problem_;
+    Element const* current_{};
+    LongIndex iterationContiguous_{};
+    LongIndex iterationStrided_{};
+    LongIndex iterationVector_{};
+    int32_t filterC_{};
+    int32_t filterR_{};
+    int32_t filterS_{};
+    int32_t offsetN_[ThreadMap::Iterations::kStrided]{};
+    int32_t offsetP_[ThreadMap::Iterations::kStrided]{};
+    int32_t offsetQ_[ThreadMap::Iterations::kStrided]{};
+    LongIndex pointerOffset_{};
+
+    CUTLASS_HOST_DEVICE
+    static LongIndex compactOffset(int32_t n, int32_t c, int32_t d,
+        int32_t h, int32_t w, int32_t channels, int32_t depth,
+        int32_t height, int32_t width)
+    {
+        int32_t const channelBlocks = (channels + 31) / 32;
+        return (((((static_cast<LongIndex>(n) * channelBlocks + c / 32)
+                          * depth
+                      + d)
+                         * height
+                     + h)
+                        * width
+                    + w)
+                       * 32)
+            + c % 32;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void logicalCoordinate(int32_t& n, int32_t& outputDepth, int32_t& h,
+        int32_t& w, int32_t& history, int32_t& channel) const
+    {
+        int32_t const flatN = offsetN_[iterationStrided_];
+        outputDepth = flatN % params_.depth;
+        n = flatN / params_.depth;
+        int32_t r = filterR_;
+        int32_t s = filterS_;
+        if (problem_.mode == cutlass::conv::Mode::kConvolution)
+        {
+            r = problem_.R - 1 - r;
+            s = problem_.S - 1 - s;
+        }
+        h = offsetP_[iterationStrided_] * problem_.stride_h - problem_.pad_h
+            + r * problem_.dilation_h;
+        w = offsetQ_[iterationStrided_] * problem_.stride_w - problem_.pad_w
+            + s * problem_.dilation_w;
+        int32_t const folded = filterC_
+            + iterationVector_ * AccessType::kElements;
+        history = folded / params_.channels;
+        channel = folded % params_.channels;
+    }
+
+public:
+    CUTLASS_HOST_DEVICE
+    SfWanDirectCausalActivationIterator(Params const& params,
+        ConvProblemSize const& problem, Element const* current,
+        int32_t threadIndex,
+        cutlass::MatrixCoord const& threadblockOffset = cutlass::MatrixCoord())
+        : params_(params), problem_(problem), current_(current)
+    {
+        cutlass::layout::PitchLinearCoord const threadCoord
+            = ThreadMap::initial_offset(threadIndex);
+        filterC_ = threadblockOffset.column() + threadCoord.contiguous();
+        CUTLASS_PRAGMA_UNROLL
+        for (int32_t index = 0; index < ThreadMap::Iterations::kStrided;
+             ++index)
+        {
+            int32_t const npq = threadblockOffset.row()
+                + threadCoord.strided() + index * ThreadMap::Delta::kStrided;
+            offsetN_[index] = npq / (problem_.P * problem_.Q);
+            int32_t const residual = npq % (problem_.P * problem_.Q);
+            offsetP_[index] = residual / problem_.Q;
+            offsetQ_[index] = residual % problem_.Q;
+        }
+        set_iteration_index(0);
+    }
+
+    CUTLASS_HOST_DEVICE
+    static Params getParams(ConvProblemSize const&, Layout const&)
+    {
+        return Params{};
+    }
+
+    CUTLASS_HOST_DEVICE
+    static cutlass::Status can_implement(ConvProblemSize const& problem)
+    {
+        return problem.C % AccessType::kElements
+            ? cutlass::Status::kErrorInvalidProblem
+            : cutlass::Status::kSuccess;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void set_iteration_index(Index index)
+    {
+        iterationVector_ = index % kAccessesPerVector;
+        int32_t const residual = index / kAccessesPerVector;
+        iterationContiguous_
+            = residual % ThreadMap::Iterations::kContiguous;
+        iterationStrided_
+            = residual / ThreadMap::Iterations::kContiguous;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void add_pointer_offset(LongIndex offset)
+    {
+        pointerOffset_ += offset;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void advance()
+    {
+        ++filterS_;
+        if (filterS_ < problem_.S)
+        {
+            return;
+        }
+        filterS_ = 0;
+        ++filterR_;
+        if (filterR_ < problem_.R)
+        {
+            return;
+        }
+        filterR_ = 0;
+        filterC_ += Shape::kColumn * problem_.split_k_slices;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void clear_mask(bool = true)
+    {
+    }
+
+    CUTLASS_HOST_DEVICE
+    bool valid() const
+    {
+        if (params_.channels <= 0 || params_.depth <= 0)
+        {
+            return false;
+        }
+        int32_t n{}, outputDepth{}, h{}, w{}, history{}, channel{};
+        logicalCoordinate(n, outputDepth, h, w, history, channel);
+        if (offsetN_[iterationStrided_] < 0
+            || offsetN_[iterationStrided_] >= problem_.N || h < 0
+            || h >= params_.height || w < 0 || w >= params_.width
+            || history < 0 || history >= 3 || channel < 0
+            || channel + AccessType::kElements > params_.channels
+            || channel / 32
+                    != (channel + AccessType::kElements - 1) / 32)
+        {
+            return false;
+        }
+        int32_t const source
+            = params_.cacheDepth + outputDepth - 2 + history;
+        if (source < params_.cacheDepth)
+        {
+            return params_.hasCache && params_.cache != nullptr && source >= 0;
+        }
+        int32_t const currentDepth = source - params_.cacheDepth;
+        return currentDepth >= 0 && currentDepth < params_.depth;
+    }
+
+    CUTLASS_HOST_DEVICE
+    AccessType const* get() const
+    {
+        int32_t n{}, outputDepth{}, h{}, w{}, history{}, channel{};
+        logicalCoordinate(n, outputDepth, h, w, history, channel);
+        int32_t const source
+            = params_.cacheDepth + outputDepth - 2 + history;
+        Element const* base = current_;
+        int32_t sourceDepth = source - params_.cacheDepth;
+        int32_t storageDepth = params_.depth;
+        if (source < params_.cacheDepth && params_.cache != nullptr)
+        {
+            base = reinterpret_cast<Element const*>(params_.cache);
+            sourceDepth = source;
+            storageDepth = params_.cacheDepth;
+        }
+        if (base == nullptr || offsetN_[iterationStrided_] < 0
+            || offsetN_[iterationStrided_] >= problem_.N || n < 0
+            || sourceDepth < 0
+            || sourceDepth >= storageDepth || h < 0 || h >= params_.height
+            || w < 0 || w >= params_.width || channel < 0
+            || channel >= params_.channels)
+        {
+            return reinterpret_cast<AccessType const*>(current_);
+        }
+        LongIndex const offset = compactOffset(n, channel, sourceDepth, h,
+            w, params_.channels, storageDepth, params_.height, params_.width)
+            + pointerOffset_;
+        return reinterpret_cast<AccessType const*>(base + offset);
+    }
+
+    CUTLASS_HOST_DEVICE
+    SfWanDirectCausalActivationIterator& operator++()
+    {
+        ++iterationVector_;
+        if (iterationVector_ < kAccessesPerVector)
+        {
+            return *this;
+        }
+        iterationVector_ = 0;
+        ++iterationContiguous_;
+        if (iterationContiguous_ < ThreadMap::Iterations::kContiguous)
+        {
+            return *this;
+        }
+        iterationContiguous_ = 0;
+        ++iterationStrided_;
+        if (iterationStrided_ == ThreadMap::Iterations::kStrided)
+        {
+            iterationStrided_ = 0;
+        }
+        return *this;
+    }
+};
+
 __global__ void entryNormQuantCompactKernel(void const* input,
     int8_t const* cache, half const* gamma, int8_t* current,
     int8_t* cacheOutput, bool inputIsInt8, bool hasCache, float inputScale,
@@ -151,6 +434,87 @@ __global__ void accumulatorNormQuantCompactKernel(
                   * weightScale[c]
                 + bias[c])
             * factor * __half2float(gamma[c]);
+        int8_t const q = quantizeSigned(
+            normalized / (1.0F + expf(-normalized)), outputScale);
+        current[cdhw32Offset(
+            n, c, d, h, w, channels, depth, height, width)] = q;
+        int32_t const combinedDepth = cacheDepth + depth;
+        for (int32_t outputIndex = 0; outputIndex < cacheOutputDepth;
+             ++outputIndex)
+        {
+            int32_t const source
+                = combinedDepth - cacheOutputDepth + outputIndex;
+            if (source < cacheDepth)
+            {
+                if (d == 0)
+                {
+                    int8_t history = 0;
+                    if (hasCache && source >= 0)
+                    {
+                        history = cache[cdhw32Offset(n, c, source, h, w,
+                            channels, cacheDepth, height, width)];
+                    }
+                    cacheOutput[cdhw32Offset(n, c, outputIndex, h, w,
+                        channels, cacheOutputDepth, height, width)] = history;
+                }
+            }
+            else if (source - cacheDepth == d)
+            {
+                cacheOutput[cdhw32Offset(n, c, outputIndex, h, w,
+                    channels, cacheOutputDepth, height, width)] = q;
+            }
+        }
+    }
+}
+
+// P3 receives Conv1's dequantized FP16 result directly from the CUTLASS
+// epilogue.  This producer performs the only required channel reduction,
+// applies Wan RMSNorm/SiLU, quantizes once into compact CDHW32, and advances
+// cache2 in the same traversal.
+__global__ void fp16NormQuantCompactKernel(half const* mid,
+    int8_t const* cache, half const* gamma, int8_t* current,
+    int8_t* cacheOutput, bool hasCache, float outputScale, int32_t nSize,
+    int32_t channels, int32_t depth, int32_t height, int32_t width,
+    int32_t cacheDepth, int32_t cacheOutputDepth)
+{
+    int32_t constexpr warps = 4;
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    int64_t const site = static_cast<int64_t>(blockIdx.x) * warps + warp;
+    int64_t const sites
+        = static_cast<int64_t>(nSize) * depth * height * width;
+    if (site >= sites)
+    {
+        return;
+    }
+    int64_t value = site;
+    int32_t const w = value % width;
+    value /= width;
+    int32_t const h = value % height;
+    value /= height;
+    int32_t const d = value % depth;
+    int32_t const n = value / depth;
+    float sum = 0.0F;
+    for (int32_t c = lane; c < channels; c += 32)
+    {
+        int64_t const index
+            = nhwcOffset(n * depth + d, h, w, c, height, width, channels);
+        float const x = __half2float(mid[index]);
+        sum += x * x;
+    }
+    unsigned int const mask = __activemask();
+    for (int32_t offset = 16; offset; offset >>= 1)
+    {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+    float const factor = sqrtf(static_cast<float>(channels))
+        / fmaxf(sqrtf(__shfl_sync(mask, sum, 0)), 1.0e-12F);
+    for (int32_t c = lane; c < channels; c += 32)
+    {
+        int64_t const index
+            = nhwcOffset(n * depth + d, h, w, c, height, width, channels);
+        float normalized
+            = __half2float(mid[index]) * factor * __half2float(gamma[c]);
         int8_t const q = quantizeSigned(
             normalized / (1.0F + expf(-normalized)), outputScale);
         current[cdhw32Offset(

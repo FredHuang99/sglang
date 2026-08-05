@@ -48,6 +48,10 @@ from .vae_trt_native_int8_v2 import (
     NATIVE_INT8_V2_PLUGIN_VERSION,
     NATIVE_INT8_V2_P1_ALGORITHM,
     NATIVE_INT8_V2_P1_KERNEL_REVISION,
+    NATIVE_INT8_V2_P2_ALGORITHM,
+    NATIVE_INT8_V2_P2_KERNEL_REVISION,
+    NATIVE_INT8_V2_P3_ALGORITHM,
+    NATIVE_INT8_V2_P3_KERNEL_REVISION,
     NATIVE_INT8_V2_SCHEMA_VERSION,
     NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION,
     NATIVE_INT8_V2_SUBDIRECTORY,
@@ -230,6 +234,74 @@ def _p1_kernel_contract(library: Any) -> dict[str, Any]:
     return {"algorithm": actual_algorithm, **result}
 
 
+def _level_kernel_contract(library: Any, *, level: str) -> dict[str, Any]:
+    if level == "p1":
+        return _p1_kernel_contract(library)
+    specifications = {
+        "p2": {
+            "algorithm_symbol": "sfwanNativeInt8V2P2Algorithm",
+            "contract_symbol": "sfwanNativeInt8V2P2KernelContract",
+            "algorithm": NATIVE_INT8_V2_P2_ALGORITHM,
+            "revision": NATIVE_INT8_V2_P2_KERNEL_REVISION,
+            "keys": (
+                "tensor_core_int8",
+                "direct_causal_iterator",
+                "legacy_direct_wmma",
+                "temporal_window_bytes",
+                "accumulator1_global_store",
+                "accumulator2_global_store",
+                "conv2_fused_residual_epilogue",
+            ),
+            "expected": (True, True, False, 0, True, False, True),
+        },
+        "p3": {
+            "algorithm_symbol": "sfwanNativeInt8V2P3Algorithm",
+            "contract_symbol": "sfwanNativeInt8V2P3KernelContract",
+            "algorithm": NATIVE_INT8_V2_P3_ALGORITHM,
+            "revision": NATIVE_INT8_V2_P3_KERNEL_REVISION,
+            "keys": (
+                "tensor_core_int8",
+                "legacy_persistent_wmma",
+                "direct_causal_iterator",
+                "temporal_window_bytes",
+                "accumulator1_global_store",
+                "accumulator2_global_store",
+                "conv1_output_dtype_fp16",
+                "conv1_fused_dequant_bias",
+                "conv2_fused_residual_epilogue",
+            ),
+            "expected": (True, False, True, 0, False, False, True, True, True),
+        },
+    }[level]
+    algorithm = getattr(library, specifications["algorithm_symbol"], None)
+    contract = getattr(library, specifications["contract_symbol"], None)
+    if algorithm is None or contract is None:
+        raise RuntimeError(f"Native INT8 V2 plugin lacks the {level} CUTLASS contract")
+    algorithm.argtypes = []
+    algorithm.restype = ctypes.c_char_p
+    actual_algorithm = algorithm().decode("ascii")
+    values = (ctypes.c_uint64 * len(specifications["keys"]))()
+    contract.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_int32]
+    contract.restype = ctypes.c_int32
+    if int(contract(values, len(values))) != 0:
+        raise RuntimeError(f"Native INT8 V2 plugin rejected the {level} contract")
+    converted: list[Any] = []
+    for key, value in zip(specifications["keys"], values):
+        converted.append(int(value) if key.endswith("_bytes") else bool(value))
+    result = dict(zip(specifications["keys"], converted))
+    expected = dict(zip(specifications["keys"], specifications["expected"]))
+    if actual_algorithm != specifications["algorithm"] or result != expected:
+        raise RuntimeError(
+            f"Native INT8 V2 {level} kernel contract mismatch: "
+            f"algorithm={actual_algorithm!r}, contract={result!r}"
+        )
+    return {
+        "algorithm": actual_algorithm,
+        "kernel_revision": specifications["revision"],
+        **result,
+    }
+
+
 class _BlockConfig(ctypes.Structure):
     _fields_ = [
         ("inputShape", ctypes.c_int32 * 5),
@@ -314,32 +386,23 @@ def _workspace_audit(*, library: Any, graph_paths: Mapping[str, Path], level: st
         from onnx import helper
     except ImportError as exc:
         raise RuntimeError("Native INT8 V2 workspace audit requires ONNX") from exc
-    workspace = library.sfwanNativeInt8V2WorkspaceContract
+    workspace = library.sfwanNativeInt8V2WorkspaceContractV2
     workspace.argtypes = [
         ctypes.POINTER(_BlockConfig),
         ctypes.POINTER(ctypes.c_uint64),
         ctypes.c_int32,
     ]
     workspace.restype = ctypes.c_int32
-    persistent = library.sfwanNativeInt8V2PersistentTile
-    persistent.argtypes = [
-        ctypes.POINTER(_BlockConfig),
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.POINTER(ctypes.c_int32),
-        ctypes.POINTER(ctypes.c_uint64),
-    ]
-    persistent.restype = ctypes.c_int32
     records: list[dict[str, Any]] = []
-    maxima = [0, 0, 0, 0]
-    persistent_count = 0
+    maxima = [0, 0, 0, 0, 0]
     for kind, path in graph_paths.items():
         model = onnx.load(str(path), load_external_data=False)
         for node in model.graph.node:
             if node.op_type != NATIVE_INT8_V2_PLUGIN_NAME:
                 continue
             config = _block_config(_attribute_map(node, helper))
-            values = (ctypes.c_uint64 * 4)()
-            if int(workspace(ctypes.byref(config), values, 4)) != 0:
+            values = (ctypes.c_uint64 * 5)()
+            if int(workspace(ctypes.byref(config), values, 5)) != 0:
                 raise RuntimeError(f"workspace audit failed for {node.name}")
             current = [int(value) for value in values]
             maxima = [max(old, value) for old, value in zip(maxima, current)]
@@ -349,42 +412,25 @@ def _workspace_audit(*, library: Any, graph_paths: Mapping[str, Path], level: st
                 "accumulator1_workspace_bytes": current[0],
                 "accumulator2_workspace_bytes": current[1],
                 "temporal_window_bytes": current[2],
-                "total_workspace_bytes": current[3],
+                "conv1_mid_workspace_bytes": current[3],
+                "total_workspace_bytes": current[4],
             }
-            if level == "p3":
-                tile_h = ctypes.c_int32()
-                tile_w = ctypes.c_int32()
-                shared = ctypes.c_uint64()
-                if int(
-                    persistent(
-                        ctypes.byref(config),
-                        ctypes.byref(tile_h),
-                        ctypes.byref(tile_w),
-                        ctypes.byref(shared),
-                    )
-                ) != 0:
-                    raise RuntimeError(f"persistent tile audit failed for {node.name}")
-                record.update(
-                    {
-                        "persistent_tile": [tile_h.value, tile_w.value],
-                        "dynamic_shared_bytes": int(shared.value),
-                    }
-                )
-                persistent_count += 1
             records.append(record)
     return {
         "plugin_call_count": len(records),
         "accumulator1_workspace_bytes": maxima[0],
         "accumulator2_workspace_bytes": maxima[1],
         "temporal_window_bytes": maxima[2],
-        "max_plugin_workspace_bytes": maxima[3],
-        "persistent_block_count": persistent_count,
+        "conv1_mid_workspace_bytes": maxima[3],
+        "max_plugin_workspace_bytes": maxima[4],
+        "persistent_block_count": 0,
         "records": records,
     }
 
 
-def _rebind_existing_p1(
+def _rebind_existing_level(
     *,
+    level: str,
     level_root: Path,
     base_root: Path,
     base_manifest: Mapping[str, Any],
@@ -392,10 +438,12 @@ def _rebind_existing_p1(
     plugin_manifest: Mapping[str, Any],
     library: Any,
 ) -> dict[str, Any]:
-    """Atomically bind an unchanged P1 plan to the corrected compatible DSO."""
+    """Atomically bind an unchanged P1/P2 plan to a compatible corrected DSO."""
 
     manifest_path = level_root / _LEVEL_FILES["manifest"]
-    old = _load_json(manifest_path, label="existing Native INT8 V2 P1 manifest")
+    old = _load_json(
+        manifest_path, label=f"existing Native INT8 V2 {level} manifest"
+    )
     old_plugin = old.get("plugin")
     engines = old.get("engines")
     graph = old.get("graph")
@@ -405,14 +453,18 @@ def _rebind_existing_p1(
         isinstance(value, Mapping)
         for value in (old_plugin, engines, graph, audit_record, timing_cache)
     ):
-        raise RuntimeError("P1 compatible rebind rejected an incomplete old manifest")
+        raise RuntimeError(
+            f"{level} compatible rebind rejected an incomplete old manifest"
+        )
     if (
         old.get("schema_version") != NATIVE_INT8_V2_SCHEMA_VERSION
         or old.get("variant") != NATIVE_INT8_V2_VARIANT
-        or old.get("level") != "p1"
+        or old.get("level") != level
         or old.get("base_native_int8_v1_identity") != _identity(v1_manifest)
     ):
-        raise RuntimeError("P1 compatible rebind identity changed; rebuild is required")
+        raise RuntimeError(
+            f"{level} compatible rebind identity changed; rebuild is required"
+        )
     abi_keys = (
         "file",
         "plugin_name",
@@ -422,10 +474,12 @@ def _rebind_existing_p1(
         "cutlass_commit",
     )
     if any(old_plugin.get(key) != plugin_manifest.get(key) for key in abi_keys):
-        raise RuntimeError("P1 plugin creator/ABI changed; rebuild is required")
+        raise RuntimeError(
+            f"{level} plugin creator/ABI changed; rebuild is required"
+        )
     if old_plugin.get("sha256") == plugin_manifest.get("sha256"):
         raise RuntimeError(
-            "P1 manifest already references this DSO but lacks the corrected "
+            f"{level} manifest already references this DSO but lacks the corrected "
             "kernel contract; install the rebuilt plugin or perform a full rebuild"
         )
 
@@ -434,10 +488,12 @@ def _rebind_existing_p1(
         not old_audit_path.is_file()
         or sha256_file(old_audit_path) != audit_record.get("sha256")
     ):
-        raise RuntimeError("P1 old audit SHA changed; rebuild is required")
-    old_audit = _load_json(old_audit_path, label="existing Native INT8 V2 P1 audit")
+        raise RuntimeError(f"{level} old audit SHA changed; rebuild is required")
+    old_audit = _load_json(
+        old_audit_path, label=f"existing Native INT8 V2 {level} audit"
+    )
     if old_audit.get("passed") is not True or old_audit.get("errors") != []:
-        raise RuntimeError("P1 old audit did not pass; rebuild is required")
+        raise RuntimeError(f"{level} old audit did not pass; rebuild is required")
 
     graph_paths: dict[str, Path] = {}
     inspector_mappings: dict[str, Any] = {}
@@ -445,7 +501,7 @@ def _rebind_existing_p1(
         engine = engines.get(kind)
         graph_record = graph.get(kind)
         if not isinstance(engine, Mapping) or not isinstance(graph_record, Mapping):
-            raise RuntimeError(f"P1 {kind} artifact record is incomplete")
+            raise RuntimeError(f"{level} {kind} artifact record is incomplete")
         plan_path = level_root / str(engine.get("file"))
         onnx_path = level_root / str(engine.get("source_onnx_file"))
         inspector_path = level_root / str(engine.get("inspector_file"))
@@ -457,43 +513,58 @@ def _rebind_existing_p1(
         for path, expected_sha, label in checks:
             if not path.is_file() or sha256_file(path) != expected_sha:
                 raise RuntimeError(
-                    f"P1 {kind} {label} changed; compatible rebind is unsafe"
+                    f"{level} {kind} {label} changed; compatible rebind is unsafe"
                 )
         if old_audit.get("plan_sha256", {}).get(kind) != engine.get("sha256"):
-            raise RuntimeError(f"P1 {kind} audit/plan identity changed")
+            raise RuntimeError(f"{level} {kind} audit/plan identity changed")
         if graph_record.get("destination_sha256") != sha256_file(onnx_path):
-            raise RuntimeError(f"P1 {kind} serialized plugin graph changed")
+            raise RuntimeError(f"{level} {kind} serialized plugin graph changed")
         expected_names = [
             value["v2_name"] for value in graph_record.get("plugins", [])
         ]
         if len(expected_names) != EXPECTED_RESIDUAL_BLOCKS * 3:
-            raise RuntimeError(f"P1 {kind} serialized plugin count changed")
+            raise RuntimeError(f"{level} {kind} serialized plugin count changed")
         inspector = json.loads(inspector_path.read_text(encoding="utf-8"))
         inspector_mappings[kind] = _map_native_plugins(
             inspector, expected_names=expected_names
         )
         if inspector_mappings[kind]["passed"] is not True:
-            raise RuntimeError(f"P1 {kind} Inspector mapping changed")
+            raise RuntimeError(f"{level} {kind} Inspector mapping changed")
         graph_paths[kind] = onnx_path
 
     cache_path = level_root / str(timing_cache.get("file"))
     if not cache_path.is_file() or sha256_file(cache_path) != timing_cache.get(
         "sha256"
     ):
-        raise RuntimeError("P1 timing cache changed; compatible rebind is unsafe")
+        raise RuntimeError(
+            f"{level} timing cache changed; compatible rebind is unsafe"
+        )
     if old.get("cache") != v1_manifest.get("cache"):
-        raise RuntimeError("P1 mixed-cache ABI changed; rebuild is required")
+        raise RuntimeError(f"{level} mixed-cache ABI changed; rebuild is required")
 
     workspace = _workspace_audit(
-        library=library, graph_paths=graph_paths, level="p1"
+        library=library, graph_paths=graph_paths, level=level
     )
     expected_plugins = EXPECTED_RESIDUAL_BLOCKS * 3 * 2
     if (
         workspace["plugin_call_count"] != expected_plugins
         or workspace["accumulator2_workspace_bytes"] != 0
     ):
-        raise RuntimeError("P1 corrected DSO workspace contract did not pass")
-    kernel_contract = _p1_kernel_contract(library)
+        raise RuntimeError(f"{level} corrected DSO workspace contract did not pass")
+    old_workspace = int(old_audit.get("max_plugin_workspace_bytes", 0))
+    if old_workspace <= 0 or workspace["max_plugin_workspace_bytes"] > old_workspace:
+        raise RuntimeError(
+            f"{level} corrected DSO requires a larger plugin workspace; "
+            "compatible plan rebind is unsafe"
+        )
+    kernel_contract = _level_kernel_contract(library, level=level)
+    algorithm = str(kernel_contract.pop("algorithm"))
+    kernel_revision = str(
+        kernel_contract.pop(
+            "kernel_revision",
+            NATIVE_INT8_V2_P1_KERNEL_REVISION,
+        )
+    )
     plan_sha = {kind: str(engines[kind]["sha256"]) for kind in _KINDS}
     audit = {
         **old_audit,
@@ -507,11 +578,17 @@ def _rebind_existing_p1(
             "accumulator2_workspace_bytes"
         ],
         "temporal_window_bytes": workspace["temporal_window_bytes"],
+        "conv1_mid_workspace_bytes": workspace["conv1_mid_workspace_bytes"],
         "max_plugin_workspace_bytes": workspace["max_plugin_workspace_bytes"],
         "residual_epilogue_kernel_present": False,
-        "p1_algorithm": kernel_contract.pop("algorithm"),
-        "p1_kernel_revision": NATIVE_INT8_V2_P1_KERNEL_REVISION,
-        "p1_kernel_contract": kernel_contract,
+        "native_int8_v2_algorithm": algorithm,
+        "native_int8_v2_kernel_revision": kernel_revision,
+        "native_int8_v2_legacy_wmma_used": False,
+        "native_int8_v2_kernel_contract": kernel_contract,
+        "persistent_block_count": 0,
+        "p1_algorithm": algorithm if level == "p1" else None,
+        "p1_kernel_revision": kernel_revision if level == "p1" else None,
+        "p1_kernel_contract": kernel_contract if level == "p1" else None,
         "plan_sha256": plan_sha,
         "inspector_plugin_mappings": inspector_mappings,
         "workspace_records": workspace["records"],
@@ -529,17 +606,44 @@ def _rebind_existing_p1(
         },
         "plan_reused": True,
         "plugin_rebound": True,
-        "p1_kernel_revision": NATIVE_INT8_V2_P1_KERNEL_REVISION,
+        "native_int8_v2_algorithm": algorithm,
+        "native_int8_v2_kernel_revision": kernel_revision,
+        "native_int8_v2_legacy_wmma_used": False,
+        "p1_kernel_revision": kernel_revision if level == "p1" else None,
     }
     write_json_atomic(manifest_path, rebound)
     validate_native_int8_v2_manifest(
         rebound,
         engine_dir=base_root,
         base_manifest=base_manifest,
-        level="p1",
+        level=level,
         verify_hashes=True,
     )
     return rebound
+
+
+def _archive_legacy_p3(level_root: Path) -> None:
+    """Preserve the obsolete single-warp P3 artifacts before rebuilding."""
+
+    names = (
+        _LEVEL_FILES["manifest"],
+        _LEVEL_FILES["audit"],
+        _LEVEL_FILES["initial_plan"],
+        _LEVEL_FILES["steady_plan"],
+        _LEVEL_FILES["initial_inspector"],
+        _LEVEL_FILES["steady_inspector"],
+        _LEVEL_FILES["timing_cache"],
+    )
+    for name in names:
+        source = level_root / name
+        if not source.exists():
+            continue
+        destination = source.with_name(f"{source.name}.legacy_wmma")
+        if destination.exists():
+            destination = source.with_name(
+                f"{source.name}.legacy_wmma.{time.time_ns()}"
+            )
+        source.replace(destination)
 
 
 def _build_level(
@@ -559,6 +663,8 @@ def _build_level(
     level_root = root / level
     level_root.mkdir(parents=True, exist_ok=True)
     existing_manifest = level_root / _LEVEL_FILES["manifest"]
+    if level == "p3" and existing_manifest.is_file() and not resume:
+        _archive_legacy_p3(level_root)
     if resume and existing_manifest.is_file():
         manifest = load_native_int8_v2_manifest(base_root, level=level)
         try:
@@ -570,17 +676,19 @@ def _build_level(
                 verify_hashes=True,
             )
         except ValueError:
-            if level != "p1":
-                raise
-            return _rebind_existing_p1(
-                level_root=level_root,
-                base_root=base_root,
-                base_manifest=base_manifest,
-                v1_manifest=v1_manifest,
-                plugin_manifest=plugin_manifest,
-                library=library,
-            )
-        return manifest
+            if level in {"p1", "p2"}:
+                return _rebind_existing_level(
+                    level=level,
+                    level_root=level_root,
+                    base_root=base_root,
+                    base_manifest=base_manifest,
+                    v1_manifest=v1_manifest,
+                    plugin_manifest=plugin_manifest,
+                    library=library,
+                )
+            _archive_legacy_p3(level_root)
+        else:
+            return manifest
 
     v1_root = base_root / NATIVE_INT8_SUBDIRECTORY
     graph_records: dict[str, Any] = {}
@@ -648,9 +756,19 @@ def _build_level(
         errors.append("temporal-window workspace is nonzero")
     if level == "p3" and workspace["accumulator1_workspace_bytes"] != 0:
         errors.append("Conv1 accumulator workspace is nonzero")
-    if level == "p3" and workspace["persistent_block_count"] != expected_plugins:
-        errors.append("persistent-block coverage is incomplete")
-    p1_kernel_contract = _p1_kernel_contract(library) if level == "p1" else None
+    if level == "p2" and workspace["accumulator1_workspace_bytes"] <= 0:
+        errors.append("P2 Conv1 accumulator workspace is missing")
+    if level == "p3" and workspace["conv1_mid_workspace_bytes"] <= 0:
+        errors.append("P3 FP16 Conv1-mid workspace is missing")
+    if workspace["persistent_block_count"] != 0:
+        errors.append("obsolete persistent WMMA block is still active")
+    level_kernel_contract = _level_kernel_contract(library, level=level)
+    algorithm = str(level_kernel_contract["algorithm"])
+    kernel_revision = str(
+        level_kernel_contract.get(
+            "kernel_revision", NATIVE_INT8_V2_P1_KERNEL_REVISION
+        )
+    )
 
     inspector_mappings: dict[str, Any] = {}
     for kind in _KINDS:
@@ -691,23 +809,30 @@ def _build_level(
             "accumulator2_workspace_bytes"
         ],
         "temporal_window_bytes": workspace["temporal_window_bytes"],
+        "conv1_mid_workspace_bytes": workspace["conv1_mid_workspace_bytes"],
         "max_plugin_workspace_bytes": workspace["max_plugin_workspace_bytes"],
         "direct_causal_iterator": level in {"p2", "p3"},
         "persistent_block_count": workspace["persistent_block_count"],
         "residual_epilogue_kernel_present": False,
-        "p1_algorithm": (
-            p1_kernel_contract["algorithm"] if p1_kernel_contract else None
-        ),
+        "native_int8_v2_algorithm": algorithm,
+        "native_int8_v2_kernel_revision": kernel_revision,
+        "native_int8_v2_legacy_wmma_used": False,
+        "native_int8_v2_kernel_contract": {
+            key: value
+            for key, value in level_kernel_contract.items()
+            if key not in {"algorithm", "kernel_revision"}
+        },
+        "p1_algorithm": algorithm if level == "p1" else None,
         "p1_kernel_revision": (
-            NATIVE_INT8_V2_P1_KERNEL_REVISION if level == "p1" else None
+            kernel_revision if level == "p1" else None
         ),
         "p1_kernel_contract": (
             {
                 key: value
-                for key, value in p1_kernel_contract.items()
-                if key != "algorithm"
+                for key, value in level_kernel_contract.items()
+                if key not in {"algorithm", "kernel_revision"}
             }
-            if p1_kernel_contract
+            if level == "p1"
             else None
         ),
         "plan_reused": False,
@@ -780,8 +905,11 @@ def _build_level(
         "build": dict(v1_manifest["build"]),
         "plan_reused": False,
         "plugin_rebound": False,
+        "native_int8_v2_algorithm": algorithm,
+        "native_int8_v2_kernel_revision": kernel_revision,
+        "native_int8_v2_legacy_wmma_used": False,
         "p1_kernel_revision": (
-            NATIVE_INT8_V2_P1_KERNEL_REVISION if level == "p1" else None
+            kernel_revision if level == "p1" else None
         ),
     }
     write_json_atomic(existing_manifest, manifest)
@@ -885,7 +1013,8 @@ def build_native_int8_v2(
             "p3": {
                 "conv2_fused_residual_epilogue": True,
                 "direct_causal_iterator": True,
-                "persistent_two_conv_block": True,
+                "persistent_two_conv_block": False,
+                "conv1_fused_fp16_epilogue": True,
             },
         },
     }
