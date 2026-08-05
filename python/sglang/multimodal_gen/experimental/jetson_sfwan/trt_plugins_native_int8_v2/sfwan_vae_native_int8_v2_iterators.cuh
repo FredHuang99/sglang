@@ -28,9 +28,9 @@ constexpr size_t kBlockScratchBytes = kWarpsPerBlock * kWarpScratchBytes;
 // logical activation is [N * D, H, W, 3 * C].  Materialising that tensor was
 // the largest remaining P2 boundary.  This access iterator preserves the
 // stock CUTLASS multistage mainloop while resolving every 16-byte A-side
-// access directly to compact CDHW32 current/cache storage.  Invalid history
-// and spatial padding are predicated out, so cp.async writes zero without a
-// physical pad/concat buffer.
+// access directly to compact CDHW32 current/cache storage. Invalid history
+// and spatial padding are predicated out, so the pipelined tile load writes
+// zero without a physical pad/concat buffer.
 template <typename Shape_, typename Element_, typename Layout_,
     typename ThreadMap_, typename AccessType_ = cutlass::AlignedArray<
         Element_, ThreadMap_::kElementsPerAccess>>
