@@ -865,17 +865,49 @@ def _profiling_verbosity(trt: Any, value: str) -> Any:
 
 def _engine_io_contract(engine: Any) -> list[dict[str, Any]]:
     records = []
+    get_tensor_format = getattr(engine, "get_tensor_format", None)
     for index in range(int(engine.num_io_tensors)):
         name = engine.get_tensor_name(index)
-        records.append(
-            {
-                "name": name,
-                "mode": str(engine.get_tensor_mode(name)).split(".")[-1].lower(),
-                "dtype": str(engine.get_tensor_dtype(name)).split(".")[-1].lower(),
-                "shape": [int(value) for value in engine.get_tensor_shape(name)],
-            }
-        )
+        record = {
+            "name": name,
+            "mode": str(engine.get_tensor_mode(name)).split(".")[-1].lower(),
+            "dtype": str(engine.get_tensor_dtype(name)).split(".")[-1].lower(),
+            "shape": [int(value) for value in engine.get_tensor_shape(name)],
+        }
+        if callable(get_tensor_format):
+            record["format"] = (
+                str(get_tensor_format(name)).split(".")[-1].lower()
+            )
+        records.append(record)
     return records
+
+
+def _constrain_network_io_formats(
+    *, network: Any, io_tensor_formats: dict[str, Any] | None
+) -> None:
+    """Apply explicit physical formats only at TensorRT network boundaries."""
+
+    if not io_tensor_formats:
+        return
+    tensors: dict[str, Any] = {}
+    for index in range(int(network.num_inputs)):
+        tensor = network.get_input(index)
+        tensors[str(tensor.name)] = tensor
+    for index in range(int(network.num_outputs)):
+        tensor = network.get_output(index)
+        tensors[str(tensor.name)] = tensor
+    missing = sorted(set(io_tensor_formats) - set(tensors))
+    if missing:
+        raise ValueError(
+            f"TensorRT I/O format constraints reference unknown tensors: {missing}"
+        )
+    for name, tensor_format in io_tensor_formats.items():
+        tensor = tensors[name]
+        if not hasattr(tensor, "allowed_formats"):
+            raise RuntimeError(
+                f"TensorRT tensor {name!r} cannot constrain its I/O format"
+            )
+        tensor.allowed_formats = 1 << int(tensor_format)
 
 
 def _attach_timing_cache(
@@ -950,6 +982,7 @@ def _build_engine_bytes(
     workspace_gib: float,
     profiling_verbosity: str,
     timing_cache_path: Path | None = None,
+    io_tensor_formats: dict[str, Any] | None = None,
 ) -> tuple[bytes, list[dict[str, Any]], str, bytes | None]:
     logger = _trt_logger(trt)
     builder = trt.Builder(logger)
@@ -960,6 +993,10 @@ def _build_engine_bytes(
             str(parser.get_error(index)) for index in range(int(parser.num_errors))
         ]
         raise RuntimeError(f"TensorRT could not parse {onnx_path}: {errors}")
+    _constrain_network_io_formats(
+        network=network,
+        io_tensor_formats=io_tensor_formats,
+    )
     config = builder.create_builder_config()
     config.set_memory_pool_limit(
         trt.MemoryPoolType.WORKSPACE,

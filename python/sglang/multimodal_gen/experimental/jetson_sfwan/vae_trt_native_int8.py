@@ -976,6 +976,8 @@ def validate_native_int8_manifest(
         raise ValueError("manifest is not native_int8_v1")
     if manifest.get("algorithm") != NATIVE_INT8_ALGORITHM:
         raise ValueError("native INT8 algorithm contract changed")
+    if manifest.get("cache_io_format_contract") != "cdhw32_network_io_v1":
+        raise ValueError("native INT8 cache network-I/O format contract changed")
     if manifest.get("base_manifest_sha256") != _base_manifest_identity(base_manifest):
         raise ValueError("native/base manifest identity mismatch")
 
@@ -1096,6 +1098,34 @@ def validate_native_int8_manifest(
         raise ValueError("native mixed-cache dtype counts changed")
     if cache.get("migration") != "none":
         raise ValueError("native INT8 must not depend on cache migration")
+    int8_indices = {int(entry["index"]) for entry in int8_slots}
+    for kind in ("initial", "steady"):
+        record = engines[kind]
+        io_tensors = record.get("io_tensors")
+        if not isinstance(io_tensors, list):
+            raise ValueError(f"native {kind} engine I/O contract is missing")
+        by_name = {
+            str(value.get("name")): value
+            for value in io_tensors
+            if isinstance(value, Mapping)
+        }
+        expected_names = {
+            f"cache_out_{index:03d}" for index in int8_indices
+        }
+        if kind == "steady":
+            expected_names.update(
+                f"cache_in_{index:03d}" for index in int8_indices
+            )
+        invalid_formats = {
+            name: by_name.get(name, {}).get("format")
+            for name in sorted(expected_names)
+            if by_name.get(name, {}).get("format") != "cdhw32"
+        }
+        if invalid_formats:
+            raise ValueError(
+                f"native {kind} INT8 cache I/O formats changed: "
+                f"{invalid_formats}"
+            )
     if (
         cache.get("single_bank_bytes") != calculated_bank_bytes
         or cache.get("double_bank_bytes") != calculated_bank_bytes * 2

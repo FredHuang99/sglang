@@ -78,6 +78,7 @@ _SOURCE_FILES = {
 }
 _V5_SCALES_FILE = "quant_scales_v5.json"
 _STAGE_ORDER = ("analyze", "calibrate", "pack", "tune", "build", "audit")
+_CACHE_IO_FORMAT_CONTRACT = "cdhw32_network_io_v1"
 
 
 def _load_json(path: Path, *, label: str) -> dict[str, Any]:
@@ -632,6 +633,40 @@ def _expected_io(
     return expected
 
 
+def _native_cache_io_format_constraints(
+    *, trt: Any, kind: str, int8_slots: set[int]
+) -> dict[str, Any]:
+    tensor_format = getattr(trt.TensorFormat, "CDHW32", None)
+    if tensor_format is None:
+        raise RuntimeError("TensorRT runtime has no CDHW32 tensor-format symbol")
+    result = {
+        f"cache_out_{index:03d}": tensor_format for index in int8_slots
+    }
+    if kind == "steady":
+        result.update(
+            {f"cache_in_{index:03d}": tensor_format for index in int8_slots}
+        )
+    return result
+
+
+def _validate_native_cache_io_formats(
+    *, records: list[dict[str, Any]], kind: str, int8_slots: set[int]
+) -> None:
+    by_name = {str(record.get("name")): record for record in records}
+    names = {f"cache_out_{index:03d}" for index in int8_slots}
+    if kind == "steady":
+        names.update(f"cache_in_{index:03d}" for index in int8_slots)
+    failures = {
+        name: by_name.get(name, {}).get("format")
+        for name in sorted(names)
+        if by_name.get(name, {}).get("format") != "cdhw32"
+    }
+    if failures:
+        raise ValueError(
+            f"native {kind} INT8 cache I/O must expose CDHW32: {failures}"
+        )
+
+
 def _inspector_layers(inspector: Any) -> list[dict[str, Any]]:
     if isinstance(inspector, list):
         return [value for value in inspector if isinstance(value, dict)]
@@ -847,13 +882,18 @@ def build_native_int8(
 
     if resume and (root / NATIVE_INT8_MANIFEST_FILE).is_file() and limit == "audit":
         existing = load_native_int8_manifest(base_root)
-        validate_native_int8_manifest(
-            existing,
-            engine_dir=base_root,
-            base_manifest=base_manifest,
-            verify_hashes=True,
+        if existing.get("cache_io_format_contract") == _CACHE_IO_FORMAT_CONTRACT:
+            validate_native_int8_manifest(
+                existing,
+                engine_dir=base_root,
+                base_manifest=base_manifest,
+                verify_hashes=True,
+            )
+            return existing
+        print(
+            "Existing native INT8 manifest predates the CDHW32 network-I/O "
+            "contract; preserving its artifacts and rebuilding build/audit"
         )
-        return existing
 
     analysis_path = root / NATIVE_INT8_ANALYSIS_FILE
     if "analyze" in stages:
@@ -1031,6 +1071,9 @@ def build_native_int8(
     except ImportError as exc:
         raise RuntimeError("native INT8 graph build requires safetensors") from exc
     packed_tensors = load_file(str(root / NATIVE_INT8_PACKED_WEIGHTS_FILE))
+    int8_slots = {
+        int(value["index"]) for value in analysis["int8_cache_slots"]
+    }
     graph_records: dict[str, Any] = {}
     plan_records: dict[str, Any] = {}
     stable_cache = root / NATIVE_INT8_TIMING_CACHE_FILE
@@ -1045,6 +1088,24 @@ def build_native_int8(
             for kind in _KINDS
         )
     )
+    if reuse_built_plans:
+        try:
+            for kind in _KINDS:
+                existing_io, _ = _load_plan(
+                    trt=trt,
+                    plan_path=root / NATIVE_INT8_PLAN_FILES[kind],
+                )
+                _validate_native_cache_io_formats(
+                    records=existing_io,
+                    kind=kind,
+                    int8_slots=int8_slots,
+                )
+        except (RuntimeError, ValueError) as exc:
+            print(
+                "Existing native INT8 plans cannot be resumed under the "
+                f"CDHW32 network-I/O contract: {exc}"
+            )
+            reuse_built_plans = False
     if "build" in stages and not reuse_built_plans:
         _mark_stage(root=root, state=state, stage="build", status="running")
         try:
@@ -1068,7 +1129,17 @@ def build_native_int8(
                         workspace_gib=workspace_gib,
                         profiling_verbosity="detailed",
                         timing_cache_path=candidate_cache if use_timing_cache else None,
+                        io_tensor_formats=_native_cache_io_format_constraints(
+                            trt=trt,
+                            kind=kind,
+                            int8_slots=int8_slots,
+                        ),
                     )
+                )
+                _validate_native_cache_io_formats(
+                    records=io_contract,
+                    kind=kind,
+                    int8_slots=int8_slots,
                 )
                 if use_timing_cache and candidate_bytes is not None:
                     _write_bytes(candidate_cache, candidate_bytes)
@@ -1115,6 +1186,11 @@ def build_native_int8(
         for kind in _KINDS:
             plan_path = root / NATIVE_INT8_PLAN_FILES[kind]
             io_contract, inspector_json = _load_plan(trt=trt, plan_path=plan_path)
+            _validate_native_cache_io_formats(
+                records=io_contract,
+                kind=kind,
+                int8_slots=int8_slots,
+            )
             inspector_path = root / NATIVE_INT8_INSPECTOR_FILES[kind]
             inspector = json.loads(inspector_json)
             write_json_atomic(inspector_path, inspector)
@@ -1212,6 +1288,7 @@ def build_native_int8(
             "schema_version": NATIVE_INT8_AUDIT_SCHEMA_VERSION,
             "variant": NATIVE_INT8_VARIANT,
             "algorithm": NATIVE_INT8_ALGORITHM,
+            "cache_io_format_contract": _CACHE_IO_FORMAT_CONTRACT,
             "passed": not errors,
             "complete": not errors,
             "errors": errors,
@@ -1252,6 +1329,7 @@ def build_native_int8(
             "schema_version": NATIVE_INT8_SCHEMA_VERSION,
             "variant": NATIVE_INT8_VARIANT,
             "algorithm": NATIVE_INT8_ALGORITHM,
+            "cache_io_format_contract": _CACHE_IO_FORMAT_CONTRACT,
             "identity": identity,
             "base_manifest_sha256": _base_manifest_identity(base_manifest),
             "plugin": plugin_manifest,
