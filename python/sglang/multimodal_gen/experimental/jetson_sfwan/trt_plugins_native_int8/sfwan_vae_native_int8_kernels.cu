@@ -49,6 +49,7 @@ inline std::int64_t sfwan_implicit_gemm_tensor_c_size(
 #include <cutlass/conv/kernel/default_conv2d_fprop_with_broadcast.h>
 #include <cutlass/conv/kernel/implicit_gemm_convolution_with_fused_epilogue.h>
 #include <cutlass/conv/threadblock/conv2d_tile_iterator.h>
+#include <cutlass/conv/threadblock/implicit_gemm_multistage.h>
 #include <cutlass/conv/threadblock/implicit_gemm_pipelined.h>
 #include <cutlass/epilogue/threadblock/default_epilogue_with_broadcast.h>
 #endif
@@ -71,28 +72,48 @@ namespace
 {
 
 #ifdef SFWAN_NATIVE_INT8_V2
-// CUTLASS 57e3cfb selects ImplicitGemmPipelined for the SM87 INT8 kernels
-// used by Native V1.  P2/P3 only replace the A-side activation iterator;
-// every other mainloop policy and transform must remain byte-for-byte the
-// default one.  Rebinding the complete type avoids accidentally mixing the
-// pipelined shared-memory iterators with the incompatible multistage loop.
-template <typename Mma, typename IteratorA>
+// CUTLASS 57e3cfb selects ImplicitGemmPipelined for stage-2 tiles and
+// ImplicitGemmMultistage for stage-3 tiles. P2/P3 only replace the A-side
+// activation iterator; every other mainloop policy and transform must remain
+// byte-for-byte the default one.
+template <typename Mma, typename AccessIteratorA>
 struct SfWanRebindPipelinedIteratorA;
 
 template <typename Shape, typename PreviousIteratorA,
     typename SmemIteratorA, typename IteratorB, typename SmemIteratorB,
     typename ElementC, typename LayoutC, typename Policy,
     typename TransformA, typename TransformB, typename Enable,
-    typename IteratorA>
+    typename AccessIteratorA>
 struct SfWanRebindPipelinedIteratorA<
     cutlass::conv::threadblock::ImplicitGemmPipelined<Shape,
         PreviousIteratorA, SmemIteratorA, IteratorB, SmemIteratorB, ElementC,
         LayoutC, Policy, TransformA, TransformB, Enable>,
-    IteratorA>
+    AccessIteratorA>
 {
+    using IteratorA
+        = cutlass::conv::threadblock::TileIterator<AccessIteratorA>;
     using Type = cutlass::conv::threadblock::ImplicitGemmPipelined<Shape,
         IteratorA, SmemIteratorA, IteratorB, SmemIteratorB, ElementC, LayoutC,
         Policy, TransformA, TransformB, Enable>;
+};
+
+// CUTLASS selects the cp.async multistage mainloop for the stage-3 tile
+// variants. Unlike ImplicitGemmPipelined, that mainloop consumes the access
+// iterator directly rather than through conv::threadblock::TileIterator.
+template <typename Shape, typename PreviousIteratorA,
+    typename SmemIteratorA, cutlass::arch::CacheOperation::Kind CacheOpA,
+    typename IteratorB, typename SmemIteratorB,
+    cutlass::arch::CacheOperation::Kind CacheOpB, typename Policy, int Stages,
+    typename Enable, typename AccessIteratorA>
+struct SfWanRebindPipelinedIteratorA<
+    cutlass::conv::threadblock::ImplicitGemmMultistage<Shape,
+        PreviousIteratorA, SmemIteratorA, CacheOpA, IteratorB, SmemIteratorB,
+        CacheOpB, Policy, Stages, Enable>,
+    AccessIteratorA>
+{
+    using Type = cutlass::conv::threadblock::ImplicitGemmMultistage<Shape,
+        AccessIteratorA, SmemIteratorA, CacheOpA, IteratorB, SmemIteratorB,
+        CacheOpB, Policy, Stages, Enable>;
 };
 
 constexpr int32_t kBaseTileCount = 6;
@@ -820,10 +841,9 @@ cutlass::Status runDirectCausalConv(int8_t const* current,
         typename DefaultIteratorA::Shape, ElementInput, Layout,
         typename DefaultIteratorA::ThreadMap,
         typename DefaultIteratorA::AccessType>;
-    using IteratorA
-        = cutlass::conv::threadblock::TileIterator<AccessIteratorA>;
     using Mma = typename SfWanRebindPipelinedIteratorA<
-        DefaultMma, IteratorA>::Type;
+        DefaultMma, AccessIteratorA>::Type;
+    using IteratorA = typename Mma::IteratorA;
     using Kernel = cutlass::conv::kernel::ImplicitGemmConvolution<Mma,
         typename DefaultKernel::Epilogue, Swizzle,
         cutlass::conv::Operator::kFprop>;
@@ -894,10 +914,9 @@ cutlass::Status runDirectCausalFusedConv(int8_t const* current,
         typename DefaultIteratorA::Shape, ElementInput, Layout,
         typename DefaultIteratorA::ThreadMap,
         typename DefaultIteratorA::AccessType>;
-    using IteratorA
-        = cutlass::conv::threadblock::TileIterator<AccessIteratorA>;
     using Mma = typename SfWanRebindPipelinedIteratorA<
-        DefaultMma, IteratorA>::Type;
+        DefaultMma, AccessIteratorA>::Type;
+    using IteratorA = typename Mma::IteratorA;
     using StandardEpilogue = typename DefaultKernel::Epilogue;
     using Epilogue = SfWanCutlassResidualEpilogue<
         typename StandardEpilogue::Shape,
