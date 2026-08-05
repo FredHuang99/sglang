@@ -577,7 +577,9 @@ WorkspaceLayout workspaceLayout(SfWanNativeInt8BlockConfig const& config)
     int64_t const h2 = config.outputShape[3];
     int64_t const w2 = config.outputShape[4];
     int64_t const c2 = config.weight2Shape[3];
+#ifndef SFWAN_NATIVE_INT8_V2
     int64_t const k2 = config.weight2Shape[0];
+#endif
     size_t cursor = 0;
 #ifdef SFWAN_NATIVE_INT8_V2
     int32_t const level = config.tile1 / kBaseTileCount + 1;
@@ -808,8 +810,10 @@ extern "C" int32_t sfwanNativeInt8LaunchResidualBlock(
     auto* accumulator1
         = reinterpret_cast<int32_t*>(bytes + layout.accumulator1Offset);
     auto* window2 = reinterpret_cast<int8_t*>(bytes + layout.window2Offset);
+#ifndef SFWAN_NATIVE_INT8_V2
     auto* accumulator2
         = reinterpret_cast<int32_t*>(bytes + layout.accumulator2Offset);
+#endif
     void* cutlassWorkspace = bytes + layout.cutlassOffset;
     int32_t const n = config->inputShape[0];
     int32_t const c1 = config->inputShape[1];
