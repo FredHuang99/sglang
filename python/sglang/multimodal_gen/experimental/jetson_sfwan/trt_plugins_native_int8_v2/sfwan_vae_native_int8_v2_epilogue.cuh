@@ -9,7 +9,6 @@
 #include <cutlass/epilogue/threadblock/epilogue_with_broadcast.h>
 #include <cutlass/matrix_shape.h>
 #include <cutlass/numeric_conversion.h>
-#include <cutlass/util/integer_subbyte.h>
 
 // P1 keeps the proven Native V1 CUTLASS implicit-GEMM mainloop.  This output
 // operator is deliberately limited to the last step of Conv2: it consumes the
