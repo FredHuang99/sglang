@@ -606,13 +606,19 @@ class SfWanRuntime:
         if self.engine is None:
             return EngineStatus(
                 role=self.config.role,
+                model_loaded=self.model_loaded,
                 waiting_count=0,
                 waiting_ids=[],
                 running_ids=[],
                 contract=contract,
             )
         snapshot = self.engine.snapshot()
-        return snapshot.model_copy(update={"contract": contract})
+        return snapshot.model_copy(
+            update={
+                "model_loaded": self.model_loaded,
+                "contract": contract,
+            }
+        )
 
     def _cleanup_shm_region(self, request_id: str) -> None:
         region = self._shm_regions.pop(request_id, None)

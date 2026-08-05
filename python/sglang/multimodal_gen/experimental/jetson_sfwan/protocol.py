@@ -330,6 +330,7 @@ class SubmissionResponse(BaseModel):
 
 class EngineStatus(BaseModel):
     role: Literal["monolithic", "dit", "vae"]
+    model_loaded: bool = False
     waiting_count: int
     waiting_ids: list[str]
     running_ids: list[str]
