@@ -307,6 +307,399 @@ public:
     }
 };
 
+template <int32_t Channels, bool InputIsInt8, bool HasCache,
+    int32_t CacheDepth>
+__global__ void entryNormQuantWindowRegisterKernel(void const* input,
+    int8_t const* cache, half const* gamma, int8_t* temporalWindow,
+    int8_t* cacheOutput, float inputScale, float outputScale, int32_t nSize,
+    int32_t depth, int32_t height, int32_t width,
+    int32_t cacheOutputDepth)
+{
+    static_assert(Channels == 96 || Channels == 192 || Channels == 384);
+    static_assert(!HasCache || CacheDepth == 1 || CacheDepth == 2);
+    constexpr int32_t valuesPerLane = Channels / 32;
+    constexpr int32_t warps = 4;
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    int64_t const site = static_cast<int64_t>(blockIdx.x) * warps + warp;
+    int64_t const sites
+        = static_cast<int64_t>(nSize) * depth * height * width;
+    if (site >= sites)
+    {
+        return;
+    }
+
+    int64_t coordinate = site;
+    int32_t const w = coordinate % width;
+    coordinate /= width;
+    int32_t const h = coordinate % height;
+    coordinate /= height;
+    int32_t const d = coordinate % depth;
+    int32_t const n = coordinate / depth;
+    float values[valuesPerLane];
+    float sum = 0.0F;
+#pragma unroll
+    for (int32_t index = 0; index < valuesPerLane; ++index)
+    {
+        int32_t const c = lane + index * 32;
+        float const value = readBlockValue(input, InputIsInt8, inputScale, n,
+            c, d, h, w, Channels, depth, height, width);
+        values[index] = value;
+        sum += value * value;
+    }
+    unsigned int const mask = __activemask();
+#pragma unroll
+    for (int32_t offset = 16; offset; offset >>= 1)
+    {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+    float const factor = sqrtf(static_cast<float>(Channels))
+        / fmaxf(sqrtf(__shfl_sync(mask, sum, 0)), 1.0e-12F);
+    constexpr int32_t foldedChannels = Channels * 3;
+#pragma unroll
+    for (int32_t index = 0; index < valuesPerLane; ++index)
+    {
+        int32_t const c = lane + index * 32;
+        if (d == 0)
+        {
+            for (int32_t outputDepth = 0; outputDepth < depth;
+                 ++outputDepth)
+            {
+#pragma unroll
+                for (int32_t history = 0; history < 3; ++history)
+                {
+                    int32_t const source
+                        = CacheDepth + outputDepth - 2 + history;
+                    if (source < CacheDepth)
+                    {
+                        int8_t value = 0;
+                        if constexpr (HasCache)
+                        {
+                            if (source >= 0)
+                            {
+                                value = cache[cdhw32Offset(n, c, source, h,
+                                    w, Channels, CacheDepth, height, width)];
+                            }
+                        }
+                        temporalWindow[nhwcOffset(n * depth + outputDepth, h,
+                            w, history * Channels + c, height, width,
+                            foldedChannels)] = value;
+                    }
+                }
+            }
+        }
+        float const normalized
+            = values[index] * factor * __half2float(gamma[c]);
+        int8_t const q = quantizeSigned(
+            normalized / (1.0F + expf(-normalized)), outputScale);
+        for (int32_t outputDepth = d;
+             outputDepth < depth && outputDepth <= d + 2; ++outputDepth)
+        {
+            int32_t const history = 2 - (outputDepth - d);
+            temporalWindow[nhwcOffset(n * depth + outputDepth, h, w,
+                history * Channels + c, height, width, foldedChannels)] = q;
+        }
+        int32_t const combinedDepth = CacheDepth + depth;
+        for (int32_t outputIndex = 0; outputIndex < cacheOutputDepth;
+             ++outputIndex)
+        {
+            int32_t const source
+                = combinedDepth - cacheOutputDepth + outputIndex;
+            if (source < CacheDepth && d == 0)
+            {
+                int8_t value = 0;
+                if constexpr (HasCache)
+                {
+                    if (source >= 0)
+                    {
+                        value = cache[cdhw32Offset(n, c, source, h, w,
+                            Channels, CacheDepth, height, width)];
+                    }
+                }
+                cacheOutput[cdhw32Offset(n, c, outputIndex, h, w, Channels,
+                    cacheOutputDepth, height, width)] = value;
+            }
+            if (source - CacheDepth == d)
+            {
+                cacheOutput[cdhw32Offset(n, c, outputIndex, h, w, Channels,
+                    cacheOutputDepth, height, width)] = q;
+            }
+        }
+    }
+}
+
+template <int32_t Channels, bool HasCache, int32_t CacheDepth,
+    bool InputIsFp16>
+__global__ void midNormQuantWindowRegisterKernel(void const* input,
+    float const* weightScale, float const* bias, int8_t const* cache,
+    half const* gamma, int8_t* temporalWindow, int8_t* cacheOutput,
+    float activationScale, float outputScale, int32_t nSize, int32_t depth,
+    int32_t height, int32_t width, int32_t cacheOutputDepth)
+{
+    static_assert(Channels == 96 || Channels == 192 || Channels == 384);
+    static_assert(!HasCache || CacheDepth == 1 || CacheDepth == 2);
+    constexpr int32_t valuesPerLane = Channels / 32;
+    constexpr int32_t warps = 4;
+    int32_t const lane = threadIdx.x & 31;
+    int32_t const warp = threadIdx.x >> 5;
+    int64_t const site = static_cast<int64_t>(blockIdx.x) * warps + warp;
+    int64_t const sites
+        = static_cast<int64_t>(nSize) * depth * height * width;
+    if (site >= sites)
+    {
+        return;
+    }
+
+    int64_t coordinate = site;
+    int32_t const w = coordinate % width;
+    coordinate /= width;
+    int32_t const h = coordinate % height;
+    coordinate /= height;
+    int32_t const d = coordinate % depth;
+    int32_t const n = coordinate / depth;
+    float values[valuesPerLane];
+    float sum = 0.0F;
+#pragma unroll
+    for (int32_t index = 0; index < valuesPerLane; ++index)
+    {
+        int32_t const c = lane + index * 32;
+        int64_t const offset
+            = nhwcOffset(n * depth + d, h, w, c, height, width, Channels);
+        float value;
+        if constexpr (InputIsFp16)
+        {
+            value = __half2float(static_cast<half const*>(input)[offset]);
+        }
+        else
+        {
+            value = static_cast<float>(
+                        static_cast<int32_t const*>(input)[offset])
+                    * activationScale * weightScale[c]
+                + bias[c];
+        }
+        values[index] = value;
+        sum += value * value;
+    }
+    unsigned int const mask = __activemask();
+#pragma unroll
+    for (int32_t offset = 16; offset; offset >>= 1)
+    {
+        sum += __shfl_down_sync(mask, sum, offset);
+    }
+    float const factor = sqrtf(static_cast<float>(Channels))
+        / fmaxf(sqrtf(__shfl_sync(mask, sum, 0)), 1.0e-12F);
+    constexpr int32_t foldedChannels = Channels * 3;
+#pragma unroll
+    for (int32_t index = 0; index < valuesPerLane; ++index)
+    {
+        int32_t const c = lane + index * 32;
+        if (d == 0)
+        {
+            for (int32_t outputDepth = 0; outputDepth < depth;
+                 ++outputDepth)
+            {
+#pragma unroll
+                for (int32_t history = 0; history < 3; ++history)
+                {
+                    int32_t const source
+                        = CacheDepth + outputDepth - 2 + history;
+                    if (source < CacheDepth)
+                    {
+                        int8_t value = 0;
+                        if constexpr (HasCache)
+                        {
+                            if (source >= 0)
+                            {
+                                value = cache[cdhw32Offset(n, c, source, h,
+                                    w, Channels, CacheDepth, height, width)];
+                            }
+                        }
+                        temporalWindow[nhwcOffset(n * depth + outputDepth, h,
+                            w, history * Channels + c, height, width,
+                            foldedChannels)] = value;
+                    }
+                }
+            }
+        }
+        float const normalized
+            = values[index] * factor * __half2float(gamma[c]);
+        int8_t const q = quantizeSigned(
+            normalized / (1.0F + expf(-normalized)), outputScale);
+        for (int32_t outputDepth = d;
+             outputDepth < depth && outputDepth <= d + 2; ++outputDepth)
+        {
+            int32_t const history = 2 - (outputDepth - d);
+            temporalWindow[nhwcOffset(n * depth + outputDepth, h, w,
+                history * Channels + c, height, width, foldedChannels)] = q;
+        }
+        int32_t const combinedDepth = CacheDepth + depth;
+        for (int32_t outputIndex = 0; outputIndex < cacheOutputDepth;
+             ++outputIndex)
+        {
+            int32_t const source
+                = combinedDepth - cacheOutputDepth + outputIndex;
+            if (source < CacheDepth && d == 0)
+            {
+                int8_t value = 0;
+                if constexpr (HasCache)
+                {
+                    if (source >= 0)
+                    {
+                        value = cache[cdhw32Offset(n, c, source, h, w,
+                            Channels, CacheDepth, height, width)];
+                    }
+                }
+                cacheOutput[cdhw32Offset(n, c, outputIndex, h, w, Channels,
+                    cacheOutputDepth, height, width)] = value;
+            }
+            if (source - CacheDepth == d)
+            {
+                cacheOutput[cdhw32Offset(n, c, outputIndex, h, w, Channels,
+                    cacheOutputDepth, height, width)] = q;
+            }
+        }
+    }
+}
+
+template <int32_t Channels, bool InputIsInt8, bool HasCache,
+    int32_t CacheDepth>
+cudaError_t launchEntryWindowRegister(void const* input, int8_t const* cache,
+    half const* gamma, int8_t* temporalWindow, int8_t* cacheOutput,
+    float inputScale, float outputScale, int32_t nSize, int32_t depth,
+    int32_t height, int32_t width, int32_t cacheOutputDepth,
+    cudaStream_t stream)
+{
+    int64_t const sites
+        = static_cast<int64_t>(nSize) * depth * height * width;
+    entryNormQuantWindowRegisterKernel<Channels, InputIsInt8, HasCache,
+        CacheDepth><<<static_cast<int32_t>((sites + 3) / 4), 128, 0, stream>>>(
+        input, cache, gamma, temporalWindow, cacheOutput, inputScale,
+        outputScale, nSize, depth, height, width, cacheOutputDepth);
+    return cudaPeekAtLastError();
+}
+
+template <int32_t Channels, bool InputIsFp16, bool HasCache,
+    int32_t CacheDepth>
+cudaError_t launchMidWindowRegister(void const* input,
+    float const* weightScale, float const* bias, int8_t const* cache,
+    half const* gamma, int8_t* temporalWindow, int8_t* cacheOutput,
+    float activationScale, float outputScale, int32_t nSize, int32_t depth,
+    int32_t height, int32_t width, int32_t cacheOutputDepth,
+    cudaStream_t stream)
+{
+    int64_t const sites
+        = static_cast<int64_t>(nSize) * depth * height * width;
+    midNormQuantWindowRegisterKernel<Channels, HasCache, CacheDepth,
+        InputIsFp16><<<static_cast<int32_t>((sites + 3) / 4), 128, 0, stream>>>(
+        input, weightScale, bias, cache, gamma, temporalWindow, cacheOutput,
+        activationScale, outputScale, nSize, depth, height, width,
+        cacheOutputDepth);
+    return cudaPeekAtLastError();
+}
+
+template <int32_t Channels, bool InputIsInt8>
+cudaError_t dispatchEntryWindowCache(void const* input, int8_t const* cache,
+    half const* gamma, int8_t* temporalWindow, int8_t* cacheOutput,
+    bool hasCache, float inputScale, float outputScale, int32_t nSize,
+    int32_t depth, int32_t height, int32_t width, int32_t cacheDepth,
+    int32_t cacheOutputDepth, cudaStream_t stream)
+{
+    if (!hasCache && cacheDepth == 0)
+        return launchEntryWindowRegister<Channels, InputIsInt8, false, 0>(
+            input, cache, gamma, temporalWindow, cacheOutput, inputScale,
+            outputScale, nSize, depth, height, width, cacheOutputDepth, stream);
+    if (hasCache && cacheDepth == 1)
+        return launchEntryWindowRegister<Channels, InputIsInt8, true, 1>(
+            input, cache, gamma, temporalWindow, cacheOutput, inputScale,
+            outputScale, nSize, depth, height, width, cacheOutputDepth, stream);
+    if (hasCache && cacheDepth == 2)
+        return launchEntryWindowRegister<Channels, InputIsInt8, true, 2>(
+            input, cache, gamma, temporalWindow, cacheOutput, inputScale,
+            outputScale, nSize, depth, height, width, cacheOutputDepth, stream);
+    return cudaErrorInvalidValue;
+}
+
+inline cudaError_t dispatchEntryWindowRegister(void const* input,
+    int8_t const* cache, half const* gamma, int8_t* temporalWindow,
+    int8_t* cacheOutput, bool inputIsInt8, bool hasCache, float inputScale,
+    float outputScale, int32_t nSize, int32_t channels, int32_t depth,
+    int32_t height, int32_t width, int32_t cacheDepth,
+    int32_t cacheOutputDepth, cudaStream_t stream)
+{
+#define SFWAN_ENTRY_CHANNELS(C)                                              \
+    return inputIsInt8                                                      \
+        ? dispatchEntryWindowCache<C, true>(input, cache, gamma,            \
+              temporalWindow, cacheOutput, hasCache, inputScale,            \
+              outputScale, nSize, depth, height, width, cacheDepth,         \
+              cacheOutputDepth, stream)                                     \
+        : dispatchEntryWindowCache<C, false>(input, cache, gamma,           \
+              temporalWindow, cacheOutput, hasCache, inputScale,            \
+              outputScale, nSize, depth, height, width, cacheDepth,         \
+              cacheOutputDepth, stream)
+    switch (channels)
+    {
+    case 96: SFWAN_ENTRY_CHANNELS(96);
+    case 192: SFWAN_ENTRY_CHANNELS(192);
+    case 384: SFWAN_ENTRY_CHANNELS(384);
+    default: return cudaErrorInvalidValue;
+    }
+#undef SFWAN_ENTRY_CHANNELS
+}
+
+template <int32_t Channels, bool InputIsFp16>
+cudaError_t dispatchMidWindowCache(void const* input,
+    float const* weightScale, float const* bias, int8_t const* cache,
+    half const* gamma, int8_t* temporalWindow, int8_t* cacheOutput,
+    bool hasCache, float activationScale, float outputScale, int32_t nSize,
+    int32_t depth, int32_t height, int32_t width, int32_t cacheDepth,
+    int32_t cacheOutputDepth, cudaStream_t stream)
+{
+    if (!hasCache && cacheDepth == 0)
+        return launchMidWindowRegister<Channels, InputIsFp16, false, 0>(input,
+            weightScale, bias, cache, gamma, temporalWindow, cacheOutput,
+            activationScale, outputScale, nSize, depth, height, width,
+            cacheOutputDepth, stream);
+    if (hasCache && cacheDepth == 1)
+        return launchMidWindowRegister<Channels, InputIsFp16, true, 1>(input,
+            weightScale, bias, cache, gamma, temporalWindow, cacheOutput,
+            activationScale, outputScale, nSize, depth, height, width,
+            cacheOutputDepth, stream);
+    if (hasCache && cacheDepth == 2)
+        return launchMidWindowRegister<Channels, InputIsFp16, true, 2>(input,
+            weightScale, bias, cache, gamma, temporalWindow, cacheOutput,
+            activationScale, outputScale, nSize, depth, height, width,
+            cacheOutputDepth, stream);
+    return cudaErrorInvalidValue;
+}
+
+inline cudaError_t dispatchMidWindowRegister(void const* input,
+    float const* weightScale, float const* bias, int8_t const* cache,
+    half const* gamma, int8_t* temporalWindow, int8_t* cacheOutput,
+    bool inputIsFp16, bool hasCache, float activationScale,
+    float outputScale, int32_t nSize, int32_t channels, int32_t depth,
+    int32_t height, int32_t width, int32_t cacheDepth,
+    int32_t cacheOutputDepth, cudaStream_t stream)
+{
+#define SFWAN_MID_CHANNELS(C)                                                \
+    return inputIsFp16                                                      \
+        ? dispatchMidWindowCache<C, true>(input, weightScale, bias, cache,  \
+              gamma, temporalWindow, cacheOutput, hasCache,                 \
+              activationScale, outputScale, nSize, depth, height, width,    \
+              cacheDepth, cacheOutputDepth, stream)                         \
+        : dispatchMidWindowCache<C, false>(input, weightScale, bias, cache, \
+              gamma, temporalWindow, cacheOutput, hasCache,                 \
+              activationScale, outputScale, nSize, depth, height, width,    \
+              cacheDepth, cacheOutputDepth, stream)
+    switch (channels)
+    {
+    case 96: SFWAN_MID_CHANNELS(96);
+    case 192: SFWAN_MID_CHANNELS(192);
+    case 384: SFWAN_MID_CHANNELS(384);
+    default: return cudaErrorInvalidValue;
+    }
+#undef SFWAN_MID_CHANNELS
+}
+
 __global__ void entryNormQuantCompactKernel(void const* input,
     int8_t const* cache, half const* gamma, int8_t* current,
     int8_t* cacheOutput, bool inputIsInt8, bool hasCache, float inputScale,

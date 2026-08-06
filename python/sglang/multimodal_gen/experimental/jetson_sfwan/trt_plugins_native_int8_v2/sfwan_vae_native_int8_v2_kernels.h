@@ -80,10 +80,15 @@ extern "C" int32_t sfwanNativeInt8V2P1KernelContract(
     uint64_t* values, int32_t valueCount);
 
 extern "C" char const* sfwanNativeInt8V2P2Algorithm();
+// P2 values: tensor-core INT8, direct-causal iterator,
+// legacy-direct-causal use, materialized temporal window, entry global loads,
+// mid-accumulator global loads, accumulator1/2 global stores, and fused Conv2.
 extern "C" int32_t sfwanNativeInt8V2P2KernelContract(
     uint64_t* values, int32_t valueCount);
 
 extern "C" char const* sfwanNativeInt8V2P3Algorithm();
+// P3 adds the FP16 Conv1 epilogue contract and persistent-block count while
+// retaining the regular temporal-window CUTLASS mainloop.
 extern "C" int32_t sfwanNativeInt8V2P3KernelContract(
     uint64_t* values, int32_t valueCount);
 

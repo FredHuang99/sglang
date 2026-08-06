@@ -487,19 +487,19 @@ def compare_profile_summaries(
         if server.get("native_int8_v2_accumulator2_workspace_bytes") != 0:
             raise ValueError(f"{label} retained Conv2 accumulator workspace")
         if level in {"p2", "p3"}:
-            if server.get("native_int8_v2_temporal_window_bytes") != 0:
-                raise ValueError(f"{label} retained temporal-window workspace")
-            if server.get("native_int8_v2_direct_causal_iterator") is not True:
-                raise ValueError(f"{label} did not enable direct causal iterator")
+            if int(server.get("native_int8_v2_temporal_window_bytes") or 0) <= 0:
+                raise ValueError(f"{label} has no temporal-window workspace")
+            if server.get("native_int8_v2_direct_causal_iterator") is not False:
+                raise ValueError(f"{label} unexpectedly enabled direct causal iterator")
             if server.get("native_int8_v2_legacy_wmma_used") is not False:
                 raise ValueError(f"{label} still reports the legacy WMMA path")
         if level == "p2":
             if int(server.get("native_int8_v2_accumulator1_workspace_bytes") or 0) <= 0:
                 raise ValueError(f"{label} lost its Conv1 accumulator workspace")
             if server.get("native_int8_v2_algorithm") != (
-                "cutlass_direct_causal_implicit_gemm"
+                "cutlass_windowed_register_producer"
             ):
-                raise ValueError(f"{label} does not use direct causal CUTLASS")
+                raise ValueError(f"{label} does not use the windowed producer")
         if level == "p3":
             if server.get("native_int8_v2_accumulator1_workspace_bytes") != 0:
                 raise ValueError(f"{label} retained Conv1 accumulator workspace")
@@ -508,9 +508,9 @@ def compare_profile_summaries(
             if server.get("native_int8_v2_persistent_block_count") != 0:
                 raise ValueError(f"{label} still reports the legacy persistent WMMA path")
             if server.get("native_int8_v2_algorithm") != (
-                "cutlass_direct_two_conv_pipeline"
+                "cutlass_windowed_conv1_fp16_epilogue"
             ):
-                raise ValueError(f"{label} does not use the CUTLASS two-Conv pipeline")
+                raise ValueError(f"{label} does not use the Conv1 FP16 epilogue")
         if not server.get("native_int8_v2_plugin_sha256"):
             raise ValueError(f"{label} has no plugin SHA")
 

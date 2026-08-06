@@ -48,6 +48,7 @@ from .vae_trt_native_int8_v2 import (
     NATIVE_INT8_V2_PLUGIN_VERSION,
     NATIVE_INT8_V2_P1_ALGORITHM,
     NATIVE_INT8_V2_P1_KERNEL_REVISION,
+    NATIVE_INT8_V2_P1_SCHEMA_VERSION,
     NATIVE_INT8_V2_P2_ALGORITHM,
     NATIVE_INT8_V2_P2_KERNEL_REVISION,
     NATIVE_INT8_V2_P3_ALGORITHM,
@@ -57,6 +58,7 @@ from .vae_trt_native_int8_v2 import (
     NATIVE_INT8_V2_SUBDIRECTORY,
     NATIVE_INT8_V2_VARIANT,
     load_native_int8_v2_manifest,
+    native_int8_v2_level_root,
     rewrite_native_int8_v2_graph,
     validate_native_int8_v2_manifest,
 )
@@ -102,7 +104,7 @@ def _copy_verified(source: Path, destination: Path) -> None:
 
 
 def _load_state(root: Path, identity: Mapping[str, Any], resume: bool) -> dict[str, Any]:
-    path = root / "build_state.json"
+    path = root / "build_state_windowed_v3.json"
     fresh = {
         "schema_version": NATIVE_INT8_V2_SCHEMA_VERSION,
         "variant": NATIVE_INT8_V2_VARIANT,
@@ -138,7 +140,7 @@ def _load_state(root: Path, identity: Mapping[str, Any], resume: bool) -> dict[s
 
 
 def _save_state(root: Path, state: Mapping[str, Any]) -> None:
-    write_json_atomic(root / "build_state.json", state)
+    write_json_atomic(root / "build_state_windowed_v3.json", state)
 
 
 def _mark(
@@ -246,13 +248,15 @@ def _level_kernel_contract(library: Any, *, level: str) -> dict[str, Any]:
             "keys": (
                 "tensor_core_int8",
                 "direct_causal_iterator",
-                "legacy_direct_wmma",
-                "temporal_window_bytes",
+                "legacy_direct_causal_used",
+                "temporal_window_materialized",
+                "entry_value_global_loads",
+                "mid_accumulator_global_loads",
                 "accumulator1_global_store",
                 "accumulator2_global_store",
                 "conv2_fused_residual_epilogue",
             ),
-            "expected": (True, True, False, 0, True, False, True),
+            "expected": (True, False, False, True, 1, 1, True, False, True),
         },
         "p3": {
             "algorithm_symbol": "sfwanNativeInt8V2P3Algorithm",
@@ -261,16 +265,22 @@ def _level_kernel_contract(library: Any, *, level: str) -> dict[str, Any]:
             "revision": NATIVE_INT8_V2_P3_KERNEL_REVISION,
             "keys": (
                 "tensor_core_int8",
-                "legacy_persistent_wmma",
                 "direct_causal_iterator",
-                "temporal_window_bytes",
+                "legacy_persistent_wmma",
+                "temporal_window_materialized",
+                "entry_value_global_loads",
+                "mid_value_global_loads",
                 "accumulator1_global_store",
                 "accumulator2_global_store",
                 "conv1_output_dtype_fp16",
                 "conv1_fused_dequant_bias",
                 "conv2_fused_residual_epilogue",
+                "persistent_block_count",
             ),
-            "expected": (True, False, True, 0, False, False, True, True, True),
+            "expected": (
+                True, False, False, True, 1, 1, False, False, True, True,
+                True, 0,
+            ),
         },
     }[level]
     algorithm = getattr(library, specifications["algorithm_symbol"], None)
@@ -287,7 +297,11 @@ def _level_kernel_contract(library: Any, *, level: str) -> dict[str, Any]:
         raise RuntimeError(f"Native INT8 V2 plugin rejected the {level} contract")
     converted: list[Any] = []
     for key, value in zip(specifications["keys"], values):
-        converted.append(int(value) if key.endswith("_bytes") else bool(value))
+        converted.append(
+            int(value)
+            if key.endswith(("_bytes", "_loads", "_count"))
+            else bool(value)
+        )
     result = dict(zip(specifications["keys"], converted))
     expected = dict(zip(specifications["keys"], specifications["expected"]))
     if actual_algorithm != specifications["algorithm"] or result != expected:
@@ -457,7 +471,12 @@ def _rebind_existing_level(
             f"{level} compatible rebind rejected an incomplete old manifest"
         )
     if (
-        old.get("schema_version") != NATIVE_INT8_V2_SCHEMA_VERSION
+        old.get("schema_version")
+        != (
+            NATIVE_INT8_V2_P1_SCHEMA_VERSION
+            if level == "p1"
+            else NATIVE_INT8_V2_SCHEMA_VERSION
+        )
         or old.get("variant") != NATIVE_INT8_V2_VARIANT
         or old.get("level") != level
         or old.get("base_native_int8_v1_identity") != _identity(v1_manifest)
@@ -660,7 +679,7 @@ def _build_level(
     trt: Any,
     resume: bool,
 ) -> dict[str, Any]:
-    level_root = root / level
+    level_root = native_int8_v2_level_root(base_root, level=level)
     level_root.mkdir(parents=True, exist_ok=True)
     existing_manifest = level_root / _LEVEL_FILES["manifest"]
     if level == "p3" and existing_manifest.is_file() and not resume:
@@ -676,7 +695,7 @@ def _build_level(
                 verify_hashes=True,
             )
         except ValueError:
-            if level in {"p1", "p2"}:
+            if level == "p1":
                 return _rebind_existing_level(
                     level=level,
                     level_root=level_root,
@@ -752,8 +771,8 @@ def _build_level(
         errors.append("V2 did not audit all 84 residual-block calls")
     if workspace["accumulator2_workspace_bytes"] != 0:
         errors.append("Conv2 accumulator workspace is nonzero")
-    if level in {"p2", "p3"} and workspace["temporal_window_bytes"] != 0:
-        errors.append("temporal-window workspace is nonzero")
+    if level in {"p2", "p3"} and workspace["temporal_window_bytes"] <= 0:
+        errors.append("temporal-window workspace is missing")
     if level == "p3" and workspace["accumulator1_workspace_bytes"] != 0:
         errors.append("Conv1 accumulator workspace is nonzero")
     if level == "p2" and workspace["accumulator1_workspace_bytes"] <= 0:
@@ -811,7 +830,7 @@ def _build_level(
         "temporal_window_bytes": workspace["temporal_window_bytes"],
         "conv1_mid_workspace_bytes": workspace["conv1_mid_workspace_bytes"],
         "max_plugin_workspace_bytes": workspace["max_plugin_workspace_bytes"],
-        "direct_causal_iterator": level in {"p2", "p3"},
+        "direct_causal_iterator": False,
         "persistent_block_count": workspace["persistent_block_count"],
         "residual_epilogue_kernel_present": False,
         "native_int8_v2_algorithm": algorithm,
@@ -865,7 +884,11 @@ def _build_level(
         for kind in _KINDS
     }
     manifest = {
-        "schema_version": NATIVE_INT8_V2_SCHEMA_VERSION,
+        "schema_version": (
+            NATIVE_INT8_V2_P1_SCHEMA_VERSION
+            if level == "p1"
+            else NATIVE_INT8_V2_SCHEMA_VERSION
+        ),
         "variant": NATIVE_INT8_V2_VARIANT,
         "level": level,
         "base_native_int8_v1_identity": _identity(v1_manifest),
@@ -875,14 +898,22 @@ def _build_level(
         "cache": dict(v1_manifest["cache"]),
         "weights": {
             **dict(v1_manifest["weights"]),
-            "file": "../packed_weights.safetensors",
+            "file": (
+                "../packed_weights.safetensors"
+                if level == "p1"
+                else "../../packed_weights.safetensors"
+            ),
         },
         "scales": {
             **dict(v1_manifest["scales"]),
-            "file": "../scales.json",
+            "file": "../scales.json" if level == "p1" else "../../scales.json",
         },
         "kernel_catalog": {
-            "file": "../kernel_catalog.json",
+            "file": (
+                "../kernel_catalog.json"
+                if level == "p1"
+                else "../../kernel_catalog.json"
+            ),
             "level_offset": NATIVE_INT8_V2_LEVEL_OFFSETS[level],
             "kernel_tile_map": {
                 signature: int(tile) + NATIVE_INT8_V2_LEVEL_OFFSETS[level]
@@ -1007,12 +1038,16 @@ def build_native_int8_v2(
             },
             "p2": {
                 "conv2_fused_residual_epilogue": True,
-                "direct_causal_iterator": True,
+                "direct_causal_iterator": False,
+                "register_reuse_producer": True,
+                "temporal_window_materialized": True,
                 "persistent_two_conv_block": False,
             },
             "p3": {
                 "conv2_fused_residual_epilogue": True,
-                "direct_causal_iterator": True,
+                "direct_causal_iterator": False,
+                "register_reuse_producer": True,
+                "temporal_window_materialized": True,
                 "persistent_two_conv_block": False,
                 "conv1_fused_fp16_epilogue": True,
             },
@@ -1115,7 +1150,10 @@ def build_native_int8_v2(
                 state,
                 current,
                 "completed",
-                manifest_sha256=sha256_file(root / current / "manifest.json"),
+                manifest_sha256=sha256_file(
+                    native_int8_v2_level_root(base_root, level=current)
+                    / "manifest.json"
+                ),
             )
         except BaseException as exc:
             _mark(root, state, current, "failed", error=f"{type(exc).__name__}: {exc}")

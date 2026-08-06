@@ -1220,22 +1220,27 @@ class TensorRTVaeRuntime:
             "p2": (
                 "tensor_core_int8",
                 "direct_causal_iterator",
-                "legacy_direct_wmma",
-                "temporal_window_bytes",
+                "legacy_direct_causal_used",
+                "temporal_window_materialized",
+                "entry_value_global_loads",
+                "mid_accumulator_global_loads",
                 "accumulator1_global_store",
                 "accumulator2_global_store",
                 "conv2_fused_residual_epilogue",
             ),
             "p3": (
                 "tensor_core_int8",
-                "legacy_persistent_wmma",
                 "direct_causal_iterator",
-                "temporal_window_bytes",
+                "legacy_persistent_wmma",
+                "temporal_window_materialized",
+                "entry_value_global_loads",
+                "mid_value_global_loads",
                 "accumulator1_global_store",
                 "accumulator2_global_store",
                 "conv1_output_dtype_fp16",
                 "conv1_fused_dequant_bias",
                 "conv2_fused_residual_epilogue",
+                "persistent_block_count",
             ),
         }[level]
         try:
@@ -1262,7 +1267,7 @@ class TensorRTVaeRuntime:
         observed = {
             key: (
                 int(value)
-                if key.endswith("_bytes")
+                if key.endswith(("_bytes", "_loads", "_count"))
                 else bool(value)
             )
             for key, value in zip(value_keys, values)
@@ -1301,20 +1306,20 @@ class TensorRTVaeRuntime:
             )
         elif self.variant == "native_int8_v2" and self.native_int8_v2_level == "p2":
             stage_names = (
-                "entry_norm_silu_quant_cache_ms",
-                "direct_cutlass_conv1_ms",
-                "mid_norm_silu_quant_cache_ms",
-                "direct_cutlass_conv2_fused_residual_ms",
+                "entry_register_norm_silu_quant_window_cache_ms",
+                "cutlass_conv1_int32_ms",
+                "mid_register_norm_silu_quant_window_cache_ms",
+                "cutlass_conv2_fused_residual_ms",
                 "reserved_fused_stage_ms",
                 "group_exit_ms",
                 "residual_block_total_ms",
             )
         elif self.variant == "native_int8_v2":
             stage_names = (
-                "entry_norm_silu_quant_cache_ms",
-                "direct_cutlass_conv1_fp16_epilogue_ms",
-                "mid_fp16_norm_silu_quant_cache_ms",
-                "direct_cutlass_conv2_fused_residual_ms",
+                "entry_register_norm_silu_quant_window_cache_ms",
+                "cutlass_conv1_fp16_epilogue_ms",
+                "mid_fp16_register_norm_silu_quant_window_cache_ms",
+                "cutlass_conv2_fused_residual_ms",
                 "reserved_fused_stage_ms",
                 "group_exit_ms",
                 "residual_block_total_ms",

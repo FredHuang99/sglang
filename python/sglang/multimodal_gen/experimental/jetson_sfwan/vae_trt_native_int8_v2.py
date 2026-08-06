@@ -19,8 +19,10 @@ from .vae_trt_native_int8 import (
 )
 
 NATIVE_INT8_V2_VARIANT = "native_int8_v2"
-NATIVE_INT8_V2_SCHEMA_VERSION = 2
+NATIVE_INT8_V2_SCHEMA_VERSION = 3
+NATIVE_INT8_V2_P1_SCHEMA_VERSION = 2
 NATIVE_INT8_V2_SUBDIRECTORY = "native_int8_v2"
+NATIVE_INT8_V2_WINDOWED_SUBDIRECTORY = "windowed_v3"
 NATIVE_INT8_V2_LEVELS = ("p1", "p2", "p3")
 NATIVE_INT8_V2_PLUGIN_LIBRARY_FILE = "libsfwan_vae_native_int8_v2.so"
 NATIVE_INT8_V2_PLUGIN_NAME = "SfWanNativeInt8V2ResidualBlockPlugin"
@@ -31,10 +33,10 @@ NATIVE_INT8_V2_CUTLASS_COMMIT = "57e3cfb47a2d9e0d46eb6335c3dc411498efa198"
 NATIVE_INT8_V2_LEVEL_OFFSETS = {"p1": 0, "p2": 6, "p3": 12}
 NATIVE_INT8_V2_P1_ALGORITHM = "cutlass_implicit_gemm_fused_epilogue"
 NATIVE_INT8_V2_P1_KERNEL_REVISION = "cutlass_fused_epilogue_v2"
-NATIVE_INT8_V2_P2_ALGORITHM = "cutlass_direct_causal_implicit_gemm"
-NATIVE_INT8_V2_P2_KERNEL_REVISION = "cutlass_direct_causal_v1"
-NATIVE_INT8_V2_P3_ALGORITHM = "cutlass_direct_two_conv_pipeline"
-NATIVE_INT8_V2_P3_KERNEL_REVISION = "cutlass_two_conv_pipeline_v1"
+NATIVE_INT8_V2_P2_ALGORITHM = "cutlass_windowed_register_producer"
+NATIVE_INT8_V2_P2_KERNEL_REVISION = "windowed_register_producer_v1"
+NATIVE_INT8_V2_P3_ALGORITHM = "cutlass_windowed_conv1_fp16_epilogue"
+NATIVE_INT8_V2_P3_KERNEL_REVISION = "windowed_conv1_fp16_epilogue_v1"
 NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION = 1
 
 
@@ -52,6 +54,25 @@ def _identity(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+
+
+def native_int8_v2_level_root(engine_dir: str | Path, *, level: str) -> Path:
+    if level not in NATIVE_INT8_V2_LEVELS:
+        raise ValueError(f"unsupported Native INT8 V2 level: {level}")
+    root = (
+        Path(engine_dir).expanduser().resolve() / NATIVE_INT8_V2_SUBDIRECTORY
+    )
+    if level == "p1":
+        return root / level
+    return root / NATIVE_INT8_V2_WINDOWED_SUBDIRECTORY / level
+
+
+def _manifest_schema(level: str) -> int:
+    return (
+        NATIVE_INT8_V2_P1_SCHEMA_VERSION
+        if level == "p1"
+        else NATIVE_INT8_V2_SCHEMA_VERSION
+    )
 
 
 def rewrite_native_int8_v2_graph(
@@ -111,7 +132,7 @@ def rewrite_native_int8_v2_graph(
     onnx.save(model, str(temporary))
     temporary.replace(destination)
     return {
-        "schema_version": NATIVE_INT8_V2_SCHEMA_VERSION,
+        "schema_version": _manifest_schema(level),
         "variant": NATIVE_INT8_V2_VARIANT,
         "level": level,
         "source": str(source),
@@ -129,12 +150,7 @@ def load_native_int8_v2_manifest(
 ) -> dict[str, Any]:
     if level not in NATIVE_INT8_V2_LEVELS:
         raise ValueError(f"unsupported Native INT8 V2 level: {level}")
-    path = (
-        Path(engine_dir).expanduser().resolve()
-        / NATIVE_INT8_V2_SUBDIRECTORY
-        / level
-        / "manifest.json"
-    )
+    path = native_int8_v2_level_root(engine_dir, level=level) / "manifest.json"
     if not path.is_file():
         raise ValueError(f"Native INT8 V2 {level} manifest does not exist: {path}")
     return _load_json(path, label=f"Native INT8 V2 {level} manifest")
@@ -153,7 +169,7 @@ def validate_native_int8_v2_manifest(
     if level not in NATIVE_INT8_V2_LEVELS:
         raise ValueError(f"unsupported Native INT8 V2 level: {level}")
     if (
-        manifest.get("schema_version") != NATIVE_INT8_V2_SCHEMA_VERSION
+        manifest.get("schema_version") != _manifest_schema(level)
         or manifest.get("variant") != NATIVE_INT8_V2_VARIANT
         or manifest.get("level") != level
     ):
@@ -162,7 +178,7 @@ def validate_native_int8_v2_manifest(
         Path(engine_dir).expanduser().resolve()
         / NATIVE_INT8_V2_SUBDIRECTORY
     )
-    level_root = root / level
+    level_root = native_int8_v2_level_root(engine_dir, level=level)
     v1_manifest = load_native_int8_manifest(engine_dir)
     v1_validated = validate_native_int8_manifest(
         v1_manifest,
@@ -201,14 +217,12 @@ def validate_native_int8_v2_manifest(
         "p1": {"accumulator2_workspace_bytes": 0, "direct_causal_iterator": False},
         "p2": {
             "accumulator2_workspace_bytes": 0,
-            "temporal_window_bytes": 0,
-            "direct_causal_iterator": True,
+            "direct_causal_iterator": False,
         },
         "p3": {
             "accumulator1_workspace_bytes": 0,
             "accumulator2_workspace_bytes": 0,
-            "temporal_window_bytes": 0,
-            "direct_causal_iterator": True,
+            "direct_causal_iterator": False,
             "persistent_block_count": 0,
         },
     }[level]
@@ -230,6 +244,8 @@ def validate_native_int8_v2_manifest(
         raise ValueError("Native INT8 V2 P2 lost its Conv1 accumulator workspace")
     if level == "p3" and int(audit.get("conv1_mid_workspace_bytes", 0)) <= 0:
         raise ValueError("Native INT8 V2 P3 has no FP16 Conv1-mid workspace")
+    if level in {"p2", "p3"} and int(audit.get("temporal_window_bytes", 0)) <= 0:
+        raise ValueError(f"Native INT8 V2 {level} has no temporal-window workspace")
     if level == "p1":
         contract = audit.get("p1_kernel_contract")
         expected_contract = {
@@ -257,9 +273,11 @@ def validate_native_int8_v2_manifest(
                 NATIVE_INT8_V2_P2_KERNEL_REVISION,
                 {
                     "tensor_core_int8": True,
-                    "direct_causal_iterator": True,
-                    "legacy_direct_wmma": False,
-                    "temporal_window_bytes": 0,
+                    "direct_causal_iterator": False,
+                    "legacy_direct_causal_used": False,
+                    "temporal_window_materialized": True,
+                    "entry_value_global_loads": 1,
+                    "mid_accumulator_global_loads": 1,
                     "accumulator1_global_store": True,
                     "accumulator2_global_store": False,
                     "conv2_fused_residual_epilogue": True,
@@ -270,14 +288,17 @@ def validate_native_int8_v2_manifest(
                 NATIVE_INT8_V2_P3_KERNEL_REVISION,
                 {
                     "tensor_core_int8": True,
+                    "direct_causal_iterator": False,
                     "legacy_persistent_wmma": False,
-                    "direct_causal_iterator": True,
-                    "temporal_window_bytes": 0,
+                    "temporal_window_materialized": True,
+                    "entry_value_global_loads": 1,
+                    "mid_value_global_loads": 1,
                     "accumulator1_global_store": False,
                     "accumulator2_global_store": False,
                     "conv1_output_dtype_fp16": True,
                     "conv1_fused_dequant_bias": True,
                     "conv2_fused_residual_epilogue": True,
+                    "persistent_block_count": 0,
                 },
             ),
         }
@@ -346,11 +367,14 @@ __all__ = [
     "NATIVE_INT8_V2_PLUGIN_VERSION",
     "NATIVE_INT8_V2_P1_ALGORITHM",
     "NATIVE_INT8_V2_P1_KERNEL_REVISION",
+    "NATIVE_INT8_V2_P1_SCHEMA_VERSION",
     "NATIVE_INT8_V2_SCHEMA_VERSION",
     "NATIVE_INT8_V2_SERIALIZATION_ABI_REVISION",
     "NATIVE_INT8_V2_SUBDIRECTORY",
+    "NATIVE_INT8_V2_WINDOWED_SUBDIRECTORY",
     "NATIVE_INT8_V2_VARIANT",
     "load_native_int8_v2_manifest",
+    "native_int8_v2_level_root",
     "rewrite_native_int8_v2_graph",
     "validate_native_int8_v2_manifest",
 ]
