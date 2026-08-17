@@ -9,6 +9,7 @@ import json
 import os
 import pprint
 import random
+import re
 import signal
 import socket
 import subprocess
@@ -31,6 +32,9 @@ NUM_WARMUP_RUNS = 2
 EXPECTED_MAX_MODEL_LEN = 32768
 FORCED_SERVER_ENVIRONMENT = {"SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0"}
 REMOVED_SERVER_ENVIRONMENT = ("SGLANG_USE_JIT_ALL_REDUCE",)
+ALL_REDUCE_MODES = ("legacy_v1", "nccl")
+PROMPT_TOKENS_PATTERN = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
+COMPLETION_TOKENS_PATTERN = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
 IO_MATRIX = {
     128: (512, 2048),
     256: (256, 1920),
@@ -186,11 +190,20 @@ def prepare_output_directory(path: Path) -> None:
     path.mkdir(parents=True)
 
 
-def build_server_environment() -> dict[str, str]:
+def build_server_environment(all_reduce_mode: str = "legacy_v1") -> dict[str, str]:
+    if all_reduce_mode not in ALL_REDUCE_MODES:
+        raise ValueError(
+            f"Unsupported all-reduce mode {all_reduce_mode!r}; "
+            f"expected one of {ALL_REDUCE_MODES}"
+        )
     environment = os.environ.copy()
     for name in REMOVED_SERVER_ENVIRONMENT:
         environment.pop(name, None)
-    environment.update(FORCED_SERVER_ENVIRONMENT)
+    if all_reduce_mode == "legacy_v1":
+        environment.update(FORCED_SERVER_ENVIRONMENT)
+    else:
+        for name in FORCED_SERVER_ENVIRONMENT:
+            environment.pop(name, None)
     return environment
 
 
@@ -217,9 +230,20 @@ def base_url(host: str, port: int) -> str:
 
 
 def build_server_command(
-    model_path: Path, served_model_name: str, host: str, port: int, tp_size: int
+    model_path: Path,
+    served_model_name: str,
+    host: str,
+    port: int,
+    tp_size: int,
+    incremental_streaming_output: bool = True,
+    all_reduce_mode: str = "legacy_v1",
 ) -> list[str]:
-    return [
+    if all_reduce_mode not in ALL_REDUCE_MODES:
+        raise ValueError(
+            f"Unsupported all-reduce mode {all_reduce_mode!r}; "
+            f"expected one of {ALL_REDUCE_MODES}"
+        )
+    command = [
         sys.executable,
         "-m",
         "sglang.launch_server",
@@ -245,18 +269,22 @@ def build_server_command(
         "full",
         "--cuda-graph-backend-prefill",
         "disabled",
-        "--incremental-streaming-output",
     ]
+    if incremental_streaming_output:
+        command.append("--incremental-streaming-output")
+    if all_reduce_mode == "nccl":
+        command.append("--disable-custom-all-reduce")
+    return command
 
 
 def start_server(
-    command: list[str], log_path: Path
+    command: list[str], log_path: Path, all_reduce_mode: str = "legacy_v1"
 ) -> tuple[subprocess.Popen[bytes], Any]:
     log_file = log_path.open("wb")
     kwargs: dict[str, Any] = {
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
-        "env": build_server_environment(),
+        "env": build_server_environment(all_reduce_mode),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
@@ -361,22 +389,32 @@ def validate_server_log(
     model_path: Path,
     tp_size: int,
     require_decode_execution: bool = False,
+    incremental_streaming_output: bool = True,
+    all_reduce_mode: str = "legacy_v1",
 ) -> dict[str, Any]:
+    if all_reduce_mode not in ALL_REDUCE_MODES:
+        raise ValueError(
+            f"Unsupported all-reduce mode {all_reduce_mode!r}; "
+            f"expected one of {ALL_REDUCE_MODES}"
+        )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
     required_markers = [
         f"model_path='{model_path}'",
         f"tp_size={tp_size}",
-        "incremental_streaming_output=True",
+        f"incremental_streaming_output={incremental_streaming_output}",
         "attention_backend='flashinfer'",
         "cuda_graph_backend_decode='full'",
         "cuda_graph_backend_prefill='disabled'",
-        "disable_custom_all_reduce=False",
         f"type={EXPECTED_ARCHITECTURE}",
         "Disable prefill CUDA graph because",
         "Capture target decode CUDA graph end.",
     ]
-    if tp_size > 1:
-        required_markers.append(" cuda graph addresses")
+    if all_reduce_mode == "legacy_v1":
+        required_markers.append("disable_custom_all_reduce=False")
+        if tp_size > 1:
+            required_markers.append(" cuda graph addresses")
+    else:
+        required_markers.append("disable_custom_all_reduce=True")
     if require_decode_execution:
         required_markers.append("cuda graph: True")
 
@@ -384,9 +422,12 @@ def validate_server_log(
         "Setup Custom allreduce failed",
         "sgl_kernel_jit_cuda_ipc",
         "custom_all_reduce_v2",
-        "All-reduce call path: NCCL (custom AR disabled)",
         "Capture cuda graph failed",
     ]
+    if all_reduce_mode == "legacy_v1":
+        forbidden_markers.append("All-reduce call path: NCCL (custom AR disabled)")
+    else:
+        forbidden_markers.append(" cuda graph addresses")
     missing = [marker for marker in required_markers if marker not in log_text]
     present_forbidden = [
         marker for marker in forbidden_markers if marker in log_text
@@ -400,7 +441,7 @@ def validate_server_log(
     return {
         "required_markers": required_markers,
         "forbidden_markers_absent": forbidden_markers,
-        "custom_all_reduce": "legacy_v1",
+        "all_reduce_mode": all_reduce_mode,
         "attention_backend": "flashinfer",
         "decode_cuda_graph_backend": "full",
         "prefill_cuda_graph_backend": "disabled",
@@ -471,19 +512,19 @@ def measure_request(
             body = line[len(b"data:") :].strip()
             if body == b"[DONE]":
                 break
-            event = json.loads(body)
-            meta_info = event.get("meta_info") or {}
-            event_prompt_tokens = meta_info.get("prompt_tokens")
-            if isinstance(event_prompt_tokens, int):
+            prompt_match = PROMPT_TOKENS_PATTERN.search(body)
+            if prompt_match is not None:
+                event_prompt_tokens = int(prompt_match.group(1))
                 if prompt_tokens is None:
                     prompt_tokens = event_prompt_tokens
                 elif event_prompt_tokens != prompt_tokens:
                     raise RuntimeError(
                         "prompt_tokens changed during the streaming response"
                     )
-            event_completion_tokens = meta_info.get("completion_tokens")
-            if not isinstance(event_completion_tokens, int):
+            completion_match = COMPLETION_TOKENS_PATTERN.search(body)
+            if completion_match is None:
                 continue
+            event_completion_tokens = int(completion_match.group(1))
             if event_completion_tokens < completion_tokens:
                 raise RuntimeError(
                     "completion_tokens decreased during the streaming response"
@@ -597,7 +638,8 @@ def main() -> None:
         "timing_semantics": (
             "TTFT is request start to receipt of the first raw SSE token line; "
             "TPOT is (last token line receipt - first token line receipt) / "
-            "(OSL - 1). JSON parsing is outside token receipt timestamps."
+            "(OSL - 1). Token counts are extracted directly from raw SSE bytes "
+            "without materializing the response JSON."
         ),
         "radix_cache_control": (
             "Every request within a TP run has a distinct deterministic first "
