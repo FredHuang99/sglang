@@ -33,6 +33,8 @@ EXPECTED_MAX_MODEL_LEN = 32768
 FORCED_SERVER_ENVIRONMENT = {"SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0"}
 REMOVED_SERVER_ENVIRONMENT = ("SGLANG_USE_JIT_ALL_REDUCE",)
 ALL_REDUCE_MODES = ("legacy_v1", "nccl")
+ATTENTION_BACKEND_MODES = ("auto", "flashinfer", "triton")
+DECODE_CUDA_GRAPH_BACKENDS = ("full", "disabled")
 PROMPT_TOKENS_PATTERN = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
 COMPLETION_TOKENS_PATTERN = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
 IO_MATRIX = {
@@ -237,11 +239,24 @@ def build_server_command(
     tp_size: int,
     incremental_streaming_output: bool = True,
     all_reduce_mode: str = "legacy_v1",
+    attention_backend: str = "flashinfer",
+    decode_cuda_graph_backend: str = "full",
+    server_random_seed: int | None = None,
 ) -> list[str]:
     if all_reduce_mode not in ALL_REDUCE_MODES:
         raise ValueError(
             f"Unsupported all-reduce mode {all_reduce_mode!r}; "
             f"expected one of {ALL_REDUCE_MODES}"
+        )
+    if attention_backend not in ATTENTION_BACKEND_MODES:
+        raise ValueError(
+            f"Unsupported attention backend {attention_backend!r}; "
+            f"expected one of {ATTENTION_BACKEND_MODES}"
+        )
+    if decode_cuda_graph_backend not in DECODE_CUDA_GRAPH_BACKENDS:
+        raise ValueError(
+            f"Unsupported decode CUDA graph backend {decode_cuda_graph_backend!r}; "
+            f"expected one of {DECODE_CUDA_GRAPH_BACKENDS}"
         )
     command = [
         sys.executable,
@@ -263,13 +278,15 @@ def build_server_command(
         "--mem-fraction-static",
         "0.9",
         "--skip-server-warmup",
-        "--attention-backend",
-        "flashinfer",
         "--cuda-graph-backend-decode",
-        "full",
+        decode_cuda_graph_backend,
         "--cuda-graph-backend-prefill",
         "disabled",
     ]
+    if attention_backend != "auto":
+        command.extend(["--attention-backend", attention_backend])
+    if server_random_seed is not None:
+        command.extend(["--random-seed", str(server_random_seed)])
     if incremental_streaming_output:
         command.append("--incremental-streaming-output")
     if all_reduce_mode == "nccl":
@@ -391,32 +408,66 @@ def validate_server_log(
     require_decode_execution: bool = False,
     incremental_streaming_output: bool = True,
     all_reduce_mode: str = "legacy_v1",
+    attention_backend: str = "flashinfer",
+    decode_cuda_graph_backend: str = "full",
 ) -> dict[str, Any]:
     if all_reduce_mode not in ALL_REDUCE_MODES:
         raise ValueError(
             f"Unsupported all-reduce mode {all_reduce_mode!r}; "
             f"expected one of {ALL_REDUCE_MODES}"
         )
+    if attention_backend not in ATTENTION_BACKEND_MODES:
+        raise ValueError(
+            f"Unsupported attention backend {attention_backend!r}; "
+            f"expected one of {ATTENTION_BACKEND_MODES}"
+        )
+    if decode_cuda_graph_backend not in DECODE_CUDA_GRAPH_BACKENDS:
+        raise ValueError(
+            f"Unsupported decode CUDA graph backend {decode_cuda_graph_backend!r}; "
+            f"expected one of {DECODE_CUDA_GRAPH_BACKENDS}"
+        )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    resolved_attention_match = re.search(
+        r"attention_backend='([^']+)'", log_text
+    )
+    if resolved_attention_match is None:
+        raise RuntimeError(
+            f"Could not resolve attention_backend from {log_path}\n"
+            f"{read_log_tail(log_path)}"
+        )
+    resolved_attention_backend = resolved_attention_match.group(1)
+    if (
+        attention_backend != "auto"
+        and resolved_attention_backend != attention_backend
+    ):
+        raise RuntimeError(
+            f"Requested attention backend {attention_backend!r}, but the server "
+            f"resolved {resolved_attention_backend!r}.\n{read_log_tail(log_path)}"
+        )
     required_markers = [
         f"model_path='{model_path}'",
         f"tp_size={tp_size}",
         f"incremental_streaming_output={incremental_streaming_output}",
-        "attention_backend='flashinfer'",
-        "cuda_graph_backend_decode='full'",
+        f"attention_backend='{resolved_attention_backend}'",
+        f"cuda_graph_backend_decode='{decode_cuda_graph_backend}'",
         "cuda_graph_backend_prefill='disabled'",
         f"type={EXPECTED_ARCHITECTURE}",
         "Disable prefill CUDA graph because",
-        "Capture target decode CUDA graph end.",
     ]
+    if decode_cuda_graph_backend == "full":
+        required_markers.append("Capture target decode CUDA graph end.")
     if all_reduce_mode == "legacy_v1":
         required_markers.append("disable_custom_all_reduce=False")
-        if tp_size > 1:
+        if tp_size > 1 and decode_cuda_graph_backend == "full":
             required_markers.append(" cuda graph addresses")
     else:
         required_markers.append("disable_custom_all_reduce=True")
     if require_decode_execution:
-        required_markers.append("cuda graph: True")
+        required_markers.append(
+            "cuda graph: True"
+            if decode_cuda_graph_backend == "full"
+            else "cuda graph: False"
+        )
 
     forbidden_markers = [
         "Setup Custom allreduce failed",
@@ -428,6 +479,14 @@ def validate_server_log(
         forbidden_markers.append("All-reduce call path: NCCL (custom AR disabled)")
     else:
         forbidden_markers.append(" cuda graph addresses")
+    if decode_cuda_graph_backend == "disabled":
+        forbidden_markers.append("Capture target decode CUDA graph")
+    if require_decode_execution:
+        forbidden_markers.append(
+            "cuda graph: False"
+            if decode_cuda_graph_backend == "full"
+            else "cuda graph: True"
+        )
     missing = [marker for marker in required_markers if marker not in log_text]
     present_forbidden = [
         marker for marker in forbidden_markers if marker in log_text
@@ -442,8 +501,10 @@ def validate_server_log(
         "required_markers": required_markers,
         "forbidden_markers_absent": forbidden_markers,
         "all_reduce_mode": all_reduce_mode,
-        "attention_backend": "flashinfer",
-        "decode_cuda_graph_backend": "full",
+        "requested_attention_backend": attention_backend,
+        "resolved_attention_backend": resolved_attention_backend,
+        "attention_backend": resolved_attention_backend,
+        "decode_cuda_graph_backend": decode_cuda_graph_backend,
         "prefill_cuda_graph_backend": "disabled",
     }
 
@@ -469,6 +530,7 @@ def measure_request(
     input_ids: list[int],
     output_length: int,
     timeout_s: float,
+    sampling_seed: int | None = None,
 ) -> dict[str, float | int]:
     payload = {
         "input_ids": input_ids,
@@ -479,6 +541,8 @@ def measure_request(
         },
         "stream": True,
     }
+    if sampling_seed is not None:
+        payload["sampling_params"]["sampling_seed"] = sampling_seed
     first_token_ns: int | None = None
     last_token_ns: int | None = None
     prompt_tokens: int | None = None

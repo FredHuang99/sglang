@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run short Hunyuan reprompt streaming and all-reduce latency A/B checks."""
+"""Run controlled Hunyuan reprompt latency root-cause A/B experiments."""
 
 from __future__ import annotations
 
@@ -26,37 +26,83 @@ NUM_RUNS = 5
 NUM_WARMUP_RUNS = 2
 DEFAULT_INPUT_LENGTH = 128
 DEFAULT_OUTPUT_LENGTH = 512
-DECODE_THROUGHPUT_PATTERN = re.compile(
-    r"Decode batch[^\r\n]*gen throughput \(token/s\): ([0-9.]+)"
+DEFAULT_SERVER_RANDOM_SEED = 20260818
+DECODE_STATUS_PATTERN = re.compile(
+    r"Decode batch[^\r\n]*cuda graph: (True|False), "
+    r"gen throughput \(token/s\): ([0-9.]+)"
 )
+
+
+def experiment_config(
+    name: str,
+    tp_size: int,
+    attention_backend: str = "flashinfer",
+    decode_cuda_graph_backend: str = "full",
+    all_reduce_mode: str = "legacy_v1",
+    incremental_streaming_output: bool = True,
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "tp_size": tp_size,
+        "attention_backend": attention_backend,
+        "decode_cuda_graph_backend": decode_cuda_graph_backend,
+        "all_reduce_mode": all_reduce_mode,
+        "incremental_streaming_output": incremental_streaming_output,
+    }
+
+
 EXPERIMENT_CONFIGS = {
     "streaming": (
-        {
-            "name": "tp1_default_stream",
-            "tp_size": 1,
-            "incremental_streaming_output": False,
-            "all_reduce_mode": "legacy_v1",
-        },
-        {
-            "name": "tp1_incremental_stream",
-            "tp_size": 1,
-            "incremental_streaming_output": True,
-            "all_reduce_mode": "legacy_v1",
-        },
+        experiment_config(
+            "tp1_default_stream", 1, incremental_streaming_output=False
+        ),
+        experiment_config("tp1_incremental_stream", 1),
     ),
     "allreduce": (
-        {
-            "name": "tp8_nccl",
-            "tp_size": 8,
-            "incremental_streaming_output": False,
-            "all_reduce_mode": "nccl",
-        },
-        {
-            "name": "tp8_legacy_v1",
-            "tp_size": 8,
-            "incremental_streaming_output": False,
-            "all_reduce_mode": "legacy_v1",
-        },
+        experiment_config("tp8_nccl", 8, all_reduce_mode="nccl"),
+        experiment_config("tp8_legacy_v1", 8),
+    ),
+    "backend_graph": (
+        experiment_config("tp1_auto_full", 1, attention_backend="auto"),
+        experiment_config("tp1_flashinfer_full", 1),
+        experiment_config("tp1_triton_full", 1, attention_backend="triton"),
+        experiment_config(
+            "tp1_flashinfer_eager", 1, decode_cuda_graph_backend="disabled"
+        ),
+        experiment_config(
+            "tp1_triton_eager",
+            1,
+            attention_backend="triton",
+            decode_cuda_graph_backend="disabled",
+        ),
+    ),
+    "tp_stack": (
+        experiment_config("tp1_flashinfer_full", 1),
+        experiment_config("tp1_triton_full", 1, attention_backend="triton"),
+        experiment_config("tp8_flashinfer_full_v1", 8),
+        experiment_config(
+            "tp8_flashinfer_full_nccl", 8, all_reduce_mode="nccl"
+        ),
+        experiment_config(
+            "tp8_flashinfer_eager_v1",
+            8,
+            decode_cuda_graph_backend="disabled",
+        ),
+        experiment_config(
+            "tp8_triton_full_v1", 8, attention_backend="triton"
+        ),
+        experiment_config(
+            "tp8_triton_full_nccl",
+            8,
+            attention_backend="triton",
+            all_reduce_mode="nccl",
+        ),
+        experiment_config(
+            "tp8_triton_eager_v1",
+            8,
+            attention_backend="triton",
+            decode_cuda_graph_backend="disabled",
+        ),
     ),
 }
 
@@ -64,9 +110,9 @@ EXPERIMENT_CONFIGS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run one short 128/512 A/B experiment. The streaming experiment "
-            "compares default versus incremental output on TP1. The allreduce "
-            "experiment compares NCCL versus legacy Custom AllReduce V1 on TP8."
+            "Run a matched-input Hunyuan reprompt latency A/B experiment. "
+            "backend_graph isolates TP1 attention and CUDA Graph behavior; "
+            "tp_stack isolates TP8 attention, graph, and all-reduce behavior."
         )
     )
     parser.add_argument(
@@ -83,8 +129,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-length", type=int, default=DEFAULT_OUTPUT_LENGTH)
     parser.add_argument("--server-timeout-s", type=float, default=1800.0)
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
+    parser.add_argument("--scheduler-log-timeout-s", type=float, default=5.0)
+    parser.add_argument("--scheduler-log-quiet-s", type=float, default=0.25)
     parser.add_argument("--cooldown-s", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--server-random-seed", type=int, default=DEFAULT_SERVER_RANDOM_SEED
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -99,6 +150,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("--output-length must be greater than one")
     if args.server_timeout_s <= 0 or args.request_timeout_s <= 0:
         parser.error("timeouts must be positive")
+    if args.scheduler_log_timeout_s <= 0:
+        parser.error("--scheduler-log-timeout-s must be positive")
+    if args.scheduler_log_quiet_s <= 0:
+        parser.error("--scheduler-log-quiet-s must be positive")
+    if args.scheduler_log_quiet_s >= args.scheduler_log_timeout_s:
+        parser.error(
+            "--scheduler-log-quiet-s must be smaller than "
+            "--scheduler-log-timeout-s"
+        )
     if args.cooldown_s < 0:
         parser.error("--cooldown-s must be non-negative")
     return args
@@ -175,35 +235,115 @@ def system_snapshot() -> dict[str, Any]:
     }
 
 
-def scheduler_decode_metrics(log_path: Path) -> dict[str, float | int]:
-    log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    throughputs = [
-        float(match.group(1))
-        for match in DECODE_THROUGHPUT_PATTERN.finditer(log_text)
-    ]
+def input_ids_sha256(input_ids: list[int]) -> str:
+    return hashlib.sha256(
+        ",".join(str(token_id) for token_id in input_ids).encode("ascii")
+    ).hexdigest()
+
+
+def build_matched_inputs(
+    vocab_size: int,
+    input_length: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    matched_inputs: list[dict[str, Any]] = []
+    for run_index in range(NUM_RUNS):
+        input_seed = seed + run_index
+        first_token_id = (seed + run_index) % vocab_size
+        input_ids = latency.random_input_ids(
+            vocab_size,
+            input_length,
+            input_seed,
+            first_token_id,
+        )
+        matched_inputs.append(
+            {
+                "run": run_index + 1,
+                "seed": input_seed,
+                "sampling_seed": seed + 100_000 + run_index,
+                "first_token_id": first_token_id,
+                "input_ids_sha256": input_ids_sha256(input_ids),
+                "input_ids": input_ids,
+            }
+        )
+    return matched_inputs
+
+
+def read_log_bytes(log_path: Path, start_offset: int, end_offset: int) -> str:
+    with log_path.open("rb") as log_file:
+        log_file.seek(start_offset)
+        return log_file.read(end_offset - start_offset).decode(
+            "utf-8", errors="replace"
+        )
+
+
+def wait_for_request_log_segment(
+    log_path: Path,
+    start_offset: int,
+    timeout_s: float,
+    quiet_s: float,
+) -> tuple[str, int]:
+    deadline = time.monotonic() + timeout_s
+    last_size = start_offset
+    last_change = time.monotonic()
+    while time.monotonic() < deadline:
+        current_size = log_path.stat().st_size
+        if current_size != last_size:
+            last_size = current_size
+            last_change = time.monotonic()
+        elif (
+            current_size > start_offset
+            and time.monotonic() - last_change >= quiet_s
+        ):
+            segment = read_log_bytes(log_path, start_offset, current_size)
+            if DECODE_STATUS_PATTERN.search(segment) is not None:
+                return segment, current_size
+        time.sleep(0.05)
+    segment = read_log_bytes(log_path, start_offset, last_size)
+    raise TimeoutError(
+        f"No stable per-request decode log was found in {log_path} within "
+        f"{timeout_s}s. Captured segment:\n{segment[-4000:]}"
+    )
+
+
+def scheduler_decode_metrics(
+    log_segment: str,
+    expected_cuda_graph: bool,
+) -> dict[str, Any]:
+    matches = list(DECODE_STATUS_PATTERN.finditer(log_segment))
+    throughputs = [float(match.group(2)) for match in matches]
+    graph_states = [match.group(1) == "True" for match in matches]
     if not throughputs or any(
         value <= 0 or not math.isfinite(value) for value in throughputs
     ):
         raise RuntimeError(
-            f"No valid scheduler decode throughput was found in {log_path}"
+            "No valid scheduler decode throughput was found in the request log segment"
         )
-    scheduler_tpot_values = [1000.0 / value for value in throughputs]
+    unexpected_graph_states = [
+        state for state in graph_states if state != expected_cuda_graph
+    ]
+    if unexpected_graph_states:
+        raise RuntimeError(
+            f"Expected cuda graph={expected_cuda_graph} for every decode sample, "
+            f"got {graph_states}"
+        )
+    throughput_median = median(throughputs)
     return {
         "decode_log_count": len(throughputs),
-        "decode_throughput_tok_s_mean": fmean(throughputs),
-        "decode_throughput_tok_s_median": median(throughputs),
+        "decode_throughput_tok_s_samples": throughputs,
+        "decode_throughput_tok_s_median": throughput_median,
         "decode_throughput_tok_s_min": min(throughputs),
         "decode_throughput_tok_s_max": max(throughputs),
-        "scheduler_tpot_ms_mean": fmean(scheduler_tpot_values),
-        "scheduler_tpot_ms_median": median(scheduler_tpot_values),
+        "scheduler_tpot_ms_from_median": 1000.0 / throughput_median,
+        "cuda_graph": expected_cuda_graph,
     }
 
 
-def average_measurements(records: list[dict[str, Any]]) -> dict[str, float]:
+def aggregate_measurements(records: list[dict[str, Any]]) -> dict[str, float | int]:
     measured = [record for record in records if not record["warmup"]]
     if len(measured) != NUM_RUNS - NUM_WARMUP_RUNS:
         raise RuntimeError("Measured A/B run count is incomplete")
-    fields = (
+    client_fields = (
         "ttft_ms",
         "tpot_ms",
         "e2e_ms",
@@ -211,40 +351,206 @@ def average_measurements(records: list[dict[str, Any]]) -> dict[str, float]:
         "sse_bytes",
         "token_update_event_count",
     )
-    return {
+    aggregate: dict[str, float | int] = {
         f"{field}_mean": fmean(float(record[field]) for record in measured)
-        for field in fields
+        for field in client_fields
     }
+    request_medians = [
+        float(record["scheduler"]["decode_throughput_tok_s_median"])
+        for record in measured
+    ]
+    all_samples = [
+        float(sample)
+        for record in measured
+        for sample in record["scheduler"]["decode_throughput_tok_s_samples"]
+    ]
+    if not all_samples:
+        raise RuntimeError("Measured requests contain no scheduler samples")
+    combined_median = median(all_samples)
+    aggregate.update(
+        {
+            "scheduler_decode_log_count_measured": len(all_samples),
+            "scheduler_decode_throughput_tok_s_request_median_mean": fmean(
+                request_medians
+            ),
+            "scheduler_decode_throughput_tok_s_combined_median": combined_median,
+            "scheduler_tpot_ms_request_median_mean": fmean(
+                1000.0 / value for value in request_medians
+            ),
+            "scheduler_tpot_ms_combined_median": 1000.0 / combined_median,
+        }
+    )
+    aggregate["client_div_scheduler_tpot"] = (
+        float(aggregate["tpot_ms_mean"])
+        / float(aggregate["scheduler_tpot_ms_combined_median"])
+    )
+    return aggregate
 
 
-def comparison(
-    experiment: str, aggregates: dict[str, dict[str, Any]]
+COMPARISON_FIELDS = (
+    "ttft_ms_mean",
+    "tpot_ms_mean",
+    "e2e_ms_mean",
+    "scheduler_tpot_ms_combined_median",
+    "scheduler_decode_throughput_tok_s_combined_median",
+    "sse_bytes_mean",
+)
+
+
+def pairwise_comparison(
+    name: str,
+    baseline_name: str,
+    candidate_name: str,
+    aggregates: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    if experiment == "streaming":
-        baseline_name = "tp1_default_stream"
-        candidate_name = "tp1_incremental_stream"
-    else:
-        baseline_name = "tp8_nccl"
-        candidate_name = "tp8_legacy_v1"
     baseline = aggregates[baseline_name]
     candidate = aggregates[candidate_name]
-    ratio_fields = (
-        "ttft_ms_mean",
-        "tpot_ms_mean",
-        "e2e_ms_mean",
-        "scheduler_tpot_ms_mean",
-        "decode_throughput_tok_s_mean",
-        "sse_bytes_mean",
-    )
     ratios = {
         f"candidate_div_baseline_{field}": candidate[field] / baseline[field]
-        for field in ratio_fields
+        for field in COMPARISON_FIELDS
     }
     return {
+        "name": name,
         "baseline": baseline_name,
         "candidate": candidate_name,
         **ratios,
+        "client_tpot_speedup_baseline_div_candidate": (
+            baseline["tpot_ms_mean"] / candidate["tpot_ms_mean"]
+        ),
+        "scheduler_tpot_speedup_baseline_div_candidate": (
+            baseline["scheduler_tpot_ms_combined_median"]
+            / candidate["scheduler_tpot_ms_combined_median"]
+        ),
     }
+
+
+def comparison_specs(experiment: str) -> tuple[tuple[str, str, str], ...]:
+    if experiment == "streaming":
+        return (
+            (
+                "incremental_vs_default_stream",
+                "tp1_default_stream",
+                "tp1_incremental_stream",
+            ),
+        )
+    if experiment == "allreduce":
+        return (("legacy_v1_vs_nccl", "tp8_nccl", "tp8_legacy_v1"),)
+    if experiment == "backend_graph":
+        return (
+            (
+                "explicit_flashinfer_vs_auto",
+                "tp1_auto_full",
+                "tp1_flashinfer_full",
+            ),
+            (
+                "triton_vs_flashinfer_full",
+                "tp1_flashinfer_full",
+                "tp1_triton_full",
+            ),
+            (
+                "flashinfer_full_vs_eager",
+                "tp1_flashinfer_eager",
+                "tp1_flashinfer_full",
+            ),
+            (
+                "triton_full_vs_eager",
+                "tp1_triton_eager",
+                "tp1_triton_full",
+            ),
+        )
+    return (
+        (
+            "flashinfer_tp8_v1_vs_tp1",
+            "tp1_flashinfer_full",
+            "tp8_flashinfer_full_v1",
+        ),
+        (
+            "triton_tp8_v1_vs_tp1",
+            "tp1_triton_full",
+            "tp8_triton_full_v1",
+        ),
+        (
+            "flashinfer_v1_vs_nccl",
+            "tp8_flashinfer_full_nccl",
+            "tp8_flashinfer_full_v1",
+        ),
+        (
+            "triton_v1_vs_nccl",
+            "tp8_triton_full_nccl",
+            "tp8_triton_full_v1",
+        ),
+        (
+            "flashinfer_full_vs_eager_tp8_v1",
+            "tp8_flashinfer_eager_v1",
+            "tp8_flashinfer_full_v1",
+        ),
+        (
+            "triton_full_vs_eager_tp8_v1",
+            "tp8_triton_eager_v1",
+            "tp8_triton_full_v1",
+        ),
+    )
+
+
+def comparisons(
+    experiment: str,
+    aggregates: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        pairwise_comparison(name, baseline, candidate, aggregates)
+        for name, baseline, candidate in comparison_specs(experiment)
+    ]
+
+
+def validate_matched_input_hashes(
+    configs: list[dict[str, Any]], expected_hashes: list[str]
+) -> None:
+    for config in configs:
+        actual_hashes = [run["input_ids_sha256"] for run in config["runs"]]
+        if actual_hashes != expected_hashes:
+            raise RuntimeError(
+                f"Matched-input validation failed for {config['name']}: "
+                f"expected={expected_hashes}, actual={actual_hashes}"
+            )
+
+
+def print_human_summary(
+    aggregates: dict[str, dict[str, Any]],
+    pairwise: list[dict[str, Any]],
+) -> None:
+    print("[summary] per-configuration means", flush=True)
+    print(
+        f"{'name':32} {'TP':>2} {'attention':>17} {'graph':>8} "
+        f"{'allreduce':>10} {'TTFT ms':>9} {'TPOT ms':>9} "
+        f"{'sched ms':>9} {'SSE KiB':>9}",
+        flush=True,
+    )
+    for aggregate in aggregates.values():
+        requested_attention = aggregate["attention_backend"]
+        resolved_attention = aggregate["resolved_attention_backend"]
+        attention_label = (
+            f"auto->{resolved_attention}"
+            if requested_attention == "auto"
+            else resolved_attention
+        )
+        print(
+            f"{aggregate['name']:32} {aggregate['tp_size']:>2} "
+            f"{attention_label:>17} "
+            f"{aggregate['decode_cuda_graph_backend']:>8} "
+            f"{aggregate['all_reduce_mode']:>10} "
+            f"{aggregate['ttft_ms_mean']:>9.3f} "
+            f"{aggregate['tpot_ms_mean']:>9.3f} "
+            f"{aggregate['scheduler_tpot_ms_combined_median']:>9.3f} "
+            f"{aggregate['sse_bytes_mean'] / 1024.0:>9.1f}",
+            flush=True,
+        )
+    print("[summary] pairwise scheduler TPOT speedups", flush=True)
+    for item in pairwise:
+        print(
+            f"{item['name']}: {item['baseline']} / {item['candidate']} = "
+            f"{item['scheduler_tpot_speedup_baseline_div_candidate']:.4f}x",
+            flush=True,
+        )
 
 
 def main() -> None:
@@ -256,6 +562,11 @@ def main() -> None:
     latency.prepare_output_directory(args.output_dir)
     details_path = args.output_dir / "details.json"
     summary_path = args.output_dir / "summary.json"
+    matched_inputs = build_matched_inputs(vocab_size, args.input_length, args.seed)
+    matched_input_metadata = [
+        {key: value for key, value in item.items() if key != "input_ids"}
+        for item in matched_inputs
+    ]
     details: dict[str, Any] = {
         "status": "running",
         "experiment": args.experiment,
@@ -268,9 +579,13 @@ def main() -> None:
         "output_length": args.output_length,
         "num_runs": NUM_RUNS,
         "num_warmup_runs": NUM_WARMUP_RUNS,
+        "server_random_seed": args.server_random_seed,
+        "matched_inputs": matched_input_metadata,
         "timing_semantics": (
-            "Token timestamps are recorded immediately after raw SSE line receipt. "
-            "Token counts are extracted directly from SSE bytes without full JSON parsing."
+            "Client token timestamps are recorded immediately after raw SSE line "
+            "receipt. Every configuration reuses the same five input_ids and "
+            "sampling seeds. Scheduler decode samples are sliced from the server "
+            "log per request and only the final three requests are aggregated."
         ),
         "system_before": system_snapshot(),
         "configs": [],
@@ -279,11 +594,14 @@ def main() -> None:
     aggregates: dict[str, dict[str, Any]] = {}
 
     try:
-        for config_index, config in enumerate(EXPERIMENT_CONFIGS[args.experiment]):
+        for config in EXPERIMENT_CONFIGS[args.experiment]:
             name = str(config["name"])
             tp_size = int(config["tp_size"])
             incremental = bool(config["incremental_streaming_output"])
             all_reduce_mode = str(config["all_reduce_mode"])
+            attention_backend = str(config["attention_backend"])
+            decode_cuda_graph_backend = str(config["decode_cuda_graph_backend"])
+            expected_cuda_graph = decode_cuda_graph_backend == "full"
             port = latency.find_free_port(args.host)
             url = latency.base_url(args.host, port)
             log_path = args.output_dir / f"server_{name}.log"
@@ -295,6 +613,9 @@ def main() -> None:
                 tp_size,
                 incremental_streaming_output=incremental,
                 all_reduce_mode=all_reduce_mode,
+                attention_backend=attention_backend,
+                decode_cuda_graph_backend=decode_cuda_graph_backend,
+                server_random_seed=args.server_random_seed,
             )
             config_record: dict[str, Any] = {
                 **config,
@@ -324,42 +645,31 @@ def main() -> None:
                 model_entry = latency.validate_model_card(
                     model_card, args.served_model_name
                 )
-                config_record["startup_validation"] = latency.validate_server_log(
+                startup_validation = latency.validate_server_log(
                     log_path,
                     args.model_path,
                     tp_size,
                     incremental_streaming_output=incremental,
                     all_reduce_mode=all_reduce_mode,
+                    attention_backend=attention_backend,
+                    decode_cuda_graph_backend=decode_cuda_graph_backend,
                 )
+                config_record["startup_validation"] = startup_validation
                 config_record["model_card"] = model_card
                 config_record["validated_model_entry"] = model_entry
                 latency.save_json(details_path, details)
                 session = requests.Session()
                 session.trust_env = False
 
-                for run_index in range(NUM_RUNS):
+                for run_index, matched_input in enumerate(matched_inputs):
                     is_warmup = run_index < NUM_WARMUP_RUNS
-                    seed = args.seed + config_index * 10_000 + run_index
-                    first_token_id = (
-                        args.seed + config_index * 1_000 + run_index
-                    ) % vocab_size
-                    input_ids = latency.random_input_ids(
-                        vocab_size,
-                        args.input_length,
-                        seed,
-                        first_token_id,
-                    )
-                    input_ids_sha256 = hashlib.sha256(
-                        ",".join(str(token_id) for token_id in input_ids).encode(
-                            "ascii"
-                        )
-                    ).hexdigest()
                     run_record: dict[str, Any] = {
-                        "run": run_index + 1,
+                        **{
+                            key: value
+                            for key, value in matched_input.items()
+                            if key != "input_ids"
+                        },
                         "warmup": is_warmup,
-                        "seed": seed,
-                        "first_token_id": first_token_id,
-                        "input_ids_sha256": input_ids_sha256,
                         "status": "running",
                     }
                     config_record["runs"].append(run_record)
@@ -369,41 +679,64 @@ def main() -> None:
                         f"{'warmup' if is_warmup else 'measure'}",
                         flush=True,
                     )
+                    log_start_offset = log_path.stat().st_size
+                    run_record["scheduler_log_start_offset"] = log_start_offset
                     try:
                         metrics = latency.measure_request(
                             session,
                             url,
-                            input_ids,
+                            matched_input["input_ids"],
                             args.output_length,
                             args.request_timeout_s,
+                            sampling_seed=int(matched_input["sampling_seed"]),
+                        )
+                        log_segment, log_end_offset = wait_for_request_log_segment(
+                            log_path,
+                            log_start_offset,
+                            args.scheduler_log_timeout_s,
+                            args.scheduler_log_quiet_s,
+                        )
+                        scheduler_metrics = scheduler_decode_metrics(
+                            log_segment, expected_cuda_graph
                         )
                     except Exception as exc:
                         run_record.update(status="failed", error=str(exc))
                         latency.save_json(details_path, details)
                         raise
-                    run_record.update(status="completed", **metrics)
+                    run_record.update(
+                        status="completed",
+                        scheduler_log_end_offset=log_end_offset,
+                        scheduler=scheduler_metrics,
+                        **metrics,
+                    )
                     latency.save_json(details_path, details)
 
-                time.sleep(0.2)
-                config_record["runtime_validation"] = latency.validate_server_log(
+                runtime_validation = latency.validate_server_log(
                     log_path,
                     args.model_path,
                     tp_size,
                     require_decode_execution=True,
                     incremental_streaming_output=incremental,
                     all_reduce_mode=all_reduce_mode,
+                    attention_backend=attention_backend,
+                    decode_cuda_graph_backend=decode_cuda_graph_backend,
                 )
                 aggregate = {
                     "name": name,
                     "tp_size": tp_size,
                     "incremental_streaming_output": incremental,
                     "all_reduce_mode": all_reduce_mode,
-                    **average_measurements(config_record["runs"]),
-                    **scheduler_decode_metrics(log_path),
+                    "attention_backend": attention_backend,
+                    "resolved_attention_backend": runtime_validation[
+                        "resolved_attention_backend"
+                    ],
+                    "decode_cuda_graph_backend": decode_cuda_graph_backend,
+                    **aggregate_measurements(config_record["runs"]),
                 }
                 aggregates[name] = aggregate
                 config_record.update(
                     status="completed",
+                    runtime_validation=runtime_validation,
                     aggregate=aggregate,
                     gpu_after_requests=gpu_snapshot(),
                 )
@@ -419,12 +752,18 @@ def main() -> None:
                 if args.cooldown_s:
                     time.sleep(args.cooldown_s)
 
+        expected_hashes = [
+            item["input_ids_sha256"] for item in matched_input_metadata
+        ]
+        validate_matched_input_hashes(details["configs"], expected_hashes)
+        pairwise = comparisons(args.experiment, aggregates)
         summary = {
             "experiment": args.experiment,
             "input_length": args.input_length,
             "output_length": args.output_length,
+            "matched_input_hashes": expected_hashes,
             "aggregates": aggregates,
-            "comparison": comparison(args.experiment, aggregates),
+            "comparisons": pairwise,
         }
         latency.save_json(summary_path, summary)
         details["system_after"] = system_snapshot()
@@ -432,7 +771,8 @@ def main() -> None:
         details["summary_path"] = str(summary_path)
         details["summary"] = summary
         latency.save_json(details_path, details)
-        print("[done] A/B summary", flush=True)
+        print_human_summary(aggregates, pairwise)
+        print("[done] A/B summary JSON", flush=True)
         print(json.dumps(summary, indent=2, ensure_ascii=False), flush=True)
     except BaseException as exc:
         details["system_after"] = system_snapshot()
