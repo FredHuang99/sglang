@@ -27,6 +27,9 @@ DEFAULT_TP_SIZES = (1, 2, 4, 8)
 SUMMARY_TP_ORDER = (8, 4, 2, 1)
 NUM_RUNS = 5
 NUM_WARMUP_RUNS = 2
+EXPECTED_MAX_MODEL_LEN = 32768
+FORCED_SERVER_ENVIRONMENT = {"SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0"}
+REMOVED_SERVER_ENVIRONMENT = ("SGLANG_USE_JIT_ALL_REDUCE",)
 SETUPS = {
     "non_optimized": (),
     "optimized": (
@@ -34,7 +37,7 @@ SETUPS = {
         "512",
         "--max-running-requests",
         "1",
-        "--cuda-graph-max-bs",
+        "--cuda-graph-max-bs-decode",
         "1",
     ),
 }
@@ -162,6 +165,26 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary_path, path)
 
 
+def prepare_output_directory(path: Path) -> None:
+    if path.exists():
+        if not path.is_dir():
+            raise NotADirectoryError(f"Output path is not a directory: {path}")
+        if next(path.iterdir(), None) is not None:
+            raise FileExistsError(
+                f"Output directory must be empty to avoid mixing profile runs: {path}"
+            )
+        return
+    path.mkdir(parents=True)
+
+
+def build_server_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in REMOVED_SERVER_ENVIRONMENT:
+        environment.pop(name, None)
+    environment.update(FORCED_SERVER_ENVIRONMENT)
+    return environment
+
+
 def read_log_tail(path: Path, line_count: int = 100) -> str:
     if not path.exists():
         return ""
@@ -182,6 +205,19 @@ def base_url(host: str, port: int) -> str:
     if ":" in connect_host and not connect_host.startswith("["):
         connect_host = f"[{connect_host}]"
     return f"http://{connect_host}:{port}"
+
+
+def wait_for_port_release(host: str, port: int, timeout_s: float = 30.0) -> None:
+    connect_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        try:
+            with socket.create_connection((connect_host, port), timeout=0.2):
+                pass
+        except OSError:
+            return
+        time.sleep(0.1)
+    raise TimeoutError(f"Port {connect_host}:{port} remained open after server shutdown")
 
 
 def build_server_command(
@@ -212,7 +248,12 @@ def build_server_command(
         "--mem-fraction-static",
         "0.9",
         "--skip-server-warmup",
-        "--disable-piecewise-cuda-graph",
+        "--attention-backend",
+        "flashinfer",
+        "--cuda-graph-backend-decode",
+        "full",
+        "--cuda-graph-backend-prefill",
+        "disabled",
     ]
     command.extend(SETUPS[setup_name])
     return command
@@ -225,6 +266,7 @@ def start_timed_server(
     kwargs: dict[str, Any] = {
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
+        "env": build_server_environment(),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
@@ -302,6 +344,83 @@ def wait_for_ready(
     )
 
 
+def validate_model_card(
+    payload: dict[str, Any], served_model_name: str
+) -> dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise RuntimeError(f"Invalid /v1/models payload: {payload!r}")
+    matches = [item for item in data if item.get("id") == served_model_name]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected exactly one /v1/models entry for {served_model_name!r}, "
+            f"got {matches!r}"
+        )
+    model_entry = matches[0]
+    if model_entry.get("max_model_len") != EXPECTED_MAX_MODEL_LEN:
+        raise RuntimeError(
+            f"Expected max_model_len={EXPECTED_MAX_MODEL_LEN}, got "
+            f"{model_entry.get('max_model_len')!r}"
+        )
+    return model_entry
+
+
+def validate_server_log(
+    log_path: Path,
+    model_path: Path,
+    tp_size: int,
+    setup_name: str,
+) -> dict[str, Any]:
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    required_markers = [
+        f"model_path='{model_path}'",
+        f"tp_size={tp_size}",
+        "attention_backend='flashinfer'",
+        "cuda_graph_backend_decode='full'",
+        "cuda_graph_backend_prefill='disabled'",
+        "disable_custom_all_reduce=False",
+        f"type={EXPECTED_ARCHITECTURE}",
+        "Disable prefill CUDA graph because",
+        "Capture target decode CUDA graph end.",
+    ]
+    if tp_size > 1:
+        required_markers.append(" cuda graph addresses")
+    if setup_name == "optimized":
+        required_markers.extend(
+            [
+                "chunked_prefill_size=512",
+                "max_running_requests=1",
+                "cuda_graph_max_bs_decode=1",
+            ]
+        )
+
+    forbidden_markers = [
+        "Setup Custom allreduce failed",
+        "sgl_kernel_jit_cuda_ipc",
+        "custom_all_reduce_v2",
+        "All-reduce call path: NCCL (custom AR disabled)",
+        "Capture cuda graph failed",
+    ]
+    missing = [marker for marker in required_markers if marker not in log_text]
+    present_forbidden = [
+        marker for marker in forbidden_markers if marker in log_text
+    ]
+    if missing or present_forbidden:
+        raise RuntimeError(
+            f"Server log validation failed for TP={tp_size}, setup={setup_name}; "
+            f"missing={missing}, forbidden={present_forbidden}.\n"
+            f"{read_log_tail(log_path)}"
+        )
+    return {
+        "required_markers": required_markers,
+        "forbidden_markers_absent": forbidden_markers,
+        "custom_all_reduce": "legacy_v1",
+        "attention_backend": "flashinfer",
+        "decode_cuda_graph_backend": "full",
+        "prefill_cuda_graph_backend": "disabled",
+    }
+
+
 def write_summary(
     output_path: Path,
     aggregates: dict[tuple[str, int], float],
@@ -331,10 +450,9 @@ def main() -> None:
     args = parse_args()
     args.model_path = resolve_model_path(args.model_path)
     architecture, model_type = load_model_identity(args.model_path)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    prepare_output_directory(args.output_dir)
     details_path = args.output_dir / "details.json"
     summary_path = args.output_dir / "summary.py"
-    summary_path.unlink(missing_ok=True)
     details: dict[str, Any] = {
         "status": "running",
         "model_path": str(args.model_path),
@@ -345,9 +463,14 @@ def main() -> None:
         "setups": {name: list(extra_args) for name, extra_args in SETUPS.items()},
         "num_runs": NUM_RUNS,
         "num_warmup_runs": NUM_WARMUP_RUNS,
+        "server_environment": {
+            "forced": FORCED_SERVER_ENVIRONMENT,
+            "removed": list(REMOVED_SERVER_ENVIRONMENT),
+        },
         "startup_time_semantics": (
             "time.perf_counter_ns immediately before Popen until /v1/models "
-            "first returns HTTP 200 with the expected served model id"
+            "first returns HTTP 200 with the expected served model id. Log and "
+            "configuration validation happens after the ready timestamp."
         ),
         "runs": [],
         "aggregates": [],
@@ -411,10 +534,21 @@ def main() -> None:
                             log_path,
                         )
                         startup_time_ms = (ready_ns - start_ns) / 1_000_000.0
+                        model_entry = validate_model_card(
+                            model_card, args.served_model_name
+                        )
+                        validation = validate_server_log(
+                            log_path,
+                            args.model_path,
+                            tp_size,
+                            setup_name,
+                        )
                         record.update(
                             status="completed",
                             startup_time_ms=startup_time_ms,
                             model_card=model_card,
+                            validated_model_entry=model_entry,
+                            validation=validation,
                         )
                         if not is_warmup:
                             measured_times.append(startup_time_ms)
@@ -424,6 +558,7 @@ def main() -> None:
                     finally:
                         session.close()
                         stop_server(process, log_file)
+                        wait_for_port_release(args.host, port)
                         save_json(details_path, details)
                         if args.cooldown_s:
                             time.sleep(args.cooldown_s)

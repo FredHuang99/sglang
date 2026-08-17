@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pprint
@@ -27,6 +28,9 @@ EXPECTED_MODEL_TYPE = "hunyuan_v1_dense"
 DEFAULT_TP_SIZES = (1, 2, 4, 8)
 NUM_RUNS = 5
 NUM_WARMUP_RUNS = 2
+EXPECTED_MAX_MODEL_LEN = 32768
+FORCED_SERVER_ENVIRONMENT = {"SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0"}
+REMOVED_SERVER_ENVIRONMENT = ("SGLANG_USE_JIT_ALL_REDUCE",)
 IO_MATRIX = {
     128: (512, 2048),
     256: (256, 1920),
@@ -170,6 +174,26 @@ def save_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary_path, path)
 
 
+def prepare_output_directory(path: Path) -> None:
+    if path.exists():
+        if not path.is_dir():
+            raise NotADirectoryError(f"Output path is not a directory: {path}")
+        if next(path.iterdir(), None) is not None:
+            raise FileExistsError(
+                f"Output directory must be empty to avoid mixing profile runs: {path}"
+            )
+        return
+    path.mkdir(parents=True)
+
+
+def build_server_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    for name in REMOVED_SERVER_ENVIRONMENT:
+        environment.pop(name, None)
+    environment.update(FORCED_SERVER_ENVIRONMENT)
+    return environment
+
+
 def read_log_tail(path: Path, line_count: int = 100) -> str:
     if not path.exists():
         return ""
@@ -215,7 +239,13 @@ def build_server_command(
         "--mem-fraction-static",
         "0.9",
         "--skip-server-warmup",
-        "--disable-piecewise-cuda-graph",
+        "--attention-backend",
+        "flashinfer",
+        "--cuda-graph-backend-decode",
+        "full",
+        "--cuda-graph-backend-prefill",
+        "disabled",
+        "--incremental-streaming-output",
     ]
 
 
@@ -226,6 +256,7 @@ def start_server(
     kwargs: dict[str, Any] = {
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
+        "env": build_server_environment(),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
@@ -304,17 +335,100 @@ def wait_for_ready(
     )
 
 
-def random_input_ids(vocab_size: int, input_length: int, seed: int) -> list[int]:
+def validate_model_card(
+    payload: dict[str, Any], served_model_name: str
+) -> dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, list):
+        raise RuntimeError(f"Invalid /v1/models payload: {payload!r}")
+    matches = [item for item in data if item.get("id") == served_model_name]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"Expected exactly one /v1/models entry for {served_model_name!r}, "
+            f"got {matches!r}"
+        )
+    model_entry = matches[0]
+    if model_entry.get("max_model_len") != EXPECTED_MAX_MODEL_LEN:
+        raise RuntimeError(
+            f"Expected max_model_len={EXPECTED_MAX_MODEL_LEN}, got "
+            f"{model_entry.get('max_model_len')!r}"
+        )
+    return model_entry
+
+
+def validate_server_log(
+    log_path: Path,
+    model_path: Path,
+    tp_size: int,
+    require_decode_execution: bool = False,
+) -> dict[str, Any]:
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    required_markers = [
+        f"model_path='{model_path}'",
+        f"tp_size={tp_size}",
+        "incremental_streaming_output=True",
+        "attention_backend='flashinfer'",
+        "cuda_graph_backend_decode='full'",
+        "cuda_graph_backend_prefill='disabled'",
+        "disable_custom_all_reduce=False",
+        f"type={EXPECTED_ARCHITECTURE}",
+        "Disable prefill CUDA graph because",
+        "Capture target decode CUDA graph end.",
+    ]
+    if tp_size > 1:
+        required_markers.append(" cuda graph addresses")
+    if require_decode_execution:
+        required_markers.append("cuda graph: True")
+
+    forbidden_markers = [
+        "Setup Custom allreduce failed",
+        "sgl_kernel_jit_cuda_ipc",
+        "custom_all_reduce_v2",
+        "All-reduce call path: NCCL (custom AR disabled)",
+        "Capture cuda graph failed",
+    ]
+    missing = [marker for marker in required_markers if marker not in log_text]
+    present_forbidden = [
+        marker for marker in forbidden_markers if marker in log_text
+    ]
+    if missing or present_forbidden:
+        raise RuntimeError(
+            f"Server log validation failed for TP={tp_size}; "
+            f"missing={missing}, forbidden={present_forbidden}.\n"
+            f"{read_log_tail(log_path)}"
+        )
+    return {
+        "required_markers": required_markers,
+        "forbidden_markers_absent": forbidden_markers,
+        "custom_all_reduce": "legacy_v1",
+        "attention_backend": "flashinfer",
+        "decode_cuda_graph_backend": "full",
+        "prefill_cuda_graph_backend": "disabled",
+    }
+
+
+def random_input_ids(
+    vocab_size: int, input_length: int, seed: int, first_token_id: int
+) -> list[int]:
+    if input_length <= 0:
+        raise ValueError(f"input_length must be positive, got {input_length}")
+    if not 0 <= first_token_id < vocab_size:
+        raise ValueError(
+            f"first_token_id must be in [0, {vocab_size}), got {first_token_id}"
+        )
     generator = random.Random(seed)
-    return [generator.randrange(vocab_size) for _ in range(input_length)]
+    input_ids = [generator.randrange(vocab_size) for _ in range(input_length)]
+    input_ids[0] = first_token_id
+    return input_ids
 
 
 def measure_request(
+    session: requests.Session,
     url: str,
     input_ids: list[int],
     output_length: int,
     timeout_s: float,
-) -> tuple[float, float, float, int, int]:
+) -> dict[str, float | int]:
     payload = {
         "input_ids": input_ids,
         "sampling_params": {
@@ -328,55 +442,59 @@ def measure_request(
     last_token_ns: int | None = None
     prompt_tokens: int | None = None
     completion_tokens = 0
+    sse_event_count = 0
+    sse_bytes = 0
+    token_update_event_count = 0
     start_ns = time.perf_counter_ns()
 
-    with requests.Session() as session:
-        session.trust_env = False
-        with session.post(
-            f"{url}/generate",
-            json=payload,
-            stream=True,
-            timeout=(10.0, timeout_s),
-        ) as response:
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"/generate returned HTTP {response.status_code}: {response.text}"
-                )
-            response.raw.decode_content = True
-            while True:
-                raw_line = response.raw.readline()
-                if not raw_line:
-                    break
-                line = raw_line.strip()
-                if not line or not line.startswith(b"data:"):
-                    continue
-                body = line[len(b"data:") :].strip()
-                if body == b"[DONE]":
-                    break
-                event = json.loads(body)
-                meta_info = event.get("meta_info") or {}
-                event_prompt_tokens = meta_info.get("prompt_tokens")
-                if isinstance(event_prompt_tokens, int):
-                    if prompt_tokens is None:
-                        prompt_tokens = event_prompt_tokens
-                    elif event_prompt_tokens != prompt_tokens:
-                        raise RuntimeError(
-                            "prompt_tokens changed during the streaming response"
-                        )
-                event_completion_tokens = meta_info.get("completion_tokens")
-                if not isinstance(event_completion_tokens, int):
-                    continue
-                if event_completion_tokens < completion_tokens:
+    with session.post(
+        f"{url}/generate",
+        json=payload,
+        stream=True,
+        timeout=(10.0, timeout_s),
+    ) as response:
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"/generate returned HTTP {response.status_code}: {response.text}"
+            )
+        response.raw.decode_content = True
+        while True:
+            raw_line = response.raw.readline()
+            line_received_ns = time.perf_counter_ns()
+            if not raw_line:
+                break
+            sse_bytes += len(raw_line)
+            line = raw_line.strip()
+            if not line or not line.startswith(b"data:"):
+                continue
+            sse_event_count += 1
+            body = line[len(b"data:") :].strip()
+            if body == b"[DONE]":
+                break
+            event = json.loads(body)
+            meta_info = event.get("meta_info") or {}
+            event_prompt_tokens = meta_info.get("prompt_tokens")
+            if isinstance(event_prompt_tokens, int):
+                if prompt_tokens is None:
+                    prompt_tokens = event_prompt_tokens
+                elif event_prompt_tokens != prompt_tokens:
                     raise RuntimeError(
-                        "completion_tokens decreased during the streaming response"
+                        "prompt_tokens changed during the streaming response"
                     )
-                if event_completion_tokens == completion_tokens:
-                    continue
-                completion_tokens = event_completion_tokens
-                now_ns = time.perf_counter_ns()
-                if first_token_ns is None:
-                    first_token_ns = now_ns
-                last_token_ns = now_ns
+            event_completion_tokens = meta_info.get("completion_tokens")
+            if not isinstance(event_completion_tokens, int):
+                continue
+            if event_completion_tokens < completion_tokens:
+                raise RuntimeError(
+                    "completion_tokens decreased during the streaming response"
+                )
+            if event_completion_tokens == completion_tokens:
+                continue
+            completion_tokens = event_completion_tokens
+            token_update_event_count += 1
+            if first_token_ns is None:
+                first_token_ns = line_received_ns
+            last_token_ns = line_received_ns
 
     expected_prompt_tokens = len(input_ids)
     if prompt_tokens != expected_prompt_tokens:
@@ -394,7 +512,16 @@ def measure_request(
     ttft_ms = (first_token_ns - start_ns) / 1_000_000.0
     e2e_ms = (last_token_ns - start_ns) / 1_000_000.0
     tpot_ms = (last_token_ns - first_token_ns) / (output_length - 1) / 1_000_000.0
-    return ttft_ms, tpot_ms, e2e_ms, prompt_tokens, completion_tokens
+    return {
+        "ttft_ms": ttft_ms,
+        "tpot_ms": tpot_ms,
+        "e2e_ms": e2e_ms,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "sse_event_count": sse_event_count,
+        "sse_bytes": sse_bytes,
+        "token_update_event_count": token_update_event_count,
+    }
 
 
 def write_summary(
@@ -440,10 +567,15 @@ def main() -> None:
     args = parse_args()
     args.model_path = resolve_model_path(args.model_path)
     vocab_size, architecture, model_type = load_model_config(args.model_path)
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    requests_per_tp = sum(len(lengths) for lengths in IO_MATRIX.values()) * NUM_RUNS
+    if requests_per_tp > vocab_size:
+        raise ValueError(
+            f"Need {requests_per_tp} unique first tokens per TP, but vocab_size is "
+            f"only {vocab_size}"
+        )
+    prepare_output_directory(args.output_dir)
     details_path = args.output_dir / "details.json"
     summary_path = args.output_dir / "summary.py"
-    summary_path.unlink(missing_ok=True)
     details: dict[str, Any] = {
         "status": "running",
         "model_path": str(args.model_path),
@@ -458,6 +590,19 @@ def main() -> None:
         },
         "num_runs": NUM_RUNS,
         "num_warmup_runs": NUM_WARMUP_RUNS,
+        "server_environment": {
+            "forced": FORCED_SERVER_ENVIRONMENT,
+            "removed": list(REMOVED_SERVER_ENVIRONMENT),
+        },
+        "timing_semantics": (
+            "TTFT is request start to receipt of the first raw SSE token line; "
+            "TPOT is (last token line receipt - first token line receipt) / "
+            "(OSL - 1). JSON parsing is outside token receipt timestamps."
+        ),
+        "radix_cache_control": (
+            "Every request within a TP run has a distinct deterministic first "
+            "input token, preventing shared-prefix Radix Cache hits."
+        ),
         "runs": [],
         "aggregates": [],
     }
@@ -478,6 +623,7 @@ def main() -> None:
             )
             process: subprocess.Popen[bytes] | None = None
             log_file = None
+            request_session: requests.Session | None = None
             try:
                 print(f"[server] launching TP={tp_size} on {url}", flush=True)
                 process, log_file = start_server(command, log_path)
@@ -488,16 +634,26 @@ def main() -> None:
                     args.server_timeout_s,
                     log_path,
                 )
-                details.setdefault("servers", []).append(
-                    {
-                        "tp_size": tp_size,
-                        "url": url,
-                        "command": command,
-                        "log_path": str(log_path),
-                        "model_card": model_card,
-                    }
+                model_entry = validate_model_card(
+                    model_card, args.served_model_name
                 )
+                startup_validation = validate_server_log(
+                    log_path, args.model_path, tp_size
+                )
+                server_record = {
+                    "tp_size": tp_size,
+                    "url": url,
+                    "command": command,
+                    "log_path": str(log_path),
+                    "model_card": model_card,
+                    "validated_model_entry": model_entry,
+                    "startup_validation": startup_validation,
+                }
+                details.setdefault("servers", []).append(server_record)
                 save_json(details_path, details)
+                request_session = requests.Session()
+                request_session.trust_env = False
+                request_ordinal = 0
 
                 for case_index, (input_length, output_lengths) in enumerate(
                     IO_MATRIX.items()
@@ -514,6 +670,21 @@ def main() -> None:
                                 + output_length * 10
                                 + run_index
                             )
+                            first_token_id = (
+                                args.seed + tp_size * 1_000 + request_ordinal
+                            ) % vocab_size
+                            input_ids = random_input_ids(
+                                vocab_size,
+                                input_length,
+                                seed,
+                                first_token_id,
+                            )
+                            input_ids_sha256 = hashlib.sha256(
+                                ",".join(str(token_id) for token_id in input_ids).encode(
+                                    "ascii"
+                                )
+                            ).hexdigest()
+                            request_ordinal += 1
                             record: dict[str, Any] = {
                                 "tp_size": tp_size,
                                 "input_length": input_length,
@@ -521,6 +692,8 @@ def main() -> None:
                                 "run": run_index + 1,
                                 "warmup": is_warmup,
                                 "seed": seed,
+                                "first_token_id": first_token_id,
+                                "input_ids_sha256": input_ids_sha256,
                                 "status": "running",
                             }
                             details["runs"].append(record)
@@ -532,15 +705,10 @@ def main() -> None:
                                 flush=True,
                             )
                             try:
-                                (
-                                    ttft_ms,
-                                    tpot_ms,
-                                    e2e_ms,
-                                    prompt_tokens,
-                                    completion_tokens,
-                                ) = measure_request(
+                                metrics = measure_request(
+                                    request_session,
                                     url,
-                                    random_input_ids(vocab_size, input_length, seed),
+                                    input_ids,
                                     output_length,
                                     args.request_timeout_s,
                                 )
@@ -550,16 +718,12 @@ def main() -> None:
                                 raise
                             record.update(
                                 status="completed",
-                                prompt_tokens=prompt_tokens,
-                                completion_tokens=completion_tokens,
-                                ttft_ms=ttft_ms,
-                                tpot_ms=tpot_ms,
-                                e2e_ms=e2e_ms,
+                                **metrics,
                             )
                             save_json(details_path, details)
                             if not is_warmup:
-                                measured_ttft.append(ttft_ms)
-                                measured_tpot.append(tpot_ms)
+                                measured_ttft.append(float(metrics["ttft_ms"]))
+                                measured_tpot.append(float(metrics["tpot_ms"]))
 
                         if len(measured_ttft) != NUM_RUNS - NUM_WARMUP_RUNS:
                             raise RuntimeError("Measured run count is incomplete")
@@ -577,7 +741,16 @@ def main() -> None:
                             }
                         )
                         save_json(details_path, details)
+                server_record["runtime_validation"] = validate_server_log(
+                    log_path,
+                    args.model_path,
+                    tp_size,
+                    require_decode_execution=True,
+                )
+                save_json(details_path, details)
             finally:
+                if request_session is not None:
+                    request_session.close()
                 stop_server(process, log_file)
 
         write_summary(summary_path, aggregates, args.tp_sizes)
