@@ -37,6 +37,9 @@ ATTENTION_BACKEND_MODES = ("auto", "flashinfer", "triton")
 DECODE_CUDA_GRAPH_BACKENDS = ("full", "disabled")
 PROMPT_TOKENS_PATTERN = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
 COMPLETION_TOKENS_PATTERN = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
+DECODE_CUDA_GRAPH_STATE_PATTERN = re.compile(
+    r"Decode batch[^\r\n]*cuda graph: (True|False)"
+)
 IO_MATRIX = {
     128: (512, 2048),
     256: (256, 1920),
@@ -462,13 +465,6 @@ def validate_server_log(
             required_markers.append(" cuda graph addresses")
     else:
         required_markers.append("disable_custom_all_reduce=True")
-    if require_decode_execution:
-        required_markers.append(
-            "cuda graph: True"
-            if decode_cuda_graph_backend == "full"
-            else "cuda graph: False"
-        )
-
     forbidden_markers = [
         "Setup Custom allreduce failed",
         "sgl_kernel_jit_cuda_ipc",
@@ -481,12 +477,6 @@ def validate_server_log(
         forbidden_markers.append(" cuda graph addresses")
     if decode_cuda_graph_backend == "disabled":
         forbidden_markers.append("Capture target decode CUDA graph")
-    if require_decode_execution:
-        forbidden_markers.append(
-            "cuda graph: False"
-            if decode_cuda_graph_backend == "full"
-            else "cuda graph: True"
-        )
     missing = [marker for marker in required_markers if marker not in log_text]
     present_forbidden = [
         marker for marker in forbidden_markers if marker in log_text
@@ -497,6 +487,25 @@ def validate_server_log(
             f"missing={missing}, forbidden={present_forbidden}.\n"
             f"{read_log_tail(log_path)}"
         )
+    decode_cuda_graph_states: list[bool] = []
+    if require_decode_execution:
+        decode_cuda_graph_states = [
+            match.group(1) == "True"
+            for match in DECODE_CUDA_GRAPH_STATE_PATTERN.finditer(log_text)
+        ]
+        expected_decode_cuda_graph = decode_cuda_graph_backend == "full"
+        if not decode_cuda_graph_states or any(
+            state != expected_decode_cuda_graph
+            for state in decode_cuda_graph_states
+        ):
+            raise RuntimeError(
+                f"Decode CUDA graph validation failed for TP={tp_size}; "
+                f"expected={expected_decode_cuda_graph}, "
+                f"observed={decode_cuda_graph_states}. Only Decode batch log "
+                "lines are checked; eager prefill is expected because prefill "
+                "CUDA graph is disabled.\n"
+                f"{read_log_tail(log_path)}"
+            )
     return {
         "required_markers": required_markers,
         "forbidden_markers_absent": forbidden_markers,
@@ -505,6 +514,7 @@ def validate_server_log(
         "resolved_attention_backend": resolved_attention_backend,
         "attention_backend": resolved_attention_backend,
         "decode_cuda_graph_backend": decode_cuda_graph_backend,
+        "decode_cuda_graph_state_count": len(decode_cuda_graph_states),
         "prefill_cuda_graph_backend": "disabled",
     }
 
