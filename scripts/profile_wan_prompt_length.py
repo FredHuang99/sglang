@@ -15,11 +15,8 @@ from profile_diffusion_common import (
     WAN21,
     WAN22,
     WAN_MODEL_SPECS,
-    allocate_ports,
-    build_server_command,
-    build_server_environment,
     denoising_stage_ms,
-    launch_server,
+    launch_server_with_port_retries,
     materialize_reference_image,
     measured_mean,
     model_metadata,
@@ -35,7 +32,6 @@ from profile_diffusion_common import (
     stop_server,
     validate_cuda_compat_lib_dir,
     validate_model_path,
-    wait_for_ready,
 )
 
 
@@ -261,20 +257,8 @@ def main() -> None:
         model_path = model_paths[spec.key]
         model_dir = output_dir / spec.key
         server_dir = model_dir / "server"
-        ports = allocate_ports(args.host)
-        command = build_server_command(
-            spec,
-            model_path,
-            1,
-            args.host,
-            ports,
-            server_dir,
-            attention_backend=args.attention_backend,
-        )
         model_record: dict[str, Any] = {
             "model": spec.key,
-            "ports": ports,
-            "command": command,
             "status": "starting",
             "lengths": [],
         }
@@ -283,29 +267,30 @@ def main() -> None:
         server = None
         print(f"[server] launching {spec.label} prompt-length profile", flush=True)
         try:
-            server = launch_server(
-                command,
-                model_dir / "server.log",
-                build_server_environment(
-                    server_dir,
-                    enable_cuda_event_stage_profiling=True,
-                    cuda_compat_lib_dir=args.cuda_compat_lib_dir,
-                ),
-            )
-            base_url = server_base_url(args.host, ports["http"])
-            card, ready_ns = wait_for_ready(
-                server,
-                base_url,
+            ready_server = launch_server_with_port_retries(
                 spec,
                 model_path,
                 1,
-                args.server_timeout_s,
-                args.ready_poll_interval_s,
+                args.host,
+                server_dir,
+                model_dir / "server.log",
+                attention_backend=args.attention_backend,
+                enable_cuda_event_stage_profiling=True,
+                cuda_compat_lib_dir=args.cuda_compat_lib_dir,
+                server_timeout_s=args.server_timeout_s,
+                ready_poll_interval_s=args.ready_poll_interval_s,
+                shutdown_timeout_s=args.shutdown_timeout_s,
             )
+            server = ready_server.server
+            ports = ready_server.ports
+            model_record["ports"] = ports
+            model_record["command"] = ready_server.command
+            model_record["launch_attempts"] = ready_server.launch_attempts
+            base_url = server_base_url(args.host, ports["http"])
             model_record["status"] = "running"
-            model_record["ready_model_card"] = card
+            model_record["ready_model_card"] = ready_server.model_card
             model_record["ready_after_launch_ms"] = (
-                ready_ns - server.started_ns
+                ready_server.ready_ns - server.started_ns
             ) / 1_000_000.0
             save_json(state_path, state)
 

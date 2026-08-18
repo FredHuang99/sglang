@@ -15,21 +15,16 @@ from profile_diffusion_common import (
     WAN21,
     WAN22,
     Z_IMAGE,
-    allocate_ports,
-    build_server_command,
-    build_server_environment,
-    launch_server,
+    launch_server_with_port_retries,
     measured_mean,
     model_metadata,
     normalize_attention_backend,
     normalize_gpu_counts,
     prepare_output_dir,
     save_json,
-    server_base_url,
     stop_server,
     validate_cuda_compat_lib_dir,
     validate_model_path,
-    wait_for_ready,
     write_python_summary,
 )
 
@@ -148,21 +143,9 @@ def main() -> None:
                     / f"run_{run_index + 1:02d}"
                 )
                 server_dir = trial_dir / "server"
-                ports = allocate_ports(args.host)
-                command = build_server_command(
-                    spec,
-                    model_path,
-                    gpu_count,
-                    args.host,
-                    ports,
-                    server_dir,
-                    attention_backend=args.attention_backend,
-                )
                 record: dict[str, Any] = {
                     "run": run_index + 1,
                     "warmup": run_index < NUM_WARMUP_RUNS,
-                    "ports": ports,
-                    "command": command,
                     "status": "starting",
                 }
                 point["runs"].append(record)
@@ -174,29 +157,28 @@ def main() -> None:
                     flush=True,
                 )
                 try:
-                    server = launch_server(
-                        command,
-                        trial_dir / "server.log",
-                        build_server_environment(
-                            server_dir,
-                            enable_cuda_event_stage_profiling=False,
-                            cuda_compat_lib_dir=args.cuda_compat_lib_dir,
-                        ),
-                    )
-                    base_url = server_base_url(args.host, ports["http"])
-                    card, ready_ns = wait_for_ready(
-                        server,
-                        base_url,
+                    ready_server = launch_server_with_port_retries(
                         spec,
                         model_path,
                         gpu_count,
-                        args.server_timeout_s,
-                        args.ready_poll_interval_s,
+                        args.host,
+                        server_dir,
+                        trial_dir / "server.log",
+                        attention_backend=args.attention_backend,
+                        enable_cuda_event_stage_profiling=False,
+                        cuda_compat_lib_dir=args.cuda_compat_lib_dir,
+                        server_timeout_s=args.server_timeout_s,
+                        ready_poll_interval_s=args.ready_poll_interval_s,
+                        shutdown_timeout_s=args.shutdown_timeout_s,
                     )
+                    server = ready_server.server
+                    record["ports"] = ready_server.ports
+                    record["command"] = ready_server.command
+                    record["launch_attempts"] = ready_server.launch_attempts
                     record["startup_time_ms"] = (
-                        ready_ns - server.started_ns
+                        ready_server.ready_ns - server.started_ns
                     ) / 1_000_000.0
-                    record["ready_model_card"] = card
+                    record["ready_model_card"] = ready_server.model_card
                     record["status"] = "complete"
                     save_json(state_path, state)
                 except BaseException as exc:

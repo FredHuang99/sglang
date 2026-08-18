@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import shutil
 import signal
 import socket
@@ -25,6 +26,7 @@ import requests
 
 NUM_RUNS = 5
 NUM_WARMUP_RUNS = 2
+MAX_PORT_LAUNCH_ATTEMPTS = 5
 EXPECTED_DENOISE_STEPS = 50
 SUPPORTED_GPU_COUNTS = (1, 2, 4, 8)
 REQUIRED_STAGE_NAMES = (
@@ -36,6 +38,16 @@ DEFAULT_REFERENCE_IMAGE = (
     "https://huggingface.co/datasets/huggingface/documentation-images/"
     "resolve/main/diffusers/cat.png"
 )
+
+# Match the April H200 Z-Image baseline. Z-Image has 30 attention heads, so
+# these points use the largest Ulysses degree that divides both SP and 30;
+# the remaining SP dimension is assigned to Ring Attention.
+Z_IMAGE_APRIL_PARALLELISM = {
+    1: (1, 1),
+    2: (2, 1),
+    4: (2, 2),
+    8: (2, 4),
+}
 
 
 @dataclass(frozen=True)
@@ -94,7 +106,7 @@ Z_IMAGE = ModelSpec(
     size="1024x1024",
     num_frames=1,
     fps=24,
-    parallelism={1: (1, 1), 2: (2, 1), 4: (2, 2), 8: (2, 4)},
+    parallelism=Z_IMAGE_APRIL_PARALLELISM,
 )
 
 ALL_MODEL_SPECS = (WAN22, WAN21, Z_IMAGE)
@@ -108,6 +120,20 @@ class LaunchedServer:
     log_path: Path
     command: list[str]
     started_ns: int
+
+
+@dataclass
+class ReadyServer:
+    server: LaunchedServer
+    ports: dict[str, int]
+    command: list[str]
+    model_card: dict[str, Any]
+    ready_ns: int
+    launch_attempts: list[dict[str, Any]]
+
+
+class StrictPortUnavailableError(RuntimeError):
+    pass
 
 
 def normalize_gpu_counts(values: Iterable[int]) -> list[int]:
@@ -230,54 +256,98 @@ def read_log_tail(path: Path, line_count: int = 120) -> str:
     return "\n".join(lines[-line_count:])
 
 
-def _bind_address(host: str) -> tuple[int, str]:
+def _reservation_bind_address(host: str) -> tuple[int, str]:
     if host in {"::", "[::]"}:
         return socket.AF_INET6, "::"
-    if host == "localhost":
-        return socket.AF_INET, "127.0.0.1"
-    return socket.AF_INET, host
+    return socket.AF_INET, ""
 
 
-def _can_bind(host: str, port: int) -> bool:
-    family, bind_host = _bind_address(host)
+@lru_cache(maxsize=1)
+def _profile_port_ranges() -> tuple[tuple[int, int], ...]:
+    minimum = 10_000
+    maximum = 65_534
+    ephemeral_low = 32_768
+    ephemeral_high = 60_999
+    linux_ephemeral_range = Path("/proc/sys/net/ipv4/ip_local_port_range")
     try:
-        with socket.socket(family, socket.SOCK_STREAM) as sock:
-            sock.bind((bind_host, port))
-        return True
-    except OSError:
-        return False
+        values = linux_ephemeral_range.read_text(encoding="ascii").split()
+        if len(values) == 2:
+            ephemeral_low, ephemeral_high = (int(value) for value in values)
+    except (OSError, ValueError):
+        pass
+
+    ranges = []
+    if minimum <= ephemeral_low - 1:
+        ranges.append((minimum, min(maximum, ephemeral_low - 1)))
+    if ephemeral_high + 1 <= maximum:
+        ranges.append((max(minimum, ephemeral_high + 1), maximum))
+    if not ranges:
+        ranges.append((minimum, maximum))
+    return tuple(ranges)
 
 
-def find_free_port(host: str, excluded: set[int] | None = None) -> int:
-    excluded = excluded or set()
-    family, bind_host = _bind_address(host)
-    for _ in range(100):
-        with socket.socket(family, socket.SOCK_STREAM) as sock:
-            sock.bind((bind_host, 0))
-            port = int(sock.getsockname()[1])
-        if port not in excluded:
+def _random_profile_port(excluded: set[int], *, adjacent: bool = False) -> int:
+    ranges = [
+        (lower, upper - int(adjacent))
+        for lower, upper in _profile_port_ranges()
+        if lower <= upper - int(adjacent)
+    ]
+    for _ in range(1_000):
+        lower, upper = random.choice(ranges)
+        port = random.randint(lower, upper)
+        required = {port, port + 1} if adjacent else {port}
+        if required.isdisjoint(excluded):
             return port
-    raise RuntimeError("Could not allocate a unique local port")
+    raise RuntimeError("Could not select a unique non-ephemeral profile port")
+
+
+def _reserve_port(host: str, port: int) -> socket.socket:
+    family, bind_host = _reservation_bind_address(host)
+    reservation = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        if family == socket.AF_INET6:
+            reservation.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        reservation.bind((bind_host, port))
+        reservation.listen(1)
+        return reservation
+    except BaseException:
+        reservation.close()
+        raise
 
 
 def allocate_ports(host: str) -> dict[str, int]:
-    for _ in range(100):
-        http_port = find_free_port(host)
-        if http_port < 65535 and _can_bind(host, http_port + 1):
-            break
-    else:
-        raise RuntimeError("Could not allocate adjacent HTTP and broker ports")
+    for _ in range(500):
+        reservations: list[socket.socket] = []
+        try:
+            excluded: set[int] = set()
+            http_port = _random_profile_port(excluded, adjacent=True)
+            reservations.append(_reserve_port(host, http_port))
+            reservations.append(_reserve_port(host, http_port + 1))
+            excluded.update((http_port, http_port + 1))
 
-    excluded = {http_port, http_port + 1}
-    scheduler_port = find_free_port(host, excluded)
-    excluded.add(scheduler_port)
-    master_port = find_free_port(host, excluded)
-    return {
-        "http": http_port,
-        "broker": http_port + 1,
-        "scheduler": scheduler_port,
-        "master": master_port,
-    }
+            scheduler_port = _random_profile_port(excluded)
+            reservations.append(_reserve_port(host, scheduler_port))
+            excluded.add(scheduler_port)
+
+            master_port = _random_profile_port(excluded)
+            reservations.append(_reserve_port(host, master_port))
+
+            ports = {
+                "http": http_port,
+                "broker": http_port + 1,
+                "scheduler": scheduler_port,
+                "master": master_port,
+            }
+        except OSError:
+            continue
+        finally:
+            for reservation in reservations:
+                reservation.close()
+        return ports
+    raise RuntimeError(
+        "Could not reserve unique HTTP, broker, scheduler, and master ports"
+    )
 
 
 def server_base_url(host: str, port: int) -> str:
@@ -466,9 +536,15 @@ def wait_for_ready(
         while time.perf_counter() < deadline:
             return_code = server.process.poll()
             if return_code is not None:
-                raise RuntimeError(
+                log_tail = read_log_tail(server.log_path)
+                error_type = (
+                    StrictPortUnavailableError
+                    if "is unavailable and --strict-ports is enabled" in log_tail
+                    else RuntimeError
+                )
+                raise error_type(
                     f"Server exited with code {return_code} before becoming ready.\n"
-                    f"{read_log_tail(server.log_path)}"
+                    f"{log_tail}"
                 )
             try:
                 response = session.get(f"{base_url}/v1/models", timeout=1.0)
@@ -502,6 +578,110 @@ def wait_for_ready(
         f"Timed out after {timeout_s}s waiting for {base_url}/v1/models: "
         f"{last_error}\n{read_log_tail(server.log_path)}"
     )
+
+
+def launch_server_with_port_retries(
+    spec: ModelSpec,
+    model_path: Path,
+    gpu_count: int,
+    host: str,
+    server_dir: Path,
+    log_path: Path,
+    *,
+    attention_backend: str | None,
+    enable_cuda_event_stage_profiling: bool,
+    cuda_compat_lib_dir: Path | None,
+    server_timeout_s: float,
+    ready_poll_interval_s: float,
+    shutdown_timeout_s: float,
+) -> ReadyServer:
+    attempts_path = log_path.with_name(f"{log_path.stem}_launch_attempts.json")
+    launch_attempts: list[dict[str, Any]] = []
+    for attempt_number in range(1, MAX_PORT_LAUNCH_ATTEMPTS + 1):
+        ports = allocate_ports(host)
+        command = build_server_command(
+            spec,
+            model_path,
+            gpu_count,
+            host,
+            ports,
+            server_dir,
+            attention_backend=attention_backend,
+        )
+        attempt_log_path = (
+            log_path
+            if attempt_number == 1
+            else log_path.with_name(
+                f"{log_path.stem}_port_retry_{attempt_number:02d}{log_path.suffix}"
+            )
+        )
+        attempt: dict[str, Any] = {
+            "attempt": attempt_number,
+            "ports": ports,
+            "command": command,
+            "log_path": str(attempt_log_path),
+            "status": "starting",
+        }
+        launch_attempts.append(attempt)
+        save_json(attempts_path, launch_attempts)
+        server = None
+        try:
+            server = launch_server(
+                command,
+                attempt_log_path,
+                build_server_environment(
+                    server_dir,
+                    enable_cuda_event_stage_profiling=(
+                        enable_cuda_event_stage_profiling
+                    ),
+                    cuda_compat_lib_dir=cuda_compat_lib_dir,
+                ),
+            )
+            base_url = server_base_url(host, ports["http"])
+            model_card, ready_ns = wait_for_ready(
+                server,
+                base_url,
+                spec,
+                model_path,
+                gpu_count,
+                server_timeout_s,
+                ready_poll_interval_s,
+            )
+        except StrictPortUnavailableError as exc:
+            attempt["status"] = "strict_port_unavailable"
+            attempt["error"] = f"{type(exc).__name__}: {exc}"
+            save_json(attempts_path, launch_attempts)
+            stop_server(server, shutdown_timeout_s)
+            server = None
+            if attempt_number == MAX_PORT_LAUNCH_ATTEMPTS:
+                raise
+            print(
+                f"[server] strict port collision on launch attempt "
+                f"{attempt_number}/{MAX_PORT_LAUNCH_ATTEMPTS}; retrying",
+                flush=True,
+            )
+            continue
+        except BaseException as exc:
+            attempt["status"] = "failed"
+            attempt["error"] = f"{type(exc).__name__}: {exc}"
+            save_json(attempts_path, launch_attempts)
+            stop_server(server, shutdown_timeout_s)
+            raise
+
+        attempt["status"] = "ready"
+        attempt["ready_after_launch_ms"] = (
+            ready_ns - server.started_ns
+        ) / 1_000_000.0
+        save_json(attempts_path, launch_attempts)
+        return ReadyServer(
+            server=server,
+            ports=ports,
+            command=command,
+            model_card=model_card,
+            ready_ns=ready_ns,
+            launch_attempts=launch_attempts,
+        )
+    raise AssertionError("Port launch retry loop exited unexpectedly")
 
 
 def materialize_reference_image(source: str, output_dir: Path, timeout_s: float) -> Path:
