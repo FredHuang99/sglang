@@ -22,10 +22,13 @@ from profile_diffusion_common import (
     launch_server,
     materialize_reference_image,
     measured_mean,
+    module_durations_ms,
     model_metadata,
     normalize_gpu_counts,
     prepare_output_dir,
     read_perf_dump,
+    repository_commit,
+    response_request_id,
     save_json,
     send_generation_request,
     server_base_url,
@@ -41,6 +44,14 @@ SUMMARY_VARIABLES = {
     WAN22.key: "wan22_ti2v_5b_execution_time_ms",
     WAN21.key: "wan21_t2v_1_3b_execution_time_ms",
     Z_IMAGE.key: "z_image_execution_time_ms",
+}
+
+MODULE_SUMMARY_VARIABLES = {
+    spec.key: {
+        module: f"{spec.key}_{module}_duration_ms"
+        for module in ("encoder", "denoiser", "decoder")
+    }
+    for spec in ALL_MODEL_SPECS
 }
 
 
@@ -120,6 +131,7 @@ def main() -> None:
         for spec in ALL_MODEL_SPECS
     }
     output_dir = prepare_output_dir(args.output_dir)
+    profile_commit = repository_commit()
     reference_image = materialize_reference_image(
         args.wan22_reference_image,
         output_dir,
@@ -130,7 +142,10 @@ def main() -> None:
     state: dict[str, Any] = {
         "status": "running",
         "metric": "perf_dump.total_duration_ms",
+        "module_metric": "perf_dump.steps[stage].duration_ms",
+        "module_timing_method": "cuda_event",
         "unit": "ms",
+        "commit_hash": profile_commit,
         "runs_per_point": NUM_RUNS,
         "warmup_runs": NUM_WARMUP_RUNS,
         "gpu_counts": args.gpu_counts,
@@ -143,6 +158,10 @@ def main() -> None:
     save_json(state_path, state)
     summaries: dict[str, list[list[float | int]]] = {
         spec.key: [] for spec in ALL_MODEL_SPECS
+    }
+    module_summaries: dict[str, dict[str, list[list[float | int]]]] = {
+        spec.key: {module: [] for module in ("encoder", "denoiser", "decoder")}
+        for spec in ALL_MODEL_SPECS
     }
 
     for spec in ALL_MODEL_SPECS:
@@ -214,11 +233,21 @@ def main() -> None:
                         args.request_timeout_s,
                         args.video_poll_interval_s,
                     )
-                    perf_dump = read_perf_dump(perf_path, args.perf_timeout_s)
+                    request_id = response_request_id(response)
+                    perf_dump = read_perf_dump(
+                        perf_path,
+                        args.perf_timeout_s,
+                        expected_request_id=request_id,
+                        expected_commit_hash=profile_commit,
+                        expected_model_path=model_path,
+                        expected_world_size=gpu_count,
+                    )
+                    module_times = module_durations_ms(perf_dump)
                     record = {
                         "run": run_index + 1,
                         "warmup": run_index < NUM_WARMUP_RUNS,
                         "total_duration_ms": total_duration_ms(perf_dump),
+                        "module_duration_ms": module_times,
                         "perf_dump_path": str(perf_path),
                         "response": response_metadata(response),
                     }
@@ -227,8 +256,27 @@ def main() -> None:
 
                 average_ms = measured_mean(point["runs"], "total_duration_ms")
                 point["measured_average_ms"] = average_ms
+                module_average_ms = {
+                    module: measured_mean(
+                        [
+                            {
+                                f"{module}_duration_ms": run["module_duration_ms"][
+                                    module
+                                ]
+                            }
+                            for run in point["runs"]
+                        ],
+                        f"{module}_duration_ms",
+                    )
+                    for module in ("encoder", "denoiser", "decoder")
+                }
+                point["measured_module_average_ms"] = module_average_ms
                 point["status"] = "complete"
                 summaries[spec.key].append([gpu_count, average_ms])
+                for module, module_average in module_average_ms.items():
+                    module_summaries[spec.key][module].append(
+                        [gpu_count, module_average]
+                    )
                 save_json(state_path, state)
             except BaseException as exc:
                 point["status"] = "failed"
@@ -245,12 +293,28 @@ def main() -> None:
         (SUMMARY_VARIABLES[spec.key], summaries[spec.key]) for spec in ALL_MODEL_SPECS
     ]
     summary_text = write_python_summary(output_dir / "summary.py", summary_values)
+    module_summary_values = [
+        (
+            MODULE_SUMMARY_VARIABLES[spec.key][module],
+            module_summaries[spec.key][module],
+        )
+        for spec in ALL_MODEL_SPECS
+        for module in ("encoder", "denoiser", "decoder")
+    ]
+    module_summary_text = write_python_summary(
+        output_dir / "module_summary.py", module_summary_values
+    )
     state["status"] = "complete"
     state["summary"] = {
         SUMMARY_VARIABLES[spec.key]: summaries[spec.key] for spec in ALL_MODEL_SPECS
     }
+    state["module_summary"] = {
+        MODULE_SUMMARY_VARIABLES[spec.key][module]: module_summaries[spec.key][module]
+        for spec in ALL_MODEL_SPECS
+        for module in ("encoder", "denoiser", "decoder")
+    }
     save_json(state_path, state)
-    print("\n" + summary_text, end="", flush=True)
+    print("\n" + summary_text + "\n" + module_summary_text, end="", flush=True)
 
 
 if __name__ == "__main__":

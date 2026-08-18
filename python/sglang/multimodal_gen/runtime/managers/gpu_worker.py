@@ -425,6 +425,10 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
             ):
                 self.do_mem_analysis(output_batch)
 
+            if self.rank == 0 and req.perf_dump_path is not None:
+                for metrics in output_metrics:
+                    metrics.resolve_cuda_stage_events()
+
             duration_ms = (time.monotonic() - start_time) * 1000
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
@@ -444,14 +448,19 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
             # dump per-request perf report to the server-mode file path.
             if (
-                req.perf_dump_path is not None
+                self.rank == 0
+                and req.perf_dump_path is not None
                 and not req.is_warmup
                 and output_batch.metrics is not None
             ):
                 PerformanceLogger.dump_benchmark_report(
                     file_path=req.perf_dump_path,
                     metrics=output_batch.metrics,
-                    meta={"model": self.server_args.model_path},
+                    meta={
+                        "model": self.server_args.model_path,
+                        "rank": self.rank,
+                        "world_size": self.server_args.num_gpus,
+                    },
                     tag="server_perf_dump",
                 )
         except Exception as e:

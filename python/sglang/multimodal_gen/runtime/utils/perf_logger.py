@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from functools import lru_cache
@@ -26,6 +27,10 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 
 logger = init_logger(__name__)
+
+CUDA_EVENT_PROFILED_STAGES = frozenset(
+    {"TextEncodingStage", "DenoisingStage", "DecodingStage"}
+)
 
 
 @dataclasses.dataclass
@@ -53,6 +58,9 @@ class RequestMetrics:
         self.stages: Dict[str, float] = {}
         self.steps: list[float] = []
         self.total_duration_ms: float = 0.0
+        self.stage_timing_method: str = "host_perf_counter"
+        self.cuda_event_stage_names: set[str] = set()
+        self._cuda_stage_events: Dict[str, tuple[Any, Any]] = {}
         self.suppress_stage_breakdown: bool = False
         # memory tracking: {checkpoint_name: MemorySnapshot}
         self.memory_snapshots: Dict[str, MemorySnapshot] = {}
@@ -73,6 +81,19 @@ class RequestMetrics:
             return
         self.steps.append(duration_s * 1000)
 
+    def record_cuda_stage_events(
+        self, stage_name: str, start_event: Any, end_event: Any
+    ) -> None:
+        self._cuda_stage_events[stage_name] = (start_event, end_event)
+        self.stage_timing_method = "cuda_event"
+        self.cuda_event_stage_names.add(stage_name)
+
+    def resolve_cuda_stage_events(self) -> None:
+        for stage_name, (start_event, end_event) in self._cuda_stage_events.items():
+            end_event.synchronize()
+            self.stages[stage_name] = start_event.elapsed_time(end_event)
+        self._cuda_stage_events.clear()
+
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
         if self.suppress_stage_breakdown:
             return
@@ -85,6 +106,8 @@ class RequestMetrics:
             "stages": self.stages,
             "steps": self.steps,
             "total_duration_ms": self.total_duration_ms,
+            "stage_timing_method": self.stage_timing_method,
+            "cuda_event_stage_names": sorted(self.cuda_event_stage_names),
             "memory_snapshots": {
                 name: snapshot.to_dict()
                 for name, snapshot in self.memory_snapshots.items()
@@ -208,9 +231,25 @@ class StageProfiler:
         self.log_stage_start_end = log_stage_start_end
         self.capture_memory = capture_memory
         self.record_as_step = record_as_step
+        self._cuda_start_event = None
+        self._cuda_end_event = None
 
     def _should_record_as_step(self) -> bool:
         return self.record_as_step or self.stage_name.startswith("denoising_step_")
+
+    def _should_use_cuda_event_timing(self) -> bool:
+        return (
+            self.log_timing
+            and self.metrics is not None
+            and not self._should_record_as_step()
+            and self.stage_name in CUDA_EVENT_PROFILED_STAGES
+            and os.environ.get(
+                "SGLANG_DIFFUSION_CUDA_EVENT_STAGE_PROFILING", "0"
+            )
+            == "1"
+            and current_platform.is_cuda()
+            and torch.cuda.is_available()
+        )
 
     def __enter__(self):
         if self.log_stage_start_end:
@@ -233,6 +272,10 @@ class StageProfiler:
             ):
                 torch.get_device_module().synchronize()
             self.start_time = time.perf_counter()
+            if self._should_use_cuda_event_timing():
+                self._cuda_start_event = torch.cuda.Event(enable_timing=True)
+                self._cuda_end_event = torch.cuda.Event(enable_timing=True)
+                self._cuda_start_event.record()
 
         return self
 
@@ -246,6 +289,11 @@ class StageProfiler:
             and torch.get_device_module().is_available()
         ):
             torch.get_device_module().synchronize()
+        uses_cuda_event = (
+            self._cuda_start_event is not None and self._cuda_end_event is not None
+        )
+        if uses_cuda_event:
+            self._cuda_end_event.record()
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
@@ -266,6 +314,12 @@ class StageProfiler:
         if self.log_timing and self.metrics:
             if self._should_record_as_step():
                 self.metrics.record_step(execution_time_s)
+            elif uses_cuda_event:
+                self.metrics.record_cuda_stage_events(
+                    self.stage_name,
+                    self._cuda_start_event,
+                    self._cuda_end_event,
+                )
             else:
                 self.metrics.record_stage(self.stage_name, execution_time_s)
 
@@ -300,6 +354,7 @@ class PerformanceLogger:
         Static method to dump a standardized benchmark report to a file.
         Eliminates duplicate logic in CLI/Client code.
         """
+        metrics.resolve_cuda_stage_events()
         formatted_steps = [
             {"name": name, "duration_ms": duration_ms}
             for name, duration_ms in metrics.stages.items()
@@ -316,25 +371,48 @@ class PerformanceLogger:
         }
 
         report = {
+            "schema_version": 2,
             "timestamp": datetime.now(UTC).isoformat(),
             "request_id": metrics.request_id,
             "commit_hash": get_git_commit_hash(),
             "tag": tag,
             "total_duration_ms": metrics.total_duration_ms,
+            "stage_timing_method": metrics.stage_timing_method,
+            "cuda_event_stage_names": sorted(metrics.cuda_event_stage_names),
             "steps": formatted_steps,
             "denoise_steps_ms": denoise_steps_ms,
             "memory_checkpoints": memory_checkpoints,
             "meta": meta or {},
         }
 
+        abs_path = os.path.abspath(file_path)
+        temporary_path = None
         try:
-            abs_path = os.path.abspath(file_path)
-            os.makedirs(os.path.dirname(abs_path), exist_ok=True)
-            with open(abs_path, "w", encoding="utf-8") as f:
+            output_dir = os.path.dirname(abs_path)
+            os.makedirs(output_dir, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=output_dir,
+                prefix=f".{os.path.basename(abs_path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                temporary_path = f.name
                 json.dump(report, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, abs_path)
+            temporary_path = None
             logger.info(f"Metrics dumped to: {CYAN}{abs_path}{RESET}")
-        except IOError as e:
+        except OSError as e:
             logger.error(f"Failed to dump metrics to {abs_path}: {e}")
+        finally:
+            if temporary_path is not None:
+                try:
+                    os.unlink(temporary_path)
+                except FileNotFoundError:
+                    pass
 
     @classmethod
     def log_request_summary(
@@ -347,6 +425,8 @@ class PerformanceLogger:
 
         Note that this accords to the time spent internally in server, postprocess is not included
         """
+        if get_is_main_process():
+            metrics.resolve_cuda_stage_events()
         formatted_stages = [
             {"name": name, "execution_time_ms": duration_ms}
             for name, duration_ms in metrics.stages.items()

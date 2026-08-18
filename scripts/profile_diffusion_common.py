@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from statistics import fmean
 from typing import Any, BinaryIO, Iterable
@@ -24,7 +25,13 @@ import requests
 
 NUM_RUNS = 5
 NUM_WARMUP_RUNS = 2
+EXPECTED_DENOISE_STEPS = 50
 SUPPORTED_GPU_COUNTS = (1, 2, 4, 8)
+REQUIRED_STAGE_NAMES = (
+    "TextEncodingStage",
+    "DenoisingStage",
+    "DecodingStage",
+)
 DEFAULT_REFERENCE_IMAGE = (
     "https://huggingface.co/datasets/huggingface/documentation-images/"
     "resolve/main/diffusers/cat.png"
@@ -168,6 +175,24 @@ def save_json(path: Path, payload: Any) -> None:
         json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     os.replace(temporary_path, path)
+
+
+@lru_cache(maxsize=1)
+def repository_commit() -> str:
+    repository_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    commit_hash = result.stdout.strip()
+    if len(commit_hash) != 40 or any(
+        character not in "0123456789abcdefABCDEF" for character in commit_hash
+    ):
+        raise RuntimeError(f"Invalid Git commit hash: {commit_hash!r}")
+    return commit_hash.lower()
 
 
 def read_log_tail(path: Path, line_count: int = 120) -> str:
@@ -316,8 +341,10 @@ def build_server_environment(server_dir: Path) -> dict[str, str]:
     environment = os.environ.copy()
     environment["SGLANG_CACHE_DIT_ENABLED"] = "false"
     environment["SGLANG_DIFFUSION_SYNC_STAGE_PROFILING"] = "0"
+    environment["SGLANG_DIFFUSION_CUDA_EVENT_STAGE_PROFILING"] = "1"
     environment["SGLANG_DIFFUSION_STAGE_LOGGING"] = "0"
     environment["SGLANG_PERF_LOG_DIR"] = str(server_dir / "performance_logs")
+    environment["SGLANG_GIT_COMMIT"] = repository_commit()
     environment.pop("SGLANG_DIFFUSION_TORCH_PROFILER_DIR", None)
     environment.pop("SGLANG_TORCH_PROFILER_DIR", None)
     environment.pop("SGLANG_TEST_NUM_INFERENCE_STEPS", None)
@@ -548,19 +575,161 @@ def send_generation_request(
                 raise RuntimeError(f"Video generation failed: {result}")
 
 
-def read_perf_dump(path: Path, timeout_s: float) -> dict[str, Any]:
+def response_request_id(response: dict[str, Any]) -> str:
+    request_id = response.get("id")
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError(f"Generation response has no valid request id: {response}")
+    return request_id
+
+
+def _validate_perf_dump(
+    payload: dict[str, Any],
+    *,
+    expected_request_id: str,
+    expected_commit_hash: str,
+    expected_model_path: Path,
+    expected_world_size: int,
+    expected_denoise_steps: int,
+) -> None:
+    if payload.get("schema_version") != 2:
+        raise ValueError(
+            f"perf dump schema_version must be 2, got {payload.get('schema_version')!r}"
+        )
+    if payload.get("tag") != "server_perf_dump":
+        raise ValueError(f"Unexpected perf dump tag: {payload.get('tag')!r}")
+    if payload.get("request_id") != expected_request_id:
+        raise ValueError(
+            "perf dump request_id does not match the completed request: "
+            f"{payload.get('request_id')!r} != {expected_request_id!r}"
+        )
+    actual_commit = payload.get("commit_hash")
+    if not isinstance(actual_commit, str) or (
+        actual_commit.lower() != expected_commit_hash.lower()
+    ):
+        raise ValueError(
+            "perf dump commit does not match the profiling script checkout: "
+            f"{actual_commit!r} != {expected_commit_hash!r}"
+        )
+    if payload.get("stage_timing_method") != "cuda_event":
+        raise ValueError(
+            "perf dump did not use CUDA-event stage timing: "
+            f"{payload.get('stage_timing_method')!r}"
+        )
+    cuda_event_stage_names = payload.get("cuda_event_stage_names")
+    if not isinstance(cuda_event_stage_names, list) or (
+        set(cuda_event_stage_names) != set(REQUIRED_STAGE_NAMES)
+    ):
+        raise ValueError(
+            "CUDA-event timing must cover exactly the required module stages: "
+            f"{cuda_event_stage_names!r}"
+        )
+
+    meta = payload.get("meta")
+    if not isinstance(meta, dict):
+        raise ValueError("perf dump meta must be an object")
+    if meta.get("rank") != 0:
+        raise ValueError(
+            f"perf dump must be published by rank 0, got {meta.get('rank')!r}"
+        )
+    if meta.get("world_size") != expected_world_size:
+        raise ValueError(
+            "perf dump world_size mismatch: "
+            f"{meta.get('world_size')!r} != {expected_world_size}"
+        )
+    actual_model = meta.get("model")
+    if not isinstance(actual_model, str) or (
+        Path(actual_model).expanduser().resolve() != expected_model_path.resolve()
+    ):
+        raise ValueError(
+            "perf dump model path mismatch: "
+            f"{actual_model!r} != {str(expected_model_path)!r}"
+        )
+
+    total_duration_ms(payload)
+    stages = payload.get("steps")
+    if not isinstance(stages, list):
+        raise ValueError("perf dump does not contain a steps list")
+    stage_counts: dict[str, int] = {}
+    for stage in stages:
+        if not isinstance(stage, dict) or not isinstance(stage.get("name"), str):
+            raise ValueError(f"Invalid stage entry: {stage!r}")
+        stage_name = stage["name"]
+        stage_counts[stage_name] = stage_counts.get(stage_name, 0) + 1
+        require_nonnegative_ms(stage.get("duration_ms"), f"{stage_name}.duration_ms")
+    invalid_stage_counts = {
+        name: stage_counts.get(name, 0)
+        for name in REQUIRED_STAGE_NAMES
+        if stage_counts.get(name, 0) != 1
+    }
+    if invalid_stage_counts:
+        raise ValueError(
+            "Expected exactly one entry for each required stage; got "
+            f"{invalid_stage_counts}"
+        )
+    for stage_name in REQUIRED_STAGE_NAMES:
+        stage_duration_ms(payload, stage_name)
+
+    denoise_steps = payload.get("denoise_steps_ms")
+    if not isinstance(denoise_steps, list) or (
+        len(denoise_steps) != expected_denoise_steps
+    ):
+        count = len(denoise_steps) if isinstance(denoise_steps, list) else None
+        raise ValueError(
+            f"Expected {expected_denoise_steps} denoise steps, got {count}"
+        )
+    for index, step in enumerate(denoise_steps):
+        if not isinstance(step, dict) or step.get("step") != index:
+            raise ValueError(f"Invalid denoise step {index}: {step!r}")
+        require_positive_ms(step.get("duration_ms"), f"denoise step {index}")
+
+
+def read_perf_dump(
+    path: Path,
+    timeout_s: float,
+    *,
+    expected_request_id: str,
+    expected_commit_hash: str,
+    expected_model_path: Path,
+    expected_world_size: int,
+    expected_denoise_steps: int = EXPECTED_DENOISE_STEPS,
+) -> dict[str, Any]:
     deadline = time.perf_counter() + timeout_s
     last_error = "file was not created"
+    stable_signature: tuple[int, int, str] | None = None
+    stable_observations = 0
     while time.perf_counter() < deadline:
         if path.is_file():
             try:
-                payload = json.loads(path.read_text(encoding="utf-8"))
+                raw = path.read_bytes()
+                stat = path.stat()
+                signature = (
+                    len(raw),
+                    stat.st_mtime_ns,
+                    hashlib.sha256(raw).hexdigest(),
+                )
+                if signature == stable_signature:
+                    stable_observations += 1
+                else:
+                    stable_signature = signature
+                    stable_observations = 1
+                if stable_observations < 3:
+                    time.sleep(0.1)
+                    continue
+                payload = json.loads(raw.decode("utf-8"))
                 if not isinstance(payload, dict):
                     raise ValueError("perf dump root is not an object")
+                _validate_perf_dump(
+                    payload,
+                    expected_request_id=expected_request_id,
+                    expected_commit_hash=expected_commit_hash,
+                    expected_model_path=expected_model_path,
+                    expected_world_size=expected_world_size,
+                    expected_denoise_steps=expected_denoise_steps,
+                )
                 return payload
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
                 last_error = str(exc)
-        time.sleep(0.05)
+        time.sleep(0.1)
     raise TimeoutError(f"Could not read perf dump {path}: {last_error}")
 
 
@@ -573,33 +742,59 @@ def require_positive_ms(value: Any, field_name: str) -> float:
     return result
 
 
+def require_nonnegative_ms(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be numeric, got {value!r}")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise ValueError(
+            f"{field_name} must be finite and non-negative, got {value!r}"
+        )
+    return result
+
+
 def total_duration_ms(perf_dump: dict[str, Any]) -> float:
     return require_positive_ms(perf_dump.get("total_duration_ms"), "total_duration_ms")
 
 
 def denoising_stage_ms(perf_dump: dict[str, Any]) -> float:
+    return stage_duration_ms(perf_dump, "DenoisingStage")
+
+
+def stage_duration_ms(perf_dump: dict[str, Any], stage_name: str) -> float:
     stages = perf_dump.get("steps")
     if not isinstance(stages, list):
         raise ValueError("perf dump does not contain a steps list")
     matches = [
         stage
         for stage in stages
-        if isinstance(stage, dict) and stage.get("name") == "DenoisingStage"
+        if isinstance(stage, dict) and stage.get("name") == stage_name
     ]
     if len(matches) != 1:
         raise ValueError(
-            f"Expected exactly one DenoisingStage entry, found {len(matches)}"
+            f"Expected exactly one {stage_name} entry, found {len(matches)}"
         )
     return require_positive_ms(
-        matches[0].get("duration_ms"), "DenoisingStage.duration_ms"
+        matches[0].get("duration_ms"), f"{stage_name}.duration_ms"
     )
+
+
+def module_durations_ms(perf_dump: dict[str, Any]) -> dict[str, float]:
+    return {
+        "encoder": stage_duration_ms(perf_dump, "TextEncodingStage"),
+        "denoiser": stage_duration_ms(perf_dump, "DenoisingStage"),
+        "decoder": stage_duration_ms(perf_dump, "DecodingStage"),
+    }
 
 
 def measured_mean(records: list[dict[str, Any]], metric_name: str) -> float:
     if len(records) != NUM_RUNS:
         raise ValueError(f"Expected {NUM_RUNS} records, got {len(records)}")
     measured = records[NUM_WARMUP_RUNS:]
-    values = [require_positive_ms(record.get(metric_name), metric_name) for record in measured]
+    values = [
+        require_positive_ms(record.get(metric_name), metric_name)
+        for record in measured
+    ]
     return float(fmean(values))
 
 

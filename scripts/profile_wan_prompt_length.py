@@ -26,6 +26,8 @@ from profile_diffusion_common import (
     prepare_output_dir,
     prompt_fingerprint,
     read_perf_dump,
+    repository_commit,
+    response_request_id,
     save_json,
     send_generation_request,
     server_base_url,
@@ -206,6 +208,7 @@ def main() -> None:
         spec.key: load_prompts(model_paths[spec.key]) for spec in WAN_MODEL_SPECS
     }
     output_dir = prepare_output_dir(args.output_dir)
+    profile_commit = repository_commit()
     reference_image = materialize_reference_image(
         args.wan22_reference_image,
         output_dir,
@@ -217,6 +220,7 @@ def main() -> None:
         "status": "running",
         "metric": "perf_dump.steps[DenoisingStage].duration_ms",
         "unit": "ms",
+        "commit_hash": profile_commit,
         "gpu_count": 1,
         "runs_per_length": NUM_RUNS,
         "warmup_runs": NUM_WARMUP_RUNS,
@@ -296,7 +300,7 @@ def main() -> None:
                         f"run={run_index + 1}/{NUM_RUNS}",
                         flush=True,
                     )
-                    send_generation_request(
+                    response = send_generation_request(
                         base_url,
                         spec,
                         prompt,
@@ -305,7 +309,14 @@ def main() -> None:
                         args.request_timeout_s,
                         args.video_poll_interval_s,
                     )
-                    perf_dump = read_perf_dump(perf_path, args.perf_timeout_s)
+                    perf_dump = read_perf_dump(
+                        perf_path,
+                        args.perf_timeout_s,
+                        expected_request_id=response_request_id(response),
+                        expected_commit_hash=profile_commit,
+                        expected_model_path=model_path,
+                        expected_world_size=1,
+                    )
                     length_record["runs"].append(
                         {
                             "run": run_index + 1,
