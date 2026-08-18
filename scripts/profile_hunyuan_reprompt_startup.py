@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import pprint
+import re
 import signal
 import socket
 import subprocess
@@ -28,8 +29,14 @@ SUMMARY_TP_ORDER = (8, 4, 2, 1)
 NUM_RUNS = 5
 NUM_WARMUP_RUNS = 2
 EXPECTED_MAX_MODEL_LEN = 32768
-FORCED_SERVER_ENVIRONMENT = {"SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0"}
-REMOVED_SERVER_ENVIRONMENT = ("SGLANG_USE_JIT_ALL_REDUCE",)
+CUSTOM_ALL_REDUCE_V2_ENV = "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2"
+REMOVED_SERVER_ENVIRONMENT = ("SGLANG_USE_JIT_ALL_REDUCE", CUSTOM_ALL_REDUCE_V2_ENV)
+ALL_REDUCE_MODES = ("legacy_v1", "custom_v2", "nccl")
+ATTENTION_BACKEND_MODES = ("auto", "flashinfer", "fa3")
+DECODE_CUDA_GRAPH_BACKENDS = ("full", "disabled")
+LEGACY_CUSTOM_AR_GRAPH_PATTERN = re.compile(
+    r"Registering \d+ cuda graph addresses"
+)
 SETUPS = {
     "non_optimized": (),
     "optimized": (
@@ -72,6 +79,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--startup-timeout-s", type=float, default=1800.0)
     parser.add_argument("--ready-poll-interval-s", type=float, default=0.05)
     parser.add_argument("--cooldown-s", type=float, default=2.0)
+    parser.add_argument(
+        "--attention-backend",
+        choices=ATTENTION_BACKEND_MODES,
+        default="flashinfer",
+        help="SGLang attention backend. Use fa3 on a compatible Hopper image.",
+    )
+    parser.add_argument(
+        "--all-reduce-mode",
+        choices=ALL_REDUCE_MODES,
+        default="legacy_v1",
+        help=(
+            "legacy_v1 forces the legacy custom all-reduce, custom_v2 forces "
+            "the JIT V2 path, and nccl disables custom all-reduce."
+        ),
+    )
+    parser.add_argument(
+        "--decode-cuda-graph-backend",
+        choices=DECODE_CUDA_GRAPH_BACKENDS,
+        default="full",
+    )
     args = parser.parse_args()
 
     args.model_path = args.model_path.expanduser()
@@ -177,11 +204,24 @@ def prepare_output_directory(path: Path) -> None:
     path.mkdir(parents=True)
 
 
-def build_server_environment() -> dict[str, str]:
+def forced_server_environment(all_reduce_mode: str) -> dict[str, str]:
+    if all_reduce_mode == "legacy_v1":
+        return {CUSTOM_ALL_REDUCE_V2_ENV: "0"}
+    if all_reduce_mode == "custom_v2":
+        return {CUSTOM_ALL_REDUCE_V2_ENV: "1"}
+    if all_reduce_mode == "nccl":
+        return {}
+    raise ValueError(
+        f"Unsupported all-reduce mode {all_reduce_mode!r}; "
+        f"expected one of {ALL_REDUCE_MODES}"
+    )
+
+
+def build_server_environment(all_reduce_mode: str = "legacy_v1") -> dict[str, str]:
     environment = os.environ.copy()
     for name in REMOVED_SERVER_ENVIRONMENT:
         environment.pop(name, None)
-    environment.update(FORCED_SERVER_ENVIRONMENT)
+    environment.update(forced_server_environment(all_reduce_mode))
     return environment
 
 
@@ -227,7 +267,25 @@ def build_server_command(
     port: int,
     tp_size: int,
     setup_name: str,
+    all_reduce_mode: str = "legacy_v1",
+    attention_backend: str = "flashinfer",
+    decode_cuda_graph_backend: str = "full",
 ) -> list[str]:
+    if all_reduce_mode not in ALL_REDUCE_MODES:
+        raise ValueError(
+            f"Unsupported all-reduce mode {all_reduce_mode!r}; "
+            f"expected one of {ALL_REDUCE_MODES}"
+        )
+    if attention_backend not in ATTENTION_BACKEND_MODES:
+        raise ValueError(
+            f"Unsupported attention backend {attention_backend!r}; "
+            f"expected one of {ATTENTION_BACKEND_MODES}"
+        )
+    if decode_cuda_graph_backend not in DECODE_CUDA_GRAPH_BACKENDS:
+        raise ValueError(
+            f"Unsupported decode CUDA graph backend {decode_cuda_graph_backend!r}; "
+            f"expected one of {DECODE_CUDA_GRAPH_BACKENDS}"
+        )
     command = [
         sys.executable,
         "-m",
@@ -248,25 +306,27 @@ def build_server_command(
         "--mem-fraction-static",
         "0.9",
         "--skip-server-warmup",
-        "--attention-backend",
-        "flashinfer",
         "--cuda-graph-backend-decode",
-        "full",
+        decode_cuda_graph_backend,
         "--cuda-graph-backend-prefill",
         "disabled",
     ]
+    if attention_backend != "auto":
+        command.extend(["--attention-backend", attention_backend])
+    if all_reduce_mode == "nccl":
+        command.append("--disable-custom-all-reduce")
     command.extend(SETUPS[setup_name])
     return command
 
 
 def start_timed_server(
-    command: list[str], log_path: Path
+    command: list[str], log_path: Path, all_reduce_mode: str = "legacy_v1"
 ) -> tuple[subprocess.Popen[bytes], Any, int]:
     log_file = log_path.open("wb")
     kwargs: dict[str, Any] = {
         "stdout": log_file,
         "stderr": subprocess.STDOUT,
-        "env": build_server_environment(),
+        "env": build_server_environment(all_reduce_mode),
     }
     if os.name == "posix":
         kwargs["start_new_session"] = True
@@ -370,21 +430,64 @@ def validate_server_log(
     model_path: Path,
     tp_size: int,
     setup_name: str,
+    all_reduce_mode: str = "legacy_v1",
+    attention_backend: str = "flashinfer",
+    decode_cuda_graph_backend: str = "full",
 ) -> dict[str, Any]:
+    if all_reduce_mode not in ALL_REDUCE_MODES:
+        raise ValueError(
+            f"Unsupported all-reduce mode {all_reduce_mode!r}; "
+            f"expected one of {ALL_REDUCE_MODES}"
+        )
+    if attention_backend not in ATTENTION_BACKEND_MODES:
+        raise ValueError(
+            f"Unsupported attention backend {attention_backend!r}; "
+            f"expected one of {ATTENTION_BACKEND_MODES}"
+        )
+    if decode_cuda_graph_backend not in DECODE_CUDA_GRAPH_BACKENDS:
+        raise ValueError(
+            f"Unsupported decode CUDA graph backend {decode_cuda_graph_backend!r}; "
+            f"expected one of {DECODE_CUDA_GRAPH_BACKENDS}"
+        )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    resolved_attention_match = re.search(
+        r"attention_backend='([^']+)'", log_text
+    )
+    if resolved_attention_match is None:
+        raise RuntimeError(
+            f"Could not resolve attention_backend from {log_path}\n"
+            f"{read_log_tail(log_path)}"
+        )
+    resolved_attention_backend = resolved_attention_match.group(1)
+    if (
+        attention_backend != "auto"
+        and resolved_attention_backend != attention_backend
+    ):
+        raise RuntimeError(
+            f"Requested attention backend {attention_backend!r}, but the server "
+            f"resolved {resolved_attention_backend!r}.\n{read_log_tail(log_path)}"
+        )
     required_markers = [
         f"model_path='{model_path}'",
         f"tp_size={tp_size}",
-        "attention_backend='flashinfer'",
-        "cuda_graph_backend_decode='full'",
+        f"attention_backend='{resolved_attention_backend}'",
+        f"cuda_graph_backend_decode='{decode_cuda_graph_backend}'",
         "cuda_graph_backend_prefill='disabled'",
-        "disable_custom_all_reduce=False",
         f"type={EXPECTED_ARCHITECTURE}",
         "Disable prefill CUDA graph because",
-        "Capture target decode CUDA graph end.",
     ]
-    if tp_size > 1:
-        required_markers.append(" cuda graph addresses")
+    if decode_cuda_graph_backend == "full":
+        required_markers.append("Capture target decode CUDA graph end.")
+    if all_reduce_mode in {"legacy_v1", "custom_v2"}:
+        required_markers.append("disable_custom_all_reduce=False")
+        if tp_size > 1 and decode_cuda_graph_backend == "full":
+            required_markers.append(
+                " cuda graph addresses via "
+                if all_reduce_mode == "custom_v2"
+                else " cuda graph addresses"
+            )
+    else:
+        required_markers.append("disable_custom_all_reduce=True")
     if setup_name == "optimized":
         required_markers.extend(
             [
@@ -396,15 +499,40 @@ def validate_server_log(
 
     forbidden_markers = [
         "Setup Custom allreduce failed",
-        "sgl_kernel_jit_cuda_ipc",
-        "custom_all_reduce_v2",
-        "All-reduce call path: NCCL (custom AR disabled)",
         "Capture cuda graph failed",
     ]
+    if all_reduce_mode == "legacy_v1":
+        forbidden_markers.extend(
+            [
+                "All-reduce call path: NCCL (custom AR disabled)",
+                "sgl_kernel_jit_cuda_ipc",
+                "custom_all_reduce_v2",
+                " cuda graph addresses via ",
+            ]
+        )
+    elif all_reduce_mode == "custom_v2":
+        forbidden_markers.extend(
+            [
+                "All-reduce call path: NCCL (custom AR disabled)",
+                "CustomAllReduceV2 is disabled",
+            ]
+        )
+    else:
+        forbidden_markers.append(" cuda graph addresses via ")
+    if decode_cuda_graph_backend == "disabled":
+        forbidden_markers.append("Capture target decode CUDA graph")
     missing = [marker for marker in required_markers if marker not in log_text]
     present_forbidden = [
         marker for marker in forbidden_markers if marker in log_text
     ]
+    legacy_graph_registration_present = bool(
+        LEGACY_CUSTOM_AR_GRAPH_PATTERN.search(log_text)
+    )
+    if (
+        all_reduce_mode in {"custom_v2", "nccl"}
+        and legacy_graph_registration_present
+    ):
+        present_forbidden.append("legacy custom all-reduce graph registration")
     if missing or present_forbidden:
         raise RuntimeError(
             f"Server log validation failed for TP={tp_size}, setup={setup_name}; "
@@ -414,9 +542,12 @@ def validate_server_log(
     return {
         "required_markers": required_markers,
         "forbidden_markers_absent": forbidden_markers,
-        "custom_all_reduce": "legacy_v1",
-        "attention_backend": "flashinfer",
-        "decode_cuda_graph_backend": "full",
+        "all_reduce_mode": all_reduce_mode,
+        "requested_attention_backend": attention_backend,
+        "resolved_attention_backend": resolved_attention_backend,
+        "attention_backend": resolved_attention_backend,
+        "decode_cuda_graph_backend": decode_cuda_graph_backend,
+        "legacy_graph_registration_present": legacy_graph_registration_present,
         "prefill_cuda_graph_backend": "disabled",
     }
 
@@ -464,9 +595,12 @@ def main() -> None:
         "num_runs": NUM_RUNS,
         "num_warmup_runs": NUM_WARMUP_RUNS,
         "server_environment": {
-            "forced": FORCED_SERVER_ENVIRONMENT,
+            "forced": forced_server_environment(args.all_reduce_mode),
             "removed": list(REMOVED_SERVER_ENVIRONMENT),
         },
+        "attention_backend": args.attention_backend,
+        "all_reduce_mode": args.all_reduce_mode,
+        "decode_cuda_graph_backend": args.decode_cuda_graph_backend,
         "startup_time_semantics": (
             "time.perf_counter_ns immediately before Popen until /v1/models "
             "first returns HTTP 200 with the expected served model id. Log and "
@@ -496,6 +630,9 @@ def main() -> None:
                         port,
                         tp_size,
                         setup_name,
+                        all_reduce_mode=args.all_reduce_mode,
+                        attention_backend=args.attention_backend,
+                        decode_cuda_graph_backend=args.decode_cuda_graph_backend,
                     )
                     record: dict[str, Any] = {
                         "tp_size": tp_size,
@@ -522,7 +659,7 @@ def main() -> None:
                     session.trust_env = False
                     try:
                         process, log_file, start_ns = start_timed_server(
-                            command, log_path
+                            command, log_path, args.all_reduce_mode
                         )
                         ready_ns, model_card = wait_for_ready(
                             process,
@@ -542,6 +679,9 @@ def main() -> None:
                             args.model_path,
                             tp_size,
                             setup_name,
+                            all_reduce_mode=args.all_reduce_mode,
+                            attention_backend=args.attention_backend,
+                            decode_cuda_graph_backend=args.decode_cuda_graph_backend,
                         )
                         record.update(
                             status="completed",
