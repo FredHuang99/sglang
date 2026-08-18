@@ -104,6 +104,7 @@ REFERENCE_IGNORED_ARGS = {
     "profile-enabled",
     "profile-output-dir",
     "profile-run-id",
+    "strict-ports",
 }
 
 SERVER_ARGS_EXPECTED = {
@@ -334,6 +335,8 @@ def build_command(
             str(ports.get("scheduler_port", find_free_port(args.host))),
             "--master-port",
             str(ports.get("master_port", find_free_port(args.host))),
+            "--strict-ports",
+            "true",
             "--num-gpus",
             str(args.num_gpus),
             "--warmup",
@@ -1085,10 +1088,11 @@ def summarize_combined_run(
     launch_task_records = load_launch_task_records(
         official_result.get("launch_task_log_path")
     )
+    metrics_ready = bool(metrics_result and metrics_result.get("ready"))
     summary = summarize_run(
         official_result,
-        records,
-        module_records,
+        records if metrics_ready else [],
+        module_records if metrics_ready else [],
         launch_task_records=launch_task_records,
     )
     summary["ready"] = 1.0 if official_result.get("ready") else 0.0
@@ -1099,9 +1103,9 @@ def summarize_combined_run(
             summary["wall_delta_vs_reference_s"] = (
                 float(timing_result["launch_wall_s"]) - reference_launch_time_s
             )
-    if metrics_result is not None:
+    if metrics_ready:
         summary["wall_profiled_s"] = float(metrics_result["launch_wall_s"])
-    if timing_result is not None and metrics_result is not None:
+    if timing_result is not None and metrics_ready:
         summary["profile_overhead_s"] = (
             float(metrics_result["launch_wall_s"])
             - float(timing_result["launch_wall_s"])
@@ -1348,7 +1352,11 @@ def main() -> None:
             records = load_profile_records(args.profile_output_dir, metrics_run_id)
             module_records = load_module_records(args.profile_output_dir, metrics_run_id)
             official = timing_result or metrics_result
-            if official and official.get("ready"):
+            pair_complete = all(
+                per_pass_results[measurement_pass].get("ready")
+                for measurement_pass in passes
+            )
+            if official and official.get("ready") and pair_complete:
                 run_summaries.append(
                     (
                         setup,

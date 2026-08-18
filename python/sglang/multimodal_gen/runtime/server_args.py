@@ -226,6 +226,7 @@ class ServerArgs:
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    strict_ports: bool = False
 
     output_path: str | None = "outputs/"
     input_save_path: str | None = "inputs/uploads"
@@ -570,6 +571,34 @@ class ServerArgs:
             RoleType.MONOLITHIC,
             RoleType.SERVER,
         )
+        initial_master_port = (
+            self.master_port
+            if self.master_port is not None
+            else (30005 + random.randint(0, 100))
+        )
+
+        if self.strict_ports:
+            requested_ports: list[tuple[int | None, str]] = []
+            if needs_http:
+                requested_ports.append((self.port, "HTTP"))
+            requested_ports.extend(
+                [
+                    (self.scheduler_port, "Scheduler"),
+                    (initial_master_port, "Master"),
+                ]
+            )
+            seen_ports: dict[int | None, str] = {}
+            for port, name in requested_ports:
+                if port in seen_ports:
+                    raise RuntimeError(
+                        f"{name} port {port} duplicates {seen_ports[port]} port "
+                        "and --strict-ports is enabled."
+                    )
+                seen_ports[port] = name
+                self._require_port(port, name)
+            self.master_port = initial_master_port
+            return
+
         if needs_http:
             self.port = self.settle_port(self.port)
 
@@ -577,12 +606,19 @@ class ServerArgs:
             random.randint(0, 100) if self.scheduler_port == 5555 else 0
         )
         self.scheduler_port = self.settle_port(initial_scheduler_port)
-        initial_master_port = (
-            self.master_port
-            if self.master_port is not None
-            else (30005 + random.randint(0, 100))
-        )
         self.master_port = self.settle_port(initial_master_port, 37)
+
+    @staticmethod
+    def _require_port(port: int | None, name: str) -> None:
+        if port is None or isinstance(port, bool) or not 1 <= port <= 65535:
+            raise RuntimeError(
+                f"{name} port {port!r} is invalid and --strict-ports is enabled."
+            )
+        if not is_port_available(port):
+            raise RuntimeError(
+                f"{name} port {port} is unavailable and --strict-ports is enabled. "
+                "Either use a different port or disable --strict-ports."
+            )
 
     def _adjust_parallelism(self):
         if self.tp_size is None:
@@ -1172,6 +1208,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.port,
             help="Port for the HTTP API server.",
+        )
+        parser.add_argument(
+            "--strict-ports",
+            action=StoreBoolean,
+            default=ServerArgs.strict_ports,
+            help="Fail instead of silently changing requested network ports.",
         )
         parser.add_argument(
             "--webui",
