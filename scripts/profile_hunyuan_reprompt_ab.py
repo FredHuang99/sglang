@@ -65,20 +65,20 @@ EXPERIMENT_CONFIGS = {
     "backend_graph": (
         experiment_config("tp1_auto_full", 1, attention_backend="auto"),
         experiment_config("tp1_flashinfer_full", 1),
-        experiment_config("tp1_triton_full", 1, attention_backend="triton"),
+        experiment_config("tp1_fa3_full", 1, attention_backend="fa3"),
         experiment_config(
             "tp1_flashinfer_eager", 1, decode_cuda_graph_backend="disabled"
         ),
         experiment_config(
-            "tp1_triton_eager",
+            "tp1_fa3_eager",
             1,
-            attention_backend="triton",
+            attention_backend="fa3",
             decode_cuda_graph_backend="disabled",
         ),
     ),
     "tp_stack": (
         experiment_config("tp1_flashinfer_full", 1),
-        experiment_config("tp1_triton_full", 1, attention_backend="triton"),
+        experiment_config("tp1_fa3_full", 1, attention_backend="fa3"),
         experiment_config("tp8_flashinfer_full_v1", 8),
         experiment_config(
             "tp8_flashinfer_full_nccl", 8, all_reduce_mode="nccl"
@@ -89,18 +89,18 @@ EXPERIMENT_CONFIGS = {
             decode_cuda_graph_backend="disabled",
         ),
         experiment_config(
-            "tp8_triton_full_v1", 8, attention_backend="triton"
+            "tp8_fa3_full_v1", 8, attention_backend="fa3"
         ),
         experiment_config(
-            "tp8_triton_full_nccl",
+            "tp8_fa3_full_nccl",
             8,
-            attention_backend="triton",
+            attention_backend="fa3",
             all_reduce_mode="nccl",
         ),
         experiment_config(
-            "tp8_triton_eager_v1",
+            "tp8_fa3_eager_v1",
             8,
-            attention_backend="triton",
+            attention_backend="fa3",
             decode_cuda_graph_backend="disabled",
         ),
     ),
@@ -443,9 +443,9 @@ def comparison_specs(experiment: str) -> tuple[tuple[str, str, str], ...]:
                 "tp1_flashinfer_full",
             ),
             (
-                "triton_vs_flashinfer_full",
+                "fa3_vs_flashinfer_full",
                 "tp1_flashinfer_full",
-                "tp1_triton_full",
+                "tp1_fa3_full",
             ),
             (
                 "flashinfer_full_vs_eager",
@@ -453,9 +453,9 @@ def comparison_specs(experiment: str) -> tuple[tuple[str, str, str], ...]:
                 "tp1_flashinfer_full",
             ),
             (
-                "triton_full_vs_eager",
-                "tp1_triton_eager",
-                "tp1_triton_full",
+                "fa3_full_vs_eager",
+                "tp1_fa3_eager",
+                "tp1_fa3_full",
             ),
         )
     return (
@@ -465,9 +465,9 @@ def comparison_specs(experiment: str) -> tuple[tuple[str, str, str], ...]:
             "tp8_flashinfer_full_v1",
         ),
         (
-            "triton_tp8_v1_vs_tp1",
-            "tp1_triton_full",
-            "tp8_triton_full_v1",
+            "fa3_tp8_v1_vs_tp1",
+            "tp1_fa3_full",
+            "tp8_fa3_full_v1",
         ),
         (
             "flashinfer_v1_vs_nccl",
@@ -475,9 +475,9 @@ def comparison_specs(experiment: str) -> tuple[tuple[str, str, str], ...]:
             "tp8_flashinfer_full_v1",
         ),
         (
-            "triton_v1_vs_nccl",
-            "tp8_triton_full_nccl",
-            "tp8_triton_full_v1",
+            "fa3_v1_vs_nccl",
+            "tp8_fa3_full_nccl",
+            "tp8_fa3_full_v1",
         ),
         (
             "flashinfer_full_vs_eager_tp8_v1",
@@ -485,9 +485,9 @@ def comparison_specs(experiment: str) -> tuple[tuple[str, str, str], ...]:
             "tp8_flashinfer_full_v1",
         ),
         (
-            "triton_full_vs_eager_tp8_v1",
-            "tp8_triton_eager_v1",
-            "tp8_triton_full_v1",
+            "fa3_full_vs_eager_tp8_v1",
+            "tp8_fa3_eager_v1",
+            "tp8_fa3_full_v1",
         ),
     )
 
@@ -700,9 +700,20 @@ def main() -> None:
                             log_segment, expected_cuda_graph
                         )
                     except Exception as exc:
-                        run_record.update(status="failed", error=str(exc))
+                        time.sleep(0.2)
+                        server_returncode = process.poll()
+                        failure = (
+                            f"{type(exc).__name__}: {exc}\n"
+                            f"server_process_returncode={server_returncode!r}\n"
+                            f"server log tail:\n{latency.read_log_tail(log_path)}"
+                        )
+                        run_record.update(
+                            status="failed",
+                            error=failure,
+                            server_process_returncode=server_returncode,
+                        )
                         latency.save_json(details_path, details)
-                        raise
+                        raise RuntimeError(failure) from exc
                     run_record.update(
                         status="completed",
                         scheduler_log_end_offset=log_end_offset,
