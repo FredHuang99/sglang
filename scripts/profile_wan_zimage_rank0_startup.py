@@ -351,8 +351,6 @@ def build_server_command(
         str(ulysses_degree),
         "--ring-degree",
         str(ring_degree),
-        "--enable-cfg-parallel",
-        "false",
         "--dit-cpu-offload",
         "false",
         "--dit-layerwise-offload",
