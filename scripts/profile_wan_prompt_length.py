@@ -219,6 +219,7 @@ def main() -> None:
     state: dict[str, Any] = {
         "status": "running",
         "metric": "perf_dump.steps[DenoisingStage].duration_ms",
+        "timing_method": "cuda_event",
         "unit": "ms",
         "commit_hash": profile_commit,
         "gpu_count": 1,
@@ -258,7 +259,9 @@ def main() -> None:
             server = launch_server(
                 command,
                 model_dir / "server.log",
-                build_server_environment(server_dir),
+                build_server_environment(
+                    server_dir, enable_cuda_event_stage_profiling=True
+                ),
             )
             base_url = server_base_url(args.host, ports["http"])
             card, ready_ns = wait_for_ready(
@@ -309,10 +312,11 @@ def main() -> None:
                         args.request_timeout_s,
                         args.video_poll_interval_s,
                     )
+                    request_id = response_request_id(response)
                     perf_dump = read_perf_dump(
                         perf_path,
                         args.perf_timeout_s,
-                        expected_request_id=response_request_id(response),
+                        expected_request_id=request_id,
                         expected_commit_hash=profile_commit,
                         expected_model_path=model_path,
                         expected_world_size=1,
@@ -322,6 +326,11 @@ def main() -> None:
                             "run": run_index + 1,
                             "warmup": run_index < NUM_WARMUP_RUNS,
                             "dit_duration_ms": denoising_stage_ms(perf_dump),
+                            "request_id": request_id,
+                            "commit_hash": perf_dump["commit_hash"],
+                            "stage_timing_method": perf_dump[
+                                "stage_timing_method"
+                            ],
                             "perf_dump_path": str(perf_path),
                         }
                     )

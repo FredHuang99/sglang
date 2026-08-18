@@ -94,6 +94,7 @@ def main() -> None:
         "status": "running",
         "metric": "Popen to validated /v1/models readiness",
         "unit": "ms",
+        "generation_stage_profiling": False,
         "runs_per_point": NUM_RUNS,
         "warmup_runs": NUM_WARMUP_RUNS,
         "gpu_counts": args.gpu_counts,
@@ -154,7 +155,10 @@ def main() -> None:
                     server = launch_server(
                         command,
                         trial_dir / "server.log",
-                        build_server_environment(server_dir),
+                        build_server_environment(
+                            server_dir,
+                            enable_cuda_event_stage_profiling=False,
+                        ),
                     )
                     base_url = server_base_url(args.host, ports["http"])
                     card, ready_ns = wait_for_ready(

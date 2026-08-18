@@ -198,7 +198,9 @@ def main() -> None:
                 server = launch_server(
                     command,
                     point_dir / "server.log",
-                    build_server_environment(server_dir),
+                    build_server_environment(
+                        server_dir, enable_cuda_event_stage_profiling=True
+                    ),
                 )
                 base_url = server_base_url(args.host, ports["http"])
                 card, ready_ns = wait_for_ready(

@@ -337,14 +337,19 @@ def build_server_command(
     ]
 
 
-def build_server_environment(server_dir: Path) -> dict[str, str]:
+def build_server_environment(
+    server_dir: Path, *, enable_cuda_event_stage_profiling: bool = False
+) -> dict[str, str]:
     environment = os.environ.copy()
     environment["SGLANG_CACHE_DIT_ENABLED"] = "false"
     environment["SGLANG_DIFFUSION_SYNC_STAGE_PROFILING"] = "0"
-    environment["SGLANG_DIFFUSION_CUDA_EVENT_STAGE_PROFILING"] = "1"
+    environment["SGLANG_DIFFUSION_CUDA_EVENT_STAGE_PROFILING"] = (
+        "1" if enable_cuda_event_stage_profiling else "0"
+    )
     environment["SGLANG_DIFFUSION_STAGE_LOGGING"] = "0"
     environment["SGLANG_PERF_LOG_DIR"] = str(server_dir / "performance_logs")
-    environment["SGLANG_GIT_COMMIT"] = repository_commit()
+    if enable_cuda_event_stage_profiling:
+        environment["SGLANG_GIT_COMMIT"] = repository_commit()
     environment.pop("SGLANG_DIFFUSION_TORCH_PROFILER_DIR", None)
     environment.pop("SGLANG_TORCH_PROFILER_DIR", None)
     environment.pop("SGLANG_TEST_NUM_INFERENCE_STEPS", None)
