@@ -34,9 +34,13 @@ REQUIRED_STAGE_NAMES = (
     "DenoisingStage",
     "DecodingStage",
 )
-DEFAULT_REFERENCE_IMAGE = (
-    "https://huggingface.co/datasets/huggingface/documentation-images/"
-    "resolve/main/diffusers/cat.png"
+DEFAULT_REFERENCE_IMAGE = str(
+    Path(__file__).resolve().parents[1]
+    / "examples"
+    / "frontend_language"
+    / "quick_start"
+    / "images"
+    / "cat.jpeg"
 )
 
 # Match the April H200 Z-Image baseline. Z-Image has 30 attention heads, so
