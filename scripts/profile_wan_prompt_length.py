@@ -23,6 +23,7 @@ from profile_diffusion_common import (
     materialize_reference_image,
     measured_mean,
     model_metadata,
+    normalize_attention_backend,
     prepare_output_dir,
     prompt_fingerprint,
     read_perf_dump,
@@ -32,6 +33,7 @@ from profile_diffusion_common import (
     send_generation_request,
     server_base_url,
     stop_server,
+    validate_cuda_compat_lib_dir,
     validate_model_path,
     wait_for_ready,
 )
@@ -51,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wan22-model-path", type=Path, default=WAN22.default_path)
     parser.add_argument("--wan21-model-path", type=Path, default=WAN21.default_path)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--cuda-compat-lib-dir", type=Path)
+    parser.add_argument("--attention-backend")
     parser.add_argument(
         "--wan22-reference-image", default=DEFAULT_REFERENCE_IMAGE
     )
@@ -68,6 +72,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--shutdown-timeout-s", type=float, default=60.0)
     parser.add_argument("--cooldown-s", type=float, default=2.0)
     args = parser.parse_args()
+    try:
+        args.attention_backend = normalize_attention_backend(args.attention_backend)
+        args.cuda_compat_lib_dir = validate_cuda_compat_lib_dir(
+            args.cuda_compat_lib_dir
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        parser.error(str(exc))
     for name in (
         "server_timeout_s",
         "request_timeout_s",
@@ -227,6 +238,14 @@ def main() -> None:
         "warmup_runs": NUM_WARMUP_RUNS,
         "raw_prompt_lengths": list(PROMPT_LENGTHS),
         "effective_wan_context_tokens": EFFECTIVE_WAN_CONTEXT_TOKENS,
+        "runtime_overrides": {
+            "attention_backend": args.attention_backend,
+            "cuda_compat_lib_dir": (
+                str(args.cuda_compat_lib_dir)
+                if args.cuda_compat_lib_dir is not None
+                else None
+            ),
+        },
         "reference_image": str(reference_image),
         "models": [
             model_metadata(spec, model_paths[spec.key]) for spec in WAN_MODEL_SPECS
@@ -243,7 +262,15 @@ def main() -> None:
         model_dir = output_dir / spec.key
         server_dir = model_dir / "server"
         ports = allocate_ports(args.host)
-        command = build_server_command(spec, model_path, 1, args.host, ports, server_dir)
+        command = build_server_command(
+            spec,
+            model_path,
+            1,
+            args.host,
+            ports,
+            server_dir,
+            attention_backend=args.attention_backend,
+        )
         model_record: dict[str, Any] = {
             "model": spec.key,
             "ports": ports,
@@ -260,7 +287,9 @@ def main() -> None:
                 command,
                 model_dir / "server.log",
                 build_server_environment(
-                    server_dir, enable_cuda_event_stage_profiling=True
+                    server_dir,
+                    enable_cuda_event_stage_profiling=True,
+                    cuda_compat_lib_dir=args.cuda_compat_lib_dir,
                 ),
             )
             base_url = server_base_url(args.host, ports["http"])

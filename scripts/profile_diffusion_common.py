@@ -122,6 +122,34 @@ def normalize_gpu_counts(values: Iterable[int]) -> list[int]:
     return counts
 
 
+def normalize_attention_backend(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not normalized:
+        raise ValueError("Attention backend must not be empty")
+    return normalized
+
+
+def validate_cuda_compat_lib_dir(path: Path | None) -> Path | None:
+    if path is None:
+        return None
+    resolved = path.expanduser().resolve()
+    if not resolved.is_dir():
+        raise FileNotFoundError(
+            f"CUDA compatibility library directory not found: {resolved}"
+        )
+    if not any(
+        (resolved / library).is_file()
+        for library in ("libcuda.so.1", "libcuda.so")
+    ):
+        raise FileNotFoundError(
+            f"CUDA compatibility library directory does not contain libcuda.so.1 "
+            f"or libcuda.so: {resolved}"
+        )
+    return resolved
+
+
 def prepare_output_dir(path: Path) -> Path:
     resolved = path.expanduser().resolve()
     if resolved.exists() and any(resolved.iterdir()):
@@ -266,13 +294,15 @@ def build_server_command(
     host: str,
     ports: dict[str, int],
     server_dir: Path,
+    *,
+    attention_backend: str | None = None,
 ) -> list[str]:
     ulysses_degree, ring_degree = spec.parallelism[gpu_count]
     generated_dir = server_dir / "generated"
     uploaded_dir = server_dir / "uploaded"
     generated_dir.mkdir(parents=True, exist_ok=True)
     uploaded_dir.mkdir(parents=True, exist_ok=True)
-    return [
+    command = [
         sys.executable,
         "-m",
         "sglang.multimodal_gen.runtime.launch_server",
@@ -335,12 +365,26 @@ def build_server_command(
         "--input-save-path",
         str(uploaded_dir),
     ]
+    if attention_backend is not None:
+        command.extend(["--attention-backend", attention_backend])
+    return command
 
 
 def build_server_environment(
-    server_dir: Path, *, enable_cuda_event_stage_profiling: bool = False
+    server_dir: Path,
+    *,
+    enable_cuda_event_stage_profiling: bool = False,
+    cuda_compat_lib_dir: Path | None = None,
 ) -> dict[str, str]:
     environment = os.environ.copy()
+    if cuda_compat_lib_dir is not None:
+        compat_dir = str(cuda_compat_lib_dir)
+        existing = environment.get("LD_LIBRARY_PATH", "")
+        library_paths = [compat_dir]
+        library_paths.extend(path for path in existing.split(os.pathsep) if path)
+        environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+            dict.fromkeys(library_paths)
+        )
     environment["SGLANG_CACHE_DIT_ENABLED"] = "false"
     environment["SGLANG_DIFFUSION_SYNC_STAGE_PROFILING"] = "0"
     environment["SGLANG_DIFFUSION_CUDA_EVENT_STAGE_PROFILING"] = (

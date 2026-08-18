@@ -21,11 +21,13 @@ from profile_diffusion_common import (
     launch_server,
     measured_mean,
     model_metadata,
+    normalize_attention_backend,
     normalize_gpu_counts,
     prepare_output_dir,
     save_json,
     server_base_url,
     stop_server,
+    validate_cuda_compat_lib_dir,
     validate_model_path,
     wait_for_ready,
     write_python_summary,
@@ -51,6 +53,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--z-image-model-path", type=Path, default=Z_IMAGE.default_path)
     parser.add_argument("--gpu-counts", nargs="+", type=int, default=[1, 2, 4, 8])
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--cuda-compat-lib-dir", type=Path)
+    parser.add_argument("--attention-backend")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -63,7 +67,11 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     try:
         args.gpu_counts = normalize_gpu_counts(args.gpu_counts)
-    except ValueError as exc:
+        args.attention_backend = normalize_attention_backend(args.attention_backend)
+        args.cuda_compat_lib_dir = validate_cuda_compat_lib_dir(
+            args.cuda_compat_lib_dir
+        )
+    except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
     for name in (
         "server_timeout_s",
@@ -98,6 +106,14 @@ def main() -> None:
         "runs_per_point": NUM_RUNS,
         "warmup_runs": NUM_WARMUP_RUNS,
         "gpu_counts": args.gpu_counts,
+        "runtime_overrides": {
+            "attention_backend": args.attention_backend,
+            "cuda_compat_lib_dir": (
+                str(args.cuda_compat_lib_dir)
+                if args.cuda_compat_lib_dir is not None
+                else None
+            ),
+        },
         "models": [
             model_metadata(spec, model_paths[spec.key]) for spec in ALL_MODEL_SPECS
         ],
@@ -134,7 +150,13 @@ def main() -> None:
                 server_dir = trial_dir / "server"
                 ports = allocate_ports(args.host)
                 command = build_server_command(
-                    spec, model_path, gpu_count, args.host, ports, server_dir
+                    spec,
+                    model_path,
+                    gpu_count,
+                    args.host,
+                    ports,
+                    server_dir,
+                    attention_backend=args.attention_backend,
                 )
                 record: dict[str, Any] = {
                     "run": run_index + 1,
@@ -158,6 +180,7 @@ def main() -> None:
                         build_server_environment(
                             server_dir,
                             enable_cuda_event_stage_profiling=False,
+                            cuda_compat_lib_dir=args.cuda_compat_lib_dir,
                         ),
                     )
                     base_url = server_base_url(args.host, ports["http"])
