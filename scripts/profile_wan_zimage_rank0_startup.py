@@ -30,6 +30,7 @@ SUPPORTED_GPU_COUNTS = (1, 2, 4, 8)
 DEFAULT_NUM_RUNS = 5
 DEFAULT_WARMUP_RUNS = 2
 DEFAULT_METRICS_RUNS = 1
+MAX_PORT_LAUNCH_ATTEMPTS = 5
 SETUPS = ("baseline", "rank0_broadcast_pageable")
 OPTIMIZED_FLAGS = (
     "--diffusion-weight-staging",
@@ -266,16 +267,18 @@ def write_python_summary(path: Path, payload: dict[str, Any]) -> None:
 def _bind_address(host: str) -> tuple[int, str]:
     if host in {"::", "[::]"}:
         return socket.AF_INET6, "::"
-    if host == "localhost":
-        return socket.AF_INET, "127.0.0.1"
-    return socket.AF_INET, host
+    # ServerArgs validates IPv4 ports by binding the wildcard address. Match
+    # that behavior so a port bound on another local interface is not selected.
+    return socket.AF_INET, ""
 
 
 def _can_bind(host: str, port: int) -> bool:
     family, bind_host = _bind_address(host)
     try:
         with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((bind_host, port))
+            sock.listen(1)
         return True
     except OSError:
         return False
@@ -286,7 +289,9 @@ def find_free_port(host: str, excluded: set[int] | None = None) -> int:
     family, bind_host = _bind_address(host)
     for _ in range(100):
         with socket.socket(family, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((bind_host, 0))
+            sock.listen(1)
             port = int(sock.getsockname()[1])
         if port not in excluded:
             return port
@@ -477,6 +482,14 @@ def read_log_tail(path: Path, line_count: int = 120) -> str:
     return "\n".join(lines[-line_count:])
 
 
+def is_strict_port_collision(path: Path) -> bool:
+    log_tail = read_log_tail(path)
+    return (
+        " port " in log_tail
+        and "is unavailable and --strict-ports is enabled" in log_tail
+    )
+
+
 def server_base_url(host: str, port: int) -> str:
     connect_host = "127.0.0.1" if host in {"0.0.0.0", "::", "[::]"} else host
     if ":" in connect_host and not connect_host.startswith("["):
@@ -622,70 +635,107 @@ def execute_launch(
 ) -> dict[str, Any]:
     server_dir = trial_dir / "server"
     profile_output_dir = trial_dir / "profile" if profile_enabled else None
-    ports = allocate_ports(args.host)
-    command = build_server_command(
-        args,
-        spec,
-        model_path,
-        gpu_count,
-        setup,
-        ports,
-        server_dir,
-        profile_enabled=profile_enabled,
-        profile_run_id=profile_run_id,
-        profile_output_dir=profile_output_dir,
-    )
     record: dict[str, Any] = {
         "status": "starting",
         "setup": setup,
         "profile_enabled": profile_enabled,
         "profile_run_id": profile_run_id,
-        "ports": ports,
-        "command": command,
+        "port_allocation_attempts": [],
         "common_env_overrides": COMMON_ENV_OVERRIDES,
         "server_log": str(trial_dir / "server.log"),
     }
-    save_json(trial_dir / "run_meta.json", record)
-    server = None
     try:
-        server = launch_server(
-            command,
-            trial_dir / "server.log",
-            build_server_environment(server_dir),
-        )
-        card, ready_ns = wait_for_ready(
-            server,
-            server_base_url(args.host, ports["http"]),
-            spec,
-            model_path,
-            gpu_count,
-            args.server_timeout_s,
-            args.ready_poll_interval_s,
-        )
-        startup_time_ms = (ready_ns - server.started_ns) / 1_000_000.0
-        actual_server_args = load_server_args_from_log(server.log_path)
-        validate_effective_server_args(
-            actual_server_args, spec, model_path, gpu_count, setup
-        )
-        record.update(
-            {
-                "status": "complete",
-                "startup_time_ms": startup_time_ms,
-                "ready_model_card": card,
-                "effective_server_args": actual_server_args,
-            }
-        )
-        return record
-    except BaseException as exc:
-        record.update(
-            {
-                "status": "failed",
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        )
-        raise
+        for port_attempt in range(1, MAX_PORT_LAUNCH_ATTEMPTS + 1):
+            ports = allocate_ports(args.host)
+            command = build_server_command(
+                args,
+                spec,
+                model_path,
+                gpu_count,
+                setup,
+                ports,
+                server_dir,
+                profile_enabled=profile_enabled,
+                profile_run_id=profile_run_id,
+                profile_output_dir=profile_output_dir,
+            )
+            log_path = trial_dir / "server.log"
+            record.update(
+                {
+                    "status": "starting",
+                    "port_allocation_attempt": port_attempt,
+                    "ports": ports,
+                    "command": command,
+                }
+            )
+            save_json(trial_dir / "run_meta.json", record)
+
+            server = None
+            retry_port_collision = False
+            try:
+                server = launch_server(
+                    command,
+                    log_path,
+                    build_server_environment(server_dir),
+                )
+                card, ready_ns = wait_for_ready(
+                    server,
+                    server_base_url(args.host, ports["http"]),
+                    spec,
+                    model_path,
+                    gpu_count,
+                    args.server_timeout_s,
+                    args.ready_poll_interval_s,
+                )
+                startup_time_ms = (ready_ns - server.started_ns) / 1_000_000.0
+                actual_server_args = load_server_args_from_log(server.log_path)
+                validate_effective_server_args(
+                    actual_server_args, spec, model_path, gpu_count, setup
+                )
+                record.update(
+                    {
+                        "status": "complete",
+                        "startup_time_ms": startup_time_ms,
+                        "ready_model_card": card,
+                        "effective_server_args": actual_server_args,
+                    }
+                )
+                return record
+            except BaseException as exc:
+                retry_port_collision = (
+                    port_attempt < MAX_PORT_LAUNCH_ATTEMPTS
+                    and is_strict_port_collision(log_path)
+                )
+                if retry_port_collision:
+                    archived_log = trial_dir / (
+                        f"server_port_collision_attempt_{port_attempt}.log"
+                    )
+                    record["port_allocation_attempts"].append(
+                        {
+                            "attempt": port_attempt,
+                            "ports": ports,
+                            "error": f"{type(exc).__name__}: {exc}",
+                            "server_log": str(archived_log),
+                        }
+                    )
+                    record["status"] = "retrying-port-allocation"
+                    continue
+                record.update(
+                    {
+                        "status": "failed",
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                raise
+            finally:
+                stop_server(server, args.shutdown_timeout_s)
+                if retry_port_collision and log_path.exists():
+                    os.replace(
+                        log_path,
+                        trial_dir
+                        / f"server_port_collision_attempt_{port_attempt}.log",
+                    )
     finally:
-        stop_server(server, args.shutdown_timeout_s)
         save_json(trial_dir / "run_meta.json", record)
         if args.cooldown_s:
             time.sleep(args.cooldown_s)
