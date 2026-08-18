@@ -61,8 +61,10 @@ def _load_vae_state_dict_from_safetensors(
     safetensors_list: list[str],
     server_args: ServerArgs,
     weight_load_profile: DiffusionWeightLoadProfiler,
+    *,
+    read_backend: str = "safetensors",
 ) -> dict[str, torch.Tensor]:
-    weight_load_profile.set_read_backend("safetensors")
+    weight_load_profile.set_read_backend(read_backend)
     loaded: dict[str, torch.Tensor] = {}
     stage_weights = should_stage_weights_on_current_rank(
         server_args.diffusion_weight_staging
@@ -117,12 +119,14 @@ def _load_vae_weights_default(
     weight_load_profile: DiffusionWeightLoadProfiler,
     preloaded_state_dict: dict[str, torch.Tensor] | None = None,
     on_state_dict_loaded=None,
+    read_backend: str = "safetensors",
 ) -> tuple[list[str], list[str]]:
     if preloaded_state_dict is None:
         loaded = _load_vae_state_dict_from_safetensors(
             safetensors_list,
             server_args,
             weight_load_profile,
+            read_backend=read_backend,
         )
         if on_state_dict_loaded is not None:
             on_state_dict_loaded(loaded)
@@ -207,11 +211,12 @@ def _load_vae_weights_rank0_broadcast(
                 weight_load_profile.set_warm_pool_error(
                     f"{type(exc).__name__}: {exc}"
                 )
-        weight_load_profile.set_read_backend(
+        read_backend = (
             "warm-pool"
             if preloaded_state_dict is not None
             else "rank0-broadcast-no-runai"
         )
+        weight_load_profile.set_read_backend(read_backend)
 
         def _store_warm_pool_entry(loaded: dict[str, torch.Tensor]) -> None:
             if warm_pool_key is None or warm_pool_entry is not None:
@@ -248,6 +253,7 @@ def _load_vae_weights_rank0_broadcast(
                 on_state_dict_loaded=_store_warm_pool_entry
                 if warm_pool_enabled
                 else None,
+                read_backend=read_backend,
             )
         except Exception as exc:
             rank0_load_exc = exc
