@@ -43,6 +43,8 @@ DECODE_CUDA_GRAPH_STATE_PATTERN = re.compile(
 LEGACY_CUSTOM_AR_GRAPH_PATTERN = re.compile(
     r"Registering \d+ cuda graph addresses"
 )
+CUSTOM_V2_INIT_MARKER = "All Reduce config: symmetric_memory ="
+CUSTOM_V2_VMM_GRAPH_MARKER = " cuda graph addresses via "
 IO_MATRIX = {
     128: (512, 2048),
     256: (256, 1920),
@@ -502,9 +504,8 @@ def validate_server_log(
         elif (
             all_reduce_mode == "custom_v2"
             and tp_size > 1
-            and decode_cuda_graph_backend == "full"
         ):
-            required_markers.append(" cuda graph addresses via ")
+            required_markers.append(CUSTOM_V2_INIT_MARKER)
     else:
         required_markers.append("disable_custom_all_reduce=True")
     forbidden_markers = [
@@ -517,7 +518,8 @@ def validate_server_log(
                 "All-reduce call path: NCCL (custom AR disabled)",
                 "sgl_kernel_jit_cuda_ipc",
                 "custom_all_reduce_v2",
-                " cuda graph addresses via ",
+                CUSTOM_V2_INIT_MARKER,
+                CUSTOM_V2_VMM_GRAPH_MARKER,
             ]
         )
     elif all_reduce_mode == "custom_v2":
@@ -528,7 +530,9 @@ def validate_server_log(
             ]
         )
     else:
-        forbidden_markers.append(" cuda graph addresses via ")
+        forbidden_markers.extend(
+            [CUSTOM_V2_INIT_MARKER, CUSTOM_V2_VMM_GRAPH_MARKER]
+        )
     if decode_cuda_graph_backend == "disabled":
         forbidden_markers.append("Capture target decode CUDA graph")
     missing = [marker for marker in required_markers if marker not in log_text]
@@ -537,6 +541,10 @@ def validate_server_log(
     ]
     legacy_graph_registration_present = bool(
         LEGACY_CUSTOM_AR_GRAPH_PATTERN.search(log_text)
+    )
+    custom_v2_initialized = CUSTOM_V2_INIT_MARKER in log_text
+    custom_v2_vmm_graph_registration_present = (
+        CUSTOM_V2_VMM_GRAPH_MARKER in log_text
     )
     if (
         all_reduce_mode in {"custom_v2", "nccl"}
@@ -578,6 +586,10 @@ def validate_server_log(
         "decode_cuda_graph_backend": decode_cuda_graph_backend,
         "decode_cuda_graph_state_count": len(decode_cuda_graph_states),
         "legacy_graph_registration_present": legacy_graph_registration_present,
+        "custom_v2_initialized": custom_v2_initialized,
+        "custom_v2_vmm_graph_registration_present": (
+            custom_v2_vmm_graph_registration_present
+        ),
         "prefill_cuda_graph_backend": "disabled",
     }
 
