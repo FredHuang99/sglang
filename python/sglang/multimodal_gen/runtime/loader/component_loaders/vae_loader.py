@@ -212,9 +212,7 @@ def _load_vae_weights_rank0_broadcast(
                     f"{type(exc).__name__}: {exc}"
                 )
         read_backend = (
-            "warm-pool"
-            if preloaded_state_dict is not None
-            else "rank0-broadcast-no-runai"
+            "warm-pool" if preloaded_state_dict is not None else "safetensors"
         )
         weight_load_profile.set_read_backend(read_backend)
 
