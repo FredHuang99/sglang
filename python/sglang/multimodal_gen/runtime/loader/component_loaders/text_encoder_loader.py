@@ -1,6 +1,8 @@
 import dataclasses
 import glob
+import json
 import os
+import time
 from collections.abc import Generator, Iterable
 from typing import Generator, Iterable, cast
 
@@ -42,6 +44,11 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
+
+PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER_ENV = (
+    "SGLANG_PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER"
+)
+PROFILE_SP1_TEXT_ENCODER_TIMING_MARKER = "PROFILE_SP1_TEXT_ENCODER_TIMING"
 
 
 class TextEncoderLoader(ComponentLoader):
@@ -217,7 +224,28 @@ class TextEncoderLoader(ComponentLoader):
         # Determine CPU offload behavior and target device
 
         local_torch_device = get_local_torch_device()
-        should_offload = self.should_offload(server_args, model_config)
+        profile_sequential_offload = (
+            os.getenv(PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER_ENV) == "1"
+        )
+        if profile_sequential_offload:
+            world_size = dist.get_world_size() if dist.is_initialized() else 1
+            if world_size != 1:
+                raise RuntimeError(
+                    "Profile sequential text-encoder loading is only valid at SP1"
+                )
+            if not server_args.text_encoder_cpu_offload:
+                raise RuntimeError(
+                    "Profile sequential text-encoder loading requires "
+                    "--text-encoder-cpu-offload true"
+                )
+        should_offload = (
+            False
+            if profile_sequential_offload
+            else self.should_offload(server_args, model_config)
+        )
+        profile_load_started_ns = (
+            time.perf_counter_ns() if profile_sequential_offload else None
+        )
 
         if should_offload and not current_platform.is_mps():
             model_device = torch.device("cpu")
@@ -305,5 +333,32 @@ class TextEncoderLoader(ComponentLoader):
                     sorted(weights_not_loaded),
                     allowed_missing_patterns,
                 )
+
+        if profile_sequential_offload:
+            assert profile_load_started_ns is not None
+            if current_platform.is_cuda():
+                torch.cuda.synchronize(local_torch_device)
+            gpu_load_finished_ns = time.perf_counter_ns()
+            model = model.to(torch.device("cpu"))
+            if current_platform.is_cuda():
+                torch.cuda.synchronize(local_torch_device)
+                torch.cuda.empty_cache()
+            eviction_finished_ns = time.perf_counter_ns()
+            timing = {
+                "world_size": 1,
+                "gpu_load_and_materialization_ms": (
+                    gpu_load_finished_ns - profile_load_started_ns
+                )
+                / 1_000_000.0,
+                "gpu_to_cpu_eviction_ms": (
+                    eviction_finished_ns - gpu_load_finished_ns
+                )
+                / 1_000_000.0,
+            }
+            logger.info(
+                "%s %s",
+                PROFILE_SP1_TEXT_ENCODER_TIMING_MARKER,
+                json.dumps(timing, sort_keys=True),
+            )
 
         return model

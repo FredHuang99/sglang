@@ -87,6 +87,14 @@ SETUP_ENV_OVERRIDES = {
 RUNAI_STREAM_RE = re.compile(
     r"\[RunAI Streamer\].*?stream\s+([0-9.]+)\s+GiB.*?:\s+([0-9.]+)s"
 )
+PROFILE_SP1_TEXT_ENCODER_TIMING_MARKER = "PROFILE_SP1_TEXT_ENCODER_TIMING"
+PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER_ENV = (
+    "SGLANG_PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER"
+)
+PROFILE_SP1_TEXT_ENCODER_TIMING_RE = re.compile(
+    rf"{PROFILE_SP1_TEXT_ENCODER_TIMING_MARKER}\s+(\{{.*\}})"
+)
+SP1_LOW_MEMORY_MODEL_CHOICES = ("wan22_ti2v_5b",)
 
 HISTORICAL_H200_REFERENCE = {
     "wan22_ti2v_5b": {
@@ -120,7 +128,8 @@ APRIL_REPRODUCTION_POLICY = {
         "optimized process environment enables RunAI for non-broadcast loaders",
         "optimized transformer rank0 locally disables RunAI to avoid deadlock",
         "enable_cfg_parallel=false",
-        "all component offload disabled",
+        "all component offload disabled except the explicit A100 SP1 low-memory "
+        "baseline adaptation",
         "use_fsdp_inference=false",
         "enable_torch_compile=false",
         "strict_ports=true",
@@ -216,6 +225,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-runs", type=int, default=DEFAULT_NUM_RUNS)
     parser.add_argument("--warmup-runs", type=int, default=DEFAULT_WARMUP_RUNS)
     parser.add_argument("--metrics-runs", type=int, default=DEFAULT_METRICS_RUNS)
+    parser.add_argument(
+        "--sp1-low-memory-models",
+        nargs="+",
+        choices=SP1_LOW_MEMORY_MODEL_CHOICES,
+        default=[],
+        help=(
+            "At SP1 baseline, load the selected text encoder on GPU, measure it, "
+            "then evict it before loading the remaining components. Disabled by "
+            "default."
+        ),
+    )
     parser.add_argument("--server-timeout-s", type=float, default=3600.0)
     parser.add_argument("--ready-poll-interval-s", type=float, default=0.05)
     parser.add_argument("--shutdown-timeout-s", type=float, default=60.0)
@@ -224,6 +244,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     args.gpu_counts = normalize_gpu_counts(args.gpu_counts)
+    args.sp1_low_memory_models = list(dict.fromkeys(args.sp1_low_memory_models))
     if args.num_runs <= 0:
         parser.error("--num-runs must be positive")
     if args.warmup_runs < 0 or args.warmup_runs >= args.num_runs:
@@ -435,6 +456,7 @@ def build_server_command(
     server_dir: Path,
     *,
     profile_enabled: bool,
+    low_memory_sequential_text_encoder: bool,
     profile_run_id: str | None = None,
     profile_output_dir: Path | None = None,
 ) -> list[str]:
@@ -454,6 +476,8 @@ def build_server_command(
         spec.model_id,
         "--backend",
         "sglang",
+        "--attention-backend",
+        "fa",
         "--num-gpus",
         str(gpu_count),
         "--tp-size",
@@ -469,7 +493,7 @@ def build_server_command(
         "--dit-layerwise-offload",
         "false",
         "--text-encoder-cpu-offload",
-        "false",
+        str(low_memory_sequential_text_encoder).lower(),
         "--image-encoder-cpu-offload",
         "false",
         "--vae-cpu-offload",
@@ -521,13 +545,20 @@ def build_server_command(
 
 
 def build_server_environment(
-    server_dir: Path, setup: str, *, profile_enabled: bool
+    server_dir: Path,
+    setup: str,
+    *,
+    profile_enabled: bool,
+    low_memory_sequential_text_encoder: bool,
 ) -> tuple[dict[str, str], dict[str, str]]:
     if setup not in SETUP_ENV_OVERRIDES:
         raise ValueError(f"Unknown setup: {setup}")
     environment = os.environ.copy()
     environment.update(COMMON_ENV_OVERRIDES)
     environment.update(SETUP_ENV_OVERRIDES[setup])
+    environment.pop(PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER_ENV, None)
+    if low_memory_sequential_text_encoder:
+        environment[PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER_ENV] = "1"
     environment["SGLANG_PERF_LOG_DIR"] = str(server_dir / "performance_logs")
     for name in (
         "SGLANG_DIFFUSION_TORCH_PROFILER_DIR",
@@ -545,6 +576,8 @@ def build_server_environment(
         **SETUP_ENV_OVERRIDES[setup],
         "SGLANG_PERF_LOG_DIR": environment["SGLANG_PERF_LOG_DIR"],
     }
+    if low_memory_sequential_text_encoder:
+        effective_overrides[PROFILE_SP1_SEQUENTIAL_TEXT_ENCODER_ENV] = "1"
     if profile_enabled:
         effective_overrides["SGLANG_LAUNCH_TASK_LOG_PATH"] = environment[
             "SGLANG_LAUNCH_TASK_LOG_PATH"
@@ -630,6 +663,53 @@ def collect_runai_stream_info(path: Path) -> dict[str, Any]:
         ),
         "events": events,
     }
+
+
+def collect_sp1_text_encoder_timing(
+    path: Path, *, required: bool
+) -> dict[str, float] | None:
+    events: list[dict[str, Any]] = []
+    if path.exists():
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            match = PROFILE_SP1_TEXT_ENCODER_TIMING_RE.search(line)
+            if match is None:
+                continue
+            try:
+                value = json.loads(match.group(1))
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid SP1 text-encoder timing marker in {path}: {line}"
+                ) from exc
+            if isinstance(value, dict):
+                events.append(value)
+
+    if not required:
+        if events:
+            raise ValueError(
+                "Unexpected SP1 text-encoder low-memory timing marker in "
+                f"{path}"
+            )
+        return None
+    if len(events) != 1:
+        raise ValueError(
+            "Expected exactly one SP1 text-encoder timing marker; "
+            f"found {len(events)} in {path}"
+        )
+
+    event = events[0]
+    if int(event.get("world_size", 0)) != 1:
+        raise ValueError(f"SP1 text-encoder marker has invalid world size: {event}")
+    result = {
+        "gpu_load_and_materialization_ms": float(
+            event.get("gpu_load_and_materialization_ms", 0.0)
+        ),
+        "gpu_to_cpu_eviction_ms": float(
+            event.get("gpu_to_cpu_eviction_ms", 0.0)
+        ),
+    }
+    if any(not math.isfinite(value) or value <= 0 for value in result.values()):
+        raise ValueError(f"SP1 text-encoder timing must be positive: {result}")
+    return result
 
 
 def load_launch_task_records(path: Path) -> list[dict[str, Any]]:
@@ -806,12 +886,14 @@ def validate_effective_server_args(
     model_path: Path,
     gpu_count: int,
     setup: str,
+    low_memory_sequential_text_encoder: bool,
 ) -> None:
     ulysses_degree, ring_degree = spec.parallelism[gpu_count]
     expected = {
         "model_path": str(model_path),
         "model_id": spec.model_id,
         "backend": "sglang",
+        "attention_backend": "fa",
         "num_gpus": gpu_count,
         "tp_size": 1,
         "sp_degree": gpu_count,
@@ -820,7 +902,7 @@ def validate_effective_server_args(
         "enable_cfg_parallel": False,
         "dit_cpu_offload": False,
         "dit_layerwise_offload": False,
-        "text_encoder_cpu_offload": False,
+        "text_encoder_cpu_offload": low_memory_sequential_text_encoder,
         "image_encoder_cpu_offload": False,
         "vae_cpu_offload": False,
         "pin_cpu_memory": False,
@@ -911,13 +993,17 @@ def execute_launch(
     trial_dir: Path,
     *,
     profile_enabled: bool,
+    low_memory_sequential_text_encoder: bool,
     environment_provenance: dict[str, Any],
     profile_run_id: str | None = None,
 ) -> dict[str, Any]:
     server_dir = trial_dir / "server"
     profile_output_dir = trial_dir / "profile" if profile_enabled else None
     environment, effective_env_overrides = build_server_environment(
-        server_dir, setup, profile_enabled=profile_enabled
+        server_dir,
+        setup,
+        profile_enabled=profile_enabled,
+        low_memory_sequential_text_encoder=low_memory_sequential_text_encoder,
     )
     launch_task_path = (
         Path(environment["SGLANG_LAUNCH_TASK_LOG_PATH"])
@@ -929,6 +1015,11 @@ def execute_launch(
         "setup": setup,
         "profile_enabled": profile_enabled,
         "profile_run_id": profile_run_id,
+        "startup_measurement_mode": (
+            "sequential_resident_equivalent"
+            if low_memory_sequential_text_encoder
+            else "direct_popen_to_ready"
+        ),
         "port_allocation_attempts": [],
         "common_env_overrides": COMMON_ENV_OVERRIDES,
         "setup_env_overrides": SETUP_ENV_OVERRIDES[setup],
@@ -949,6 +1040,9 @@ def execute_launch(
                 ports,
                 server_dir,
                 profile_enabled=profile_enabled,
+                low_memory_sequential_text_encoder=(
+                    low_memory_sequential_text_encoder
+                ),
                 profile_run_id=profile_run_id,
                 profile_output_dir=profile_output_dir,
             )
@@ -985,12 +1079,33 @@ def execute_launch(
                 startup_time_ms = (ready_ns - server.started_ns) / 1_000_000.0
                 actual_server_args = load_server_args_from_log(server.log_path)
                 validate_effective_server_args(
-                    actual_server_args, spec, model_path, gpu_count, setup
+                    actual_server_args,
+                    spec,
+                    model_path,
+                    gpu_count,
+                    setup,
+                    low_memory_sequential_text_encoder,
                 )
+                text_encoder_timing = collect_sp1_text_encoder_timing(
+                    server.log_path,
+                    required=low_memory_sequential_text_encoder,
+                )
+                corrected_startup_time_ms = startup_time_ms
+                if text_encoder_timing is not None:
+                    corrected_startup_time_ms -= text_encoder_timing[
+                        "gpu_to_cpu_eviction_ms"
+                    ]
+                    if corrected_startup_time_ms <= 0:
+                        raise ValueError(
+                            "Resident-equivalent startup time is not positive: "
+                            f"raw={startup_time_ms}, timing={text_encoder_timing}"
+                        )
                 record.update(
                     {
                         "status": "complete",
-                        "startup_time_ms": startup_time_ms,
+                        "startup_time_ms": corrected_startup_time_ms,
+                        "startup_time_ms_raw": startup_time_ms,
+                        "sp1_text_encoder_timing": text_encoder_timing,
                         "ready_model_card": card,
                         "effective_server_args": actual_server_args,
                         "runai_streams": collect_runai_stream_info(log_path),
@@ -1317,7 +1432,10 @@ def summarize_timing_runs(
         float(record.get("runai_streams", {}).get("stream_time_s_sum", 0.0))
         for record in measured
     ]
-    return {
+    result = {
+        "measurement_mode": complete[0].get(
+            "startup_measurement_mode", "direct_popen_to_ready"
+        ),
         "all_runs_ms": [round(float(record["startup_time_ms"]), 3) for record in complete],
         "measured_runs_ms": [round(value, 3) for value in values],
         "measured_mean_ms": round(statistics.fmean(values), 3),
@@ -1328,6 +1446,49 @@ def summarize_timing_runs(
         "runai_stream_count_mean": round(statistics.fmean(stream_counts), 3),
         "runai_stream_time_s_mean": round(statistics.fmean(stream_times), 3),
     }
+    if result["measurement_mode"] == "sequential_resident_equivalent":
+        if any(
+            record.get("startup_measurement_mode")
+            != "sequential_resident_equivalent"
+            for record in complete
+        ):
+            raise ValueError("Mixed startup measurement modes in one point")
+        raw_values = [float(record["startup_time_ms_raw"]) for record in measured]
+        load_values = [
+            float(
+                record["sp1_text_encoder_timing"][
+                    "gpu_load_and_materialization_ms"
+                ]
+            )
+            for record in measured
+        ]
+        eviction_values = [
+            float(
+                record["sp1_text_encoder_timing"]["gpu_to_cpu_eviction_ms"]
+            )
+            for record in measured
+        ]
+        result.update(
+            {
+                "raw_low_memory_all_runs_ms": [
+                    round(float(record["startup_time_ms_raw"]), 3)
+                    for record in complete
+                ],
+                "raw_low_memory_measured_mean_ms": round(
+                    statistics.fmean(raw_values), 3
+                ),
+                "text_encoder_gpu_load_and_materialization_mean_ms": round(
+                    statistics.fmean(load_values), 3
+                ),
+                "text_encoder_gpu_to_cpu_eviction_mean_ms": round(
+                    statistics.fmean(eviction_values), 3
+                ),
+                "resident_equivalent_formula": (
+                    "startup_time_ms_raw - gpu_to_cpu_eviction_ms"
+                ),
+            }
+        )
+    return result
 
 
 def transformer_critical_path_summary(
@@ -1405,6 +1566,8 @@ def residual_scaling_attribution(
         "baseline_s" if setup == "baseline" else "rank0_broadcast_pageable_s"
     )
     startup_values = model_summary[startup_key]
+    if startup_values.get(low_sp) is None or startup_values.get(high_sp) is None:
+        return {}
     return {
         "setup": setup,
         "from_sp": low_sp,
@@ -1429,6 +1592,10 @@ def build_summary(state: dict[str, Any]) -> dict[str, Any]:
             "num_runs": state["num_runs"],
             "warmup_runs": state["warmup_runs"],
             "metrics_runs": state["metrics_runs"],
+            "sp1_low_memory_models": state["sp1_low_memory_models"],
+            "sp1_rank0_broadcast_policy": (
+                "optimized is not applicable and is not launched at SP1"
+            ),
             "common_env_overrides": COMMON_ENV_OVERRIDES,
             "setup_env_overrides": SETUP_ENV_OVERRIDES,
             "optimized_flags": list(OPTIMIZED_FLAGS),
@@ -1453,29 +1620,53 @@ def build_summary(state: dict[str, Any]) -> dict[str, Any]:
         baseline = summarize_timing_runs(
             point["timing_runs"]["baseline"], state["warmup_runs"]
         )
-        optimized = summarize_timing_runs(
-            point["timing_runs"]["rank0_broadcast_pageable"],
-            state["warmup_runs"],
+        optimized_records = point["timing_runs"]["rank0_broadcast_pageable"]
+        optimized = (
+            summarize_timing_runs(optimized_records, state["warmup_runs"])
+            if optimized_records
+            else None
         )
         baseline_mean = baseline["measured_mean_ms"]
-        optimized_mean = optimized["measured_mean_ms"]
+        optimized_mean = (
+            optimized["measured_mean_ms"] if optimized is not None else None
+        )
         reduction_pct = (
             ((baseline_mean - optimized_mean) / baseline_mean) * 100.0
-            if baseline_mean > 0
-            else 0.0
+            if baseline_mean > 0 and optimized_mean is not None
+            else None
         )
-        speedup = baseline_mean / optimized_mean if optimized_mean > 0 else None
+        speedup = (
+            baseline_mean / optimized_mean
+            if optimized_mean is not None and optimized_mean > 0
+            else None
+        )
         gpu_count = int(point["gpu_count"])
         baseline_s = round(baseline_mean / 1000.0, 6)
-        optimized_s = round(optimized_mean / 1000.0, 6)
+        optimized_s = (
+            round(optimized_mean / 1000.0, 6)
+            if optimized_mean is not None
+            else None
+        )
         model_summary["baseline_s"][gpu_count] = baseline_s
         model_summary["rank0_broadcast_pageable_s"][gpu_count] = optimized_s
-        model_summary["gain_pct"][gpu_count] = _gain_pct(baseline_s, optimized_s)
+        if optimized_s is not None:
+            model_summary["gain_pct"][gpu_count] = _gain_pct(
+                baseline_s, optimized_s
+            )
         model_summary["points"][gpu_count] = {
             "parallelism": point["parallelism"],
             "baseline": baseline,
-            "rank0_broadcast_pageable": optimized,
-            "reduction_pct": round(reduction_pct, 3),
+            "rank0_broadcast_pageable": (
+                optimized
+                if optimized is not None
+                else {
+                    "status": "not_applicable",
+                    "reason": "rank0 broadcast requires more than one rank",
+                }
+            ),
+            "reduction_pct": (
+                round(reduction_pct, 3) if reduction_pct is not None else None
+            ),
             "speedup_x": round(speedup, 4) if speedup is not None else None,
             "server_arg_parity": point.get("server_arg_parity", {}),
             "metrics_validation": point["metrics_validation"],
@@ -1514,7 +1705,7 @@ def build_summary(state: dict[str, Any]) -> dict[str, Any]:
             if value is not None
         }
         checks: dict[str, Any] = {}
-        if 1 in baseline_s and 1 in optimized_s:
+        if optimized_s.get(1) is not None:
             sp1_delta_pct = abs(_gain_pct(baseline_s[1], optimized_s[1]))
             checks["sp1_delta_within_5pct"] = {
                 "value_pct": round(sp1_delta_pct, 3),
@@ -1541,6 +1732,7 @@ def build_summary(state: dict[str, Any]) -> dict[str, Any]:
         model_summary["scaling"] = {
             "baseline_sp8_over_sp1": _scaling_ratio(baseline_s, 1, 8),
             "optimized_sp8_over_sp1": _scaling_ratio(optimized_s, 1, 8),
+            "optimized_sp8_over_sp2": _scaling_ratio(optimized_s, 2, 8),
             "optimized_transformer_sp8_over_sp2": critical_ratio,
         }
         model_summary["historical_h200_reference"] = HISTORICAL_H200_REFERENCE.get(
@@ -1594,6 +1786,7 @@ def main() -> None:
         "num_runs": args.num_runs,
         "warmup_runs": args.warmup_runs,
         "metrics_runs": args.metrics_runs,
+        "sp1_low_memory_models": args.sp1_low_memory_models,
         "gpu_counts": args.gpu_counts,
         "setups": list(SETUPS),
         "common_env_overrides": COMMON_ENV_OVERRIDES,
@@ -1612,6 +1805,12 @@ def main() -> None:
             model_path = model_paths[spec.key]
             for gpu_count in args.gpu_counts:
                 ulysses_degree, ring_degree = spec.parallelism[gpu_count]
+                active_setups = (
+                    ("baseline",) if gpu_count == 1 else SETUPS
+                )
+                low_memory_sp1_baseline = (
+                    gpu_count == 1 and spec.key in args.sp1_low_memory_models
+                )
                 point: dict[str, Any] = {
                     "model": spec.key,
                     "gpu_count": gpu_count,
@@ -1624,6 +1823,17 @@ def main() -> None:
                         "fsdp_inference": False,
                     },
                     "status": "running",
+                    "active_setups": list(active_setups),
+                    "skipped_setups": (
+                        {
+                            "rank0_broadcast_pageable": (
+                                "not applicable when world size is one"
+                            )
+                        }
+                        if gpu_count == 1
+                        else {}
+                    ),
+                    "low_memory_sp1_baseline": low_memory_sp1_baseline,
                     "timing_runs": {setup: [] for setup in SETUPS},
                     "metrics_runs": {setup: [] for setup in SETUPS},
                     "metrics_validation": {},
@@ -1632,7 +1842,11 @@ def main() -> None:
                 save_json(state_path, state)
 
                 for run_index in range(args.num_runs):
-                    setup_order = SETUPS if run_index % 2 == 0 else tuple(reversed(SETUPS))
+                    setup_order = (
+                        active_setups
+                        if run_index % 2 == 0
+                        else tuple(reversed(active_setups))
+                    )
                     for setup in setup_order:
                         trial_dir = (
                             output_dir
@@ -1655,6 +1869,9 @@ def main() -> None:
                             setup,
                             trial_dir,
                             profile_enabled=False,
+                            low_memory_sequential_text_encoder=(
+                                low_memory_sp1_baseline and setup == "baseline"
+                            ),
                             environment_provenance=environment_provenance,
                         )
                         record["run"] = run_index + 1
@@ -1663,15 +1880,16 @@ def main() -> None:
                         save_json(trial_dir / "run_meta.json", record)
                         save_json(state_path, state)
 
-                    point.setdefault("server_arg_parity", {})[
-                        f"timing_run_{run_index + 1:02d}"
-                    ] = validate_setup_server_arg_parity(
-                        point["timing_runs"]["baseline"][-1],
-                        point["timing_runs"]["rank0_broadcast_pageable"][-1],
-                    )
+                    if len(active_setups) == 2:
+                        point.setdefault("server_arg_parity", {})[
+                            f"timing_run_{run_index + 1:02d}"
+                        ] = validate_setup_server_arg_parity(
+                            point["timing_runs"]["baseline"][-1],
+                            point["timing_runs"]["rank0_broadcast_pageable"][-1],
+                        )
                     save_json(state_path, state)
 
-                for setup in SETUPS:
+                for setup in active_setups:
                     validations: list[dict[str, Any]] = []
                     for metrics_index in range(args.metrics_runs):
                         trial_dir = (
@@ -1699,6 +1917,9 @@ def main() -> None:
                             setup,
                             trial_dir,
                             profile_enabled=True,
+                            low_memory_sequential_text_encoder=(
+                                low_memory_sp1_baseline and setup == "baseline"
+                            ),
                             environment_provenance=environment_provenance,
                             profile_run_id=profile_run_id,
                         )
@@ -1732,15 +1953,16 @@ def main() -> None:
                         save_json(state_path, state)
                     point["metrics_validation"][setup] = validations
 
-                for metrics_index in range(args.metrics_runs):
-                    point.setdefault("server_arg_parity", {})[
-                        f"metrics_run_{metrics_index + 1:02d}"
-                    ] = validate_setup_server_arg_parity(
-                        point["metrics_runs"]["baseline"][metrics_index],
-                        point["metrics_runs"]["rank0_broadcast_pageable"][
-                            metrics_index
-                        ],
-                    )
+                if len(active_setups) == 2:
+                    for metrics_index in range(args.metrics_runs):
+                        point.setdefault("server_arg_parity", {})[
+                            f"metrics_run_{metrics_index + 1:02d}"
+                        ] = validate_setup_server_arg_parity(
+                            point["metrics_runs"]["baseline"][metrics_index],
+                            point["metrics_runs"]["rank0_broadcast_pageable"][
+                                metrics_index
+                            ],
+                        )
 
                 point["status"] = "complete"
                 save_json(state_path, state)
