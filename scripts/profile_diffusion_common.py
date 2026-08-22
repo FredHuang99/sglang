@@ -370,6 +370,7 @@ def build_server_command(
     server_dir: Path,
     *,
     attention_backend: str | None = None,
+    text_encoder_cpu_offload: bool = False,
 ) -> list[str]:
     ulysses_degree, ring_degree = spec.parallelism[gpu_count]
     generated_dir = server_dir / "generated"
@@ -407,7 +408,7 @@ def build_server_command(
         "--dit-layerwise-offload",
         "false",
         "--text-encoder-cpu-offload",
-        "false",
+        str(text_encoder_cpu_offload).lower(),
         "--image-encoder-cpu-offload",
         "false",
         "--vae-cpu-offload",
@@ -448,6 +449,7 @@ def build_server_environment(
     server_dir: Path,
     *,
     enable_cuda_event_stage_profiling: bool = False,
+    flush_offloaded_text_encoder_after_encoding: bool = False,
     cuda_compat_lib_dir: Path | None = None,
 ) -> dict[str, str]:
     environment = os.environ.copy()
@@ -465,6 +467,13 @@ def build_server_environment(
         "1" if enable_cuda_event_stage_profiling else "0"
     )
     environment["SGLANG_DIFFUSION_STAGE_LOGGING"] = "0"
+    environment.pop(
+        "SGLANG_PROFILE_FLUSH_OFFLOADED_TEXT_ENCODER_AFTER_ENCODING", None
+    )
+    if flush_offloaded_text_encoder_after_encoding:
+        environment[
+            "SGLANG_PROFILE_FLUSH_OFFLOADED_TEXT_ENCODER_AFTER_ENCODING"
+        ] = "1"
     environment["SGLANG_PERF_LOG_DIR"] = str(server_dir / "performance_logs")
     if enable_cuda_event_stage_profiling:
         environment["SGLANG_GIT_COMMIT"] = repository_commit()
@@ -598,6 +607,8 @@ def launch_server_with_port_retries(
     server_timeout_s: float,
     ready_poll_interval_s: float,
     shutdown_timeout_s: float,
+    text_encoder_cpu_offload: bool = False,
+    flush_offloaded_text_encoder_after_encoding: bool = False,
 ) -> ReadyServer:
     attempts_path = log_path.with_name(f"{log_path.stem}_launch_attempts.json")
     launch_attempts: list[dict[str, Any]] = []
@@ -611,6 +622,7 @@ def launch_server_with_port_retries(
             ports,
             server_dir,
             attention_backend=attention_backend,
+            text_encoder_cpu_offload=text_encoder_cpu_offload,
         )
         attempt_log_path = (
             log_path
@@ -637,6 +649,9 @@ def launch_server_with_port_retries(
                     server_dir,
                     enable_cuda_event_stage_profiling=(
                         enable_cuda_event_stage_profiling
+                    ),
+                    flush_offloaded_text_encoder_after_encoding=(
+                        flush_offloaded_text_encoder_after_encoding
                     ),
                     cuda_compat_lib_dir=cuda_compat_lib_dir,
                 ),

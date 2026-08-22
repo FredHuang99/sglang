@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     VERBOSE: bool = False
     SGLANG_DIFFUSION_SERVER_DEV_MODE: bool = False
     SGLANG_DIFFUSION_STAGE_LOGGING: bool = False
+    SGLANG_PROFILE_FLUSH_OFFLOADED_TEXT_ENCODER_AFTER_ENCODING: bool = False
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
     # cache-dit env vars (primary transformer)
     SGLANG_CACHE_DIT_ENABLED: bool = False
@@ -260,6 +261,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
+    # Profile-only: move an offloaded text encoder back to CPU between stage
+    # profilers so transfer time cannot contaminate downstream module timing.
+    "SGLANG_PROFILE_FLUSH_OFFLOADED_TEXT_ENCODER_AFTER_ENCODING": _lazy_bool(
+        "SGLANG_PROFILE_FLUSH_OFFLOADED_TEXT_ENCODER_AFTER_ENCODING"
+    ),
     # Fraction of denoising steps that run both CFG branches before reusing the
     # last conditional-minus-unconditional residual. Keep 1.0 to disable.
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(

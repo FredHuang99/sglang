@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Callable, List
 
 import torch
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -25,6 +26,10 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
+
+PROFILE_TEXT_ENCODER_FLUSH_MARKER = (
+    "PROFILE_TEXT_ENCODER_FLUSHED_AFTER_ENCODING"
+)
 
 
 class Timer(StageProfiler):
@@ -73,6 +78,36 @@ class PipelineExecutor(ABC):
         stage.set_component_residency_manager(self.component_residency_manager)
         self.component_residency_manager.before_stage(
             stage, stage_index, batch, server_args
+        )
+        self._flush_profile_text_encoder_after_encoding(stage, server_args)
+
+    def _flush_profile_text_encoder_after_encoding(
+        self, stage: "PipelineStage", server_args: ServerArgs
+    ) -> None:
+        if not envs.SGLANG_PROFILE_FLUSH_OFFLOADED_TEXT_ENCODER_AFTER_ENCODING:
+            return
+        if not server_args.text_encoder_cpu_offload:
+            raise RuntimeError(
+                "Profile text-encoder isolation requires "
+                "--text-encoder-cpu-offload true"
+            )
+        if stage._component_stage_name() == "TextEncodingStage":
+            return
+
+        manager = self.component_residency_manager
+        active_use = getattr(manager, "_active_use", None)
+        component_name = getattr(active_use, "component_name", "")
+        if not component_name.startswith("text_encoder"):
+            return
+
+        manager.finish_active_use(prefetch_next=False)
+        if current_platform.is_cuda():
+            torch.cuda.synchronize()
+        logger.info(
+            "%s component=%s before_stage=%s",
+            PROFILE_TEXT_ENCODER_FLUSH_MARKER,
+            component_name,
+            stage._component_stage_name(),
         )
 
     def finish_component_residency_request(self) -> None:
