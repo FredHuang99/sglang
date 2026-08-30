@@ -72,12 +72,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--attention-backend")
     parser.add_argument(
         "--sp1-text-encoder-cpu-offload-models",
+        "--text-encoder-cpu-offload-models",
+        dest="text_encoder_cpu_offload_models",
         nargs="+",
         choices=SP1_TEXT_ENCODER_OFFLOAD_CHOICES,
         default=[],
         help=(
-            "Enable profile-isolated text-encoder CPU offload for SP=1 points "
-            "of the selected Wan models. The default is disabled."
+            "Enable profile-isolated text-encoder CPU offload for the selected "
+            "Wan models at --text-encoder-cpu-offload-gpu-counts. The legacy "
+            "--sp1-text-encoder-cpu-offload-models spelling is also accepted."
+        ),
+    )
+    parser.add_argument(
+        "--text-encoder-cpu-offload-gpu-counts",
+        nargs="+",
+        type=int,
+        default=[1],
+        help=(
+            "Apply the selected Wan text-encoder offload policy at these GPU "
+            "counts. The default preserves the original SP=1-only behavior."
         ),
     )
     parser.add_argument(
@@ -103,8 +116,11 @@ def parse_args() -> argparse.Namespace:
         args.cuda_compat_lib_dir = validate_cuda_compat_lib_dir(
             args.cuda_compat_lib_dir
         )
-        args.sp1_text_encoder_cpu_offload_models = list(
-            dict.fromkeys(args.sp1_text_encoder_cpu_offload_models)
+        args.text_encoder_cpu_offload_models = list(
+            dict.fromkeys(args.text_encoder_cpu_offload_models)
+        )
+        args.text_encoder_cpu_offload_gpu_counts = normalize_gpu_counts(
+            args.text_encoder_cpu_offload_gpu_counts
         )
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
@@ -171,8 +187,9 @@ def main() -> None:
         "gpu_counts": args.gpu_counts,
         "runtime_overrides": {
             "attention_backend": args.attention_backend,
-            "sp1_text_encoder_cpu_offload_models": (
-                args.sp1_text_encoder_cpu_offload_models
+            "text_encoder_cpu_offload_models": args.text_encoder_cpu_offload_models,
+            "text_encoder_cpu_offload_gpu_counts": (
+                args.text_encoder_cpu_offload_gpu_counts
             ),
             "cuda_compat_lib_dir": (
                 str(args.cuda_compat_lib_dir)
@@ -198,9 +215,9 @@ def main() -> None:
     for spec in ALL_MODEL_SPECS:
         model_path = model_paths[spec.key]
         for gpu_count in args.gpu_counts:
-            isolate_sp1_text_encoder = (
-                gpu_count == 1
-                and spec.key in args.sp1_text_encoder_cpu_offload_models
+            isolate_text_encoder = (
+                gpu_count in args.text_encoder_cpu_offload_gpu_counts
+                and spec.key in args.text_encoder_cpu_offload_models
             )
             point_dir = output_dir / spec.key / f"gpu_{gpu_count}"
             server_dir = point_dir / "server"
@@ -212,21 +229,21 @@ def main() -> None:
                 "tp_size": 1,
                 "ulysses_degree": spec.parallelism[gpu_count][0],
                 "ring_degree": spec.parallelism[gpu_count][1],
-                "text_encoder_cpu_offload": isolate_sp1_text_encoder,
+                "text_encoder_cpu_offload": isolate_text_encoder,
                 "flush_offloaded_text_encoder_after_encoding": (
-                    isolate_sp1_text_encoder
+                    isolate_text_encoder
                 ),
                 "metric_comparability": {
                     "encoder": (
                         "offload_affected"
-                        if isolate_sp1_text_encoder
+                        if isolate_text_encoder
                         else "resident"
                     ),
                     "denoiser": "comparable",
                     "decoder": "comparable",
                     "total": (
                         "offload_affected"
-                        if isolate_sp1_text_encoder
+                        if isolate_text_encoder
                         else "resident"
                     ),
                 },
@@ -254,9 +271,9 @@ def main() -> None:
                     server_timeout_s=args.server_timeout_s,
                     ready_poll_interval_s=args.ready_poll_interval_s,
                     shutdown_timeout_s=args.shutdown_timeout_s,
-                    text_encoder_cpu_offload=isolate_sp1_text_encoder,
+                    text_encoder_cpu_offload=isolate_text_encoder,
                     flush_offloaded_text_encoder_after_encoding=(
-                        isolate_sp1_text_encoder
+                        isolate_text_encoder
                     ),
                 )
                 server = ready_server.server
@@ -309,7 +326,7 @@ def main() -> None:
                     point["runs"].append(record)
                     save_json(state_path, state)
 
-                if isolate_sp1_text_encoder:
+                if isolate_text_encoder:
                     marker_count = server.log_path.read_text(
                         encoding="utf-8", errors="replace"
                     ).count(SP1_TEXT_ENCODER_FLUSH_MARKER)
