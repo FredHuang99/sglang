@@ -103,11 +103,25 @@ class PipelineExecutor(ABC):
         manager.finish_active_use(prefetch_next=False)
         if current_platform.is_cuda():
             torch.cuda.synchronize()
+            # The text encoder's parameters are large enough that leaving their
+            # now-unused allocator segments cached can prevent the denoiser from
+            # obtaining a contiguous workspace on 40 GiB GPUs. This profile-only
+            # path is already outside the downstream stage timer, so release the
+            # inactive segments after the D2H copy has completed.
+            torch.cuda.empty_cache()
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            memory_suffix = (
+                f" free_gib={free_bytes / (1024**3):.2f}"
+                f" total_gib={total_bytes / (1024**3):.2f}"
+            )
+        else:
+            memory_suffix = ""
         logger.info(
-            "%s component=%s before_stage=%s",
+            "%s component=%s before_stage=%s%s",
             PROFILE_TEXT_ENCODER_FLUSH_MARKER,
             component_name,
             stage._component_stage_name(),
+            memory_suffix,
         )
 
     def finish_component_residency_request(self) -> None:
