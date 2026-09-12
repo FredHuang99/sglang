@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.work/
+!src/pave_sim/data/dominant_intervals.csv
+
+# Generated campaigns and audit evidence belong outside the source tree.
+/evaluation/
+/review/

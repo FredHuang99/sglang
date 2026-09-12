@@ -1,0 +1,31 @@
+PAVE offline ILP planner
+
+The matrix Bundle-Template formulation in src/pave_ilp/solver.py is adapted
+from NVIDIA aiconfigurator's td_deployment_search/planner.py, licensed under
+Apache-2.0. The corresponding copyright and SPDX notice are retained.
+
+Reference repository commit: 7758be830209fcdba7fd1d9f53dd0adce623b066
+Reference branch: codex/promptenhancer-7b-ttft-tpot
+The reference working tree included an uncommitted physical-bundle counting
+fix. This package implements explicit node/GPU/template identities rather
+than relying on the old bundle labels.
+
+Performance measurements are supplied by the user. Their source filename,
+content checksum, normalized values checksum and mapping notes are stored
+in src/pave_ilp/data/profiles.json. Reports document the explicitly chosen
+modeling assumptions and do not assert that the measurements are universal.
+
+PAVE simulation extension
+
+The simulation state/progress and event-engine design in src/pave_sim/state.py
+and src/pave_sim/engine.py is adapted from the same reference repository's
+td_deployment_search/flip_simulation.py working-tree version reviewed on
+2026-09-06, including its uncommitted simulation changes. The NVIDIA copyright
+and Apache-2.0 notices are retained. Routing, monitoring, source-set selection,
+input adaptation and reports implement the user's separately approved semantics.
+
+src/pave_sim/data/dominant_intervals.csv is the user-supplied one-hour dominant
+interval trace. Its original filename and checksum are documented in
+docs/simulation.md. Each explicitly invoked simulation archives its actual
+inputs and checksums. The original source repository and ILP outputs are not
+modified by this extension.

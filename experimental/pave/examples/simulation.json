@@ -1,0 +1,17 @@
+{
+  "ilp_dir": "~/Desktop/PAVE_ILP",
+  "profile_data": null,
+  "trace": null,
+  "generators": ["wan2.2-ti2v-5b", "wan2.1-t2v-1.3b"],
+  "scenarios": ["cluster1", "cluster2", "clustersimu"],
+  "input_tokens": 128,
+  "short_output_tokens": 512,
+  "long_output_tokens": 2048,
+  "request_rates_per_min": [4, 6, 8],
+  "windows_s": [10, 20, 30, 60],
+  "margins": [0.05, 0.10, 0.15],
+  "monitor_period_s": null,
+  "duration_s": 3600,
+  "initial_tie": "Short",
+  "seed": 0
+}

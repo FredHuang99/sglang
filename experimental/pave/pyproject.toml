@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pave-ilp"
+version = "0.1.0"
+description = "CPU-only, profile-driven PAVE deployment and static flip planner"
+requires-python = ">=3.10"
+dependencies = ["numpy>=2.0,<3", "scipy>=1.14,<2"]
+
+[project.scripts]
+pave-ilp = "pave_ilp.cli:main"
+pave-sim = "pave_sim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pave_ilp = ["data/*.json"]
+pave_sim = ["data/*.csv"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]

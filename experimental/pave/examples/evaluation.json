@@ -1,0 +1,24 @@
+{
+  "ilp_dir": "~/Desktop/PAVE_ILP",
+  "raw_trace": "~/Downloads/AzureLMMInferenceTrace_multimodal/AzureLMMInferenceTrace_multimodal.csv",
+  "hour_start_utc": "2024-10-18T06:00:00Z",
+  "duration_s": 3600,
+  "input_tokens": 128,
+  "short_output_tokens": 512,
+  "long_output_tokens": 2048,
+  "rates": {
+    "wan2.2-ti2v-5b": {"cluster1": [6, 7, 8], "cluster2": [5.5, 6.5, 7.5], "clustersimu": [44, 52, 60]},
+    "wan2.1-t2v-1.3b": {"cluster1": [12, 14, 16], "cluster2": [10, 12, 14], "clustersimu": [66, 78, 90]}
+  },
+  "windows_s": [10, 20, 30, 60],
+  "margins": [0, 0.05, 0.10, 0.15],
+  "monitor_period_s": 10,
+  "request_seeds": [0, 1, 2, 3, 4],
+  "scheduler_seeds": [0, 1, 2, 3, 4],
+  "initial_tie": "Short",
+  "max_events": 2000000,
+  "synthetic": false,
+  "expected_raw_sha256": "eeaba4bae383eeb3724a4fc804ab49f160e918b6dbe356250111bc3ab50d4a95",
+  "expected_p50": 98,
+  "expected_stats": {"15": [240, 202, 45], "30": [120, 102, 26], "60": [60, 52, 16]}
+}
