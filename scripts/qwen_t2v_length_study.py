@@ -21,6 +21,7 @@ import socket
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,6 +48,23 @@ SAMPLING = dict(
 CONTEXT = 32768
 VALID = {"eos", "length_limit"}
 REPO = Path(__file__).resolve().parents[1]
+CATEGORY_LABELS = {
+    "1_consistent_attr": "一致属性绑定",
+    "2_dynamic_attr": "动态属性绑定",
+    "3_spatial_relationship": "空间关系",
+    "4_motion_binding": "运动绑定",
+    "5_action_binding": "动作绑定",
+    "6_interaction": "对象交互",
+    "7_numeracy": "数量关系",
+}
+STATUS_LABELS = {
+    "eos": "自然结束",
+    "length_limit": "达到长度限制",
+    "failed": "请求失败",
+    "interrupted": "已中断",
+    "unfinished": "尚无最终结果",
+    "pending": "尚未提交",
+}
 
 
 def utc():
@@ -81,6 +99,44 @@ def read(path):
 
 def cmd(*args):
     return subprocess.check_output(args, text=True).strip()
+
+
+def local_model_revision(model, explicit=None):
+    """Read local HF provenance without calling Hub APIs or changing metadata."""
+    info = {"repo_id": "Qwen/Qwen2.5-7B-Instruct"}
+    if explicit:
+        return {**info, "revision": explicit, "source": "argument"}
+    weights = sorted(model.glob("*.safetensors")) or sorted(
+        model.glob("pytorch_model*.bin")
+    )
+    files = [
+        model / "config.json",
+        model / "generation_config.json",
+        model / "tokenizer_config.json",
+        model / "tokenizer.json",
+        *weights,
+    ]
+    revisions = set()
+    complete = bool(weights)
+    for path in files:
+        metadata = model / ".cache/huggingface/download" / (path.name + ".metadata")
+        try:
+            lines = metadata.read_text(encoding="utf-8").splitlines()
+            revision, timestamp = lines[0].strip(), float(lines[2])
+            if (
+                not re.fullmatch(r"[0-9a-f]{40}", revision)
+                or path.stat().st_mtime > timestamp + 1
+            ):
+                complete = False
+            else:
+                revisions.add(revision)
+        except (OSError, UnicodeError, ValueError, IndexError):
+            complete = False
+    if complete and len(revisions) == 1:
+        return {**info, "revision": revisions.pop(), "source": "hf_download_metadata"}
+    if model.parent.name == "snapshots" and re.fullmatch(r"[0-9a-f]{40}", model.name):
+        return {**info, "revision": model.name, "source": "hf_snapshot_directory"}
+    return {**info, "revision": None, "source": "unknown_local_revision"}
 
 
 @contextmanager
@@ -200,10 +256,7 @@ def prepare(args):
         context_length=CONTEXT,
         eos_ids=eos,
         special_ids=sorted(special),
-        model_revision={
-            "repo_id": "Qwen/Qwen2.5-7B-Instruct",
-            "revision": args.model_revision,
-        },
+        model_revision=local_model_revision(model, args.model_revision),
         model_config_hashes=config_hashes,
         source_commit=cmd("git", "-C", str(src), "rev-parse", "HEAD"),
         dataset_commit=cmd("git", "-C", str(ds), "rev-parse", "HEAD"),
@@ -294,6 +347,186 @@ def statistics(values):
     )
 
 
+def markdown_table(headers, rows):
+    """Markdown with display-width padding for readable Chinese terminal output."""
+    cells = [[str(c).replace("|", r"\|") for c in row] for row in [headers, *rows]]
+
+    def width(text):
+        return sum(
+            0
+            if unicodedata.combining(c)
+            else 2
+            if unicodedata.east_asian_width(c) in "WF"
+            else 1
+            for c in text
+        )
+
+    widths = [max(3, *(width(row[i]) for row in cells)) for i in range(len(headers))]
+
+    def line(row):
+        return (
+            "| "
+            + " | ".join(c + " " * (w - width(c)) for c, w in zip(row, widths))
+            + " |"
+        )
+
+    return "\n".join(
+        [
+            line(cells[0]),
+            "| " + " | ".join("-" * w for w in widths) + " |",
+            *(line(row) for row in cells[1:]),
+        ]
+    )
+
+
+def summary_markdown(summary):
+    def stat_row(label, stats):
+        return [label, str(stats["count"])] + [
+            (f"{stats[k]:,.0f}" if k == "maximum" else f"{stats[k]:,.2f}")
+            if k in stats
+            else "—"
+            for k in ("mean", "p50", "p90", "p95", "p99", "maximum")
+        ]
+
+    headers = ["口径", "条数", "均值", "p50", "p90", "p95", "p99", "最大值"]
+    groups = summary["categories"]
+    overall = summary["all"]
+    parts = [
+        "# Qwen 普通对话长度统计",
+        f"已保存 **{summary['recorded']}/{summary['expected']}** 条回复：自然结束 **{summary['naturally_finished']}** 条，达到长度限制 **{summary['length_limited']}** 条；未完成 **{summary['missing']}** 条。",
+        f"统计更新时间：{summary['generated_at']}。",
+        "raw 是原始 prompt 长度；input 包含 system 和 chat template；response 按实际生成 token IDs 计数，扣除终止及特殊 token。以下长度单位均为 tokens。",
+        "## 总体长度",
+        "只统计已保存的有效记录；未完成请求不进入长度统计。",
+        markdown_table(
+            headers,
+            [
+                stat_row("raw", overall["raw_tokens"]),
+                stat_row("input", overall["input_tokens"]),
+                stat_row("response（全部已保存）", overall["observed_response_tokens"]),
+                stat_row("response（仅自然结束）", overall["eos_only_response_tokens"]),
+            ],
+        ),
+        "## 各类别进度与输入长度",
+        markdown_table(
+            ["类别", "自然结束", "长度限制", "raw 均值", "input 均值"],
+            [
+                [
+                    CATEGORY_LABELS.get(c, c),
+                    g["eos_only_response_tokens"]["count"],
+                    g["length_limited"],
+                    *[
+                        f"{g[k]['mean']:.2f}" if g[k]["count"] else "—"
+                        for k in ("raw_tokens", "input_tokens")
+                    ],
+                ]
+                for c, g in groups.items()
+            ],
+        ),
+        "## 各类别回复长度（全部已保存）",
+        markdown_table(
+            ["类别", *headers[1:]],
+            [
+                stat_row(CATEGORY_LABELS.get(c, c), g["observed_response_tokens"])
+                for c, g in groups.items()
+            ],
+        ),
+    ]
+    if summary["length_limited"]:
+        parts.extend(
+            [
+                "## 各类别回复长度（仅自然结束）",
+                markdown_table(
+                    ["类别", *headers[1:]],
+                    [
+                        stat_row(
+                            CATEGORY_LABELS.get(c, c), g["eos_only_response_tokens"]
+                        )
+                        for c, g in groups.items()
+                    ],
+                ),
+            ]
+        )
+
+    def threshold(stats, n):
+        entry = stats.get("above", {}).get(str(n))
+        return [entry["count"], f"{entry['fraction']:.2%}"] if entry else [0, "—"]
+
+    parts.extend(
+        [
+            "## 长回复数量与比例",
+            "“超过”为严格大于阈值；两组比例分别以全部已保存回复、自然结束回复为分母。",
+            markdown_table(
+                ["超过 tokens", "全部数量", "全部占比", "自然结束数量", "自然结束占比"],
+                [
+                    [
+                        f"{n:,}",
+                        *threshold(overall["observed_response_tokens"], n),
+                        *threshold(overall["eos_only_response_tokens"], n),
+                    ]
+                    for n in (512, 1024, 2048, 4096, 8192)
+                ],
+            ),
+            "达到长度限制的回复只记录已观测长度，其自然结束长度尚未完整观测；自然结束统计不包含这些回复。",
+        ]
+    )
+    if summary["missing"]:
+        counts = {}
+        for status in summary["missing_states"].values():
+            counts[status] = counts.get(status, 0) + 1
+        parts.extend(
+            [
+                "## 未完成请求",
+                markdown_table(
+                    ["状态", "条数"],
+                    [[STATUS_LABELS.get(s, s), n] for s, n in sorted(counts.items())],
+                ),
+                "重新执行同一启动命令可续跑；逐条状态见 lengths.csv。",
+            ]
+        )
+    parts.append(
+        "完整 prompt 和回复见 responses.md；简洁数据见 lengths.csv；实际 token IDs、完整精度和诊断信息保留在 JSON/JSONL 中。"
+    )
+    return "\n\n".join(parts) + "\n"
+
+
+def write_readable_responses(root, records, expected):
+    def fenced(text):
+        longest = max((len(m.group()) for m in re.finditer(r"`+", text)), default=0)
+        fence = "`" * max(3, longest + 1)
+        return fence + "text\n" + text + ("" if text.endswith("\n") else "\n") + fence
+
+    parts = [
+        "# 原始 prompt 与完整回复",
+        f"已保存 {len(records)}/{expected} 条，按 response tokens 从多到少排列；内容不截短。",
+        "raw 不含对话模板；input 包含 system 和模板；response 按生成 token IDs 扣除终止及特殊 token 后计数。",
+    ]
+    for i, r in enumerate(
+        sorted(records, key=lambda r: (-r["response_tokens"], r["id"])), 1
+    ):
+        parts.extend(
+            [
+                f"## {i}. {CATEGORY_LABELS.get(r['category'], r['category'])} · {r['id']}",
+                f"raw：**{r['raw_tokens']}** · input：**{r['input_tokens']}** · response：**{r['response_tokens']}** tokens · 耗时：{r['elapsed_s']:.3f} s · 状态：{STATUS_LABELS[r['status']]}（{r['status']}）。",
+            ]
+        )
+        if r["status"] == "length_limit":
+            parts.append(
+                "此回复触及长度限制，以下为已生成全文；自然结束长度尚未完整观测。"
+            )
+        parts.extend(
+            [
+                "### 原始 prompt",
+                fenced(r["raw_prompt"]),
+                "### 模型回复",
+                fenced(r["response_text"]),
+            ]
+        )
+    if not records:
+        parts.append("暂无有效回复；请求进度见 lengths.csv。")
+    atomic_text(root / "responses.md", "\n\n".join(parts) + "\n")
+
+
 def export_results(root):
     dest = root
     manifest = read(dest / "manifest.json")
@@ -311,16 +544,8 @@ def export_results(root):
         "raw_tokens",
         "input_tokens",
         "response_tokens",
-        "generated_tokens",
-        "response_retokenized_tokens",
-        "status",
-        "end_token_id",
         "elapsed_s",
-        "sampling_seed",
-        "gpu",
-        "run_id",
-        "raw_prompt",
-        "response_text",
+        "status",
     ]
     buf = io.StringIO(newline="")
     w = csv.DictWriter(buf, fieldnames=fields, extrasaction="ignore")
@@ -328,7 +553,8 @@ def export_results(root):
     missing_states = {}
     for row in rows:
         if row["id"] in found:
-            w.writerow(found[row["id"]])
+            record = found[row["id"]]
+            w.writerow({**record, "elapsed_s": f"{record['elapsed_s']:.3f}"})
         else:
             attempt = dest / "attempts" / (row["id"] + ".json")
             status = read(attempt)["status"] if attempt.exists() else "pending"
@@ -367,6 +593,8 @@ def export_results(root):
         for c in sorted({r["category"] for r in rows})
     }
     save(dest / "summary.json", summary)
+    atomic_text(dest / "summary.md", summary_markdown(summary))
+    write_readable_responses(dest, records, len(rows))
     atomic_text(
         dest / "longest_responses.jsonl",
         "".join(
@@ -376,7 +604,11 @@ def export_results(root):
     )
     save(dest / "missing_ids.json", [r["id"] for r in rows if r["id"] not in found])
     print(
-        f"Exported {len(records)}/{len(rows)}: EOS={summary['naturally_finished']}, length_limit={summary['length_limited']}",
+        f"已导出 {len(records)}/{len(rows)} 条：自然结束 {summary['naturally_finished']}，达到长度限制 {summary['length_limited']}。",
+        flush=True,
+    )
+    print(
+        f"统计：{dest / 'summary.md'}\n全文：{dest / 'responses.md'}\n数据：{dest / 'lengths.csv'}",
         flush=True,
     )
     return summary
@@ -875,36 +1107,16 @@ def run(args):
 
 def report(root, top, preview_chars):
     summary = read(root / "summary.json")
-    counts = {
-        k: summary[k]
-        for k in (
-            "expected",
-            "recorded",
-            "missing",
-            "naturally_finished",
-            "length_limited",
-        )
-    }
-    print(json.dumps(counts, indent=2))
-    for name in ("observed_response_tokens", "eos_only_response_tokens"):
-        print(name + ":")
-        print(json.dumps(summary["all"][name], indent=2))
+    print(summary_markdown(summary), end="")
     with (root / "longest_responses.jsonl").open(encoding="utf-8") as f:
         for _, line in zip(range(top), f):
             r = json.loads(line)
             print(
-                f"\n{r['id']}: raw={r['raw_tokens']}, response={r['response_tokens']}, {r['status']}"
+                f"\n{r['id']}：raw={r['raw_tokens']}，response={r['response_tokens']}，{STATUS_LABELS[r['status']]}"
             )
-            print("Prompt:", r["raw_prompt"])
-            print("Response preview:", r["response_text"][:preview_chars])
-    if summary["missing"]:
-        print(
-            "Some prompts are unfinished; see missing_ids.json and resume the same run."
-        )
-    if summary["length_limited"]:
-        print(
-            "Length-limited responses are right-censored: their natural lengths were not fully observed."
-        )
+            print("原始 prompt：", r["raw_prompt"])
+            print("回复预览：", r["response_text"][:preview_chars])
+    print(f"\n完整回复文件：{root / 'responses.md'}")
 
 
 def set_runtime_directories(root):
@@ -965,8 +1177,7 @@ def main():
     )
     p.add_argument(
         "--model-revision",
-        default=os.environ.get("MODEL_REVISION"),
-        help="Exact downloaded Hugging Face commit; required for prepare/run (MODEL_REVISION)",
+        help="Optional 40-character HF commit override; otherwise read local download metadata, or record unknown",
     )
     p.add_argument("--concurrency", type=int, default=64)
     p.add_argument("--mem-fraction", type=float, default=0.85)
@@ -975,8 +1186,8 @@ def main():
     p.add_argument(
         "--top",
         type=int,
-        default=5,
-        help="Number of longest responses printed by report",
+        default=0,
+        help="Optional longest-response previews; report prints only tables by default",
     )
     p.add_argument("--preview-chars", type=int, default=500)
     args = p.parse_args()
@@ -1010,13 +1221,11 @@ def main():
             "prepare/run/export use Linux process and file locking; execute on the AWS host"
         )
     if args.action in {"prepare", "run"}:
-        if not args.model_revision or not re.fullmatch(
+        if args.model_revision is not None and not re.fullmatch(
             r"[0-9a-f]{40}", args.model_revision
         ):
-            p.error(
-                "Supply the exact downloaded model commit via --model-revision or MODEL_REVISION"
-            )
-        set_runtime_directories(args.root)
+            p.error("--model-revision, when supplied, must be a 40-character HF commit")
+        set_runtime_directories(args.output_dir)
     if args.action == "run":
         run(args)
     elif args.action == "prepare":
