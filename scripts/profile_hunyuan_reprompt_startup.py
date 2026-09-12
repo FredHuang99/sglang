@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile HunyuanImage-2.1 reprompt server startup time."""
+"""Profile Hunyuan reprompt or Qwen2.5-7B server startup time."""
 
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 
+import profile_pe_common as pe_common
 import requests
-
 
 DEFAULT_SERVED_MODEL_NAME = "HunyuanImage-2.1-reprompt"
 DEFAULT_MODEL_PATH = Path("/workspace/models/reprompt")
@@ -34,9 +34,7 @@ REMOVED_SERVER_ENVIRONMENT = ("SGLANG_USE_JIT_ALL_REDUCE", CUSTOM_ALL_REDUCE_V2_
 ALL_REDUCE_MODES = ("legacy_v1", "custom_v2", "nccl")
 ATTENTION_BACKEND_MODES = ("auto", "flashinfer", "fa3")
 DECODE_CUDA_GRAPH_BACKENDS = ("full", "disabled")
-LEGACY_CUSTOM_AR_GRAPH_PATTERN = re.compile(
-    r"Registering \d+ cuda graph addresses"
-)
+LEGACY_CUSTOM_AR_GRAPH_PATTERN = re.compile(r"Registering \d+ cuda graph addresses")
 CUSTOM_V2_INIT_MARKER = "All Reduce config: symmetric_memory ="
 CUSTOM_V2_VMM_GRAPH_MARKER = " cuda graph addresses via "
 SETUPS = {
@@ -55,28 +53,27 @@ SETUPS = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Profile HunyuanImage-2.1 reprompt startup time for ordinary and "
+            "Profile PE startup time for ordinary and "
             "optimized launch configurations. Each configuration runs two "
             "warmups and three measured launches."
         )
     )
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--model-family", choices=pe_common.MODEL_FAMILIES, default="hunyuan-reprompt"
+    )
+    parser.add_argument("--model-path", type=Path)
     parser.add_argument(
         "--served-model-name",
-        default=DEFAULT_SERVED_MODEL_NAME,
         help=(
             "Alias returned by SGLang /v1/models. The implementation class is "
             "selected separately from config.json architectures."
         ),
     )
-    parser.add_argument(
-        "--tp-sizes", nargs="+", type=int, default=list(DEFAULT_TP_SIZES)
-    )
+    parser.add_argument("--tp-sizes", nargs="+", type=int)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/outputs/hunyuan_reprompt_startup"),
     )
     parser.add_argument("--startup-timeout-s", type=float, default=1800.0)
     parser.add_argument("--ready-poll-interval-s", type=float, default=0.05)
@@ -90,7 +87,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-reduce-mode",
         choices=ALL_REDUCE_MODES,
-        default="legacy_v1",
         help=(
             "legacy_v1 forces the legacy custom all-reduce, custom_v2 forces "
             "the JIT V2 path, and nccl disables custom all-reduce."
@@ -103,12 +99,9 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
 
+    pe_common.apply_model_defaults(args, parser, "startup")
     args.model_path = args.model_path.expanduser()
     args.output_dir = args.output_dir.expanduser().resolve()
-    args.tp_sizes = list(dict.fromkeys(args.tp_sizes))
-    invalid_tp_sizes = [tp for tp in args.tp_sizes if tp not in DEFAULT_TP_SIZES]
-    if invalid_tp_sizes:
-        parser.error(f"--tp-sizes only supports 1, 2, 4, 8; got {invalid_tp_sizes}")
     if args.startup_timeout_s <= 0 or args.ready_poll_interval_s <= 0:
         parser.error("startup timeout and ready poll interval must be positive")
     if args.cooldown_s < 0:
@@ -116,7 +109,11 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def resolve_model_path(model_path: Path) -> Path:
+def resolve_model_path(
+    model_path: Path, model_family: str = "hunyuan-reprompt"
+) -> Path:
+    if model_family == pe_common.QWEN_MODEL_FAMILY:
+        return pe_common.resolve_qwen_path(model_path)
     candidate = model_path.resolve()
     direct_config = candidate / "config.json"
     nested_model_path = candidate / "reprompt"
@@ -131,7 +128,12 @@ def resolve_model_path(model_path: Path) -> Path:
     )
 
 
-def validate_checkpoint_files(model_path: Path) -> None:
+def validate_checkpoint_files(
+    model_path: Path, model_family: str = "hunyuan-reprompt"
+) -> None:
+    if model_family == pe_common.QWEN_MODEL_FAMILY:
+        pe_common.validate_qwen_checkpoint(model_path)
+        return
     required_files = (
         "chat_template.jinja",
         "config.json",
@@ -142,7 +144,9 @@ def validate_checkpoint_files(model_path: Path) -> None:
         "tokenization_hy.py",
         "tokenizer_config.json",
     )
-    missing_files = [name for name in required_files if not (model_path / name).is_file()]
+    missing_files = [
+        name for name in required_files if not (model_path / name).is_file()
+    ]
     if missing_files:
         raise FileNotFoundError(
             f"Incomplete reprompt directory {model_path}; missing files: {missing_files}"
@@ -167,12 +171,20 @@ def validate_checkpoint_files(model_path: Path) -> None:
         )
 
 
-def load_model_identity(model_path: Path) -> tuple[str, str]:
+def load_model_identity(
+    model_path: Path, model_family: str = "hunyuan-reprompt"
+) -> tuple[str, str]:
+    if model_family == pe_common.QWEN_MODEL_FAMILY:
+        config = pe_common.load_qwen_config(model_path)
+        return pe_common.QWEN_ARCHITECTURE, config["model_type"]
     validate_checkpoint_files(model_path)
     config_path = model_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     architectures = config.get("architectures")
-    if not isinstance(architectures, list) or EXPECTED_ARCHITECTURE not in architectures:
+    if (
+        not isinstance(architectures, list)
+        or EXPECTED_ARCHITECTURE not in architectures
+    ):
         raise ValueError(
             f"Expected architecture {EXPECTED_ARCHITECTURE!r} in {config_path}, "
             f"got {architectures!r}"
@@ -259,7 +271,9 @@ def wait_for_port_release(host: str, port: int, timeout_s: float = 30.0) -> None
         except OSError:
             return
         time.sleep(0.1)
-    raise TimeoutError(f"Port {connect_host}:{port} remained open after server shutdown")
+    raise TimeoutError(
+        f"Port {connect_host}:{port} remained open after server shutdown"
+    )
 
 
 def build_server_command(
@@ -272,6 +286,8 @@ def build_server_command(
     all_reduce_mode: str = "legacy_v1",
     attention_backend: str = "flashinfer",
     decode_cuda_graph_backend: str = "full",
+    context_length: int = EXPECTED_MAX_MODEL_LEN,
+    dtype: str | None = None,
 ) -> list[str]:
     if all_reduce_mode not in ALL_REDUCE_MODES:
         raise ValueError(
@@ -304,7 +320,7 @@ def build_server_command(
         "--tp-size",
         str(tp_size),
         "--context-length",
-        "32768",
+        str(context_length),
         "--mem-fraction-static",
         "0.9",
         "--skip-server-warmup",
@@ -315,6 +331,8 @@ def build_server_command(
     ]
     if attention_backend != "auto":
         command.extend(["--attention-backend", attention_backend])
+    if dtype is not None:
+        command.extend(["--dtype", dtype])
     if all_reduce_mode == "nccl":
         command.append("--disable-custom-all-reduce")
     command.extend(SETUPS[setup_name])
@@ -407,7 +425,9 @@ def wait_for_ready(
 
 
 def validate_model_card(
-    payload: dict[str, Any], served_model_name: str
+    payload: dict[str, Any],
+    served_model_name: str,
+    expected_max_model_len: int = EXPECTED_MAX_MODEL_LEN,
 ) -> dict[str, Any]:
     data = payload.get("data")
     if not isinstance(data, list):
@@ -419,9 +439,9 @@ def validate_model_card(
             f"got {matches!r}"
         )
     model_entry = matches[0]
-    if model_entry.get("max_model_len") != EXPECTED_MAX_MODEL_LEN:
+    if model_entry.get("max_model_len") != expected_max_model_len:
         raise RuntimeError(
-            f"Expected max_model_len={EXPECTED_MAX_MODEL_LEN}, got "
+            f"Expected max_model_len={expected_max_model_len}, got "
             f"{model_entry.get('max_model_len')!r}"
         )
     return model_entry
@@ -435,6 +455,7 @@ def validate_server_log(
     all_reduce_mode: str = "legacy_v1",
     attention_backend: str = "flashinfer",
     decode_cuda_graph_backend: str = "full",
+    expected_architecture: str = EXPECTED_ARCHITECTURE,
 ) -> dict[str, Any]:
     if all_reduce_mode not in ALL_REDUCE_MODES:
         raise ValueError(
@@ -452,19 +473,14 @@ def validate_server_log(
             f"expected one of {DECODE_CUDA_GRAPH_BACKENDS}"
         )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    resolved_attention_match = re.search(
-        r"attention_backend='([^']+)'", log_text
-    )
+    resolved_attention_match = re.search(r"attention_backend='([^']+)'", log_text)
     if resolved_attention_match is None:
         raise RuntimeError(
             f"Could not resolve attention_backend from {log_path}\n"
             f"{read_log_tail(log_path)}"
         )
     resolved_attention_backend = resolved_attention_match.group(1)
-    if (
-        attention_backend != "auto"
-        and resolved_attention_backend != attention_backend
-    ):
+    if attention_backend != "auto" and resolved_attention_backend != attention_backend:
         raise RuntimeError(
             f"Requested attention backend {attention_backend!r}, but the server "
             f"resolved {resolved_attention_backend!r}.\n{read_log_tail(log_path)}"
@@ -475,7 +491,7 @@ def validate_server_log(
         f"attention_backend='{resolved_attention_backend}'",
         f"cuda_graph_backend_decode='{decode_cuda_graph_backend}'",
         "cuda_graph_backend_prefill='disabled'",
-        f"type={EXPECTED_ARCHITECTURE}",
+        f"type={expected_architecture}",
         "Disable prefill CUDA graph because",
     ]
     if decode_cuda_graph_backend == "full":
@@ -520,26 +536,17 @@ def validate_server_log(
             ]
         )
     else:
-        forbidden_markers.extend(
-            [CUSTOM_V2_INIT_MARKER, CUSTOM_V2_VMM_GRAPH_MARKER]
-        )
+        forbidden_markers.extend([CUSTOM_V2_INIT_MARKER, CUSTOM_V2_VMM_GRAPH_MARKER])
     if decode_cuda_graph_backend == "disabled":
         forbidden_markers.append("Capture target decode CUDA graph")
     missing = [marker for marker in required_markers if marker not in log_text]
-    present_forbidden = [
-        marker for marker in forbidden_markers if marker in log_text
-    ]
+    present_forbidden = [marker for marker in forbidden_markers if marker in log_text]
     legacy_graph_registration_present = bool(
         LEGACY_CUSTOM_AR_GRAPH_PATTERN.search(log_text)
     )
     custom_v2_initialized = CUSTOM_V2_INIT_MARKER in log_text
-    custom_v2_vmm_graph_registration_present = (
-        CUSTOM_V2_VMM_GRAPH_MARKER in log_text
-    )
-    if (
-        all_reduce_mode in {"custom_v2", "nccl"}
-        and legacy_graph_registration_present
-    ):
+    custom_v2_vmm_graph_registration_present = CUSTOM_V2_VMM_GRAPH_MARKER in log_text
+    if all_reduce_mode in {"custom_v2", "nccl"} and legacy_graph_registration_present:
         present_forbidden.append("legacy custom all-reduce graph registration")
     if missing or present_forbidden:
         raise RuntimeError(
@@ -568,19 +575,16 @@ def write_summary(
     output_path: Path,
     aggregates: dict[tuple[str, int], float],
     tp_sizes: list[int],
+    summary_prefix: str = "hunyuan_reprompt",
 ) -> None:
     ordered_tp_sizes = [tp for tp in SUMMARY_TP_ORDER if tp in tp_sizes]
-    optimized = {
-        tp: aggregates[("optimized", tp)] for tp in ordered_tp_sizes
-    }
-    non_optimized = {
-        tp: aggregates[("non_optimized", tp)] for tp in ordered_tp_sizes
-    }
+    optimized = {tp: aggregates[("optimized", tp)] for tp in ordered_tp_sizes}
+    non_optimized = {tp: aggregates[("non_optimized", tp)] for tp in ordered_tp_sizes}
     content = (
-        "hunyuan_reprompt_init_time_ms = "
+        f"{summary_prefix}_init_time_ms = "
         + pprint.pformat(optimized, sort_dicts=False, width=100)
         + "\n\n"
-        + "hunyuan_reprompt_init_time_non_optimized_ms = "
+        + f"{summary_prefix}_init_time_non_optimized_ms = "
         + pprint.pformat(non_optimized, sort_dicts=False, width=100)
         + "\n"
     )
@@ -591,13 +595,27 @@ def write_summary(
 
 def main() -> None:
     args = parse_args()
-    args.model_path = resolve_model_path(args.model_path)
-    architecture, model_type = load_model_identity(args.model_path)
+    args.model_path = resolve_model_path(args.model_path, args.model_family)
+    architecture, model_type = load_model_identity(args.model_path, args.model_family)
+    is_qwen = args.model_family == pe_common.QWEN_MODEL_FAMILY
+    context_length = (
+        json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))[
+            "max_position_embeddings"
+        ]
+        if is_qwen
+        else EXPECTED_MAX_MODEL_LEN
+    )
+    summary_prefix = "qwen25_7b" if is_qwen else "hunyuan_reprompt"
     prepare_output_directory(args.output_dir)
     details_path = args.output_dir / "details.json"
     summary_path = args.output_dir / "summary.py"
     details: dict[str, Any] = {
         "status": "running",
+        "model_family": args.model_family,
+        "context_length": context_length,
+        "dtype": "bfloat16" if is_qwen else "auto",
+        "ready_poll_interval_s": args.ready_poll_interval_s,
+        "cooldown_s": args.cooldown_s,
         "model_path": str(args.model_path),
         "served_model_name": args.served_model_name,
         "architecture": architecture,
@@ -645,6 +663,8 @@ def main() -> None:
                         all_reduce_mode=args.all_reduce_mode,
                         attention_backend=args.attention_backend,
                         decode_cuda_graph_backend=args.decode_cuda_graph_backend,
+                        context_length=context_length,
+                        dtype="bfloat16" if is_qwen else None,
                     )
                     record: dict[str, Any] = {
                         "tp_size": tp_size,
@@ -683,8 +703,13 @@ def main() -> None:
                             log_path,
                         )
                         startup_time_ms = (ready_ns - start_ns) / 1_000_000.0
+                        record.update(
+                            start_ns=start_ns,
+                            ready_ns=ready_ns,
+                            startup_time_ms=startup_time_ms,
+                        )
                         model_entry = validate_model_card(
-                            model_card, args.served_model_name
+                            model_card, args.served_model_name, context_length
                         )
                         validation = validate_server_log(
                             log_path,
@@ -694,7 +719,13 @@ def main() -> None:
                             all_reduce_mode=args.all_reduce_mode,
                             attention_backend=args.attention_backend,
                             decode_cuda_graph_backend=args.decode_cuda_graph_backend,
+                            expected_architecture=architecture,
                         )
+                        if is_qwen:
+                            # Readback is deliberately outside the timed interval.
+                            record["runtime_parameters"] = (
+                                pe_common.read_runtime_parameters(url)
+                            )
                         record.update(
                             status="completed",
                             startup_time_ms=startup_time_ms,
@@ -728,7 +759,7 @@ def main() -> None:
                 )
                 save_json(details_path, details)
 
-        write_summary(summary_path, aggregates, args.tp_sizes)
+        write_summary(summary_path, aggregates, args.tp_sizes, summary_prefix)
         details["status"] = "completed"
         details["summary_path"] = str(summary_path)
         save_json(details_path, details)
@@ -742,4 +773,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    with pe_common.cleanup_on_sigterm():
+        main()

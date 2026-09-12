@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile HunyuanImage-2.1 reprompt TTFT and TPOT with lightweight timing."""
+"""Profile Hunyuan reprompt or Qwen2.5-7B TTFT/TPOT with lightweight timing."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any
 
+import profile_pe_common as pe_common
 import requests
-
 
 DEFAULT_SERVED_MODEL_NAME = "HunyuanImage-2.1-reprompt"
 DEFAULT_MODEL_PATH = Path("/workspace/models/reprompt")
@@ -40,9 +40,7 @@ COMPLETION_TOKENS_PATTERN = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
 DECODE_CUDA_GRAPH_STATE_PATTERN = re.compile(
     r"Decode batch[^\r\n]*cuda graph: (True|False)"
 )
-LEGACY_CUSTOM_AR_GRAPH_PATTERN = re.compile(
-    r"Registering \d+ cuda graph addresses"
-)
+LEGACY_CUSTOM_AR_GRAPH_PATTERN = re.compile(r"Registering \d+ cuda graph addresses")
 CUSTOM_V2_INIT_MARKER = "All Reduce config: symmetric_memory ="
 CUSTOM_V2_VMM_GRAPH_MARKER = " cuda graph addresses via "
 IO_MATRIX = {
@@ -68,28 +66,27 @@ IO_MATRIX = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Profile HunyuanImage-2.1 reprompt TTFT/TPOT for the registry "
+            "Profile PE TTFT/TPOT for the selected model family's "
             "input/output matrix. Each point runs two warmups and three "
             "measured requests."
         )
     )
-    parser.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
+    parser.add_argument(
+        "--model-family", choices=pe_common.MODEL_FAMILIES, default="hunyuan-reprompt"
+    )
+    parser.add_argument("--model-path", type=Path)
     parser.add_argument(
         "--served-model-name",
-        default=DEFAULT_SERVED_MODEL_NAME,
         help=(
             "Alias returned by SGLang /v1/models. The implementation class is "
             "selected separately from config.json architectures."
         ),
     )
-    parser.add_argument(
-        "--tp-sizes", nargs="+", type=int, default=list(DEFAULT_TP_SIZES)
-    )
+    parser.add_argument("--tp-sizes", nargs="+", type=int)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=Path("/workspace/outputs/hunyuan_reprompt_latency"),
     )
     parser.add_argument("--server-timeout-s", type=float, default=1800.0)
     parser.add_argument("--request-timeout-s", type=float, default=1800.0)
@@ -102,7 +99,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-reduce-mode",
         choices=ALL_REDUCE_MODES,
-        default="legacy_v1",
         help=(
             "legacy_v1 forces the legacy custom all-reduce, custom_v2 forces "
             "the JIT V2 path, and nccl disables custom all-reduce."
@@ -116,18 +112,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    pe_common.apply_model_defaults(args, parser, "latency")
     args.model_path = args.model_path.expanduser()
     args.output_dir = args.output_dir.expanduser().resolve()
-    args.tp_sizes = list(dict.fromkeys(args.tp_sizes))
-    invalid_tp_sizes = [tp for tp in args.tp_sizes if tp not in DEFAULT_TP_SIZES]
-    if invalid_tp_sizes:
-        parser.error(f"--tp-sizes only supports 1, 2, 4, 8; got {invalid_tp_sizes}")
     if args.server_timeout_s <= 0 or args.request_timeout_s <= 0:
         parser.error("timeouts must be positive")
     return args
 
 
-def resolve_model_path(model_path: Path) -> Path:
+def resolve_model_path(
+    model_path: Path, model_family: str = "hunyuan-reprompt"
+) -> Path:
+    if model_family == pe_common.QWEN_MODEL_FAMILY:
+        return pe_common.resolve_qwen_path(model_path)
     candidate = model_path.resolve()
     direct_config = candidate / "config.json"
     nested_model_path = candidate / "reprompt"
@@ -142,7 +139,12 @@ def resolve_model_path(model_path: Path) -> Path:
     )
 
 
-def validate_checkpoint_files(model_path: Path) -> None:
+def validate_checkpoint_files(
+    model_path: Path, model_family: str = "hunyuan-reprompt"
+) -> None:
+    if model_family == pe_common.QWEN_MODEL_FAMILY:
+        pe_common.validate_qwen_checkpoint(model_path)
+        return
     required_files = (
         "chat_template.jinja",
         "config.json",
@@ -153,7 +155,9 @@ def validate_checkpoint_files(model_path: Path) -> None:
         "tokenization_hy.py",
         "tokenizer_config.json",
     )
-    missing_files = [name for name in required_files if not (model_path / name).is_file()]
+    missing_files = [
+        name for name in required_files if not (model_path / name).is_file()
+    ]
     if missing_files:
         raise FileNotFoundError(
             f"Incomplete reprompt directory {model_path}; missing files: {missing_files}"
@@ -178,12 +182,20 @@ def validate_checkpoint_files(model_path: Path) -> None:
         )
 
 
-def load_model_config(model_path: Path) -> tuple[int, str, str]:
+def load_model_config(
+    model_path: Path, model_family: str = "hunyuan-reprompt"
+) -> tuple[int, str, str]:
+    if model_family == pe_common.QWEN_MODEL_FAMILY:
+        config = pe_common.load_qwen_config(model_path)
+        return config["vocab_size"], pe_common.QWEN_ARCHITECTURE, config["model_type"]
     validate_checkpoint_files(model_path)
     config_path = model_path / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     architectures = config.get("architectures")
-    if not isinstance(architectures, list) or EXPECTED_ARCHITECTURE not in architectures:
+    if (
+        not isinstance(architectures, list)
+        or EXPECTED_ARCHITECTURE not in architectures
+    ):
         raise ValueError(
             f"Expected architecture {EXPECTED_ARCHITECTURE!r} in {config_path}, "
             f"got {architectures!r}"
@@ -279,6 +291,8 @@ def build_server_command(
     attention_backend: str = "flashinfer",
     decode_cuda_graph_backend: str = "full",
     server_random_seed: int | None = None,
+    context_length: int = EXPECTED_MAX_MODEL_LEN,
+    dtype: str | None = None,
 ) -> list[str]:
     if all_reduce_mode not in ALL_REDUCE_MODES:
         raise ValueError(
@@ -311,7 +325,7 @@ def build_server_command(
         "--tp-size",
         str(tp_size),
         "--context-length",
-        "32768",
+        str(context_length),
         "--mem-fraction-static",
         "0.9",
         "--skip-server-warmup",
@@ -322,6 +336,8 @@ def build_server_command(
     ]
     if attention_backend != "auto":
         command.extend(["--attention-backend", attention_backend])
+    if dtype is not None:
+        command.extend(["--dtype", dtype])
     if server_random_seed is not None:
         command.extend(["--random-seed", str(server_random_seed)])
     if incremental_streaming_output:
@@ -405,9 +421,7 @@ def wait_for_ready(
                         return payload
                     last_error = f"ready endpoint returned model ids {model_ids!r}"
                 else:
-                    last_error = (
-                        f"ready endpoint returned HTTP {response.status_code}"
-                    )
+                    last_error = f"ready endpoint returned HTTP {response.status_code}"
             except (requests.RequestException, ValueError) as exc:
                 last_error = str(exc)
             time.sleep(0.1)
@@ -418,7 +432,9 @@ def wait_for_ready(
 
 
 def validate_model_card(
-    payload: dict[str, Any], served_model_name: str
+    payload: dict[str, Any],
+    served_model_name: str,
+    expected_max_model_len: int = EXPECTED_MAX_MODEL_LEN,
 ) -> dict[str, Any]:
     data = payload.get("data")
     if not isinstance(data, list):
@@ -430,9 +446,9 @@ def validate_model_card(
             f"got {matches!r}"
         )
     model_entry = matches[0]
-    if model_entry.get("max_model_len") != EXPECTED_MAX_MODEL_LEN:
+    if model_entry.get("max_model_len") != expected_max_model_len:
         raise RuntimeError(
-            f"Expected max_model_len={EXPECTED_MAX_MODEL_LEN}, got "
+            f"Expected max_model_len={expected_max_model_len}, got "
             f"{model_entry.get('max_model_len')!r}"
         )
     return model_entry
@@ -447,6 +463,7 @@ def validate_server_log(
     all_reduce_mode: str = "legacy_v1",
     attention_backend: str = "flashinfer",
     decode_cuda_graph_backend: str = "full",
+    expected_architecture: str = EXPECTED_ARCHITECTURE,
 ) -> dict[str, Any]:
     if all_reduce_mode not in ALL_REDUCE_MODES:
         raise ValueError(
@@ -464,19 +481,14 @@ def validate_server_log(
             f"expected one of {DECODE_CUDA_GRAPH_BACKENDS}"
         )
     log_text = log_path.read_text(encoding="utf-8", errors="replace")
-    resolved_attention_match = re.search(
-        r"attention_backend='([^']+)'", log_text
-    )
+    resolved_attention_match = re.search(r"attention_backend='([^']+)'", log_text)
     if resolved_attention_match is None:
         raise RuntimeError(
             f"Could not resolve attention_backend from {log_path}\n"
             f"{read_log_tail(log_path)}"
         )
     resolved_attention_backend = resolved_attention_match.group(1)
-    if (
-        attention_backend != "auto"
-        and resolved_attention_backend != attention_backend
-    ):
+    if attention_backend != "auto" and resolved_attention_backend != attention_backend:
         raise RuntimeError(
             f"Requested attention backend {attention_backend!r}, but the server "
             f"resolved {resolved_attention_backend!r}.\n{read_log_tail(log_path)}"
@@ -488,7 +500,7 @@ def validate_server_log(
         f"attention_backend='{resolved_attention_backend}'",
         f"cuda_graph_backend_decode='{decode_cuda_graph_backend}'",
         "cuda_graph_backend_prefill='disabled'",
-        f"type={EXPECTED_ARCHITECTURE}",
+        f"type={expected_architecture}",
         "Disable prefill CUDA graph because",
     ]
     if decode_cuda_graph_backend == "full":
@@ -501,10 +513,7 @@ def validate_server_log(
             and decode_cuda_graph_backend == "full"
         ):
             required_markers.append(" cuda graph addresses")
-        elif (
-            all_reduce_mode == "custom_v2"
-            and tp_size > 1
-        ):
+        elif all_reduce_mode == "custom_v2" and tp_size > 1:
             required_markers.append(CUSTOM_V2_INIT_MARKER)
     else:
         required_markers.append("disable_custom_all_reduce=True")
@@ -530,26 +539,17 @@ def validate_server_log(
             ]
         )
     else:
-        forbidden_markers.extend(
-            [CUSTOM_V2_INIT_MARKER, CUSTOM_V2_VMM_GRAPH_MARKER]
-        )
+        forbidden_markers.extend([CUSTOM_V2_INIT_MARKER, CUSTOM_V2_VMM_GRAPH_MARKER])
     if decode_cuda_graph_backend == "disabled":
         forbidden_markers.append("Capture target decode CUDA graph")
     missing = [marker for marker in required_markers if marker not in log_text]
-    present_forbidden = [
-        marker for marker in forbidden_markers if marker in log_text
-    ]
+    present_forbidden = [marker for marker in forbidden_markers if marker in log_text]
     legacy_graph_registration_present = bool(
         LEGACY_CUSTOM_AR_GRAPH_PATTERN.search(log_text)
     )
     custom_v2_initialized = CUSTOM_V2_INIT_MARKER in log_text
-    custom_v2_vmm_graph_registration_present = (
-        CUSTOM_V2_VMM_GRAPH_MARKER in log_text
-    )
-    if (
-        all_reduce_mode in {"custom_v2", "nccl"}
-        and legacy_graph_registration_present
-    ):
+    custom_v2_vmm_graph_registration_present = CUSTOM_V2_VMM_GRAPH_MARKER in log_text
+    if all_reduce_mode in {"custom_v2", "nccl"} and legacy_graph_registration_present:
         present_forbidden.append("legacy custom all-reduce graph registration")
     if missing or present_forbidden:
         raise RuntimeError(
@@ -565,8 +565,7 @@ def validate_server_log(
         ]
         expected_decode_cuda_graph = decode_cuda_graph_backend == "full"
         if not decode_cuda_graph_states or any(
-            state != expected_decode_cuda_graph
-            for state in decode_cuda_graph_states
+            state != expected_decode_cuda_graph for state in decode_cuda_graph_states
         ):
             raise RuntimeError(
                 f"Decode CUDA graph validation failed for TP={tp_size}; "
@@ -718,7 +717,11 @@ def write_summary(
     output_path: Path,
     aggregates: dict[tuple[int, int, int], dict[str, float]],
     tp_sizes: list[int],
+    io_matrix: dict[int, tuple[int, ...]] | None = None,
+    summary_prefix: str = "hunyuan_reprompt",
 ) -> None:
+    if io_matrix is None:
+        io_matrix = IO_MATRIX
     ordered_tp_sizes = [tp for tp in DEFAULT_TP_SIZES if tp in tp_sizes]
     ttft = {
         input_length: {
@@ -728,7 +731,7 @@ def write_summary(
             }
             for output_length in output_lengths
         }
-        for input_length, output_lengths in IO_MATRIX.items()
+        for input_length, output_lengths in io_matrix.items()
     }
     tpot = {
         input_length: {
@@ -738,13 +741,13 @@ def write_summary(
             }
             for output_length in output_lengths
         }
-        for input_length, output_lengths in IO_MATRIX.items()
+        for input_length, output_lengths in io_matrix.items()
     }
     content = (
-        "hunyuan_reprompt_ttft_ms = "
+        f"{summary_prefix}_ttft_ms = "
         + pprint.pformat(ttft, sort_dicts=False, width=100)
         + "\n\n"
-        + "hunyuan_reprompt_tpot_ms = "
+        + f"{summary_prefix}_tpot_ms = "
         + pprint.pformat(tpot, sort_dicts=False, width=100)
         + "\n"
     )
@@ -755,9 +758,27 @@ def write_summary(
 
 def main() -> None:
     args = parse_args()
-    args.model_path = resolve_model_path(args.model_path)
-    vocab_size, architecture, model_type = load_model_config(args.model_path)
-    requests_per_tp = sum(len(lengths) for lengths in IO_MATRIX.values()) * NUM_RUNS
+    args.model_path = resolve_model_path(args.model_path, args.model_family)
+    vocab_size, architecture, model_type = load_model_config(
+        args.model_path, args.model_family
+    )
+    is_qwen = args.model_family == pe_common.QWEN_MODEL_FAMILY
+    io_matrix = pe_common.QWEN_IO_MATRIX if is_qwen else IO_MATRIX
+    context_length = (
+        json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))[
+            "max_position_embeddings"
+        ]
+        if is_qwen
+        else EXPECTED_MAX_MODEL_LEN
+    )
+    if any(
+        isl + osl > context_length for isl, osls in io_matrix.items() for osl in osls
+    ):
+        raise ValueError(
+            "The profiling matrix exceeds the model's native context length"
+        )
+    summary_prefix = "qwen25_7b" if is_qwen else "hunyuan_reprompt"
+    requests_per_tp = sum(len(lengths) for lengths in io_matrix.values()) * NUM_RUNS
     if requests_per_tp > vocab_size:
         raise ValueError(
             f"Need {requests_per_tp} unique first tokens per TP, but vocab_size is "
@@ -768,6 +789,9 @@ def main() -> None:
     summary_path = args.output_dir / "summary.py"
     details: dict[str, Any] = {
         "status": "running",
+        "model_family": args.model_family,
+        "context_length": context_length,
+        "dtype": "bfloat16" if is_qwen else "auto",
         "model_path": str(args.model_path),
         "served_model_name": args.served_model_name,
         "architecture": architecture,
@@ -776,7 +800,7 @@ def main() -> None:
         "tp_sizes": args.tp_sizes,
         "io_matrix": {
             str(input_length): list(output_lengths)
-            for input_length, output_lengths in IO_MATRIX.items()
+            for input_length, output_lengths in io_matrix.items()
         },
         "num_runs": NUM_RUNS,
         "num_warmup_runs": NUM_WARMUP_RUNS,
@@ -817,6 +841,8 @@ def main() -> None:
                 all_reduce_mode=args.all_reduce_mode,
                 attention_backend=args.attention_backend,
                 decode_cuda_graph_backend=args.decode_cuda_graph_backend,
+                context_length=context_length,
+                dtype="bfloat16" if is_qwen else None,
             )
             process: subprocess.Popen[bytes] | None = None
             log_file = None
@@ -834,7 +860,7 @@ def main() -> None:
                     log_path,
                 )
                 model_entry = validate_model_card(
-                    model_card, args.served_model_name
+                    model_card, args.served_model_name, context_length
                 )
                 startup_validation = validate_server_log(
                     log_path,
@@ -843,6 +869,7 @@ def main() -> None:
                     all_reduce_mode=args.all_reduce_mode,
                     attention_backend=args.attention_backend,
                     decode_cuda_graph_backend=args.decode_cuda_graph_backend,
+                    expected_architecture=architecture,
                 )
                 server_record = {
                     "tp_size": tp_size,
@@ -860,7 +887,7 @@ def main() -> None:
                 request_ordinal = 0
 
                 for case_index, (input_length, output_lengths) in enumerate(
-                    IO_MATRIX.items()
+                    io_matrix.items()
                 ):
                     for output_length in output_lengths:
                         measured_ttft: list[float] = []
@@ -884,9 +911,9 @@ def main() -> None:
                                 first_token_id,
                             )
                             input_ids_sha256 = hashlib.sha256(
-                                ",".join(str(token_id) for token_id in input_ids).encode(
-                                    "ascii"
-                                )
+                                ",".join(
+                                    str(token_id) for token_id in input_ids
+                                ).encode("ascii")
                             ).hexdigest()
                             request_ordinal += 1
                             record: dict[str, Any] = {
@@ -953,6 +980,7 @@ def main() -> None:
                     all_reduce_mode=args.all_reduce_mode,
                     attention_backend=args.attention_backend,
                     decode_cuda_graph_backend=args.decode_cuda_graph_backend,
+                    expected_architecture=architecture,
                 )
                 save_json(details_path, details)
             finally:
@@ -960,7 +988,9 @@ def main() -> None:
                     request_session.close()
                 stop_server(process, log_file)
 
-        write_summary(summary_path, aggregates, args.tp_sizes)
+        write_summary(
+            summary_path, aggregates, args.tp_sizes, io_matrix, summary_prefix
+        )
         details["status"] = "completed"
         details["summary_path"] = str(summary_path)
         save_json(details_path, details)
@@ -974,4 +1004,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    with pe_common.cleanup_on_sigterm():
+        main()
