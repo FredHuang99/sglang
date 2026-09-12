@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile Hunyuan reprompt or Qwen2.5-7B server startup time."""
+"""Profile Hunyuan reprompt or Qwen2.5-7B/14B server startup time."""
 
 from __future__ import annotations
 
@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
 def resolve_model_path(
     model_path: Path, model_family: str = "hunyuan-reprompt"
 ) -> Path:
-    if model_family == pe_common.QWEN_MODEL_FAMILY:
+    if model_family in pe_common.QWEN_MODEL_SPECS:
         return pe_common.resolve_qwen_path(model_path)
     candidate = model_path.resolve()
     direct_config = candidate / "config.json"
@@ -131,7 +131,7 @@ def resolve_model_path(
 def validate_checkpoint_files(
     model_path: Path, model_family: str = "hunyuan-reprompt"
 ) -> None:
-    if model_family == pe_common.QWEN_MODEL_FAMILY:
+    if model_family in pe_common.QWEN_MODEL_SPECS:
         pe_common.validate_qwen_checkpoint(model_path)
         return
     required_files = (
@@ -174,8 +174,8 @@ def validate_checkpoint_files(
 def load_model_identity(
     model_path: Path, model_family: str = "hunyuan-reprompt"
 ) -> tuple[str, str]:
-    if model_family == pe_common.QWEN_MODEL_FAMILY:
-        config = pe_common.load_qwen_config(model_path)
+    if model_family in pe_common.QWEN_MODEL_SPECS:
+        config = pe_common.load_qwen_config(model_path, model_family)
         return pe_common.QWEN_ARCHITECTURE, config["model_type"]
     validate_checkpoint_files(model_path)
     config_path = model_path / "config.json"
@@ -597,7 +597,7 @@ def main() -> None:
     args = parse_args()
     args.model_path = resolve_model_path(args.model_path, args.model_family)
     architecture, model_type = load_model_identity(args.model_path, args.model_family)
-    is_qwen = args.model_family == pe_common.QWEN_MODEL_FAMILY
+    is_qwen = args.model_family in pe_common.QWEN_MODEL_SPECS
     context_length = (
         json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))[
             "max_position_embeddings"
@@ -605,7 +605,11 @@ def main() -> None:
         if is_qwen
         else EXPECTED_MAX_MODEL_LEN
     )
-    summary_prefix = "qwen25_7b" if is_qwen else "hunyuan_reprompt"
+    summary_prefix = (
+        pe_common.QWEN_MODEL_SPECS[args.model_family]["summary_prefix"]
+        if is_qwen
+        else "hunyuan_reprompt"
+    )
     prepare_output_directory(args.output_dir)
     details_path = args.output_dir / "details.json"
     summary_path = args.output_dir / "summary.py"

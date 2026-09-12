@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Profile Hunyuan reprompt or Qwen2.5-7B TTFT/TPOT with lightweight timing."""
+"""Profile Hunyuan reprompt or Qwen2.5-7B/14B TTFT/TPOT with lightweight timing."""
 
 from __future__ import annotations
 
@@ -123,7 +123,7 @@ def parse_args() -> argparse.Namespace:
 def resolve_model_path(
     model_path: Path, model_family: str = "hunyuan-reprompt"
 ) -> Path:
-    if model_family == pe_common.QWEN_MODEL_FAMILY:
+    if model_family in pe_common.QWEN_MODEL_SPECS:
         return pe_common.resolve_qwen_path(model_path)
     candidate = model_path.resolve()
     direct_config = candidate / "config.json"
@@ -142,7 +142,7 @@ def resolve_model_path(
 def validate_checkpoint_files(
     model_path: Path, model_family: str = "hunyuan-reprompt"
 ) -> None:
-    if model_family == pe_common.QWEN_MODEL_FAMILY:
+    if model_family in pe_common.QWEN_MODEL_SPECS:
         pe_common.validate_qwen_checkpoint(model_path)
         return
     required_files = (
@@ -185,8 +185,8 @@ def validate_checkpoint_files(
 def load_model_config(
     model_path: Path, model_family: str = "hunyuan-reprompt"
 ) -> tuple[int, str, str]:
-    if model_family == pe_common.QWEN_MODEL_FAMILY:
-        config = pe_common.load_qwen_config(model_path)
+    if model_family in pe_common.QWEN_MODEL_SPECS:
+        config = pe_common.load_qwen_config(model_path, model_family)
         return config["vocab_size"], pe_common.QWEN_ARCHITECTURE, config["model_type"]
     validate_checkpoint_files(model_path)
     config_path = model_path / "config.json"
@@ -762,7 +762,7 @@ def main() -> None:
     vocab_size, architecture, model_type = load_model_config(
         args.model_path, args.model_family
     )
-    is_qwen = args.model_family == pe_common.QWEN_MODEL_FAMILY
+    is_qwen = args.model_family in pe_common.QWEN_MODEL_SPECS
     io_matrix = pe_common.QWEN_IO_MATRIX if is_qwen else IO_MATRIX
     context_length = (
         json.loads((args.model_path / "config.json").read_text(encoding="utf-8"))[
@@ -777,7 +777,11 @@ def main() -> None:
         raise ValueError(
             "The profiling matrix exceeds the model's native context length"
         )
-    summary_prefix = "qwen25_7b" if is_qwen else "hunyuan_reprompt"
+    summary_prefix = (
+        pe_common.QWEN_MODEL_SPECS[args.model_family]["summary_prefix"]
+        if is_qwen
+        else "hunyuan_reprompt"
+    )
     requests_per_tp = sum(len(lengths) for lengths in io_matrix.values()) * NUM_RUNS
     if requests_per_tp > vocab_size:
         raise ValueError(

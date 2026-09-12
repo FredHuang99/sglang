@@ -11,10 +11,39 @@ from typing import Any
 
 import requests
 
-MODEL_FAMILIES = ("hunyuan-reprompt", "qwen2.5-7b")
 QWEN_MODEL_FAMILY = "qwen2.5-7b"
+QWEN_MODEL_SPECS = {
+    "qwen2.5-7b": {
+        "model_name": "Qwen2.5-7B-Instruct",
+        "summary_prefix": "qwen25_7b",
+        "tp_sizes": (1, 2, 4),
+        "config": {
+            "model_type": "qwen2",
+            "hidden_size": 3584,
+            "intermediate_size": 18944,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+        },
+    },
+    "qwen2.5-14b": {
+        "model_name": "Qwen2.5-14B-Instruct",
+        "summary_prefix": "qwen25_14b",
+        "tp_sizes": (1, 2, 4, 8),
+        "config": {
+            "model_type": "qwen2",
+            "hidden_size": 5120,
+            "intermediate_size": 13824,
+            "num_hidden_layers": 48,
+            "num_attention_heads": 40,
+            "num_key_value_heads": 8,
+        },
+    },
+}
+MODEL_FAMILIES = ("hunyuan-reprompt", *QWEN_MODEL_SPECS)
 QWEN_ARCHITECTURE = "Qwen2ForCausalLM"
-QWEN_TP_SIZES = (1, 2, 4)
+# Preserve the original 7B constant for callers; defaults use each model's spec.
+QWEN_TP_SIZES = QWEN_MODEL_SPECS[QWEN_MODEL_FAMILY]["tp_sizes"]
 QWEN_IO_MATRIX = {
     16: (128, 768),
     80: (704,),
@@ -34,34 +63,35 @@ def apply_model_defaults(
     args: argparse.Namespace, parser: argparse.ArgumentParser, study: str
 ) -> None:
     """Resolve family-specific CLI defaults without changing Hunyuan calls."""
-    is_qwen = args.model_family == QWEN_MODEL_FAMILY
+    qwen_spec = QWEN_MODEL_SPECS.get(args.model_family)
+    is_qwen = qwen_spec is not None
     if args.model_path is None:
         args.model_path = Path(
-            "/data/models/Qwen2.5-7B-Instruct"
+            f"/data/models/{qwen_spec['model_name']}"
             if is_qwen
             else "/workspace/models/reprompt"
         )
     if args.served_model_name is None:
         args.served_model_name = (
-            "Qwen2.5-7B-Instruct" if is_qwen else "HunyuanImage-2.1-reprompt"
+            qwen_spec["model_name"] if is_qwen else "HunyuanImage-2.1-reprompt"
         )
     if args.output_dir is None:
         args.output_dir = Path(
-            f"/data/outputs/qwen25_7b_{study}"
+            f"/data/outputs/{qwen_spec['summary_prefix']}_{study}"
             if is_qwen
             else f"/workspace/outputs/hunyuan_reprompt_{study}"
         )
     if args.all_reduce_mode is None:
         args.all_reduce_mode = "custom_v2" if is_qwen else "legacy_v1"
-    supported_tp = QWEN_TP_SIZES if is_qwen else (1, 2, 4, 8)
+    supported_tp = qwen_spec["tp_sizes"] if is_qwen else (1, 2, 4, 8)
     args.tp_sizes = list(dict.fromkeys(args.tp_sizes or supported_tp))
     invalid = [tp for tp in args.tp_sizes if tp not in supported_tp]
     if invalid:
         parser.error(
-            f"{args.model_family} supports TP {supported_tp}; got {invalid}. "
+            f"{args.model_family} profiling uses TP {supported_tp}; got {invalid}. "
             + (
                 "Qwen's 28 attention heads cannot be split across TP8."
-                if is_qwen
+                if args.model_family == QWEN_MODEL_FAMILY
                 else ""
             )
         )
@@ -119,22 +149,21 @@ def validate_qwen_checkpoint(model_path: Path) -> None:
         raise ValueError("Expected the Qwen BPE tokenizer in tokenizer.json")
 
 
-def load_qwen_config(model_path: Path) -> dict[str, Any]:
+def load_qwen_config(
+    model_path: Path, model_family: str = QWEN_MODEL_FAMILY
+) -> dict[str, Any]:
+    if model_family not in QWEN_MODEL_SPECS:
+        raise ValueError(f"Unknown Qwen model family: {model_family}")
+    spec = QWEN_MODEL_SPECS[model_family]
     validate_qwen_checkpoint(model_path)
     config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
     if QWEN_ARCHITECTURE not in (config.get("architectures") or []):
         raise ValueError(f"Expected architecture {QWEN_ARCHITECTURE}")
-    expected = {
-        "model_type": "qwen2",
-        "hidden_size": 3584,
-        "num_hidden_layers": 28,
-        "num_attention_heads": 28,
-        "num_key_value_heads": 4,
-    }
-    for name, value in expected.items():
+    for name, value in spec["config"].items():
         if config.get(name) != value:
             raise ValueError(
-                f"Expected Qwen2.5-7B {name}={value!r}, got {config.get(name)!r}"
+                f"Expected {spec['model_name']} {name}={value!r}, "
+                f"got {config.get(name)!r}"
             )
     for name in ("vocab_size", "max_position_embeddings"):
         if type(config.get(name)) is not int or config[name] <= 1:
