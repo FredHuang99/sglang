@@ -36,6 +36,23 @@ FILES = [
     "7_numeracy.txt",
 ]
 SYSTEM = "You are a helpful assistant."
+MODEL_SPECS = {
+    "qwen2.5-7b": {
+        "repo_id": "Qwen/Qwen2.5-7B-Instruct",
+        "hidden_size": 3584,
+        "num_hidden_layers": 28,
+        "num_attention_heads": 28,
+        "num_key_value_heads": 4,
+    },
+    "qwen2.5-14b": {
+        "repo_id": "Qwen/Qwen2.5-14B-Instruct",
+        "hidden_size": 5120,
+        "num_hidden_layers": 48,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+    },
+}
+NO_SYSTEM_TEMPLATE = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
 SAMPLING = dict(
     temperature=0.7,
     top_p=0.8,
@@ -101,9 +118,85 @@ def cmd(*args):
     return subprocess.check_output(args, text=True).strip()
 
 
-def local_model_revision(model, explicit=None):
+def sampling_parameters(greedy):
+    if greedy:
+        return dict(
+            temperature=0,
+            max_new_tokens=None,
+            ignore_eos=False,
+            skip_special_tokens=True,
+        )
+    return dict(SAMPLING)
+
+
+def validate_model_config(cfg, family):
+    spec = MODEL_SPECS[family]
+    expected = {k: v for k, v in spec.items() if k != "repo_id"}
+    expected.update(model_type="qwen2", max_position_embeddings=CONTEXT)
+    for key, value in expected.items():
+        if cfg.get(key) != value:
+            raise ValueError(
+                f"Expected {spec['repo_id']} {key}={value}, got {cfg.get(key)!r}"
+            )
+    if "Qwen2ForCausalLM" not in (cfg.get("architectures") or []):
+        raise ValueError("Expected the Qwen2ForCausalLM architecture")
+    if cfg.get("quantization_config") or cfg.get("rope_scaling"):
+        raise ValueError("Use unquantized BF16 weights with the native context")
+
+
+def encode_input(tok, text, system_mode):
+    if system_mode == "none":
+        # Qwen's default template inserts a system message for user-only lists.
+        # Render just the user turn and assistant prefix, then send these IDs.
+        return tok.encode(
+            NO_SYSTEM_TEMPLATE.replace("{prompt}", text), add_special_tokens=False
+        )
+    return tok.apply_chat_template(
+        [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": text},
+        ],
+        tokenize=True,
+        add_generation_prompt=True,
+        return_dict=False,
+        return_tensors=None,
+    )
+
+
+def source_identity(src, paths):
+    """Fingerprint staged/unstaged changes and untracked source without editing Git."""
+    git = ["git", "-C", str(src)]
+    diff = subprocess.check_output(
+        [
+            *git, "diff", "--no-ext-diff", "--no-textconv", "--binary",
+            "HEAD", "--", *paths,
+        ]
+    )
+    untracked = (
+        subprocess.check_output(
+            [*git, "ls-files", "--others", "--exclude-standard", "-z", "--", *paths]
+        )
+        .decode("utf-8")
+        .split("\0")
+    )
+    identity = {
+        "commit": cmd(*git, "rev-parse", "HEAD"),
+        "status": cmd(
+            *git, "status", "--porcelain=v1", "--untracked-files=all", "--", *paths
+        ),
+        "tracked_diff_sha256": digest(diff),
+        "untracked_sha256": {
+            name: digest((src / name).read_bytes())
+            for name in sorted(untracked)
+            if name
+        },
+    }
+    return identity, diff
+
+
+def local_model_revision(model, explicit=None, family="qwen2.5-7b"):
     """Read local HF provenance without calling Hub APIs or changing metadata."""
-    info = {"repo_id": "Qwen/Qwen2.5-7B-Instruct"}
+    info = {"repo_id": MODEL_SPECS[family]["repo_id"]}
     if explicit:
         return {**info, "revision": explicit, "source": "argument"}
     weights = sorted(model.glob("*.safetensors")) or sorted(
@@ -161,7 +254,7 @@ def prepare(args):
     root = args.output_dir
     src, ds, model = REPO, args.data_dir, args.model_dir
     if (root / "manifest.json").exists():
-        if read(root / "manifest.json").get("signature", {}).get("schema") != 2:
+        if read(root / "manifest.json").get("signature", {}).get("schema") not in {2, 3}:
             raise ValueError(
                 "This result directory belongs to the earlier standalone script. Keep it intact and use that script to resume, or choose a new --output-dir."
             )
@@ -180,18 +273,19 @@ def prepare(args):
         "scripts/qwen_t2v_length_study.py",
         "scripts/run_qwen_t2v_length_study.sh",
     ]
-    assert not cmd(
-        "git", "-C", str(src), "status", "--porcelain", "--", *source_paths
-    ), (
-        "Commit the study scripts and keep the inference source unchanged before collecting results"
-    )
+    source_state, source_diff = source_identity(src, source_paths)
     cfg = read(model / "config.json")
     gen = read(model / "generation_config.json")
-    assert cfg["max_position_embeddings"] == CONTEXT
-    for k in ("temperature", "top_p", "top_k", "repetition_penalty"):
-        assert gen[k] == SAMPLING[k], ("Unexpected generation config", k, gen[k])
-    assert gen["do_sample"] is True
+    validate_model_config(cfg, args.model_family)
+    sampling = sampling_parameters(args.greedy)
+    if not args.greedy:
+        for k in ("temperature", "top_p", "top_k", "repetition_penalty"):
+            assert gen[k] == sampling[k], ("Unexpected generation config", k, gen[k])
+        assert gen["do_sample"] is True
     tok = AutoTokenizer.from_pretrained(str(model), local_files_only=True)
+    for token, token_id in (("<|im_start|>", 151644), ("<|im_end|>", 151645)):
+        if tok.convert_tokens_to_ids(token) != token_id:
+            raise ValueError(f"Unexpected Qwen ChatML token: {token}")
     special = set(tok.all_special_ids)
     eos = gen["eos_token_id"]
     eos = eos if isinstance(eos, list) else [eos]
@@ -215,17 +309,7 @@ def prepare(args):
         assert len(lines) == 200, (name, len(lines))
         for lineno, text in lines:
             raw = tok.encode(text, add_special_tokens=False)
-            messages = [
-                {"role": "system", "content": SYSTEM},
-                {"role": "user", "content": text},
-            ]
-            inputs = tok.apply_chat_template(
-                messages,
-                tokenize=True,
-                add_generation_prompt=True,
-                return_dict=False,
-                return_tensors=None,
-            )
+            inputs = encode_input(tok, text, args.system_mode)
             assert 0 < len(inputs) < CONTEXT - 4
             rows.append(
                 dict(
@@ -238,7 +322,7 @@ def prepare(args):
                     input_token_ids=inputs,
                     raw_tokens=len(raw),
                     input_tokens=len(inputs),
-                    sampling_seed=20260912 + len(rows),
+                    **({} if args.greedy else {"sampling_seed": 20260912 + len(rows)}),
                 )
             )
     assert len(rows) == 1400
@@ -249,16 +333,24 @@ def prepare(args):
         for k in ("sglang", "torch", "transformers", "huggingface-hub", "aiohttp")
     }
     signature = dict(
-        schema=2,
+        schema=3,
         task="ordinary_chat",
-        system=SYSTEM,
-        sampling=SAMPLING,
+        model_family=args.model_family,
+        system_mode=args.system_mode,
+        system=None if args.system_mode == "none" else SYSTEM,
+        input_template=(
+            NO_SYSTEM_TEMPLATE if args.system_mode == "none" else tok.get_chat_template()
+        ),
+        decoding="greedy" if args.greedy else "sampling",
+        sampling=sampling,
+        sampling_defaults="openai",
         context_length=CONTEXT,
         eos_ids=eos,
         special_ids=sorted(special),
-        model_revision=local_model_revision(model, args.model_revision),
+        model_revision=local_model_revision(model, args.model_revision, args.model_family),
         model_config_hashes=config_hashes,
-        source_commit=cmd("git", "-C", str(src), "rev-parse", "HEAD"),
+        source_commit=source_state["commit"],
+        source_state=source_state,
         dataset_commit=cmd("git", "-C", str(ds), "rev-parse", "HEAD"),
         prompt_file_hashes=file_hashes,
         input_hash=digest(packed(rows).encode()),
@@ -282,8 +374,15 @@ def prepare(args):
         )
     else:
         save(mpath, manifest)
+    save(dest / "provenance" / "source_state.json", source_state)
+    (dest / "provenance" / "source.diff").write_bytes(source_diff)
     atomic_text(dest / "inputs.jsonl", "".join(packed(x) + "\n" for x in rows))
     print(f"Prepared {len(rows)} prompts; fingerprint={fingerprint}", flush=True)
+    print(
+        f"Model={MODEL_SPECS[args.model_family]['repo_id']}; "
+        f"system={args.system_mode}; decoding={signature['decoding']}",
+        flush=True,
+    )
     return rows, tok, special, eos, fingerprint
 
 
@@ -299,7 +398,6 @@ def checked_records(root, rows, fingerprint):
         for k in (
             "raw_token_ids",
             "input_token_ids",
-            "sampling_seed",
             "raw_prompt",
             "raw_tokens",
             "input_tokens",
@@ -307,6 +405,9 @@ def checked_records(root, rows, fingerprint):
             "source_line",
         ):
             assert r[k] == expected[r["id"]][k], (str(path), k)
+        original = expected[r["id"]]
+        assert ("sampling_seed" in r) == ("sampling_seed" in original), str(path)
+        assert r.get("sampling_seed") == original.get("sampling_seed"), str(path)
         assert all(type(t) is int for t in r["output_token_ids"])
         assert r["generated_tokens"] == len(r["output_token_ids"])
         assert r["response_tokens"] == sum(
@@ -379,6 +480,30 @@ def markdown_table(headers, rows):
     )
 
 
+def experiment_metadata(signature):
+    # Schema 2 results predate the explicit family/system/decoding fields.
+    return {
+        "model": signature.get("model_revision", {}).get("repo_id", "未记录型号"),
+        "system_mode": signature.get(
+            "system_mode", "helpful" if signature.get("system") else "none"
+        ),
+        "decoding": signature.get(
+            "decoding",
+            "greedy"
+            if signature.get("sampling", {}).get("temperature") == 0
+            else "sampling",
+        ),
+    }
+
+
+def experiment_description(experiment):
+    if not experiment:
+        return "实验设置见本目录 manifest.json。"
+    system = "无 system" if experiment["system_mode"] == "none" else "helpful system"
+    decoding = "greedy" if experiment["decoding"] == "greedy" else "随机采样"
+    return f"模型：**{experiment['model']}**；输入：**{system}**；解码：**{decoding}**。"
+
+
 def summary_markdown(summary):
     def stat_row(label, stats):
         return [label, str(stats["count"])] + [
@@ -393,9 +518,10 @@ def summary_markdown(summary):
     overall = summary["all"]
     parts = [
         "# Qwen 普通对话长度统计",
+        experiment_description(summary.get("experiment")),
         f"已保存 **{summary['recorded']}/{summary['expected']}** 条回复：自然结束 **{summary['naturally_finished']}** 条，达到长度限制 **{summary['length_limited']}** 条；未完成 **{summary['missing']}** 条。",
         f"统计更新时间：{summary['generated_at']}。",
-        "raw 是原始 prompt 长度；input 包含 system 和 chat template；response 按实际生成 token IDs 计数，扣除终止及特殊 token。以下长度单位均为 tokens。",
+        "raw 是原始 prompt 长度；input 是实际送入模型的长度，包含对话标记及所选模式的 system（无 system 模式不包含）；response 按实际生成 token IDs 计数，扣除终止及特殊 token。以下长度单位均为 tokens。",
         "## 总体长度",
         "只统计已保存的有效记录；未完成请求不进入长度统计。",
         markdown_table(
@@ -490,7 +616,7 @@ def summary_markdown(summary):
     return "\n\n".join(parts) + "\n"
 
 
-def write_readable_responses(root, records, expected):
+def write_readable_responses(root, records, expected, experiment=None):
     def fenced(text):
         longest = max((len(m.group()) for m in re.finditer(r"`+", text)), default=0)
         fence = "`" * max(3, longest + 1)
@@ -498,8 +624,9 @@ def write_readable_responses(root, records, expected):
 
     parts = [
         "# 原始 prompt 与完整回复",
+        experiment_description(experiment),
         f"已保存 {len(records)}/{expected} 条，按 response tokens 从多到少排列；内容不截短。",
-        "raw 不含对话模板；input 包含 system 和模板；response 按生成 token IDs 扣除终止及特殊 token 后计数。",
+        "raw 不含对话模板；input 为实际发送的完整输入长度；response 按生成 token IDs 扣除终止及特殊 token 后计数。",
     ]
     for i, r in enumerate(
         sorted(records, key=lambda r: (-r["response_tokens"], r["id"])), 1
@@ -564,6 +691,7 @@ def export_results(root):
             w.writerow({**row, "status": status})
     atomic_text(dest / "lengths.csv", buf.getvalue())
     summary = dict(
+        experiment=experiment_metadata(manifest["signature"]),
         expected=len(rows),
         recorded=len(records),
         missing=len(rows) - len(records),
@@ -594,7 +722,7 @@ def export_results(root):
     }
     save(dest / "summary.json", summary)
     atomic_text(dest / "summary.md", summary_markdown(summary))
-    write_readable_responses(dest, records, len(rows))
+    write_readable_responses(dest, records, len(rows), summary["experiment"])
     atomic_text(
         dest / "longest_responses.jsonl",
         "".join(
@@ -800,6 +928,8 @@ async def execute(args, rows, tok, special, eos, fingerprint, run_dir, state):
                 "1",
                 "--dtype",
                 "bfloat16",
+                "--sampling-defaults",
+                "openai",
                 "--context-length",
                 str(CONTEXT),
                 "--mem-fraction-static",
@@ -856,6 +986,8 @@ async def execute(args, rows, tok, special, eos, fingerprint, run_dir, state):
                                 assert (
                                     info.get("tp_size") == 1
                                     and info.get("context_length") == CONTEXT
+                                    and info.get("sampling_defaults") == "openai"
+                                    and not info.get("preferred_sampling_params")
                                 )
                                 save(run_dir / f"server_info_gpu{gpu}.json", info)
                                 ready.add(gpu)
@@ -892,10 +1024,11 @@ async def execute(args, rows, tok, special, eos, fingerprint, run_dir, state):
                     )
                     save(attempt_path, attempt)
                     sampling = {
-                        **SAMPLING,
-                        "sampling_seed": row["sampling_seed"],
+                        **sampling_parameters(args.greedy),
                         "stop_token_ids": eos,
                     }
+                    if not args.greedy:
+                        sampling["sampling_seed"] = row["sampling_seed"]
                     payload = dict(
                         input_ids=row["input_token_ids"],
                         sampling_params=sampling,
@@ -1041,6 +1174,9 @@ def run(args):
             base_port=args.base_port,
             python=sys.executable,
             repository=str(REPO),
+            model_family=args.model_family,
+            system_mode=args.system_mode,
+            decoding="greedy" if args.greedy else "sampling",
             model_dir=str(args.model_dir),
             data_dir=str(args.data_dir),
             output_dir=str(args.output_dir),
@@ -1107,6 +1243,10 @@ def run(args):
 
 def report(root, top, preview_chars):
     summary = read(root / "summary.json")
+    if "experiment" not in summary and (root / "manifest.json").is_file():
+        summary["experiment"] = experiment_metadata(
+            read(root / "manifest.json")["signature"]
+        )
     print(summary_markdown(summary), end="")
     with (root / "longest_responses.jsonl").open(encoding="utf-8") as f:
         for _, line in zip(range(top), f):
@@ -1150,6 +1290,23 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument(
         "action", choices=["prepare", "run", "export", "stop", "status", "report"]
+    )
+    p.add_argument(
+        "--model-family",
+        choices=tuple(MODEL_SPECS),
+        default="qwen2.5-7b",
+        help="Qwen checkpoint identity; existing calls default to 7B",
+    )
+    p.add_argument(
+        "--system-mode",
+        choices=("helpful", "none"),
+        default="helpful",
+        help="none omits the entire system turn, including Qwen's automatic default",
+    )
+    p.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Use temperature=0 without sampling filters, penalties or sampling seeds",
     )
     p.add_argument(
         "--root",
@@ -1196,15 +1353,29 @@ def main():
             "Run without -O or PYTHONOPTIMIZE; integrity assertions must stay enabled"
         )
     args.root = args.root.expanduser().resolve()
+    model_name = MODEL_SPECS[args.model_family]["repo_id"].split("/", 1)[1]
     args.model_dir = (
-        (args.model_dir or args.root / "models/Qwen2.5-7B-Instruct")
+        (args.model_dir or args.root / "models" / model_name)
         .expanduser()
         .resolve()
     )
     args.data_dir = (
         (args.data_dir or args.root / "data/T2V-CompBench").expanduser().resolve()
     )
-    args.output_dir = (args.output_dir or args.root / "results").expanduser().resolve()
+    legacy_defaults = (
+        args.model_family == "qwen2.5-7b"
+        and args.system_mode == "helpful"
+        and not args.greedy
+    )
+    result_name = (
+        "results"
+        if legacy_defaults
+        else (
+            f"results_{args.model_family}_{args.system_mode}_"
+            f"{'greedy' if args.greedy else 'sampling'}"
+        )
+    )
+    args.output_dir = (args.output_dir or args.root / result_name).expanduser().resolve()
     if args.output_dir.is_relative_to(REPO):
         p.error("--output-dir must be outside the source checkout")
     if not (1 <= args.concurrency <= 256 and 0.5 <= args.mem_fraction < 0.95):
